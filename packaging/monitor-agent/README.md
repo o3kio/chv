@@ -1,7 +1,7 @@
 # chv-monitor-agent
 
 The optional CHV in-guest monitoring agent (ADR-026,
-https://github.com/kubedoio/chv — `docs/specs/adr/026-optional-monitor-agent-and-guest-identity.md`).
+https://github.com/o3kio/chv — `docs/specs/adr/026-optional-monitor-agent-and-guest-identity.md`).
 
 ## What it does
 

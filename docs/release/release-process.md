@@ -153,7 +153,7 @@ gh release download v<version>
 sha256sum -c SHA256SUMS
 
 # Verify GitHub attestation
-gh attestation verify chv-<version>-linux-amd64.tar.gz --repo kubedoio/chv
+gh attestation verify chv-<version>-linux-amd64.tar.gz --repo o3kio/chv
 
 # Inspect SBOM
 jq '.packages | length' sbom.spdx.json

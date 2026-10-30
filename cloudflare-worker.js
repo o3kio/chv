@@ -8,7 +8,7 @@
  * 4. Update GITHUB_RAW_URL to point to your install.sh on GitHub (or another CDN).
  */
 
-const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/cellhv/chv/main/scripts/install.sh';
+const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh';
 
 export default {
   async fetch(request, env, ctx) {
@@ -36,10 +36,11 @@ export default {
   <h1>Install CHV</h1>
   <p>CHV is a Linux-first virtualization platform built on Cloud Hypervisor.</p>
   <p>Run the installer on a fresh Ubuntu server:</p>
-  <pre><code>curl -sfL https://get.cellhv.com/ | sh -</code></pre>
+  <pre><code>curl -fsSL https://get.cellhv.com/ | sudo bash -s</code></pre>
   <p>Or install a specific version:</p>
-  <pre><code>curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=0.0.0.2 sh -</code></pre>
-  <p>See the <a href="https://github.com/cellhv/chv/blob/main/docs/DEPLOYMENT.md">deployment guide</a> for details.</p>
+  <pre><code>curl -fsSL https://get.cellhv.com/ | sudo INSTALL_CHV_VERSION=0.3.0 bash -s</code></pre>
+  <p>The script requires <code>bash</code> (it uses <code>set -o pipefail</code>); <code>sh -</code> does not work.</p>
+  <p>See the <a href="https://github.com/o3kio/chv/blob/main/docs/DEPLOYMENT.md">deployment guide</a> for details.</p>
 </body>
 </html>`, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }

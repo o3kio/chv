@@ -11,7 +11,7 @@ description: |
   enrollment over mutual TLS, bounded disk spool, credential rotation.
   Runs inside VMs; a VM without it is fully usable. Never installs
   with or depends on the CHV node/control-plane packages.
-homepage: https://github.com/kubedoio/chv
+homepage: https://github.com/o3kio/chv
 license: MIT
 # Deliberately NO dependency on chv-controlplane / chv-node: this is a
 # guest package. The agent is optional per-VM software whose absence

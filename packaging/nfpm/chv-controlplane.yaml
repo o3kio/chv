@@ -6,7 +6,7 @@ section: default
 priority: optional
 maintainer: Kubedo <engineering@kubedo.io>
 description: CHV control plane service
-homepage: https://github.com/kubedoio/chv
+homepage: https://github.com/o3kio/chv
 license: MIT
 # Runtime libs: chv-controlplane links against OpenSSL 3 via reqwest's
 # `native-tls` feature and rust-s3. The runtime soname is

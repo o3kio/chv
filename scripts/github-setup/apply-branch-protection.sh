@@ -70,7 +70,7 @@ fi
 if [ -z "${REPO_SLUG}" ]; then
     echo "ERROR: Could not determine repository slug from git remote."
     echo "       Set REPO_SLUG manually, e.g.:"
-    echo "       REPO_SLUG=kubedoio/chv ./scripts/github-setup/apply-branch-protection.sh"
+    echo "       REPO_SLUG=o3kio/chv ./scripts/github-setup/apply-branch-protection.sh"
     exit 1
 fi
 

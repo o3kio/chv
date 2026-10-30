@@ -33,7 +33,7 @@ fi
 
 if [ -z "${REPO_SLUG}" ]; then
     error "Could not determine repository slug from git remote."
-    REPO_SLUG="${REPO_SLUG:-kubedoio/chv}"
+    REPO_SLUG="${REPO_SLUG:-o3kio/chv}"
 fi
 
 echo "========================================"
