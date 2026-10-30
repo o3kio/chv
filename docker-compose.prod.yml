@@ -7,6 +7,9 @@
 # production topology — use the .deb packages or scripts/install.sh
 # (see docs/DEPLOYMENT.md). Kept for existing experimental deployments.
 #
+# Unmaintained and unverified: nothing in this stack is exercised by CI or by
+# the release gates, and fixing the image build does not make it supported.
+#
 # Prerequisites:
 #   - Docker 24+ with Compose v2
 #   - /dev/kvm available on the host

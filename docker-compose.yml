@@ -1,6 +1,22 @@
 version: "3.8"
 
 # CHV local development stack
+# ===========================
+# LEGACY / DEV-ONLY: this stack is NOT part of any supported topology and must
+# not be deployed. It predates the #323 ownership model and the prompt-02 agent
+# authority cutover, and it is fenced as unsupported by
+# docs/DEPLOYMENT-ARCHITECTURE.md §10. Use the .deb/.rpm packages or
+# scripts/install.sh for anything real; this file is kept for local
+# experimentation only.
+#
+# There is no TLS provisioning here and the stack does not exercise the
+# fail-closed security posture. The control plane requires `[tls]`
+# (server_cert_path + server_key_path + client_ca_path) unless
+# CHV_ALLOW_INSECURE=1, and that env var is locked out of non-`dev` builds — so
+# as configured this stack does not start the control plane, and the agent has
+# no mTLS material to enroll with. Never expose it beyond localhost, and do not
+# "fix" this by weakening TLS or adding a `dev` feature build.
+#
 # Note: chv-webui-bff is embedded in the chv-controlplane binary (port 8080).
 #
 # Services:
@@ -18,7 +34,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c "mkdir -p /run/chv/controlplane /var/lib/chv /usr/local/share/chv/migrations &&
              cat > /etc/chv/controlplane.toml <<'EOF'
       grpc_bind = \"0.0.0.0:8443\"
@@ -56,7 +72,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c "mkdir -p /var/lib/chv/storage/localdisk /run/chv/stord &&
              cat > /etc/chv/stord.toml <<'EOF'
       socket_path = \"/run/chv/stord/api.sock\"
@@ -77,7 +93,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c "mkdir -p /run/chv/nwd &&
              cat > /etc/chv/nwd.toml <<'EOF'
       socket_path = \"/run/chv/nwd/api.sock\"
@@ -101,13 +117,13 @@ services:
     privileged: true
     devices:
       - /dev/kvm:/dev/kvm
-    command: >
+    command: |
       sh -c "mkdir -p /var/lib/chv/agent /run/chv/agent /var/lib/chv/cache /etc/chv/certs &&
              cat > /etc/chv/agent.toml <<'EOF'
       socket_path = \"/run/chv/agent/api.sock\"
       runtime_dir = \"/var/lib/chv/agent\"
       log_level = \"info\"
-      control_plane_addr = \"http://chv-controlplane:8443\"
+      control_plane_addr = \"https://chv-controlplane:8443\"
       stord_socket = \"/run/chv/stord/api.sock\"
       nwd_socket = \"/run/chv/nwd/api.sock\"
       chv_binary_path = \"/usr/bin/cloud-hypervisor\"
@@ -144,7 +160,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c "cat > /etc/nginx/sites-enabled/default <<'EOF'
       server {
         listen 80;
