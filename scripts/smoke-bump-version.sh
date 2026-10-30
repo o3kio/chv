@@ -80,7 +80,7 @@ make_fixture() {
 
 Current version: `0.2.0` (see [`VERSION`](./VERSION))
 
-    curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=0.2.0 sh -
+    curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.2.0 bash -s
 
 The sidebar shows chv-v0.2.0-alpha.
 

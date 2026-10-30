@@ -2,7 +2,7 @@
 # CHV Quick Install — the one-command lab installer (issue #482)
 #
 # Usage (designed to be curl-pipe-bash'd from raw.githubusercontent.com):
-#   curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s
+#   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
 #   curl -fsSL ... | sudo bash -s -- --version 0.3.0     # pin a release
 #   sudo ./scripts/quick-install.sh --uninstall          # remove software, keep data
 #   sudo ./scripts/quick-install.sh --uninstall --purge  # remove everything
@@ -25,7 +25,7 @@
 #   exercises this path yet (same tier the #447 package serving shape
 #   started at). See docs/DEPLOYMENT.md "Quick Install (single command)".
 #
-# Artifact source: tagged GitHub releases of kubedoio/chv only (the publish
+# Artifact source: tagged GitHub releases of o3kio/chv only (the publish
 # pipeline .github/workflows/release.yml maintains). No nightly default.
 # Asset naming matches what that pipeline actually publishes:
 #   - tarball: chv-<version>-linux-<arch>.tar.gz (+ .sha256 sidecar)
@@ -43,7 +43,7 @@
 # Environment variables (house names shared with scripts/install.sh where the
 # semantics are identical):
 #   INSTALL_CHV_VERSION       - version to install, no leading 'v' (default: latest stable)
-#   GITHUB_REPO               - override the source repository (default: kubedoio/chv)
+#   GITHUB_REPO               - override the source repository (default: o3kio/chv)
 #   INSTALL_CHV_SKIP_DEPS     - "1" to skip dependency installation
 #   INSTALL_CHV_SKIP_CLOUD_HV - "1" to skip the Cloud Hypervisor download
 #
@@ -73,7 +73,7 @@ set -euo pipefail
 # them; on a real host the defaults match install.sh and the package layout)
 # -----------------------------------------------------------------------------
 INSTALL_CHV_VERSION="${INSTALL_CHV_VERSION:-latest}"
-GITHUB_REPO="${GITHUB_REPO:-kubedoio/chv}"
+GITHUB_REPO="${GITHUB_REPO:-o3kio/chv}"
 INSTALL_CHV_SKIP_DEPS="${INSTALL_CHV_SKIP_DEPS:-0}"
 INSTALL_CHV_SKIP_CLOUD_HV="${INSTALL_CHV_SKIP_CLOUD_HV:-0}"
 
@@ -128,7 +128,7 @@ usage() {
 CHV Quick Install — one-command lab installer (issue #482)
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s
+  curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
   curl -fsSL <url> | sudo bash -s -- --version 0.3.0   # pin a tagged release
   sudo ./scripts/quick-install.sh --uninstall           # remove software, keep data
   sudo ./scripts/quick-install.sh --uninstall --purge   # remove everything
@@ -145,7 +145,7 @@ Flags:
 
 Environment:
   INSTALL_CHV_VERSION        version to install (default: latest stable)
-  GITHUB_REPO                source repository (default: kubedoio/chv)
+  GITHUB_REPO                source repository (default: o3kio/chv)
   INSTALL_CHV_SKIP_DEPS      "1" to skip dependency installation
   INSTALL_CHV_SKIP_CLOUD_HV  "1" to skip the Cloud Hypervisor download
 
@@ -227,7 +227,10 @@ github_api_get() {
     # $1: API path (e.g. releases/latest). Prints body; non-200 is fatal.
     local path="$1" body code
     body=$(mktemp)
-    code=$(curl -sS -o "$body" -w '%{http_code}' \
+    # -L: follow the redirect left behind by a repository/org rename (e.g.
+    # kubedoio/chv -> o3kio/chv returns 301 with an HTML/JSON body, which
+    # would otherwise be parsed as a failed API response).
+    code=$(curl -sSL -o "$body" -w '%{http_code}' \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/${GITHUB_REPO}/${path}" 2>/dev/null) || code="000"
     if [ "$code" != "200" ]; then

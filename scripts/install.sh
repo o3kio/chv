@@ -1,8 +1,8 @@
 #!/bin/bash
 # CHV All-in-One Installer
-# Usage:
-#   curl -sfL https://get.cellhv.com/ | sh -
-#   curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=0.3.0 sh -
+# Usage (requires bash — the installer uses `set -o pipefail`; dash/sh will not work):
+#   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
+#   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s
 #   ./scripts/install.sh --wipe    # Full teardown before clean install
 #   ./scripts/install.sh --fresh   # Alias for --wipe
 #
@@ -11,6 +11,11 @@
 #   INSTALL_CHV_TARBALL_PATH    - Path to local release tarball (dev mode)
 #   INSTALL_CHV_SKIP_DEPS       - Set to "1" to skip apt dependency installation
 #   INSTALL_CHV_SKIP_CLOUD_HV   - Set to "1" to skip cloud-hypervisor download
+#   INSTALL_CHV_ALLOW_VMM_MISMATCH - Set to "1" to keep a host cloud-hypervisor
+#                                 whose major.minor differs from the qualified
+#                                 pin (v53.0) instead of replacing it with the
+#                                 pinned, digest-verified static binary. The
+#                                 resulting install is OFF-PIN and UNQUALIFIED.
 #   INSTALL_CHV_BRIDGE_IFACE    - Host interface to attach to bridge (default: ens19)
 #   INSTALL_CHV_BRIDGE_NAME     - Bridge name (default: chvbr0)
 #   INSTALL_CHV_BRIDGE_CIDR     - Bridge CIDR (default: 10.200.0.1/24)
@@ -57,7 +62,7 @@ CHV_MIGRATIONS_DIR="/usr/local/share/chv/migrations"
 CHV_MONITORING_MIGRATIONS_DIR="/usr/local/share/chv/monitoring-migrations"
 CHV_DB_PATH="${CHV_DATA_DIR}/controlplane.db"
 
-GITHUB_REPO="${GITHUB_REPO:-kubedoio/chv}"
+GITHUB_REPO="${GITHUB_REPO:-o3kio/chv}"
 
 # Populated later
 EXTRACT_DIR=""
@@ -177,8 +182,10 @@ case "$ARCH" in
 esac
 info "Detected architecture: $ARCH (image suffix: $CHV_ARCH)"
 
-# Detect if we are running from inside a release tarball directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Detect if we are running from inside a release tarball directory.
+# BASH_SOURCE[0] is unset when the script is piped into `bash -s` (the
+# documented curl|bash path), so default it instead of tripping `set -u`.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
 if [ -f "${SCRIPT_DIR}/bin/chv-controlplane" ] && [ -z "$INSTALL_CHV_TARBALL_PATH" ]; then
     info "Detected local release directory mode (binaries next to install.sh)"
     INSTALL_CHV_TARBALL_PATH="${SCRIPT_DIR}"
@@ -269,6 +276,12 @@ print_github_install_alternatives() {
 }
 
 resolve_version() {
+    # Offline/air-gapped fallback pin: used ONLY when the GitHub API cannot be
+    # reached or queried (never silently — every use is logged as a warning
+    # naming the version, so an operator can tell a stale pin from a resolved
+    # one). Keep in sync with the last qualified release.
+    local fallback_version="0.3.0"
+
     # A local tarball/directory needs no GitHub API lookup — and the 404
     # fail-fast below must not abort the documented local-tarball install
     # path while no stable release is published yet (#440, #454 review).
@@ -276,7 +289,8 @@ resolve_version() {
     # default the failed-'latest' fallback uses, which only names the
     # extracted top-level directory (EXTRACT_DIR) in download_release().
     if [ -n "$INSTALL_CHV_TARBALL_PATH" ] && [ "$INSTALL_CHV_VERSION" = "latest" ]; then
-        INSTALL_CHV_VERSION="0.3.0"
+        INSTALL_CHV_VERSION="$fallback_version"
+        info "Local tarball mode with no explicit version — using ${INSTALL_CHV_VERSION} for the extracted directory name."
     fi
     if [ "$INSTALL_CHV_VERSION" = "latest" ]; then
         if cmd_exists curl; then
@@ -284,7 +298,9 @@ resolve_version() {
             local latest=""
             local api_body http_code
             api_body=$(mktemp)
-            http_code=$(curl -sS -o "$api_body" -w '%{http_code}' "$latest_api" 2>/dev/null) || http_code="000"
+            # -L: follow a repo/org rename redirect (301) instead of treating
+            # the redirect body as the API response.
+            http_code=$(curl -sSL -o "$api_body" -w '%{http_code}' "$latest_api" 2>/dev/null) || http_code="000"
             if [ "$http_code" = "200" ]; then
                 latest=$(grep '"tag_name":' "$api_body" | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/') || true
             fi
@@ -302,11 +318,17 @@ resolve_version() {
                 print_github_install_alternatives
                 fatal "Cannot resolve 'latest' CHV version — no stable release published yet."
             else
-                warn "Could not determine latest version from GitHub API (HTTP ${http_code}), falling back to 0.3.0"
-                INSTALL_CHV_VERSION="0.3.0"
+                warn "Could not determine the latest version from the GitHub API"
+                warn "(HTTP ${http_code}). Falling back to ${fallback_version} —"
+                warn "an offline/air-gapped fallback pin, NOT the resolved latest release."
+                warn "Pin explicitly with INSTALL_CHV_VERSION=<version> to silence this."
+                INSTALL_CHV_VERSION="$fallback_version"
             fi
         else
-            INSTALL_CHV_VERSION="0.3.0"
+            warn "curl is not available, so the latest release cannot be resolved."
+            warn "Falling back to ${fallback_version} — an offline/air-gapped fallback"
+            warn "pin, NOT the resolved latest release."
+            INSTALL_CHV_VERSION="$fallback_version"
         fi
     fi
     info "Installing CHV version: $INSTALL_CHV_VERSION"
@@ -320,7 +342,7 @@ print_tarball_download_diagnostics() {
     local tarball_url="$1"
     local release_api="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/v${INSTALL_CHV_VERSION}"
     local http_code
-    http_code=$(curl -sS -o /dev/null -w '%{http_code}' "$release_api" 2>/dev/null) || http_code="000"
+    http_code=$(curl -sSL -o /dev/null -w '%{http_code}' "$release_api" 2>/dev/null) || http_code="000"
 
     if [ "$http_code" = "404" ]; then
         warn "No GitHub Release is published for tag v${INSTALL_CHV_VERSION} in ${GITHUB_REPO}."
@@ -415,15 +437,48 @@ install_cloud_hypervisor() {
         return
     fi
 
+    local chv_version="53.0"
+
+    # Version gate: a host cloud-hypervisor is accepted only when its
+    # major.minor matches the qualified pin. Any other version is replaced
+    # with the pinned, digest-verified static binary below — the previous
+    # "any version counts as installed" early return silently kept hosts on
+    # the v43 branch the qualification campaign moved away from.
     if cmd_exists cloud-hypervisor; then
-        info "Cloud Hypervisor already installed: $(cloud-hypervisor --version 2>/dev/null || true)"
-        if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
-            ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+        local found_raw found_mm
+        found_raw="$(cloud-hypervisor --version 2>/dev/null || true)"
+        # Parse major.minor from e.g. "cloud-hypervisor v43.0.0". Comparing
+        # major.minor (not the full string) lets v53.0.0 match the "53.0" pin.
+        found_mm="$(printf '%s' "$found_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+
+        if [ "$found_mm" = "$chv_version" ]; then
+            info "Cloud Hypervisor already installed at the qualified pin (${found_raw}); keeping it."
+            if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
+                ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+            fi
+            return
         fi
-        return
+
+        if [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host Cloud Hypervisor."
+            warn "  found:    ${found_raw:-unparseable}"
+            warn "  required: v${chv_version} (qualified pin)"
+            warn "This install is OFF-PIN and UNQUALIFIED: VMs will run on a VMM the"
+            warn "qualification campaign did not cover. Re-run without this override"
+            warn "(and without INSTALL_CHV_SKIP_CLOUD_HV) to install the pinned binary."
+            if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
+                ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+            fi
+            return
+        fi
+
+        warn "Cloud Hypervisor version mismatch: found ${found_raw:-unparseable},"
+        warn "but the qualified pin is v${chv_version}. Replacing the host binary"
+        warn "with the pinned, digest-verified static build."
+        warn "To keep the host binary instead (off-pin, unqualified), re-run with"
+        warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1."
     fi
 
-    local chv_version="53.0"
     # Qualified-pin digests — D6 option (b), #448 campaign
     # (docs/evidence/vmm-requalification/v53.0/). The download aborts on
     # mismatch; the pin and its digests move together, always.
@@ -561,16 +616,17 @@ download_base_image() {
     fi
 }
 
-## added for workaround
+## Explicit local firmware override. A firmware build dropped at
+## /root/CLOUDHV.fd wins over the pinned download in download_firmware()
+## (which skips when ${FIRMWARE_PATH} already exists).
 copy_firmware() {
-    info "Copy BUID firmware file..."
-    #cp /root/Build/CloudHvX64/DEBUG_GCC/FV/CLOUDHV.fd
     if [ -f /root/CLOUDHV.fd ]; then
-        cp /root/CLOUDHV.fd /var/lib/chv/hypervisor-fw
-        chown "${CHV_USER}:${CHV_USER}" /var/lib/chv/hypervisor-fw
-        chmod 644 /var/lib/chv/hypervisor-fw
+        info "Using local firmware override /root/CLOUDHV.fd -> ${FIRMWARE_PATH}"
+        cp /root/CLOUDHV.fd "${FIRMWARE_PATH}"
+        chown "${CHV_USER}:${CHV_USER}" "${FIRMWARE_PATH}"
+        chmod 644 "${FIRMWARE_PATH}"
     else
-        warn "Firmware file /root/CLOUDHV.fd not found; skipping firmware copy."
+        info "No local firmware override at /root/CLOUDHV.fd; using the pinned download."
     fi
 }
 
@@ -597,7 +653,9 @@ download_firmware() {
         info "Firmware downloaded (${fw_size}) -> ${FIRMWARE_PATH}"
     else
         warn "Failed to download firmware from ${FIRMWARE_URL}"
-        warn "VM creation may fail without firmware."
+        warn "No firmware will be present at ${FIRMWARE_PATH}: VMs that request"
+        warn "firmware will fail to start with 'firmware not found: ${FIRMWARE_PATH}'."
+        warn "Retry manually with: curl -fSL --retry 3 '${FIRMWARE_URL}' -o '${FIRMWARE_PATH}'"
     fi
 }
 
@@ -1642,8 +1700,8 @@ download_release
 install_binaries_and_assets
 install_cloud_hypervisor
 download_base_image
-#download_firmware
-copy_firmware
+copy_firmware        # explicit local override wins (/root/CLOUDHV.fd)
+download_firmware    # otherwise fetch the pinned firmware into ${FIRMWARE_PATH}
 generate_certs
 setup_network
 install_configs
