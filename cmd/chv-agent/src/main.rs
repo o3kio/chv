@@ -39,6 +39,11 @@ const CORE_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// that the executor is explicitly cancelled (fail-closed -> InspectRequired).
 const CORE_EXECUTOR_DRAIN_BUDGET: Duration = Duration::from_secs(60);
 const CERT_ROTATION_INTERVAL_SECS: i64 = 12 * 60 * 60;
+/// Default `/metrics` listener address when `metrics_bind` is unset. Loopback,
+/// not `0.0.0.0`: an omitted key must never expose the Prometheus endpoint on
+/// every interface. Operators wanting another bind set `metrics_bind`
+/// explicitly (honored verbatim).
+const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9100";
 
 /// Write `contents` to `path` with mode 0600, normalizing the permissions of
 /// an existing file as well. Used for TLS private key material.
@@ -957,10 +962,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Metrics HTTP server for Prometheus scraping
-    let metrics_bind_addr = config
-        .metrics_bind
-        .clone()
-        .unwrap_or_else(|| "0.0.0.0:9100".to_string());
+    let metrics_bind_addr = resolve_metrics_bind(config.metrics_bind.as_deref());
+    if config.metrics_bind.is_none() {
+        warn!(
+            bind = %metrics_bind_addr,
+            "metrics_bind is not set; binding /metrics on loopback — set metrics_bind \
+             explicitly to serve a different address"
+        );
+    }
     let node_id = cache.lock().await.node_id.clone();
     let metrics_state = Arc::new(tokio::sync::Mutex::new(MetricsState::new(node_id.clone())));
     // Native monitoring sampler (G1/G2, #602): one bounded task,
@@ -1683,6 +1692,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Resolve the agent's `/metrics` listener address. An explicit `metrics_bind`
+/// is honored verbatim; only an unset key falls back to loopback.
+fn resolve_metrics_bind(configured: Option<&str>) -> String {
+    configured.unwrap_or(DEFAULT_METRICS_BIND).to_string()
+}
+
 /// Native monitoring sampler wiring (gate G1, #602).
 mod monitoring;
 
@@ -1915,6 +1930,21 @@ mod tests {
     fn omitted_authority_mode_is_legacy_and_does_not_select_core_paths() {
         let config = AgentConfig::default();
         assert_eq!(config.authority_mode, AgentAuthorityMode::Legacy);
+    }
+
+    #[test]
+    fn metrics_bind_defaults_to_loopback_and_honors_explicit_bind() {
+        // Regression pin: an agent config omitting `metrics_bind` used to bind
+        // the Prometheus endpoint on 0.0.0.0:9100 (all interfaces). The
+        // fallback must stay on loopback; an explicit bind is passed through
+        // unchanged so packaged configs keep working verbatim.
+        assert_eq!(DEFAULT_METRICS_BIND, "127.0.0.1:9100");
+        assert_eq!(resolve_metrics_bind(None), "127.0.0.1:9100");
+        assert_eq!(resolve_metrics_bind(Some("0.0.0.0:9901")), "0.0.0.0:9901");
+        assert_eq!(
+            resolve_metrics_bind(Some("127.0.0.1:9901")),
+            "127.0.0.1:9901"
+        );
     }
 
     #[tokio::test]
