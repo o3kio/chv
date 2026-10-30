@@ -26,7 +26,7 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"
@@ -79,7 +79,7 @@ The version includes the date and git short SHA, making every nightly build uniq
 
 ### Install nightly
 
-Download from the rolling [CHV Nightly](https://github.com/kubedoio/chv/releases/tag/nightly) GitHub pre-release.
+Download from the rolling [CHV Nightly](https://github.com/o3kio/chv/releases/tag/nightly) GitHub pre-release.
 
 > **Warning:** Do not use nightly packages in production. Use them only on disposable test hosts or VMs.
 

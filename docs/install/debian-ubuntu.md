@@ -35,7 +35,7 @@ Published CHV packages and release tarballs are `amd64` (`x86_64`) only. The all
 
 ## Option 2 — Manual `.deb` install (current)
 
-Download the `.deb` packages from the [GitHub Releases](https://github.com/kubedoio/chv/releases) page and install them manually.
+Download the `.deb` packages from the [GitHub Releases](https://github.com/o3kio/chv/releases) page and install them manually.
 
 ### 1. Download packages
 
@@ -43,7 +43,7 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
 curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
@@ -124,7 +124,7 @@ To upgrade to a newer version, download the new packages and install them over t
 ```bash
 # Download new packages
 VERSION="<new-version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"

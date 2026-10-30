@@ -11,14 +11,18 @@ what to alert on, and how to investigate incidents.
 | Service | Endpoint | Default bind |
 |---|---|---|
 | `chv-controlplane` | `/metrics` | `127.0.0.1:8080` (HTTP) |
-| `chv-agent` | `/metrics` | configurable via `metrics_bind` in agent config |
-| `chv-stord` | `/metrics` | configurable via `metrics_bind` in stord config |
-| `chv-nwd` | `/metrics` | configurable via `metrics_bind` in nwd config |
+| `chv-agent` | `/metrics` | `metrics_bind` in agent config; packaged/installer default `127.0.0.1:9901`; code fallback when unset `127.0.0.1:9100` (loopback) |
+| `chv-stord` | **no HTTP endpoint today** | in-process `chv_observability::Metrics` counters only — not scrapeable |
+| `chv-nwd` | **no HTTP endpoint today** | in-process `chv_observability::Metrics` counters only — not scrapeable |
 | `chv-webui-bff` | served on same port as the backend-for-frontend (BFF; default `127.0.0.1:8443`) | via `/metrics` route |
 
-> The `metrics_bind` configuration keys default to `None` (disabled). Enable with
-> e.g. `metrics_bind = "0.0.0.0:9090"` in the relevant config file. The control-plane
-> always exposes `/metrics` on its `http_bind` address.
+> Only `chv-agent` exposes an HTTP `/metrics` endpoint. `chv-stord` and
+> `chv-nwd` record `chv_observability::Metrics` counters in-process, but neither
+> daemon serves them, and the `metrics_bind` key in their config structs is
+> currently not read by any daemon — do not expect a scrape target there.
+> **Never bind `metrics_bind` to a public interface**; the qualified and packaged
+> posture is loopback (`127.0.0.1:9901`). The control plane always exposes
+> `/metrics` on its `http_bind` address.
 
 ---
 

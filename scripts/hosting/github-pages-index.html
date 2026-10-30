@@ -24,19 +24,21 @@
 
   <p>Run the all-in-one installer on a fresh Ubuntu server with root access:</p>
   <div class="cta">
-    <pre><code>curl -sfL https://get.cellhv.com/ | sh -</code></pre>
+    <pre><code>curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s</code></pre>
   </div>
 
   <p>Or pin a specific version:</p>
   <div class="cta">
-    <pre><code>curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=0.3.0 sh -</code></pre>
+    <pre><code>curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s</code></pre>
   </div>
 
-  <p>Read the full <a href="https://github.com/cellhv/chv/blob/main/docs/DEPLOYMENT.md">deployment guide</a> for manual setup, build instructions, and multi-node expansion.</p>
+  <p>The installer requires <code>bash</code>; the old <code>| sh -</code> form does not work. Supported today: one host, Cloud Hypervisor v53.0, Ubuntu amd64 — no multi-host, HA, or backup/restore.</p>
+
+  <p>Read the full <a href="https://github.com/o3kio/chv/blob/main/docs/DEPLOYMENT.md">deployment guide</a> for manual setup and build instructions.</p>
 
   <footer>
-    <a href="https://github.com/cellhv/chv">GitHub</a> &bull;
-    <a href="https://github.com/cellhv/chv/blob/main/docs/DEPLOYMENT.md">Docs</a>
+    <a href="https://github.com/o3kio/chv">GitHub</a> &bull;
+    <a href="https://github.com/o3kio/chv/blob/main/docs/DEPLOYMENT.md">Docs</a>
   </footer>
 </body>
 </html>

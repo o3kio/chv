@@ -108,7 +108,20 @@ The project has a solid Phase 1 foundation (Rust control plane, SQLite store, ce
 
 ## Install
 
-CHV is distributed as `.deb` and `.rpm` packages. Choose the guide for your distribution:
+**Supported today:** one host, Cloud Hypervisor v53.0, Ubuntu amd64. No multi-host, HA, or backup/restore — see [`docs/DEPLOYMENT-ARCHITECTURE.md` §7](./docs/DEPLOYMENT-ARCHITECTURE.md#7-supported-envelope).
+
+The qualified deployment path is the all-in-one installer on a fresh Ubuntu amd64 host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
+
+# Pin a release instead of resolving the latest stable:
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s
+```
+
+The installer requires **bash** (it uses `set -o pipefail`); do not replace `bash -s` with `sh -`.
+
+CHV is also distributed as `.deb` and `.rpm` packages. Choose the guide for your distribution:
 
 | Distribution | Guide |
 |--------------|-------|
@@ -117,11 +130,11 @@ CHV is distributed as `.deb` and `.rpm` packages. Choose the guide for your dist
 | Other / Tarball | [`docs/install/from-github-release.md`](./docs/install/from-github-release.md) |
 | In-guest monitoring agent (optional) | [`docs/install/guest-monitor-agent.md`](./docs/install/guest-monitor-agent.md) |
 
-Quick install (Debian/Ubuntu):
+Quick package install (Debian/Ubuntu):
 
 ```bash
 VERSION="<version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"

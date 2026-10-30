@@ -19,7 +19,7 @@ Please **do not** open a public GitHub issue for security reports. Use GitHub's 
 
 **GitHub Security Advisories (the reporting channel):**
 
-Open a private advisory via the repository's **Security → Advisories → Report a vulnerability** page (direct link: <https://github.com/kubedoio/chv/security/advisories/new>). This creates a private channel between you and the maintainers, and lets us collaborate on a fix and CVE assignment if applicable.
+Open a private advisory via the repository's **Security → Advisories → Report a vulnerability** page (direct link: <https://github.com/o3kio/chv/security/advisories/new>). This creates a private channel between you and the maintainers, and lets us collaborate on a fix and CVE assignment if applicable.
 
 > This is the project's only reporting channel. It is private, does not require
 > an email mailbox, and is verified enabled on the repository. Do not send

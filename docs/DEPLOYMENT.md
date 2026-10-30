@@ -15,24 +15,28 @@ This guide deploys CHV on a single Linux host. The host runs the **control plane
 3. [What Gets Installed](#what-gets-installed)
 4. [Build & Package a Release](#build--package-a-release)
 5. [Manual Deployment (Step-by-Step)](#manual-deployment-step-by-step)
-6. [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
+6. [Hosting the Installer (`get.cellhv.com`, not stood up)](#hosting-the-installer-getcellhvcom)
 7. [Operations & Troubleshooting](#operations--troubleshooting)
 
 ---
 
 ## Quick Start (One-Liner Install)
 
-Run the official installer on a fresh Ubuntu server with root access:
+Run the qualified all-in-one installer on a fresh Ubuntu server with root access:
 
 ```bash
-curl -sfL https://get.cellhv.com/ | sh -
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
 ```
 
 Or install a specific version:
 
 ```bash
-curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=<version> sh -
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s
 ```
+
+The installer script requires **bash**: it uses `set -o pipefail`, which `sh`
+(dash on Ubuntu) rejects. The old `curl … | sh -` form does not work — keep
+`bash -s`.
 
 **Network defaults** (override with environment variables):
 
@@ -45,22 +49,42 @@ curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=<version> sh -
 Example with custom network:
 
 ```bash
-curl -sfL https://get.cellhv.com/ | \
-  INSTALL_CHV_BRIDGE_IFACE=eth0 \
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | \
+  sudo INSTALL_CHV_BRIDGE_IFACE=eth0 \
   INSTALL_CHV_BRIDGE_CIDR=192.168.100.1/24 \
-  sh -
+  bash -s
 ```
+
+### Installer behavior: VMM pin and firmware
+
+- **Cloud Hypervisor pin.** The installer requires major.minor **53.0**. A
+  preinstalled `cloud-hypervisor` at that pin is kept; any other version is
+  replaced with the pinned, digest-verified v53.0 static build (with a
+  warning). `INSTALL_CHV_ALLOW_VMM_MISMATCH=1` keeps the host binary instead,
+  producing an **off-pin, unqualified** install.
+- **Firmware.** `/root/CLOUDHV.fd` is used when present. Otherwise the
+  installer downloads the pinned rust-hypervisor-firmware 0.5.0 build to
+  `/var/lib/chv/hypervisor-fw`. Without firmware, VMs that request it fail to
+  start with `firmware not found`.
+- **Version fallback.** If the GitHub API cannot be reached, the installer
+  warns explicitly and falls back to the `0.3.0` offline pin instead of
+  silently claiming it resolved the latest release.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INSTALL_CHV_ALLOW_VMM_MISMATCH` | unset | Set to `1` to keep a host Cloud Hypervisor whose major.minor is not `53.0`. Resulting install is off-pin and unqualified. |
 
 > **Release source:** the one-liner resolves the latest **stable** GitHub
 > release and downloads its tarball. v0.3.0 is that release today (published,
 > not a pre-release; its assets include the `chv-0.3.0-linux-amd64.tar.gz`
 > tarball with a `.sha256` sidecar alongside the `.deb`/`.rpm` packages), so
 > this resolution leg is live — tagged releases are the artifact source, and
-> the rolling `nightly` pre-release is never selected. The `get.cellhv.com`
-> endpoint itself is not stood up yet (see
-> [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom));
-> for a one-liner that runs today, [Quick Install](#quick-install-single-command-from-github-releases)
-> below installs from the same stable tagged releases directly off GitHub.
+> the rolling `nightly` pre-release is never selected. The
+> `get.cellhv.com` hosting surface is **not stood up** (the name does not
+> resolve); see
+> [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
+> for the optional future design. Use the raw-URL commands above, or
+> [Quick Install](#quick-install-single-command-from-github-releases) below.
 
 The installer will:
 
@@ -98,14 +122,14 @@ the local agent enrolled against it (`chv-agent` + `chv-stord` +
 `chv-nwd`), systemd units, and config under `/etc/chv`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
 ```
 
 Or pinned to a tagged release, with a dry run available:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.3.0
-curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.3.0
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --dry-run
 ```
 
 The script (`scripts/quick-install.sh`, issue #482) resolves the latest
@@ -297,7 +321,7 @@ If you prefer to deploy manually or need to customize every step, follow the det
 
 #### Hardware
 - x86_64 server with **hardware virtualization** (VT-x / AMD-V)
-- Minimum 4 cores, 8 GB RAM, 50 GB disk
+- Minimum 4 cores, 8 GB RAM, 50 GB disk (unevidenced recommendation — see caveat below)
 
 > These minimums are an unevidenced documentation guideline, not a
 > qualification-backed envelope. The qualified deployment host was 16 vCPU
@@ -768,10 +792,18 @@ it; the VM serial console stops working without it.
 
 ## Hosting the Installer (`get.cellhv.com`)
 
-The `curl -sfL https://get.cellhv.com/ | sh -` pattern requires a lightweight endpoint that serves `scripts/install.sh` as plain text.
+> **Not currently stood up.** `get.cellhv.com` does not resolve (NXDOMAIN).
+> This section is a future/optional hosting design, **not** a live install
+> command. Use the raw-URL commands in
+> [Quick Start](#quick-start-one-liner-install) above today.
+
+If the endpoint were stood up, it would serve `scripts/install.sh` as plain
+text so that operators could run
+`curl -fsSL https://get.cellhv.com/ | sudo bash -s` (the script still needs
+**bash**, not `sh`).
 
 ### Option A: GitHub Pages
-1. Create a repo `cellhv/get.cellhv.com`
+1. Create a repo `o3kio/get.cellhv.com`
 2. Add a `CNAME` file with `get.cellhv.com`
 3. Serve `scripts/install.sh` as the index
 4. Point DNS to GitHub Pages
@@ -780,7 +812,7 @@ The `curl -sfL https://get.cellhv.com/ | sh -` pattern requires a lightweight en
 ```javascript
 export default {
   async fetch(request) {
-    const installScript = await fetch('https://raw.githubusercontent.com/cellhv/chv/main/scripts/install.sh');
+    const installScript = await fetch('https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh');
     return new Response(installScript.body, {
       headers: { 'Content-Type': 'text/plain' }
     });
@@ -792,7 +824,7 @@ export default {
 1. Developer runs `./scripts/build-release.sh`
 2. CI uploads `dist/chv-<VERSION>-linux-amd64.tar.gz` to GitHub Releases
 3. The installer script at `get.cellhv.com` queries the GitHub API for the latest release tag
-4. End user runs `curl -sfL https://get.cellhv.com/ | sh -`
+4. End user runs `curl -fsSL https://get.cellhv.com/ | sudo bash -s` (once the endpoint is stood up)
 
 ---
 

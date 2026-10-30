@@ -103,7 +103,7 @@ KVM-VERIFIED, and multi-host behavior is reported as unproven.
 | Dependency | Version fact | Notes |
 |---|---|---|
 | Cloud Hypervisor | Qualified pin **v53.0** (moved from v43.0 by the #448 re-qualification campaign — decision D6, option (b); `scripts/integration/kvm-smoke.sh` default `v53.0`) | `scripts/install.sh` downloads the same **v53.0** and verifies the qualified sha256 digests before install (campaign evidence: [v53.0 tree](evidence/vmm-requalification/v53.0/README.md)). |
-| rust-hypervisor-firmware | 0.5.0 (qualification firmware; `scripts/install.sh` `FIRMWARE_URL`) | `download_firmware` is commented out in the install flow; `copy_firmware` only copies a pre-placed local `/root/CLOUDHV.fd`. |
+| rust-hypervisor-firmware | 0.5.0 (qualification firmware; `scripts/install.sh` `FIRMWARE_URL`) | `scripts/install.sh` uses a pre-placed `/root/CLOUDHV.fd` when present; otherwise it downloads the pinned 0.5.0 build to `/var/lib/chv/hypervisor-fw`. The former commented-out download is fixed in this branch — a clean host now gets firmware. |
 | fabric-linux | v0.1.5 (`Cargo.toml` git tag pin) | Consumed by `chv-nwd` for the (design-only) fabric. |
 | Host OS | Linux x86_64; `.deb` (Debian/Ubuntu) + `.rpm` | Qualified on Ubuntu noble amd64; `.rpm` built but untested in prompt-04 (declaration §3, m4.2). |
 
@@ -153,7 +153,7 @@ require review against the declaration.
 | Control-plane gRPC | `127.0.0.1:8443` | gRPC, mTLS (server cert + client CA; agents present CA-signed certs) | `chv-agent` (enrollment, reports), loopback tooling | Do not expose. | [QUALIFIED — KVM-VERIFIED] ([m4.1](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.1-harness.md)) |
 | Control-plane HTTP / BFF | `127.0.0.1:8080` | HTTP (BFF `/v1/…`, admin `/api/v1/…`, health) | nginx, `chvctl` | Do not expose directly; nginx is the edge. | [QUALIFIED — KVM-VERIFIED] |
 | Agent serial console | `127.0.0.1:8444` | WebSocket (`/vms/{vm_id}/console?token=…`) | nginx (`/ws/vms/…` proxy) | **Must not be exposed.** Default from `chv-config` (`crates/chv-config/src/lib.rs:597`). | [QUALIFIED — KVM-VERIFIED] |
-| Agent metrics | `127.0.0.1:9100` (qualification config, `deploy.sh`); packaged/install.sh default `127.0.0.1:9901`; code fallback when `metrics_bind` is unset: `0.0.0.0:9100` (all interfaces — not loopback; always set `metrics_bind` explicitly) | HTTP `/metrics` | Prometheus-style scrapers | Loopback in the qualified config. | [QUALIFIED — KVM-VERIFIED] |
+| Agent metrics | `127.0.0.1:9100` (qualification config, `deploy.sh`); packaged/install.sh default `127.0.0.1:9901`; code fallback when `metrics_bind` is unset: `127.0.0.1:9100` (loopback) | HTTP `/metrics` | Prometheus-style scrapers | Loopback in the qualified config. | [QUALIFIED — KVM-VERIFIED] |
 | nginx edge | `:80` (all interfaces) | HTTP; UI statics; proxies `/api/`, `/v1/` → `:8080`, `/ws/vms/{node_id}/…` → `:8444` | Browsers | The only externally listening component. TLS at the edge is a recommendation, not a default — see decision D7. | [CONTAINER-VERIFIED] — the m4.2 install-sh contract leg |
 | stord migration receiver | disabled by default; example `127.0.0.1:50052` | gRPC, mTLS, mandatory client certs; no plaintext mode | peer `chv-stord` | Opt-in only. With any receiver field set while `enabled = false`, the daemon refuses to start (fail-closed). | [QUALIFIED — KVM-VERIFIED] between two stord instances on one host ([m4.6](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.6-migration.md)) |
 | Fabric WireGuard | `65001/udp` (default; configurable) | WireGuard underlay mesh | peer `chv-nwd` | [DESIGN-ONLY] — [ADR-021](specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md); fails closed today. |
@@ -244,7 +244,7 @@ evidenced at container tier.**
 | Includes | Everything in §2; core-managed authority; enrollment with real mTLS; seeded admin (forced password change), base image, default network, `dev-vm-1`. |
 | Excludes | Multi-host anything (UC-6), fabric (UC-7), backup/restore as DR (declaration §3), HA (UC-9). |
 | Evidence | Declaration §3/§5; prompt-04 milestones ran this topology on the qualification host (m4.3–m4.8). The install.sh path itself has permanent coverage via `scripts/integration/qual/install-sh-leg.sh` (m4.2 §"New harness leg"): clean container, all four units active, contract assertions — with `NO_SEED`/`NO_BRIDGE` set, so it proves the packaging/systemd contract, not VM end-to-end behavior. |
-| Disclosed conflicts | (a) `GITHUB_REPO` defaulted to `cellhv/chv` (`scripts/install.sh:59`) while the install docs and canonical repository URLs use `kubedoio/chv` — **resolved via #425**: the default is now the canonical `kubedoio/chv`; the old name survives only in the `get.cellhv.com` hosting surface (§9). (b) Firmware is local-copy only (`/root/CLOUDHV.fd`; `download_firmware` commented out in the install flow) versus the qualification's 0.5.0 firmware. (The former installer/qualification VMM version conflict was resolved by pinning `scripts/install.sh` to the qualified **v43.0** — decision D6, option (a).) |
+| Disclosed conflicts | (a) Repository identity — **resolved 2026-10-30**: `github.com/kubedoio/chv` now returns HTTP 301 to the canonical `github.com/o3kio/chv` (which matches `git remote` and the installer defaults); old-name references are historical only. The `get.cellhv.com` hosting surface is **not stood up** (NXDOMAIN) and is optional/future (§9). (b) Firmware — **resolved in this branch**: `scripts/install.sh` uses `/root/CLOUDHV.fd` when present, otherwise downloads the pinned rust-hypervisor-firmware 0.5.0 to `/var/lib/chv/hypervisor-fw`; a clean host now has firmware. (The former installer/qualification VMM version conflict was resolved by moving the pin: `scripts/install.sh` now installs the qualified **v53.0** — decision D6, option (b).) |
 
 ### UC-2 — Package-based clean-host install
 
@@ -316,7 +316,8 @@ re-qualification; it is not an operator install path.
 ### UC-6 — Multi-host (control plane + remote nodes)
 
 **Status: [UNSUPPORTED/ABSENT] as a qualified capability — and
-architecturally blocked as coded.**
+architecturally blocked as coded. Single-host is the declared posture for
+now (decision D1, option (b)).**
 
 | Aspect | Statement |
 |---|---|
@@ -325,7 +326,8 @@ architecturally blocked as coded.**
 | What IS code-supported | The enrollment protocol (cert issue, `CN = <node_id>`, bootstrap token, node rows) works over the mTLS gRPC surface; nothing in the protocol is single-host-specific. |
 | What IS documented | Multi-node serial-console routing via nginx (`agent_ws_address` direct mode, or the proxied `/ws/vms/{node_id}` map) — [DEPLOYMENT.md](DEPLOYMENT.md) "Multi-Node WebSocket Console Routing". |
 | Declaration | MULTI-HOST-VERIFIED is **unprovable** on this infrastructure (declaration §5); multi-host migration and multi-node network semantics are not claimed. |
-| Options | Decision **D1** (and D2). This document does not pick a winner. |
+| Posture | **Single-host is the declared posture for now (decision D1, option (b)).** The opt-in TCP gRPC listener that multi-host needs is an unstarted project; no multi-host claim may be made without MULTI-HOST-VERIFIED evidence. |
+| Options | Decision **D1** (and D2). D1 is resolved as option (b); D2 (the `chv-node` dependency) follows from that choice. |
 
 ### UC-7 — Multi-host stretched-L2 fabric (VXLAN over WireGuard)
 
@@ -405,7 +407,7 @@ is not supported.
 | Lifecycle authority | Exactly one durable CellHV Core authority per node; legacy/control-plane paths are compatibility adapters only. | Declaration §3; prompt-02 |
 | Backup/restore | **Excluded from the RC supported matrix.** | Declaration §3 |
 | Scale | **No concurrency, density, throughput, or requests-per-second claim.** M4.8 numbers are baselines on the qualification host only. | m4.8; m4.9 §3 |
-| Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" — an unevidenced documentation claim, pending Prompt-05/06 wording. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; ADR-011 |
+| Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" and now labels it an **unevidenced recommendation**; it remains pending Prompt-05/06 qualification. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; ADR-011 |
 
 **Pending:** Prompt 05 (release-candidate notes) will fix the public wording
 of the supported matrix; Prompt 06 (reference deployment) will add the first
@@ -418,7 +420,7 @@ options, the trade-offs, and what would unblock it.
 
 | # | Decision | Options | Trade-offs | What unblocks it |
 |---|---|---|---|---|
-| D1 | Multi-host dispatch: how can a control plane reach remote agents? | (a) Add an opt-in TCP gRPC listener to `chv-agent` (mTLS, node-cert identity). (b) Declare single-host-only and document it. (c) Stage both: document single-host now, land the listener behind a feature flag later. | (a) Unblocks real multi-host but adds an exposed listener, new attack surface, and requires MULTI-HOST-VERIFIED evidence that the current infrastructure cannot produce (declaration §5). (b) Honest and cheap, but strands the code-supported enrollment protocol and the documented console routing. (c) Keeps both paths open, but carries undecided surface area longer. | Maintainer choice plus a qualification topology with a second host (or an explicit re-scoping of the claim). |
+| D1 | Multi-host dispatch: how can a control plane reach remote agents? | (a) Add an opt-in TCP gRPC listener to `chv-agent` (mTLS, node-cert identity). (b) Declare single-host-only and document it. (c) Stage both: document single-host now, land the listener behind a feature flag later. | (a) Unblocks real multi-host but adds an exposed listener, new attack surface, and requires MULTI-HOST-VERIFIED evidence that the current infrastructure cannot produce (declaration §5). (b) Honest and cheap, but strands the code-supported enrollment protocol and the documented console routing. (c) Keeps both paths open, but carries undecided surface area longer. | Maintainer choice plus a qualification topology with a second host (or an explicit re-scoping of the claim). **Declared posture 2026-10-30 — option (b), pending maintainer ratification of the decision record: single-host is the declared posture for now. The opt-in TCP gRPC listener remains an unstarted project; any multi-host claim requires MULTI-HOST-VERIFIED evidence.** |
 | D2 | `chv-node` package dependency: keep or relax the hard dependency on `chv-controlplane`? | (a) Keep. (b) Drop to `recommends`/`suggests`. (c) Split a `chv-node-common` and make the CP dependency explicit only in a meta-package. | (a) Simple, matches the qualified single-host topology; installs a useless control plane on every future node host. (b) Correct shape for node-only hosts, but changes tested install semantics and can produce half-provisioned hosts (CP fails closed anyway). (c) Cleanest dependency graph, most packaging work. | D1: node-only hosts only matter if multi-host dispatch exists. |
 | D3 | Serving the UI from packages | (a) Headless-only posture: document `chvctl` as the package-mode interface; UI requires install.sh. (b) Document an operator-provided reverse proxy against `/usr/share/chv/ui` + the BFF/console proxies. (c) The deb configures nginx itself (or ships a snippet). (d) Serve the UI from `chv-controlplane` itself (tower-http `ServeDir` from disk, opt-in `[webui]` config section). | (a) Cheapest, narrows the product. (b) Flexible, pushes TLS/edge concerns to the operator with no contract. (c) Best out-of-box parity with install.sh, but adds a web-server dependency and edge ownership to the packages. (d) Out-of-box parity without an edge dependency, but adds a serving surface to the binary and needs its own qualification. | **Resolved 2026-10-03, phased: interim (b), target (d); (c) rejected.** Interim: the packages ship an example nginx conf (`/usr/share/chv/examples/chv-example.conf`) plus operator docs ([DEPLOYMENT.md](DEPLOYMENT.md) "Serving the Web UI in package mode"); serving-from-packages is [CODE-SUPPORTED, UNQUALIFIED] until a container qualification leg exists. Target: serve from the binary — tracked in #447. (c) is rejected permanently: it breaks the fail-closed "packages provide layout only" contract (§4) and forces nginx onto every host. [2026-10-07, #447:] target (d) implemented — `tower-http` `ServeDir` from disk behind an opt-in `[webui]` config section (`enabled`, default `false`; `dir`, default `/usr/share/chv/ui`), prefix-guarded static fallback with SPA and cache headers in `admin_router`; `install_nginx` and the example conf shrunk to proxy-only edges; the `/ws/` console proxy stays at the edge by decision (maintainer-ratified 2026-10-07). [2026-10-08, #549:] the container package-smoke leg ran and passed (`scripts/package/smoke-webui.sh`, wired into `package-pr.yml`) — serving-from-packages moved [CODE-SUPPORTED, UNQUALIFIED] → [CONTAINER-VERIFIED] (§5 UC-3). |
 | D4 | Air-gapped support | (a) Not supported; state it. (b) Document an offline recipe from the existing escape hatches (`INSTALL_CHV_TARBALL_PATH`, `INSTALL_CHV_SKIP_DEPS`, `INSTALL_CHV_SKIP_CLOUD_HV`, pre-staged images). (c) Add a first-class offline mode to the installer. | (a) Free, loses sovereign/edge adopters the positioning targets. (b) Cheap documentation work; the hatches exist but are untested as a recipe. (c) Real installer work plus a qualification leg. | Maintainer priority; a qualification leg if (b) or (c). |
@@ -538,11 +540,13 @@ this branch changes only this file):**
 - `packaging/config/chv.yaml` shipped `authority_mode: legacy` while every
   shipped `.toml` config selected core-managed (§10) — resolved via #424.
 - `scripts/install.sh` formerly defaulted to the `cellhv/chv` repository and
-  downloaded Cloud Hypervisor v51.1 (§5 UC-1, decision D6; also
-  `get.cellhv.com` hosting in [DEPLOYMENT.md](DEPLOYMENT.md)). Both are
-  resolved — #425 aligned the repository default with the canonical
-  `kubedoio/chv`, and the installer now pins the qualified v43.0 (#422). The
-  `get.cellhv.com` hosting surface still references the old name.
+  downloaded Cloud Hypervisor v51.1 (§5 UC-1, decision D6; also the
+  `get.cellhv.com` hosting design in [DEPLOYMENT.md](DEPLOYMENT.md)). The
+  repository is now canonical at `o3kio/chv` (`kubedoio/chv` returns HTTP 301
+  there; the installer default follows it), and the installer pins the
+  qualified v53.0 (#448). `get.cellhv.com` is **not stood up** (NXDOMAIN);
+  [DEPLOYMENT.md](DEPLOYMENT.md#hosting-the-installer-getcellhvcom) keeps only
+  the optional hosting design — it is not a live command.
 
 ## 10. Legacy and unsupported surfaces
 
@@ -551,8 +555,8 @@ deploy them; do not file evidence against them.
 
 | Surface | Status | Why fenced |
 |---|---|---|
-| `docker-compose.prod.yml` | Legacy / unmaintained (explicit in-repo banner) | Predates the #323 ownership model and the prompt-02 authority cutover; its ownership layout differs deliberately. The banner directs users to the packages or `scripts/install.sh`. |
-| `docker-compose.yml`, `Dockerfile`, `deploy/entrypoint.sh` | Legacy (no in-repo banner; dated pre-#323) | Same era and same ownership-model mismatch; no in-file marker exists — this row is the fence. Cleanup is a docs/packaging decision outside this document's scope. |
+| `docker-compose.yml`, `docker-compose.prod.yml` | Legacy / DEV-ONLY (explicit in-repo banners) | **The image builds; the stacks remain unsupported.** Neither compose file provisions TLS/mTLS material or a bootstrap token, and the control plane fails closed without them by design, so the stacks do not run end-to-end as configured. Use the `.deb`/`.rpm` packages or `scripts/install.sh`. |
+| `Dockerfile`, `deploy/entrypoint.sh` | DEV / LAB convenience only (explicit in-repo banner) | The image builds (Rust 1.98.1 pin, protoc/cmake, `VERSION`, digest-verified Cloud Hypervisor v53.0) and is useful for local iteration and image-build smoke checks, but it is not a supported deployment path. |
 | Legacy `chvbr0` host bridge/NAT bootstrap | Opt-out dev convenience (`INSTALL_CHV_NO_BRIDGE=1`) | Qualified networks are API-created and `chv-nwd`-managed (`br-<net_id>`). |
 | `authority_mode = "legacy"` | Compatibility adapter only | Explicit opt-in; the agent logs a warning. Qualified posture is core-managed everywhere. |
 | `packaging/config/chv.yaml` (`/etc/chv/chv.yaml` in `chv-node`) | Reference-only | Ships `authority_mode: core-managed` (aligned with the shipped `.toml` configs via #424). No daemon consumes it for authority selection. |
@@ -570,7 +574,7 @@ deploy them; do not file evidence against them.
 | [release/package-contract.md](release/package-contract.md) | The package contract: contents, ownership, upgrade/rollback procedures | nfpm configurations remain the mechanical truth for contents (§2.4). |
 | [PACKAGING.md](PACKAGING.md) | Packaging overview and operator package steps | Links here for topology and tiers. |
 | [OPERATIONS.md](OPERATIONS.md) | Day-2 operations: monitoring, CLI reference, live-database access, multi-node operations | Day-2 only. |
-| [install/](install/) (channels, debian-ubuntu, rhel-rocky-alma, from-github-release, uninstall) | Per-distro install instructions | Use the canonical repository URLs; the installer default repository conflict is disclosed in §5 UC-1. |
+| [install/](install/) (channels, debian-ubuntu, rhel-rocky-alma, from-github-release, uninstall) | Per-distro install instructions | Use the canonical `o3kio/chv` repository URLs; `kubedoio/chv` 301-redirects there. The installer/repository resolution is recorded in §5 UC-1. |
 | [runbooks/](runbooks/) | Incident procedures (control-plane DR, full-site recovery, snapshot restores) | DR procedures; the DR *claim* boundary is §5 UC-9. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and data flow | The deleted upgrade stack and the removed `chvctl upgrade` surface are recorded there in past tense; this document supersedes on deployment matters. |
 | [specs/adr/](specs/adr/) | Design authority | ADRs are decisions; this document records their qualification tier (for example ADR-021 is DESIGN-ONLY). |

@@ -4,6 +4,23 @@
 **Phase:** 3 — Production Readiness & Observability (In Progress)  
 **Review basis:** 6 parallel code reviews across Correctness, Security, Error Handling, Observability, Code Quality, and Architecture dimensions. 51 findings total: **11 P0 blockers**, **24 P1 required**, **16 P2 recommended**.
 
+> **Status (2026-10-30): superseded for capability tier.**
+> This report is dated 2026-06-26 and is stale in both directions. For what is
+> supported today, use [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md)
+> §7 ("Supported envelope"). The original content below is preserved as a
+> historical snapshot, not as a current verdict.
+>
+> **Fixed since this report (verified on this branch):** Prometheus metrics
+> for `chv-stord` and `chv-nwd`; migration-reaper resume of paused VMs; the
+> `StorageMigrationService` implementation; DHCP `network_id` sanitization;
+> and the drain gate on in-flight migrations.
+>
+> **Still open:** the backup execution engine (backup/restore is excluded
+> from the supported matrix — `backup_worker.rs` refuses every job);
+> multi-host (single-host is the declared posture; no TCP agent listener);
+> Volvisor adoption (ADR-028 direction only; no code); and iSCSI/Ceph
+> `destroy()` (explicitly unimplemented).
+
 ---
 
 ## Executive Summary
