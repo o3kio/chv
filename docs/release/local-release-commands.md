@@ -56,6 +56,8 @@ Runs the full pre-release validation suite:
 3. Tests (`cargo test --workspace`)
 4. Release build (`cargo build --workspace --release`)
 5. Version output check (`chvctl version`)
+6. Hosting template copies (`cloudflare-worker.js` and
+   `github-pages-index.html` must be byte-identical to `scripts/hosting/`)
 
 Usage:
 ```bash

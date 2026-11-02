@@ -12,7 +12,8 @@ Accepted; runtime integration pending
 > [`chv-volume-backend-v1`](../contracts/chv-volume-backend-v1.md) and sequenced
 > by
 > [`2026-11-02-multihost-and-volvisor-transition.md`](../../plans/2026-11-02-multihost-and-volvisor-transition.md).
-> Volvisor's **pinned** v2 implementation has no route that advances an
+> Volvisor's reference v2 implementation (pin pending the P3 contract tests)
+> has no route that advances an
 > attachment from `prepared` to `advertised`/`active`. The corrected design is
 > tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34)
 > and implemented on a Volvisor feature branch, but it is not merged, released

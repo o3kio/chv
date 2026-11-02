@@ -424,10 +424,16 @@ install_binaries_and_assets() {
 
     # Monitoring store migrations (ADR-027, #602): applied to the
     # separate disposable monitoring.db; failure to open that file only
-    # degrades monitoring.
+    # degrades monitoring. Releases before v0.3.1 do not carry this
+    # directory (the installer runs from main against the latest tarball),
+    # so its absence must not abort an otherwise good install.
     mkdir -p "$CHV_MONITORING_MIGRATIONS_DIR" "$CHV_DATA_DIR/monitoring"
-    cp -r "${EXTRACT_DIR}/monitoring-migrations/"* "$CHV_MONITORING_MIGRATIONS_DIR/"
-    chown -R "$CHV_USER:$CHV_USER" "$CHV_MONITORING_MIGRATIONS_DIR"
+    if [ -d "${EXTRACT_DIR}/monitoring-migrations" ]; then
+        cp -r "${EXTRACT_DIR}/monitoring-migrations/"* "$CHV_MONITORING_MIGRATIONS_DIR/"
+        chown -R "$CHV_USER:$CHV_USER" "$CHV_MONITORING_MIGRATIONS_DIR"
+    else
+        warn "Release tarball carries no monitoring-migrations/; monitoring store stays degraded."
+    fi
     chown -R "$CHV_USER:$CHV_USER" "$CHV_DATA_DIR/monitoring"
 }
 
@@ -437,6 +443,13 @@ install_binaries_and_assets() {
 install_cloud_hypervisor() {
     if [ "$INSTALL_CHV_SKIP_CLOUD_HV" = "1" ]; then
         info "Skipping Cloud Hypervisor installation (INSTALL_CHV_SKIP_CLOUD_HV=1)"
+        return
+    fi
+    if [ "$CHV_ARCH" != "amd64" ]; then
+        # The pinned static artifacts are the x86_64 ones. arm64 has no
+        # published release tarball yet either; mirror quick-install and
+        # fail softly rather than installing an unrunnable VMM.
+        warn "Cloud Hypervisor install is only wired for amd64; skipping (VMs will not run until a VMM is installed)."
         return
     fi
 

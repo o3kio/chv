@@ -143,6 +143,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now chv-controlplane chv-agent chv-stord chv-nwd
 ```
 
+Packages provide the layout only: provision TLS, a real `jwt_secret`, and the
+admin seed before starting the services (see the distribution guide, steps 5–6).
+Do not start them with the example configs.
+
 See [`docs/install/channels.md`](./docs/install/channels.md) for stable, RC, nightly, and PR artifact channels.
 
 ## Development
@@ -196,7 +200,7 @@ cargo build --workspace
 |----------|---------|
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | System architecture, data flow, and boundaries |
 | [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) | Deploy CHV on a combined control-plane + hypervisor host |
-| [`docs/specs/adr/`](./docs/specs/adr) | Architecture Decision Records (ADR-001–ADR-022) |
+| [`docs/specs/adr/`](./docs/specs/adr) | Architecture Decision Records (ADR-001–ADR-029) |
 | [`docs/specs/component/`](./docs/specs/component) | Component specs (agent, stord, nwd) |
 | [`PHASED_IMPLEMENTATION_PLAN.md`](./PHASED_IMPLEMENTATION_PLAN.md) | Phased implementation roadmap |
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | Day-2 operations, monitoring, and troubleshooting |

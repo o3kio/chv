@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed — not accepted. On acceptance this ADR:
+Proposed — not accepted. The decisions (D-MH1–D-MH8) are ratified at Gate P0
+of the transition plan; the multi-host posture may be declared and enforced
+only after the P1 dispatch gate, and console routing after the P2 gate. On
+acceptance this ADR:
 
 - implements the external transport already required by
   [ADR-002](002-control-plane-boundary.md) ("gRPC over mTLS") for the
@@ -180,6 +183,20 @@ carries `serverAuth`, and has `CN == expected node_id` for the endpoint being
 dialled. Certificate validity alone is not authorization: without the CN
 check, any node can answer for any other node.
 
+The control-plane side of the hop has its own server identity:
+
+| Identity | Issued by | EKU | Used for |
+|---|---|---|---|
+| `chv-controlplane-server` | operator-provisioned control-plane server CA | `serverAuth` | node → CP enrollment and reporting |
+
+The agent MUST verify that the CP server certificate chains to the
+control-plane server CA and carries the `control_plane_addr` host as a DNS or
+IP SAN. This trust anchor MUST be available to the node *before* enrollment:
+the TLS connection that carries enrollment is what needs it. It is therefore
+delivered out-of-band (operator-installed CA file, or a fingerprint-verified
+bootstrap bundle), never learned from the enrollment response. The CP server
+CA MUST NOT be the node CA.
+
 The agent MUST additionally verify that the presented client certificate has
 `CN == "chv-controlplane-client"` (or the configured
 `allowed_client_identity`) in addition to chaining to the CP client CA.
@@ -320,10 +337,14 @@ it refuses `[agent.grpc]` unless its own config declares
 
 ## Qualification gates
 
-This ADR is accepted only with the P1 gate evidence in
+Decision acceptance happens at Gate P0. Capability claims are gated by the
+evidence in
 [`../../plans/2026-11-02-multihost-and-volvisor-transition.md`](../../plans/2026-11-02-multihost-and-volvisor-transition.md):
+the P1 dispatch gate below, plus the P2 gate for console routing and node
+lifecycle.
 
-1. Two separate hosts: enrollment, inventory, dispatch, and console.
+1. Two separate hosts: enrollment, inventory, and dispatch (console is proven
+   at the P2 gate).
 2. Node A certificate rejected by node B's agent listener.
 3. `CN=node-a` server certificate rejected when dialling `node-b`.
 4. Plaintext, optional client auth, wildcard-without-advertise, and

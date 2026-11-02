@@ -29,7 +29,8 @@ It does not define:
 
 - tenant-facing HTTP/gRPC APIs (those remain CHV's own surface);
 - VM lifecycle, VMM device configuration, or Cloud Hypervisor invocation;
-- cross-host migration policy (see ADR-021 and the transition plan);
+- cross-host migration policy (see ADR-012; ADR-021 covers only the network
+  dependency);
 - `ceph-rbd`, `nearline-replicated`, or PCI passthrough enablement;
 - Volvisor's witness, DRBD, or Rook-cell operation.
 
@@ -162,6 +163,11 @@ Releases host-side resources for an attachment that ended without a VM detach
   a no-op once the attachment record is gone, and on a create unwind (the VM
   never started) the Volvisor binding uses the detach path with the truthful
   `vm_stopped` proof (§11.2). It never fabricates `io_drained`.
+- **Generation on the detach path:** when close routes through detach, the
+  agent sends its last recorded attachment generation (re-inspecting first if
+  it has none). On `STALE_GENERATION` or `NOT_FOUND`, it re-inspects once and
+  treats a missing attachment record as success; close is idempotent and MUST
+  NOT leak a live backend attachment because local state was stale.
 
 ### 4.5 `grow`
 
@@ -218,8 +224,11 @@ Optional consumer attestation, available only when the backend advertises
   optional `reporter`, optional bounded `detail`, `operation_id`.
 - **Precondition:** the attachment instance exists and its generation matches;
   `advertised` requires `vmm_configured` or `guest_confirmed`; `active`
-  requires `guest_confirmed`. `state_revision` starts at `1` for a fresh
-  attachment instance and is scoped to it.
+  requires `guest_confirmed`. A fresh attachment instance has
+  `state_revision = 0`; the first applied report sets it to `1`, and each
+  subsequent applied advance increments it. It is scoped to the attachment
+  instance. State ordering is by rank (`prepared < advertised < active`), not
+  by revision.
 - **Postcondition:** an evidence advance yields `applied = true` with a bumped
   `state_revision`; an equal/lower report yields `applied = false` with the
   current projection, untouched (`evidence`, `reporter`, `recorded_at_ms`
@@ -275,9 +284,10 @@ backend.
 
 1. At startup, the agent queries the backend's capability set.
 2. The set MUST be intersected with the classes the backend serves and with
-   backend-level enablement (`[storage.legacy-stord] enabled` /
-   `[storage.volvisor] enabled`). There is no per-class enablement key in v1;
-   a disabled backend advertises no classes.
+   the operator enablement defined in transition plan §6.2: the
+   `[storage.ownership] mode` switch selects which owners are active, and a
+   backend disabled there or by its `[storage.<backend>] enabled` key
+   advertises no classes. There is no per-class enablement key in v1.
 3. The agent reports only the intersection in node inventory.
 4. The control plane MUST refuse to place an operation on a node whose
    advertised set lacks the required token.
@@ -300,17 +310,19 @@ Volvisor advertises its own tokens. CHV maps them one-to-one for v1:
 | `same_host_live_backing_move` | `same-host-backing-move` |
 | `attachment_state_report` | `report-attachment-state` |
 
-The table is a vocabulary mapping, not a v1 enablement: the pinned `native-local`
-provider advertises only `create`/`attach`/`resize` (plus the unused
+The table is a vocabulary mapping, not a v1 enablement: the reference
+`native-local` provider (pin pending P3) advertises only
+`create`/`attach`/`resize` (plus the unused
 `same_vg_extent_move`), so the snapshot, clone, live-migrate, offline-copy,
 backing-move and attachment-state-report rows are dormant and the operations
 stay refused. The corrected `attachment_state_report` implementation exists on
 a Volvisor feature branch; it is not part of the CHV pin until the issue is
 dispositioned, merged and consciously re-pinned (§8).
 
-`destroy` and `inspect` have no separate Volvisor capability: the pinned v2
-route set always provides both for `native-local`, so a class that passes the
-`create` handshake advertises `destroy` and `inspect` as baseline. `close` is
+`destroy` and `inspect` have no separate Volvisor capability: the reference v2
+route set (pin pending P3) always provides both for `native-local`, so a class
+that passes the `create` handshake advertises `destroy` and `inspect` as
+baseline. `close` is
 gated on `attach` and is an agent-local no-op when no attachment record exists;
 `delete-snapshot` is dormant because no v1 backend advertises `snapshot`.
 `inspect` remains mandatory for every backend.
@@ -385,7 +397,11 @@ canonical_payload = UTF-8 JSON, no insignificant whitespace, keys in exactly
 1. Replaying the same `operation_id` with the same canonical payload MUST
    return the recorded outcome without a new side effect.
 2. Reusing `operation_id` with a different payload MUST fail closed with
-   `IDEMPOTENCY_CONFLICT` → CHV `CONFLICT`.
+   `IDEMPOTENCY_CONFLICT` → CHV `CONFLICT`. Request fields not included in the
+   canonical payload MUST be identical across retries of one logical
+   operation. If one changes (for example the VMM reconfigures `vmm_disk_id`
+   after a crash), that is a new operation with a new control-plane
+   `operation_id`, not a retry; the agent MUST NOT reuse the old id.
 3. The agent MUST persist enough state to reconstruct the same
    `operation_id` after a restart. Deriving from desired state (not from a
    transient counter) is what makes this possible.
@@ -439,7 +455,8 @@ conformance evidence is reviewed:
 2. CHV MUST NOT report `advertised` or `active` for a Volvisor-owned
    attachment.
 3. CHV MAY corroborate the returned `host_device_path` with a host-side
-   existence check and record `device_present = true|false`. That is evidence
+   existence check and record the result through `attachment_observed`, leaving
+   the evidence field unset. That is evidence
    of a path, not of a live VMM attachment, and MUST NOT be labelled `active`.
 4. A UI or API MUST render `prepared` distinctly from `active`.
 5. Health and evidence MUST default to `unknown` unless the backend reports a
@@ -523,6 +540,12 @@ operations, and they MUST NOT be re-attempted by a reaper.
   bearer token. The token MUST be read from a file at startup, mode `0400`,
   owned by the agent user, never logged, never placed in a URL or error
   message.
+- **Residual risk (reference revision):** Volvisor's read routes — including
+  `GET /v2/volumes/{id}` — are unauthenticated to any local process and expose
+  volume ids, sizes, and `host_device_path`. v1 accepts this only because
+  `volvisord` binds loopback on a single-tenant node. A multi-tenant host or a
+  non-loopback bind REQUIRES read authentication to be added upstream and
+  re-pinned before use.
 
 ### 11.2 Endpoints used
 
@@ -637,11 +660,12 @@ The agent MUST, before advertising the `native-local` class:
 
 1. reach `/healthz`;
 2. fetch `/v2/capabilities`;
-3. verify API compatibility. The capabilities payload carries no
-   `api_version`; compatibility is established by the `/v2` route set and by
-   the `volvisor.volume.v2` envelope that every mutating request carries (a
-   rejected envelope is `INVALID_REQUEST`). The agent MUST fail the handshake
-   rather than retry an incompatible revision;
+3. verify API compatibility from the `/v2` route set and the capability
+   vocabulary; the capabilities payload carries no `api_version`, and the
+   `volvisor.volume.v2` envelope exists only on mutations, so the handshake
+   cannot see it. The runtime backstop is mandatory: an `INVALID_REQUEST`
+   envelope rejection at mutation time MUST disable the owner/class (fail
+   closed, no stord fallback) rather than be retried per operation;
 4. verify the provider is `lvm`; `fake` is refused outside dev/test builds;
 5. verify the required capability tokens are present.
 
@@ -697,9 +721,12 @@ passing run against a different revision is not evidence.
 3. Stopping `volvisord` makes Volvisor-owned volumes unavailable. That is an
    honest failure; it MUST NOT be papered over by opening the volume with
    stord.
-4. The agent MUST refuse to start with a volume row whose owner cannot be
-   served. The operator resolves this by enabling the backend or by not
-   running an agent on that node; there is no silent per-owner bypass.
+4. The agent MUST refuse to open, attach, or reconcile a volume whose owner
+   cannot be served by an enabled backend on the node (fail the operation, not
+   startup: unattached volumes are a control-plane concern and are not visible
+   to the agent at boot). The control plane MUST refuse to schedule such
+   volumes. The operator resolves this by enabling the backend, and there is
+   no silent per-owner bypass.
 
 ## 15. Non-goals
 

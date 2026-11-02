@@ -21,9 +21,21 @@ what to alert on, and how to investigate incidents.
 > in-process, but neither daemon serves them, and the `metrics_bind` key in
 > their config structs is currently not read by any daemon — do not expect a
 > scrape target there.
-> **Never bind `metrics_bind` to a public interface**; the qualified and packaged
-> posture is loopback (`127.0.0.1:9901`). The control plane always exposes
-> `/metrics` on its `http_bind` address.
+> **Never expose `metrics_bind` on a public interface**; the qualified and
+> packaged posture is loopback (`127.0.0.1:9901`). To scrape from another host,
+> bind to a specific management address (for example
+> `metrics_bind = "192.0.2.10:9901"`), not to a wildcard address. The code
+> fallback `9100` is node_exporter's default port: on hosts running
+> node_exporter, set `metrics_bind` explicitly so the agent cannot lose its
+> listener to an address-in-use error (the failure is logged, not fatal).
+>
+> The control plane serves `/metrics` on its `http_bind` address **behind the
+> admin auth gate**: an unauthenticated scrape receives `401`. Scrapers need an
+> admin bearer/session credential, and admin JWTs expire — plan credential
+> rotation or scrape it through an operator-managed relay. `quick-install.sh`
+> deliberately binds the control plane HTTP listener on `0.0.0.0:8080` (plain
+> HTTP); firewall it. The packages and `scripts/install.sh` leave it on
+> `127.0.0.1:8080`.
 
 ---
 
@@ -260,8 +272,10 @@ Pending runbooks should be filed as follow-up issues before the first production
 ## Prometheus scrape configuration
 
 Prometheus must run on the same host as the scraped daemons (or reach them
-through an operator-managed relay): the packaged/installer posture for the
-agent and the control plane is loopback.
+through an operator-managed relay): the packaged/`scripts/install.sh` posture
+for the agent and the control plane is loopback. `quick-install.sh` binds the
+control plane HTTP listener on `0.0.0.0:8080` (plain HTTP), so firewall that
+port and scrape it from the management network only.
 
 ```yaml
 # Minimal prometheus.yml scrape config for CHV on the local host.
@@ -269,6 +283,12 @@ agent and the control plane is loopback.
 
 scrape_configs:
   - job_name: chv-controlplane
+    # Admin-gated: an unauthenticated scrape returns 401. The token is a
+    # short-lived admin JWT, so rotate the credential file before expiry
+    # (or drop this job if you cannot manage a scrape credential).
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/chv-admin-token
     static_configs:
       - targets: ['127.0.0.1:8080']
 
@@ -285,9 +305,10 @@ rule_files:
 
 `chv-stord` and `chv-nwd` expose no HTTP endpoint today, so there are no
 scrape jobs for them. To scrape the agent from another host, set
-`metrics_bind` explicitly to a reachable address (for example
-`0.0.0.0:9901`) and restrict access at the network layer; do not expose it
-publicly. See the loopback caveat under “Metrics endpoints” above.
+`metrics_bind` explicitly to the node's management address (for example
+`192.0.2.10:9901`) and restrict access at the network layer; never bind it to
+a wildcard/public address. See the loopback caveat under “Metrics endpoints”
+above.
 
 ---
 

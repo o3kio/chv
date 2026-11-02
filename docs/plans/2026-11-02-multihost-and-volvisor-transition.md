@@ -3,7 +3,7 @@
 Status: Proposed — requires ratification of the decisions in §4 before P1 starts
 Date: 2026-11-02
 Decision sources: [ADR-028](../specs/adr/028-volvisor-storage-orchestration.md) (accepted, runtime pending), [ADR-021](../specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md) (accepted, in execution), [ADR-002](../specs/adr/002-control-plane-boundary.md) (control-plane/node boundary), [ADR-004](../specs/adr/004-storage-datapath.md) (host-side storage datapath)
-Supersedes: the single-host envelope in [`../DEPLOYMENT-ARCHITECTURE.md`](../DEPLOYMENT-ARCHITECTURE.md) §3.1/§5/§8 (D1), once D-MH5 is ratified
+Supersedes: the single-host envelope in [`../DEPLOYMENT-ARCHITECTURE.md`](../DEPLOYMENT-ARCHITECTURE.md) §3.1/§5/§8 (D1), once the P1 dispatch and P2 console gates pass (the decisions themselves are ratified at Gate P0)
 Related: [`2026-10-13-volvisor-storage-adoption.md`](2026-10-13-volvisor-storage-adoption.md), [`FABRIC_IMPLEMENTATION_PLAN.md`](FABRIC_IMPLEMENTATION_PLAN.md), [`MULTI_NODE_IMPLEMENTATION_PLAN.md`](MULTI_NODE_IMPLEMENTATION_PLAN.md) (historical, 2026-05-07 — verify against the tree), [`../GAP_ANALYSIS.md`](../GAP_ANALYSIS.md)
 
 ---
@@ -282,7 +282,11 @@ architecture change to §3.1 and is part of D-MH5.
 
 - New `[grpc]` (or extended `[tls]`) config: `bind`, `advertise_addr`,
   `server_cert_path`, `server_key_path`, `client_ca_path` (node CA),
-  optional `bind_interface`.
+  optional `bind_interface`. The CP server certificate is issued by an
+  operator-provisioned control-plane server CA; nodes carry that CA (or a
+  fingerprint-verified bundle) before enrollment, because enrollment itself
+  runs over the TLS connection that needs the anchor. The node CA MUST NOT
+  double as the CP server CA.
 - Server certificate SANs must include the advertised management DNS name
   and IP. `scripts/install.sh` and the packaged examples must generate them;
   a cert missing the advertised identity is a startup error, not a runtime
@@ -419,15 +423,17 @@ CHV's `open_volume` / `attach_volume_to_vm` split does not map one-to-one onto
 Volvisor's attach. For a Volvisor-owned volume, `open_volume` is
 ensure-exists (inspect, then create on `404`) and returns the volume id as the
 attachment handle; the real backend attachment is created by
-`attach_volume_to_vm`. `close_volume` therefore means "detach if attached" and
-MUST be idempotent. This is why the contract defines `ensure` and `attach` as
-separate operations.
+`attach_volume_to_vm`. `close_volume` therefore means "detach if attached",
+only with the truthful `vm_stopped` proof (create unwind, or the VM is already
+stopped), and MUST be idempotent. This is why the contract defines `ensure`
+and `attach` as separate operations.
 
 **Attachment phase.** CHV records:
 `state = Prepared`, `observed = false`, `backend_attachment_id`,
-`backend_generation`. It may corroborate with a host-side existence check of
-`frontend.host_device_path`, recorded as `device_present = true/false` —
-never as `Active`. The corrected upstream design is P0.5 and is
+`backend_attachment_generation` (the detach fence — distinct from
+`storage_generation` and from `state_revision`). It may corroborate with a
+host-side existence check of `frontend.host_device_path`, recorded through
+`attachment_observed` and the evidence field — never as `Active`. The corrected upstream design is P0.5 and is
 [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34); once it is
 dispositioned, merged and the pin consciously re-reviewed, P4 adds
 `Advertised` reporting from a truthful `vmm_configured` attestation behind
@@ -484,16 +490,18 @@ Backfill rules:
 |---|---|---|
 | CP | `deployment.topology` | `single-host` / `multi-host`; validated against listeners |
 | CP | `[grpc] bind`, `advertise_addr`, `client_ca_path` | remote agent reachability |
-| CP | `[agent_transport] mode`, `socket_pattern` | resolver selection; TCP endpoints come only from persisted `nodes.agent_grpc_address` / `agent_grpc_server_name` (ADR-029 I4), never from a port/template key |
+| CP | `[agent_transport] mode`, `socket_pattern` | resolver selection; TCP endpoints come only from persisted `nodes.agent_grpc_address` / `agent_grpc_server_name` (ADR-029 I4), never from a port/template key. The existing flat `agent_socket_pattern` key remains honored as a deprecated alias through the P1 window, then is removed in a documented breaking change |
 | CP | `[agent_transport.tls] client_cert_path/client_key_path/ca_cert_path` | CP client identity |
 | Agent | `deployment.topology`, `[agent.grpc]` (see §5.3) | topology declaration + opt-in listener |
 | Agent | `advertise_addr` | inventory fact |
 | Agent | `[storage.volvisor] enabled`, `endpoint`, `admin_token_file`, `api_version`, `request_timeout_ms` | Volvisor |
 | Agent | `[storage.ownership] mode = legacy-stord \| volvisor \| both` | operator switch, default `legacy-stord` in P3/P4 |
 
-`mode = both` exists only for migration windows and is refused when
-`deployment.topology = multi-host` if any volume's owner cannot be served by
-an enabled backend on its node.
+`mode = both` exists only for migration windows. Regardless of topology, the
+agent refuses any open/attach/reconcile for a volume whose owner is disabled
+or whose backend failed its capability handshake, and the control plane
+refuses to schedule such volumes. The contract's refusal rule is
+unconditional; topology changes the listener posture, not ownership safety.
 
 ---
 
@@ -529,8 +537,9 @@ merged, and the pin is re-reviewed. P0.6 (project/seed decisions)
 also remains open, and its recommendation is already encoded in contract v1
 §10/§11.3 pending ratification. No P1 work has started.
 
-**Gate P0:** all decisions in §4 (D-MH1–D-MH8, D-VS1–D-VS7) ratified; no
-code merged that assumes an unratified option.
+**Gate P0:** all decisions in §4 (D-MH1–D-MH8, D-VS1–D-VS7) ratified, plus
+the P0.6 decisions (`project_id` source and `seed_from` posture for
+Volvisor-owned volumes); no code merged that assumes an unratified option.
 
 ### P1 — Remote dispatch (5–7 weeks)
 
@@ -543,6 +552,7 @@ code merged that assumes an unratified option.
 | P1.5 | CP gRPC remote bind + server cert SANs + advertised identity validation | `cmd/chv-controlplane/src/bootstrap.rs`, `crates/chv-controlplane-service/src/server.rs` |
 | P1.6 | Split node identities (client/server), EKUs, SANs, rotation, serial denylist | `enrollment.rs`, `scripts/install.sh` |
 | P1.7 | Dedicated CP client CA generation and distribution | `scripts/install.sh`, packaging examples |
+| P1.8 | Control-plane server identity + node-side trust anchor (out-of-band CA/fingerprint distribution, verification tests) | `scripts/install.sh`, packaging examples, `peer_identity.rs` |
 | P1.8 | `advertise_addr` detection/validation + inventory fields + persistence | `chv-config`, `control-plane-node.proto`, `ReportNodeInventory` |
 | P1.9 | Listener contract tests: refuse node CA as CP, refuse CN mismatch, refuse plaintext, refuse wildcard without advertise | service + agent tests |
 
@@ -822,8 +832,9 @@ Rough order-of-magnitude, one experienced engineer per track:
 - **MH-A (remote management)** ≈ 10–14 weeks from P0.
 - **VS-A (native Volvisor local)** ≈ 15–21 weeks from P0 (P0 → P1 → P3 → P4).
 - **MH-B (tenant L2)** is gated by P5 and roughly 8–12 weeks of fabric work.
-- **Full supported multi-host + Volvisor** ≈ 30–36 weeks sequential, ~24–28
-  with a second track on P5.
+- **Full supported multi-host + Volvisor** ≈ 24–33 weeks on the critical path
+  (P0 → P1 → P3 → P4 → P6 → P7). Summing every phase end-to-end is 36–50
+  weeks; P5 runs in parallel and does not shorten the critical path.
 
 These are planning numbers, not commitments. The gate list, not the
 calendar, decides progression.

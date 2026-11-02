@@ -68,7 +68,7 @@ ARG CHV_CLOUD_HYPERVISOR_SHA256=448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b
 ARG CHV_REMOTE_SHA256=13f32ba952e6791fd901f2279be2055fbacc64005f96c42a8e90d58860df84a7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nginx ca-certificates \
+    nginx ca-certificates openssl \
     dnsmasq iproute2 bridge-utils iptables \
     wget curl \
     tini \

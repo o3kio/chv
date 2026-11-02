@@ -9,7 +9,7 @@ This guide covers installing CHV packages on Debian and Ubuntu systems.
 | Debian | 12 (Bookworm) |
 | Ubuntu | 22.04 LTS (Jammy) |
 
-Published CHV packages and release tarballs are `amd64` (`x86_64`) only. The all-in-one installer script (`scripts/install.sh`) also accepts `arm64` hosts, but no `arm64` artifacts are published.
+Published CHV packages and release tarballs are `amd64` (`x86_64`) only. `arm64` is unsupported: `scripts/install.sh` detects it but still downloads the amd64 tarball and VMM (it does not fail closed), so use an x86_64 host. `scripts/quick-install.sh` aborts on `arm64` with an explanation.
 
 ## Prerequisites
 

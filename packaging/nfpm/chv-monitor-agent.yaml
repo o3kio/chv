@@ -12,7 +12,7 @@ description: |
   Runs inside VMs; a VM without it is fully usable. Never installs
   with or depends on the CHV node/control-plane packages.
 homepage: https://github.com/o3kio/chv
-license: MIT
+license: Apache-2.0
 # Deliberately NO dependency on chv-controlplane / chv-node: this is a
 # guest package. The agent is optional per-VM software whose absence
 # changes nothing about VM lifecycle or usability (G3 gate).

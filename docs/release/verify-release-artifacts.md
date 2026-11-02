@@ -61,8 +61,9 @@ If any file fails the check, **do not install it**. Re-download from the officia
 If `SHA256SUMS.sig` is present and the project has published a GPG public key:
 
 ```bash
-# Import the CHV release signing key (if published)
-curl -sL https://kubedoio.github.io/chv/CHV-RELEASE-KEY.asc | gpg --import
+# Import the CHV release signing key once it is published (TODO: GPG signing
+# is not configured yet; there is no key URL to fetch today).
+gpg --import /path/to/CHV-RELEASE-KEY.asc
 
 # Verify the signature
 gpg --verify SHA256SUMS.sig SHA256SUMS

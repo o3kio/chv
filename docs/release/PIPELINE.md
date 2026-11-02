@@ -211,7 +211,8 @@ make sign-checksums
 
 ```bash
 # Bump VERSION and all derived version references
-# (Cargo.toml files, ui/package.json, sidebar label, README, install script)
+# (Cargo.toml files, ui/package.json, sidebar label, README, install script,
+#  hosting templates and their root copies)
 make bump-version BUMP_TYPE=patch   # or: minor / major
 
 # Derive package versions

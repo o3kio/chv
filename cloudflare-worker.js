@@ -43,7 +43,10 @@ export default {
   <p>See the <a href="https://github.com/o3kio/chv/blob/main/docs/DEPLOYMENT.md">deployment guide</a> for details.</p>
 </body>
 </html>`, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff'
+        }
       });
     }
 
@@ -62,7 +65,8 @@ export default {
     return new Response(scriptResponse.body, {
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'public, max-age=60'
+        'Cache-Control': 'public, max-age=60',
+        'X-Content-Type-Options': 'nosniff'
       }
     });
   }
