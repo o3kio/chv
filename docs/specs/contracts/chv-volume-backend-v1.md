@@ -198,7 +198,8 @@ Read-only observation.
   also returns the full per-attachment projection (`attachments[]`: state,
   `state_revision`, evidence, reporter, `recorded_at_ms`, the detach-fencing
   `attachment_generation` and the frontend) — CHV consumes that projection and
-  never infers a phase it cannot see there.
+  never infers a phase it cannot see there. `attachments[]` order is not
+  significant; CHV reconciles by `attachment_id`, never by position.
 - **MUST NOT:** mutate state, claim `Healthy` without evidence, or advance a
   generation. A report never advances `attachment_generation`; only an
   applied report advances `state_revision`.
@@ -213,17 +214,32 @@ Optional consumer attestation, available only when the backend advertises
   optional `reporter`, optional bounded `detail`, `operation_id`.
 - **Precondition:** the attachment instance exists and its generation matches;
   `advertised` requires `vmm_configured` or `guest_confirmed`; `active`
-  requires `guest_confirmed`.
+  requires `guest_confirmed`. `state_revision` starts at `1` for a fresh
+  attachment instance and is scoped to it.
 - **Postcondition:** an evidence advance yields `applied = true` with a bumped
   `state_revision`; an equal/lower report yields `applied = false` with the
-  current projection. `attachment_generation` is unchanged in both cases.
+  current projection, untouched (`evidence`, `reporter`, `recorded_at_ms`
+  included). `attachment_generation` is unchanged in both cases. `detail` is
+  journal-only diagnostic context, never part of the projection.
 - **MUST NOT:** downgrade state, advance the detach-fencing generation, treat
   the untrusted `reporter` as authentication, or claim `active` from a host
-  configuration/path check.
+  configuration/path check. The `reporter` label is bounded to 1024 bytes and
+  must not contain ASCII control characters.
 
 A post-detach or unknown attachment is `NOT_FOUND` for a new `operation_id`;
 replaying a recorded `operation_id` returns its recorded outcome (including a
-recorded no-op).
+recorded no-op). Envelope refusals (invalid api version, `prepared` target,
+unsupported evidence/state pairing, malformed or reserved `operation_id`,
+over-long or control-bearing `reporter`/`detail`) are decided before the
+backend journal write, so the `operation_id` remains reusable. A
+stale-generation or not-found refusal is journaled as a terminal outcome; its
+`operation_id` is consumed and the refusal replays verbatim.
+
+An attachment id is unique for a volume's lifetime, including across detach and
+re-attach. CHV MUST mint a fresh `attachment_id` per attach. A backend that
+advertises `attachment_state_report` MUST refuse a consumed id with
+`IDEMPOTENCY_CONFLICT`, so a delayed report from an old instance can never be
+attributed to a new one.
 
 ### 4.9 Unsupported operations
 
@@ -553,7 +569,7 @@ Report attachment state (only when the pin advertises `attachment_state_report`)
 | `expected_attachment_generation` | attach response / last inspect (the detach fence) |
 | `state` | `advertised` only in v1 (CHV configured the frontend); `active` refused without guest confirmation |
 | `evidence` | `vmm_configured` for an `advertised` report |
-| `reporter` | CHV agent identity, as an untrusted label |
+| `reporter` | CHV agent identity, as an untrusted label (at most 1024 bytes, no control characters) |
 | `detail` | optional bounded diagnostic |
 
 Destroy:
@@ -569,7 +585,9 @@ Destroy:
   `{"virtio_blk":{"host_device_path":"..."}}`.
 - CHV passes `host_device_path` to Cloud Hypervisor as the disk path, and
   records `attachment_id`, `attachment_generation`, and
-  `volume_generation`.
+  `volume_generation`. It mints a fresh `attachment_id` per attach and never
+  reuses one after detach; a `consumed id` refusal is
+  `IDEMPOTENCY_CONFLICT`, not a retryable transient.
 - A `prepared` state is recorded as §8 requires. When the pin advertises
   `attachment_state_report`, CHV records `state_revision` and `evidence` from
   inspect/report verbatim; `attachment_generation` is never treated as an
