@@ -1,6 +1,6 @@
 # Cloud Hypervisor Reference
 
-Version: v53.0 (qualified pin; downloaded by `scripts/install.sh` with sha256 verification)
+Version: v53.0 (qualified pin; downloaded by the CHV installers with sha256 verification)
 
 The qualified integration and KVM-qualification pin is v53.0
 (`scripts/integration/kvm-smoke.sh`, `scripts/integration/qual/env-preflight.sh`).

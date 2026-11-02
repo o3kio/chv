@@ -11,10 +11,11 @@
 #   INSTALL_CHV_TARBALL_PATH    - Path to local release tarball (dev mode)
 #   INSTALL_CHV_SKIP_DEPS       - Set to "1" to skip apt dependency installation
 #   INSTALL_CHV_SKIP_CLOUD_HV   - Set to "1" to skip cloud-hypervisor download
-#   INSTALL_CHV_ALLOW_VMM_MISMATCH - Set to "1" to keep a host cloud-hypervisor
-#                                 whose major.minor differs from the qualified
-#                                 pin (v53.0) instead of replacing it with the
-#                                 pinned, digest-verified static binary. The
+#   INSTALL_CHV_ALLOW_VMM_MISMATCH - Set to "1" to keep host cloud-hypervisor /
+#                                 ch-remote binaries whose major.minor differs
+#                                 from the qualified pin (v53.0) instead of
+#                                 replacing them with the pinned,
+#                                 digest-verified static binaries. The
 #                                 resulting install is OFF-PIN and UNQUALIFIED.
 #   INSTALL_CHV_BRIDGE_IFACE    - Host interface to attach to bridge (default: ens19)
 #   INSTALL_CHV_BRIDGE_NAME     - Bridge name (default: chvbr0)
@@ -407,7 +408,9 @@ install_binaries_and_assets() {
     install -m 755 "${EXTRACT_DIR}/bin/chv-nwd"          /usr/bin/
 
     info "Installing Web UI assets..."
-    rm -rf "$CHV_UI_DIR"/*
+    # SC2115: the :? guard makes an empty/mis-set CHV_UI_DIR abort the script
+    # instead of expanding to `rm -rf /*`.
+    rm -rf "${CHV_UI_DIR:?}"/*
     cp -r "${EXTRACT_DIR}/ui/"* "$CHV_UI_DIR/"
     # Owned by the control plane user since #447: the binary serves the
     # tree ([webui] in controlplane.toml), not nginx. Files/dirs stay
@@ -444,6 +447,7 @@ install_cloud_hypervisor() {
     # with the pinned, digest-verified static binary below — the previous
     # "any version counts as installed" early return silently kept hosts on
     # the v43 branch the qualification campaign moved away from.
+    local chv_pin_ok=0
     if cmd_exists cloud-hypervisor; then
         local found_raw found_mm
         found_raw="$(cloud-hypervisor --version 2>/dev/null || true)"
@@ -456,10 +460,8 @@ install_cloud_hypervisor() {
             if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
                 ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
             fi
-            return
-        fi
-
-        if [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            chv_pin_ok=1
+        elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
             warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host Cloud Hypervisor."
             warn "  found:    ${found_raw:-unparseable}"
             warn "  required: v${chv_version} (qualified pin)"
@@ -469,14 +471,14 @@ install_cloud_hypervisor() {
             if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
                 ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
             fi
-            return
+            chv_pin_ok=1
+        else
+            warn "Cloud Hypervisor version mismatch: found ${found_raw:-unparseable},"
+            warn "but the qualified pin is v${chv_version}. Replacing the host binary"
+            warn "with the pinned, digest-verified static build."
+            warn "To keep the host binary instead (off-pin, unqualified), re-run with"
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1."
         fi
-
-        warn "Cloud Hypervisor version mismatch: found ${found_raw:-unparseable},"
-        warn "but the qualified pin is v${chv_version}. Replacing the host binary"
-        warn "with the pinned, digest-verified static build."
-        warn "To keep the host binary instead (off-pin, unqualified), re-run with"
-        warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1."
     fi
 
     # Qualified-pin digests — D6 option (b), #448 campaign
@@ -485,21 +487,43 @@ install_cloud_hypervisor() {
     local chv_sha256="448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc"
     local chv_remote_sha256="13f32ba952e6791fd901f2279be2055fbacc64005f96c42a8e90d58860df84a7"
 
-    info "Downloading Cloud Hypervisor v${chv_version}..."
-    local chv_tmp
-    chv_tmp="$(mktemp)"
-    curl -fsSL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${chv_version}/cloud-hypervisor-static" \
-        -o "${chv_tmp}"
-    if ! echo "${chv_sha256}  ${chv_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+    if [ "$chv_pin_ok" = "0" ]; then
+        info "Downloading Cloud Hypervisor v${chv_version}..."
+        local chv_tmp
+        chv_tmp="$(mktemp)"
+        curl -fsSL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${chv_version}/cloud-hypervisor-static" \
+            -o "${chv_tmp}"
+        if ! echo "${chv_sha256}  ${chv_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+            rm -f "${chv_tmp}"
+            fatal "Cloud Hypervisor v${chv_version} digest mismatch (expected ${chv_sha256}); aborting install"
+        fi
+        install -m 0755 "${chv_tmp}" /usr/local/bin/cloud-hypervisor
         rm -f "${chv_tmp}"
-        fatal "Cloud Hypervisor v${chv_version} digest mismatch (expected ${chv_sha256}); aborting install"
+        ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+        info "Cloud Hypervisor installed: $(cloud-hypervisor --version)"
     fi
-    install -m 0755 "${chv_tmp}" /usr/local/bin/cloud-hypervisor
-    rm -f "${chv_tmp}"
-    ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
-    info "Cloud Hypervisor installed: $(cloud-hypervisor --version)"
 
-    if ! cmd_exists ch-remote; then
+    # ch-remote is version-coupled to cloud-hypervisor; apply the same gate so
+    # a stale host client is not left paired with the pinned VMM.
+    local remote_pin_ok=0
+    if cmd_exists ch-remote; then
+        local remote_raw remote_mm
+        remote_raw="$(ch-remote --version 2>/dev/null || true)"
+        remote_mm="$(printf '%s' "$remote_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+        if [ "$remote_mm" = "$chv_version" ]; then
+            info "ch-remote already installed at the qualified pin (${remote_raw}); keeping it."
+            remote_pin_ok=1
+        elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host ch-remote (off-pin, unqualified)."
+            remote_pin_ok=1
+        else
+            warn "ch-remote version mismatch: found ${remote_raw:-unparseable},"
+            warn "but the qualified pin is v${chv_version}. Replacing it with the"
+            warn "pinned, digest-verified static build."
+        fi
+    fi
+
+    if [ "$remote_pin_ok" = "0" ]; then
         info "Downloading ch-remote v${chv_version}..."
         local chv_remote_tmp
         chv_remote_tmp="$(mktemp)"
@@ -512,8 +536,6 @@ install_cloud_hypervisor() {
         install -m 0755 "${chv_remote_tmp}" /usr/local/bin/ch-remote
         rm -f "${chv_remote_tmp}"
         info "ch-remote installed: $(ch-remote --version 2>/dev/null || echo v${chv_version})"
-    else
-        info "ch-remote already installed: $(ch-remote --version 2>/dev/null || true)"
     fi
 }
 

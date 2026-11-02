@@ -109,7 +109,7 @@ cd "chv-${VERSION}-linux-amd64"
 sudo ./install.sh
 ```
 
-The install script downloads Cloud Hypervisor (the VMM) when it is not already installed. Set `INSTALL_CHV_SKIP_CLOUD_HV=1` to skip that step.
+The install script keeps a preinstalled Cloud Hypervisor VMM and `ch-remote` client only when their major.minor matches the qualified v53.0 pin; any other version is replaced with the pinned, digest-verified static builds. Set `INSTALL_CHV_SKIP_CLOUD_HV=1` to skip that step (the VMM and client are then neither installed nor replaced).
 
 The tarball includes:
 - Pre-built binaries (`bin/`)

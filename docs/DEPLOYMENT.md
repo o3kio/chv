@@ -57,10 +57,11 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh |
 
 ### Installer behavior: VMM pin and firmware
 
-- **Cloud Hypervisor pin.** The installer requires major.minor **53.0**. A
-  preinstalled `cloud-hypervisor` at that pin is kept; any other version is
-  replaced with the pinned, digest-verified v53.0 static build (with a
-  warning). `INSTALL_CHV_ALLOW_VMM_MISMATCH=1` keeps the host binary instead,
+- **Cloud Hypervisor pin.** The installer requires major.minor **53.0** for
+  both `cloud-hypervisor` and its version-coupled `ch-remote` client. A
+  preinstalled binary at that pin is kept; any other version is replaced with
+  the pinned, digest-verified v53.0 static build (with a warning).
+  `INSTALL_CHV_ALLOW_VMM_MISMATCH=1` keeps the host binaries instead,
   producing an **off-pin, unqualified** install.
 - **Firmware.** `/root/CLOUDHV.fd` is used when present. Otherwise the
   installer downloads the pinned rust-hypervisor-firmware 0.5.0 build to
@@ -72,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh |
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INSTALL_CHV_ALLOW_VMM_MISMATCH` | unset | Set to `1` to keep a host Cloud Hypervisor whose major.minor is not `53.0`. Resulting install is off-pin and unqualified. |
+| `INSTALL_CHV_ALLOW_VMM_MISMATCH` | unset | Set to `1` to keep host `cloud-hypervisor` / `ch-remote` binaries whose major.minor is not `53.0`. Resulting install is off-pin and unqualified. |
 
 > **Release source:** the one-liner resolves the latest **stable** GitHub
 > release and downloads its tarball. v0.3.0 is that release today (published,
@@ -174,6 +175,11 @@ After it completes, open `http://<host-ip>:8080/` and log in as
   partial or hand-managed state) is likewise refused unless `--force`:
   fresh config would mint a new `jwt_secret` against a live database and
   invalidate existing sessions and agent tokens.
+- **VMM pin.** The same v53.0 policy as `install.sh` applies: a preinstalled
+  `cloud-hypervisor` or `ch-remote` at major.minor 53.0 is kept; any other
+  version is replaced with the pinned, digest-verified static build.
+  `INSTALL_CHV_ALLOW_VMM_MISMATCH=1` keeps the host binaries instead, making
+  the install off-pin and unqualified.
 - **Uninstall.** `sudo scripts/quick-install.sh --uninstall` removes the
   software and preserves `/etc/chv` and `/var/lib/chv`;
   `--uninstall --purge` also removes data and config (the `chv` and

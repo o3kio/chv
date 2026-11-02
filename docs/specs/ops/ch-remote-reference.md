@@ -1,6 +1,6 @@
 # ch-remote CLI Reference
 
-Version: v53.0 (qualified pin; downloaded by `scripts/install.sh` with sha256 verification)
+Version: v53.0 (qualified pin; downloaded by the CHV installers with sha256 verification)
 Binary: `ch-remote-static`
 Download: https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/ch-remote-static
 Install path: `/usr/local/bin/ch-remote`
