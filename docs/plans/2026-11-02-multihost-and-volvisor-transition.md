@@ -680,7 +680,7 @@ refused). No "known flake".
 
 | WP | Work |
 |---|---|
-| P7.1 | New installs default to Volvisor-owned `native-local` where the handshake passes; stord still installed for legacy rows |
+| P7.1 | New installs default to Volvisor-owned `native-local` where the handshake passes; stord still installed for legacy rows. The default flip additionally requires the Gate P4 read-authentication re-pin; until then it applies only to the single-tenant lab/qualification posture |
 | P7.2 | Legacy volume inventory: every remaining `legacy-stord` row is tagged, reported, and documented |
 | P7.3 | Operator migration procedure: offline re-create + data copy, or keep legacy forever; **no auto-adoption** |
 | P7.4 | Deprecation notice, then removal of stord from the node package once P7.2 is empty or explicitly waived |
@@ -688,7 +688,8 @@ refused). No "known flake".
 
 **Gate P7:** no shipped configuration creates a new stord-owned volume; the
 remaining set is enumerated with an owner and a retirement date; removing
-stord does not break any documented workflow.
+stord does not break any documented workflow. Multi-tenant default enablement
+requires the upstream Volvisor read-authentication re-pin from Gate P4.
 
 ---
 
