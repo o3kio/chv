@@ -39,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c '
         mkdir -p /run/chv/controlplane /var/lib/chv /tmp;
         JWT_FILE="/var/lib/chv/.jwt_secret";
@@ -93,7 +93,7 @@ services:
       context: .
       dockerfile: Dockerfile
     user: "chv-stord:chv-stord"
-    command: >
+    command: |
       sh -c '
         mkdir -p /run/chv/stord /tmp;
         cat > /tmp/stord.toml <<EOF
@@ -130,7 +130,7 @@ services:
       context: .
       dockerfile: Dockerfile
     network_mode: host
-    command: >
+    command: |
       sh -c '
         mkdir -p /run/chv/nwd /tmp;
         cat > /tmp/nwd.toml <<EOF
@@ -168,7 +168,7 @@ services:
       - kvm
     devices:
       - /dev/kvm:/dev/kvm
-    command: >
+    command: |
       sh -c '
         mkdir -p /var/lib/chv/agent /run/chv/agent /var/lib/chv/cache /etc/chv/certs /tmp;
         JWT_FILE="/var/lib/chv/.jwt_secret";
@@ -190,7 +190,7 @@ services:
       socket_path = "/run/chv/agent/api.sock"
       runtime_dir = "/var/lib/chv/agent"
       log_level = "info"
-      control_plane_addr = "http://chv-controlplane:8443"
+      control_plane_addr = "https://chv-controlplane:8443"
       stord_socket = "/run/chv/stord/api.sock"
       nwd_socket = "/run/chv/nwd/api.sock"
       chv_binary_path = "/usr/local/bin/cloud-hypervisor"
@@ -250,7 +250,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c '
         cat > /tmp/nginx.conf <<EOF
       server {
