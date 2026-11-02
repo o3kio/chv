@@ -320,9 +320,9 @@ The table is a vocabulary mapping, not a v1 enablement: the reference
 `create`/`attach`/`resize` (plus the unused
 `same_vg_extent_move`), so the snapshot, clone, live-migrate, offline-copy,
 backing-move and attachment-state-report rows are dormant and the operations
-stay refused. The corrected `attachment_state_report` implementation exists on
-a Volvisor feature branch; it is not part of the CHV pin until the issue is
-dispositioned, merged and consciously re-pinned (§8).
+stay refused. The corrected `attachment_state_report` implementation is merged
+in Volvisor `main` (`a6d1508`); it is not part of the CHV pin until the pin is
+consciously moved to a build carrying it and the capability is verified (§8).
 
 `destroy` and `inspect` have no separate Volvisor capability: the reference v2
 route set (pin pending P3) always provides both for `native-local`, so a class
@@ -452,9 +452,10 @@ carries the full per-attachment projection (`attachments[]` with state,
 revision, evidence, reporter and the frontend). The capability token is
 `attachment_state_report` (not the earlier `attachment_phase_report` name).
 
-Implementation status: the design is corrected and implemented on a Volvisor
-feature branch, but the issue's disposition and any upstream merge/release are
-still pending. This contract does **not** assume a released upstream surface.
+Implementation status: the design is merged in Volvisor `main` (`a6d1508`,
+PR [o3kio/volvisor#35](https://github.com/o3kio/volvisor/pull/35)), but no
+release, tag, or consumer pin carries it yet. This contract does **not**
+assume a released upstream surface.
 Until the CHV pin's Volvisor build advertises `attachment_state_report` and its
 conformance evidence is reviewed:
 

@@ -81,7 +81,7 @@ Every claim below is checkable in the tree at the time of writing.
 | S5 | Class vocabularies are disjoint and must not be mapped. | CHV: `local`, `lvm`, `iscsi`, `ceph`. Volvisor: `native-local`, `nearline-replicated`, `ceph-rbd`. |
 | S6 | Volvisor has no snapshot/clone/restore routes. | `crates/volvisor-api/src/router.rs`: create, list, inspect, attach, detach, grow, move-backing, delete, capabilities, healthz, admin, mobility. |
 | S6b | Volvisor *does* have a mobility surface, but it is not enabled for `native-local`. | `POST /v2/vms/{vm_id}/check-mobility` and the `/v2/migrations/*` routes exist, but `volvisord` wires the handoff only for the `drbd` provider. With the `lvm` provider, `check-mobility` answers 404 `NOT_FOUND` ("handoff surface not available for this provider") and the migration routes answer 404 `NOT_FOUND` ("the mobility surface is not enabled on this deployment"). The typed `MIGRATION_UNSUPPORTED_LOCAL_STORAGE` code exists but is not reached in this configuration. |
-| S7 | The pinned revision (API v2) cannot report attachment phase beyond `prepared`. | The pinned implementation returns `state = prepared` and has no route that advances it. A **corrected** design is tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) and implemented on a Volvisor feature branch (not merged/released/pinned): `POST /v2/volumes/{id}/attachment-state`, a per-attachment `attachments[]` inspect view, monotonic `state_revision` (the detach-fencing `attachment_generation` never advances), and the `attachment_state_report` capability. ADR-028 requires observed attachment reporting; the pinned gap remains until the upstream disposition and a conscious re-pin. |
+| S7 | The pinned revision (API v2) cannot report attachment phase beyond `prepared`. | The pinned implementation returns `state = prepared` and has no route that advances it. A **corrected** design is tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) and merged in Volvisor `main` (`a6d1508`, PR #35; not released or pinned): `POST /v2/volumes/{id}/attachment-state`, a per-attachment `attachments[]` inspect view, monotonic `state_revision` (the detach-fencing `attachment_generation` never advances), and the `attachment_state_report` capability. ADR-028 requires observed attachment reporting; the pinned gap remains until a conscious re-pin to a build carrying it. |
 | S8 | Volvisor is a prototype with no CHV production qualification. | `volvisor/README.md`, `volvisor/AGENTS.md`, ADR-028 "Volvisor is a prototype". |
 | S9 | There is no in-place adoption route from stord state. | `POST /v2/admin/nearline/{volume_id}/adopt` is DRBD failover promotion, not foreign-volume adoption. |
 | S10 | Volvisor's privileged API is loopback + bearer token. | `volvisor/docs/configuration.md`: `listen` must be loopback without `admin_token`; privileged requests still `401` without it. |
@@ -435,8 +435,8 @@ and `attach` as separate operations.
 host-side existence check of `frontend.host_device_path`, recorded through
 `attachment_observed` with the evidence field left unset — never as `Active`.
 The corrected upstream design is P0.5 and is
-[o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34); once it is
-dispositioned, merged and the pin consciously re-reviewed, P4 adds
+[o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34); once the pin
+is consciously re-reviewed against a build carrying it, P4 adds
 `Advertised` reporting from a truthful `vmm_configured` attestation behind
 capability negotiation. P4 does **not** add `Active`: v1 has no
 guest-confirmation path, and `Active` requires `guest_confirmed` evidence.
@@ -519,22 +519,22 @@ of merged PRs. A phase does not start until the previous gate passes.
 | P0.2 | Write the `chv-volume-backend-v1` internal contract (owner, capabilities, error mapping, idempotency derivation) | `docs/specs/contracts/chv-volume-backend-v1.md` (new) |
 | P0.3 | Update `DEPLOYMENT-ARCHITECTURE.md` §3.1 listener table, §5 UC-6, §8 D1/D2 as **proposed** | `docs/DEPLOYMENT-ARCHITECTURE.md` |
 | P0.4 | Pin Volvisor: exact SHA, API version, provider/config surface, capability set; record it in the integration record (not `compat.rs` — Volvisor is not a versioned CHV component yet; that is a P3 change) | `docs/specs/contracts/chv-volume-backend-v1.md` §11/§13, this plan §10.1 |
-| P0.5 | File the upstream attachment-phase amendment request; record the accepted/dispositioned outcome | Volvisor issue [#34](https://github.com/o3kio/volvisor/issues/34) — **filed 2026-11-02, disposition pending** |
+| P0.5 | File the upstream attachment-phase amendment request; record the accepted/dispositioned outcome | Volvisor issue [#34](https://github.com/o3kio/volvisor/issues/34) — **filed and merged 2026-11-02** (PR [#35](https://github.com/o3kio/volvisor/pull/35), `a6d1508`); pin re-review pending |
 | P0.6 | Decide `project_id` carriage and `seed_from` posture for Volvisor-owned volumes | this plan + proto draft |
 
 **Status 2026-11-02:** P0.1 ([ADR-029](../specs/adr/029-multi-host-dispatch.md)),
 P0.2 ([`chv-volume-backend-v1`](../specs/contracts/chv-volume-backend-v1.md)),
 the proposed markings in P0.3, and the P0.4 pin record (§10.1.1) are written.
 The pin is a review reference until P3's contract tests run against it in CI.
-P0.5 is **filed but not dispositioned**: the corrected upstream design is
+P0.5 is **filed and merged**: the corrected upstream design is
 [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) (a
 `POST /v2/volumes/{id}/attachment-state` consumer report with monotonic
 `state_revision` and an unchanging detach-fencing generation, an `attachments[]`
-inspect projection, and the `attachment_state_report` capability). The design
-is implemented on a Volvisor feature branch with conformance/API tests, but it
-is **not merged, released or pinned**. Acceptance is not assumed; §8 keeps the
-`prepared`-only posture until the disposition lands, the implementation is
-merged, and the pin is re-reviewed. P0.6 (project/seed decisions)
+inspect projection, and the `attachment_state_report` capability), merged in
+Volvisor `main` as PR [#35](https://github.com/o3kio/volvisor/pull/35)
+(`a6d1508`) with conformance/API tests. It is **not released or pinned**. No
+consumer adoption is assumed; §8 keeps the `prepared`-only posture until the
+pin is consciously re-reviewed against a build carrying the capability. P0.6 (project/seed decisions)
 also remains open, and its recommendation is already encoded in contract v1
 §10/§11.3 pending ratification. No P1 work has started.
 
@@ -772,7 +772,7 @@ it in CI.
 | Required LVM config | `listen`, `journal_dir`, `provider = "lvm"`, `lvm_vg_prefix`, `device_claim_token` |
 | Routes used by CHV | `GET /v2/capabilities`, `GET /healthz`, `GET \| POST /v2/volumes`, `POST …/attach`, `POST …/detach`, `POST …/grow`, `DELETE /v2/volumes/{id}` (plus `POST …/attachment-state` only if/when the re-pinned build advertises `attachment_state_report`) |
 | Routes refused by CHV | `/v2/admin/*`, `/v2/migrations/*`, `/v2/vms/*/check-mobility`, nearline adopt |
-| Upstream design (P0.5) | [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) — corrected design implemented on a Volvisor feature branch; filed, disposition/merge/release pending; **not** part of this pin |
+| Upstream design (P0.5) | [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) — corrected design merged in Volvisor `main` (`a6d1508`, PR #35); not released/pinned and **not** part of this pin |
 
 Volvisor source is not vendored in this repository. Re-verify the Volvisor
 claims (S6/S6b/S10 and “rule 20”) against the exact pin with:
