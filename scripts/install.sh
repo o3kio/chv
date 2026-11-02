@@ -461,17 +461,34 @@ install_cloud_hypervisor() {
     # "any version counts as installed" early return silently kept hosts on
     # the v43 branch the qualification campaign moved away from.
     local chv_pin_ok=0
-    if cmd_exists cloud-hypervisor; then
+    # Gate the binary the agent will actually exec (`chv_binary_path` is
+    # /usr/bin/cloud-hypervisor), falling back to PATH only until that link
+    # exists. Checking PATH alone would accept a pinned /usr/local/bin copy
+    # while leaving a stale /usr/bin binary for the agent to run.
+    local chv_bin=""
+    if [ -x /usr/bin/cloud-hypervisor ]; then
+        chv_bin="/usr/bin/cloud-hypervisor"
+    elif cmd_exists cloud-hypervisor; then
+        chv_bin="$(command -v cloud-hypervisor)"
+        # A relative PATH entry makes `command -v` return a relative path;
+        # normalize it so the /usr/bin link never depends on the installer's
+        # working directory.
+        case "$chv_bin" in
+            /*) ;;
+            *) chv_bin="$(cd "$(dirname "$chv_bin")" && pwd)/$(basename "$chv_bin")" ;;
+        esac
+    fi
+    if [ -n "$chv_bin" ]; then
         local found_raw found_mm
-        found_raw="$(cloud-hypervisor --version 2>/dev/null || true)"
+        found_raw="$("$chv_bin" --version 2>/dev/null || true)"
         # Parse major.minor from e.g. "cloud-hypervisor v43.0.0". Comparing
         # major.minor (not the full string) lets v53.0.0 match the "53.0" pin.
         found_mm="$(printf '%s' "$found_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
 
         if [ "$found_mm" = "$chv_version" ]; then
             info "Cloud Hypervisor already installed at the qualified pin (${found_raw}); keeping it."
-            if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
-                ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+            if [ "$chv_bin" != "/usr/bin/cloud-hypervisor" ]; then
+                ln -sf "$chv_bin" /usr/bin/cloud-hypervisor
             fi
             chv_pin_ok=1
         elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
@@ -481,8 +498,8 @@ install_cloud_hypervisor() {
             warn "This install is OFF-PIN and UNQUALIFIED: VMs will run on a VMM the"
             warn "qualification campaign did not cover. Re-run without this override"
             warn "(and without INSTALL_CHV_SKIP_CLOUD_HV) to install the pinned binary."
-            if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
-                ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+            if [ "$chv_bin" != "/usr/bin/cloud-hypervisor" ]; then
+                ln -sf "$chv_bin" /usr/bin/cloud-hypervisor
             fi
             chv_pin_ok=1
         else

@@ -15,7 +15,7 @@ This guide deploys CHV on a single Linux host. The host runs the **control plane
 3. [What Gets Installed](#what-gets-installed)
 4. [Build & Package a Release](#build--package-a-release)
 5. [Manual Deployment (Step-by-Step)](#manual-deployment-step-by-step)
-6. [Hosting the Installer (`get.cellhv.com`, not stood up)](#hosting-the-installer-getcellhvcom)
+6. [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
 7. [Operations & Troubleshooting](#operations--troubleshooting)
 
 ---

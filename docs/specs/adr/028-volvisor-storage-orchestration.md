@@ -16,8 +16,9 @@ Accepted; runtime integration pending
 > has no route that advances an
 > attachment from `prepared` to `advertised`/`active`. The corrected design is
 > tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34)
-> and implemented on a Volvisor feature branch, but it is not merged, released
-> or part of the CHV pin. Until the pin advertises `attachment_state_report`,
+> and merged in Volvisor `main` (`a6d1508`, PR #35, 2026-11-02), but it is not
+> released, tagged, or part of the CHV pin (the pin `286f038` predates it).
+> Until the pin advertises `attachment_state_report`,
 > CHV records `prepared` with `observed = false` and does not claim a live
 > attachment (contract §8). Once re-pinned, CHV may reach `advertised` from a
 > truthful `vmm_configured` attestation, but v1 MUST NOT claim `active`: that

@@ -472,7 +472,7 @@ ALTER TABLE volumes ADD COLUMN storage_generation integer;
 ALTER TABLE volumes ADD COLUMN storage_pool_ref text;
 ALTER TABLE volume_observed_state ADD COLUMN backend_attachment_id text;
 ALTER TABLE volume_observed_state ADD COLUMN backend_attachment_generation integer;  -- detach fence; never advanced by a report
-ALTER TABLE volume_observed_state ADD COLUMN attachment_phase text;   -- prepared | advertised | active
+ALTER TABLE volume_observed_state ADD COLUMN attachment_state text;   -- prepared | advertised | active
 ALTER TABLE volume_observed_state ADD COLUMN attachment_state_revision integer;  -- backend evidence ordering (authoritative)
 ALTER TABLE volume_observed_state ADD COLUMN attachment_evidence text;   -- vmm_configured | guest_confirmed | NULL (prepared)
 ALTER TABLE volume_observed_state ADD COLUMN attachment_observed integer NOT NULL DEFAULT 0;

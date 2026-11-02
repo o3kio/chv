@@ -229,10 +229,10 @@ Optional consumer attestation, available only when the backend advertises
 - **Precondition:** the attachment instance exists and its generation matches;
   `advertised` requires `vmm_configured` or `guest_confirmed`; `active`
   requires `guest_confirmed`. A fresh attachment instance has
-  `state_revision = 0`; the first applied report sets it to `1`, and each
-  subsequent applied advance increments it. It is scoped to the attachment
-  instance. State ordering is by rank (`prepared < advertised < active`), not
-  by revision.
+  `state_revision = 1` (the provider-recorded `prepared` state at attach); the
+  first applied report sets it to `2`, and each subsequent applied advance
+  increments it by one. It is scoped to the attachment instance. State
+  ordering is by rank (`prepared < advertised < active`), not by revision.
 - **Postcondition:** an evidence advance yields `applied = true` with a bumped
   `state_revision`; an equal/lower report yields `applied = false` with the
   current projection, untouched (`evidence`, `reporter`, `recorded_at_ms`

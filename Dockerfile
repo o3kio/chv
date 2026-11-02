@@ -8,7 +8,8 @@
 #
 # What it is good for: exercising the four CHV daemons in a container for local
 # iteration and for image-build smoke checks. It carries Cloud Hypervisor at the
-# qualified pin so VM work is possible inside the container, but it provisions
+# qualified pin (amd64 only; the pinned static assets are x86_64) so VM work is
+# possible inside the container, but it provisions
 # no TLS/mTLS material — the control plane fails closed without it, so the
 # compose stacks cannot complete agent enrollment as configured.
 #
@@ -22,9 +23,17 @@ FROM rust:1.98.1-bookworm AS builder
 # from chv-controlplane via rustls/object_store, verified with `cargo tree -i
 # aws-lc-sys`) needs cmake at build time. The workspace has no openssl-sys in
 # its build graph, so libssl-dev is deliberately not installed.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    protobuf-compiler \
-    cmake \
+# The pinned Cloud Hypervisor/ch-remote static assets are x86_64-only, so the
+# image is amd64-only. Check in the first stage so a wrong-arch build fails
+# before paying for the Rust/UI compile; the runtime stage checks again.
+RUN arch="$(dpkg --print-architecture)"; \
+    if [ "$arch" != "amd64" ]; then \
+        echo "CHV images are amd64-only: the pinned Cloud Hypervisor static assets are x86_64 (found ${arch})." >&2; \
+        exit 1; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -89,6 +98,11 @@ RUN groupadd -r chv && \
 # Cloud Hypervisor + ch-remote at the qualified pin, verified exactly like
 # scripts/install.sh does (sha256sum -c against the pinned digests).
 RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    if [ "$arch" != "amd64" ]; then \
+        echo "CHV images are amd64-only: the pinned Cloud Hypervisor static assets are x86_64 (found ${arch})." >&2; \
+        exit 1; \
+    fi; \
     base="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${CHV_CLOUD_HYPERVISOR_VERSION}"; \
     curl -fsSL "${base}/cloud-hypervisor-static" -o /tmp/cloud-hypervisor; \
     echo "${CHV_CLOUD_HYPERVISOR_SHA256}  /tmp/cloud-hypervisor" | sha256sum -c -; \
