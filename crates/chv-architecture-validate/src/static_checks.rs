@@ -726,14 +726,14 @@ fn make_secret_finding(path: String, resource_ref: Option<String>) -> Finding {
 }
 
 fn walk_yaml_for_secrets(
-    v: &serde_yaml::Value,
+    v: &serde_json::Value,
     path: &str,
     leaf_name: &str,
     resource_ref: &str,
     out: &mut Vec<Finding>,
 ) {
     match v {
-        serde_yaml::Value::String(s)
+        serde_json::Value::String(s)
             if !s.is_empty() && SECRET_FIELD_NAMES.contains(&leaf_name) =>
         {
             out.push(make_secret_finding(
@@ -741,14 +741,13 @@ fn walk_yaml_for_secrets(
                 Some(resource_ref.to_string()),
             ));
         }
-        serde_yaml::Value::Mapping(m) => {
+        serde_json::Value::Object(m) => {
             for (k, val) in m {
-                let Some(k_str) = k.as_str() else { continue };
-                let new_path = format!("{path}.{k_str}");
-                walk_yaml_for_secrets(val, &new_path, k_str, resource_ref, out);
+                let new_path = format!("{path}.{k}");
+                walk_yaml_for_secrets(val, &new_path, k, resource_ref, out);
             }
         }
-        serde_yaml::Value::Sequence(seq) => {
+        serde_json::Value::Array(seq) => {
             for (i, item) in seq.iter().enumerate() {
                 let new_path = format!("{path}[{i}]");
                 walk_yaml_for_secrets(item, &new_path, leaf_name, resource_ref, out);

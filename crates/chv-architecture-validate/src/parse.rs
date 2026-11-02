@@ -17,11 +17,31 @@ pub const EXPECTED_KIND: &str = "CHVArchitecture";
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("yaml syntax error: {0}")]
-    YamlSyntax(#[from] serde_yaml::Error),
+    YamlSyntax(#[from] serde_saphyr::Error),
+    #[error("yaml model error: {0}")]
+    Model(#[from] serde_json::Error),
+    #[error("yaml emit error: {0}")]
+    YamlEmit(#[from] serde_saphyr::SerializeError),
     #[error(
         "wrong document kind: expected apiVersion={EXPECTED_API_VERSION} kind={EXPECTED_KIND}, found {found}"
     )]
     WrongKind { found: String },
+}
+
+/// Parse YAML into the JSON value model shared with the typed model and the
+/// JSON-Schema validator.
+///
+/// `strict_booleans` keeps YAML 1.2 semantics: only `true`/`false` are
+/// booleans, so values such as `n`, `yes`, or `on` stay strings. The previous
+/// `serde_yaml` parser behaved the same way, and silently coercing
+/// `name: n` into `false` would be a surprising config regression.
+pub(crate) fn parse_value(yaml: &str) -> Result<serde_json::Value, serde_saphyr::Error> {
+    serde_saphyr::from_str_with_options(
+        yaml,
+        serde_saphyr::options! {
+            strict_booleans: true,
+        },
+    )
 }
 
 /// Parse an arbitrary YAML string into a strongly-typed `CHVArchitecture`.
@@ -30,7 +50,7 @@ pub enum ParseError {
 /// `WrongKind` errors take precedence over deeper schema mismatches; this is
 /// what the BFF needs in order to give the user the most actionable error.
 pub fn parse_yaml(yaml: &str) -> Result<CHVArchitecture, ParseError> {
-    let raw: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    let raw: serde_json::Value = parse_value(yaml)?;
     let api_version = raw
         .get("apiVersion")
         .and_then(|v| v.as_str())
@@ -44,17 +64,17 @@ pub fn parse_yaml(yaml: &str) -> Result<CHVArchitecture, ParseError> {
             found: format!("apiVersion={api_version} kind={kind}"),
         });
     }
-    let model: CHVArchitecture = serde_yaml::from_value(raw)?;
+    let model: CHVArchitecture = serde_json::from_value(raw)?;
     Ok(model)
 }
 
 /// Emit the canonical YAML form of a `CHVArchitecture`. Round-trips through
 /// `parse_yaml` for a model that was itself built by `parse_yaml`. Note: a
 /// hand-built model that uses `*::Unknown` enum fallbacks WILL NOT round-trip
-/// (serde_yaml has no way to recover the original string); production code
-/// should not construct models manually for emission.
+/// (the typed model has no way to recover the original string); production
+/// code should not construct models manually for emission.
 pub fn to_yaml(model: &CHVArchitecture) -> Result<String, ParseError> {
-    Ok(serde_yaml::to_string(model)?)
+    Ok(serde_saphyr::to_string(model)?)
 }
 
 #[cfg(test)]

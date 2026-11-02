@@ -306,7 +306,7 @@ async fn deleted_sentinel_row_self_heals() {
 /// Reviewer test-analyzer F10 (existing-issue #2): pin the emitter as
 /// a fixed point. Round-tripping every fixture through
 /// `to_yaml(parse_yaml(yaml))` must produce a stable string — a future
-/// change to serde_yaml's emitter that subtly breaks key ordering or
+/// change to the YAML emitter that subtly breaks key ordering or
 /// quoting style fails this test before it ships a broken seeder.
 #[test]
 fn fixture_yaml_emitter_is_stable() {
