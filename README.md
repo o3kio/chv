@@ -143,9 +143,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now chv-controlplane chv-agent chv-stord chv-nwd
 ```
 
-Packages provide the layout only: provision TLS, a real `jwt_secret`, and the
-admin seed before starting the services (see the distribution guide, steps 5–6).
-Do not start them with the example configs.
+Packages provide the layout only: provision TLS and a real `jwt_secret` before
+starting the services (see the distribution guide, steps 5–6), and do not start
+them with the example configs. Package-only installs do not seed an admin login
+— use `scripts/install.sh` or `scripts/quick-install.sh` for a working
+deployment.
 
 See [`docs/install/channels.md`](./docs/install/channels.md) for stable, RC, nightly, and PR artifact channels.
 

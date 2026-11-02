@@ -167,7 +167,11 @@ Releases host-side resources for an attachment that ended without a VM detach
   agent sends its last recorded attachment generation (re-inspecting first if
   it has none). On `STALE_GENERATION` or `NOT_FOUND`, it re-inspects once and
   treats a missing attachment record as success; close is idempotent and MUST
-  NOT leak a live backend attachment because local state was stale.
+  NOT leak a live backend attachment because local state was stale. If the
+  record is still present, the agent re-issues the detach as a **new**
+  operation derived under the `det` verb with the fresh generation; it does
+  not reuse the `clo` id (§6.3.2 forbids changing a non-canonical field under
+  the same id).
 
 ### 4.5 `grow`
 
@@ -286,8 +290,9 @@ backend.
 2. The set MUST be intersected with the classes the backend serves and with
    the operator enablement defined in transition plan §6.2: the
    `[storage.ownership] mode` switch selects which owners are active, and a
-   backend disabled there or by its `[storage.<backend>] enabled` key
-   advertises no classes. There is no per-class enablement key in v1.
+   backend disabled there (`legacy-stord`) or by its per-backend `enabled` key
+   (`[storage.volvisor] enabled`) advertises no classes. There is no
+   per-class enablement key in v1.
 3. The agent reports only the intersection in node inventory.
 4. The control plane MUST refuse to place an operation on a node whose
    advertised set lacks the required token.
@@ -437,9 +442,11 @@ separates three honest facts per attachment instance:
 - `active` — a consumer attested a positive guest-side observation
   (`guest_confirmed`).
 
-`state_revision` orders these states monotonically
-(`prepared < advertised < active`); `attachment_generation` is the detach
-fence and is **never** advanced by a report. An equal or lower report is an
+The states are strictly ordered by rank
+(`prepared < advertised < active`); `state_revision` advances monotonically
+with each applied report and MUST NOT be used to compare separate attachment
+instances. `attachment_generation` is the detach fence and is **never**
+advanced by a report. An equal or lower report is an
 idempotent no-op, and the backend never downgrades state. The inspect surface
 carries the full per-attachment projection (`attachments[]` with state,
 revision, evidence, reporter and the frontend). The capability token is
@@ -542,10 +549,10 @@ operations, and they MUST NOT be re-attempted by a reaper.
   message.
 - **Residual risk (reference revision):** Volvisor's read routes — including
   `GET /v2/volumes/{id}` — are unauthenticated to any local process and expose
-  volume ids, sizes, and `host_device_path`. v1 accepts this only because
-  `volvisord` binds loopback on a single-tenant node. A multi-tenant host or a
-  non-loopback bind REQUIRES read authentication to be added upstream and
-  re-pinned before use.
+  volume ids, sizes, and `host_device_path`. v1 accepts this only for the
+  single-tenant lab/qualification posture, where the local process set is
+  operator-trusted. Production multi-tenant enablement or a non-loopback bind
+  REQUIRES read authentication upstream and a conscious re-pin (P4 gate).
 
 ### 11.2 Endpoints used
 
@@ -663,9 +670,11 @@ The agent MUST, before advertising the `native-local` class:
 3. verify API compatibility from the `/v2` route set and the capability
    vocabulary; the capabilities payload carries no `api_version`, and the
    `volvisor.volume.v2` envelope exists only on mutations, so the handshake
-   cannot see it. The runtime backstop is mandatory: an `INVALID_REQUEST`
-   envelope rejection at mutation time MUST disable the owner/class (fail
-   closed, no stord fallback) rather than be retried per operation;
+   cannot see it. The runtime backstop is mandatory: any `INVALID_REQUEST`
+   returned for a mutation whose payload already passed agent-side validation
+   MUST be treated as an envelope/API-version rejection and disable the
+   owner/class (fail closed, no stord fallback), rather than be retried per
+   operation;
 4. verify the provider is `lvm`; `fake` is refused outside dev/test builds;
 5. verify the required capability tokens are present.
 

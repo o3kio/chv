@@ -413,7 +413,7 @@ fallback.
 | `open_volume` (Core) / first open (legacy) | `GET /v2/volumes/{id}`; if `404`, `POST /v2/volumes` with `volume_id = CHV volume_id`, `project_id` from the attachment ref, `class = native-local`, `size_bytes`, `provisioning` | Volume creation is *ensure-exists*, idempotent on `operation_id`. `seed_from` is not a Volvisor field: CHV must either pre-seed outside Volvisor or refuse `seed_from` for Volvisor-owned volumes in P4. |
 | `attach_volume_to_vm` | `POST /v2/volumes/{id}/attach` with `attachment_id = CHV attachment_id`, `host_id = node_id`, `vm_id`, `expected_volume_generation`, `requested_frontend = "virtio-blk"` | Returns `frontend.host_device_path`, `attachment_generation`, and `volume_generation`. A stale expected generation is a typed conflict. |
 | `detach_volume_from_vm` | `POST /v2/volumes/{id}/detach` with `attachment_id`, `expected_attachment_generation`, and `vm_stopped_or_io_drained_proof` | Stale generation → conflict, never forced. The drain proof must be truthful: `io_drained` only after CHV's own drain check. |
-| `close_volume` | no-op when no attachment record exists; otherwise `POST /v2/volumes/{id}/detach` with `attachment_id` and the truthful `vm_stopped` proof (create unwind only; the VM never started) | Never deletes the volume. Never fabricates `io_drained`. |
+| `close_volume` | no-op when no attachment record exists; otherwise `POST /v2/volumes/{id}/detach` with `attachment_id` and the truthful `vm_stopped` proof (create unwind or an already-stopped VM) | Never deletes the volume. Never fabricates `io_drained`. |
 | `destroy_volume` | `DELETE /v2/volumes/{id}` with `expected_generation` and an explicit `data_erasure_policy` | Refused unless owner = volvisor and the volume is detached. There is no implicit erasure policy. |
 | `resize_volume` (grow) | `POST /v2/volumes/{id}/grow` | Grow-only; shrink refused. `new_size_bytes` must be 512-aligned and aligned to the fixed 4096-byte logical block size. |
 | `snapshot_volume`, `clone_volume`, `restore_volume`, `delete_volume_snapshot` | none | Refused with `Unimplemented` for volvisor-owned volumes, advertised via capabilities. |
@@ -433,7 +433,8 @@ and `attach` as separate operations.
 `backend_attachment_generation` (the detach fence — distinct from
 `storage_generation` and from `state_revision`). It may corroborate with a
 host-side existence check of `frontend.host_device_path`, recorded through
-`attachment_observed` and the evidence field — never as `Active`. The corrected upstream design is P0.5 and is
+`attachment_observed` with the evidence field left unset — never as `Active`.
+The corrected upstream design is P0.5 and is
 [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34); once it is
 dispositioned, merged and the pin consciously re-reviewed, P4 adds
 `Advertised` reporting from a truthful `vmm_configured` attestation behind
@@ -552,9 +553,9 @@ Volvisor-owned volumes); no code merged that assumes an unratified option.
 | P1.5 | CP gRPC remote bind + server cert SANs + advertised identity validation | `cmd/chv-controlplane/src/bootstrap.rs`, `crates/chv-controlplane-service/src/server.rs` |
 | P1.6 | Split node identities (client/server), EKUs, SANs, rotation, serial denylist | `enrollment.rs`, `scripts/install.sh` |
 | P1.7 | Dedicated CP client CA generation and distribution | `scripts/install.sh`, packaging examples |
-| P1.8 | Control-plane server identity + node-side trust anchor (out-of-band CA/fingerprint distribution, verification tests) | `scripts/install.sh`, packaging examples, `peer_identity.rs` |
-| P1.8 | `advertise_addr` detection/validation + inventory fields + persistence | `chv-config`, `control-plane-node.proto`, `ReportNodeInventory` |
-| P1.9 | Listener contract tests: refuse node CA as CP, refuse CN mismatch, refuse plaintext, refuse wildcard without advertise | service + agent tests |
+| P1.8 | Control-plane server identity + node-side trust anchor (out-of-band CA/fingerprint distribution, verification tests) | `scripts/install.sh`, packaging examples, agent enrollment/report client, `chv-config` |
+| P1.9 | `advertise_addr` detection/validation + inventory fields + persistence | `chv-config`, `control-plane-node.proto`, `ReportNodeInventory` |
+| P1.10 | Listener contract tests: refuse node CA as CP, refuse CN mismatch, refuse plaintext, refuse wildcard without advertise | service + agent tests |
 
 **Gate P1 (MH-A minus packaging):**
 
@@ -629,7 +630,9 @@ have no control-plane process or CA key.
 **Gate P4:** on a real host with a claimed LVM pool, a VM boots from a
 Volvisor-created `native-local` volume, survives agent restart, detaches on
 delete, and leaves no stord session. The refusal matrix is enforced and
-observable.
+observable. Volvisor-owned volumes are enabled only for a single-tenant
+lab/qualification posture until Volvisor adds read authentication and CHV
+re-pins it; multi-tenant enablement is blocked on that upstream change.
 
 ### P5 — Multi-host tenant networking (parallel; 8–12 weeks, owned by ADR-021 plan)
 
