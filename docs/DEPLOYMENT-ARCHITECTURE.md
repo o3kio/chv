@@ -156,8 +156,15 @@ require review against the declaration.
 | Agent metrics | `127.0.0.1:9100` (qualification config, `deploy.sh`); packaged/install.sh default `127.0.0.1:9901`; code fallback when `metrics_bind` is unset: `127.0.0.1:9100` (loopback) | HTTP `/metrics` | Prometheus-style scrapers | Loopback in the qualified config. | [QUALIFIED — KVM-VERIFIED] |
 | nginx edge | `:80` (all interfaces) | HTTP; UI statics; proxies `/api/`, `/v1/` → `:8080`, `/ws/vms/{node_id}/…` → `:8444` | Browsers | The only externally listening component. TLS at the edge is a recommendation, not a default — see decision D7. | [CONTAINER-VERIFIED] — the m4.2 install-sh contract leg |
 | stord migration receiver | disabled by default; example `127.0.0.1:50052` | gRPC, mTLS, mandatory client certs; no plaintext mode | peer `chv-stord` | Opt-in only. With any receiver field set while `enabled = false`, the daemon refuses to start (fail-closed). | [QUALIFIED — KVM-VERIFIED] between two stord instances on one host ([m4.6](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.6-migration.md)) |
-| Fabric WireGuard | `65001/udp` (default; configurable) | WireGuard underlay mesh | peer `chv-nwd` | [DESIGN-ONLY] — [ADR-021](specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md); fails closed today. |
-| Fabric VXLAN | `4789/udp` | kernel VXLAN overlay | peer `chv-nwd` | [DESIGN-ONLY] — ADR-021. |
+| Fabric WireGuard | `65001/udp` (default; configurable) | WireGuard underlay mesh | peer `chv-nwd` | Underlay network only; peer-authenticated. | [DESIGN-ONLY] — [ADR-021](specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md); fails closed today. |
+| Fabric VXLAN | `4789/udp` | kernel VXLAN overlay | peer `chv-nwd` | Underlay network only; peered to ADR-021's WireGuard fabric. | [DESIGN-ONLY] — ADR-021. |
+| Control-plane gRPC (multi-host) | operator-declared management bind (proposed default `:8443`) | gRPC, mTLS (server cert carries the advertised management identity; client CA = node CA) | remote `chv-agent` (enrollment, reports) | Management network only; never public. **[PROPOSED — ADR-029; NOT IMPLEMENTED]** | [DESIGN-ONLY] |
+| Agent gRPC (multi-host) | operator-declared management bind + `advertise_addr` (proposed default `:9443`) | gRPC, mTLS (server cert `CN=<node_id>`; client CA = dedicated control-plane client CA) | `chv-controlplane` (dispatch) | Management network only; requires explicit opt-in, `advertise_addr`, and a non-wildcard bind. **[PROPOSED — ADR-029; NOT IMPLEMENTED]** | [DESIGN-ONLY] |
+
+The two multi-host rows are proposed by
+[ADR-029](specs/adr/029-multi-host-dispatch.md) and are **not implemented**.
+Until ADR-029 is accepted and the P1 gate passes, only the loopback listeners
+above exist.
 
 ### 3.2 Unix sockets
 
@@ -175,19 +182,30 @@ require review against the declaration.
 socket**:
 
 - `resolve_agent_socket` returns a `PathBuf`
-  (`crates/chv-controlplane-service/src/migration.rs:1539-1550`); node ids are
+  (`crates/chv-controlplane-service/src/migration.rs:1654-1665`); node ids are
   validated as single safe path components.
 - The orchestrator dispatches through the node client pool with that path
-  (`crates/chv-controlplane-service/src/orchestrator.rs:461-464`), and the
-  client connects with `UnixStream::connect`
-  (`crates/chv-controlplane-service/src/node_client.rs:189`).
+  (`crates/chv-controlplane-service/src/orchestrator.rs:768-771` and
+  `:1605-1609`), and the client connects with `UnixStream::connect`
+  (`crates/chv-controlplane-service/src/node_client.rs:204-211`).
 - The agent serves gRPC from a `UnixListener`
-  (`crates/chv-agent-core/src/agent_server.rs:138`). **The agent has no TCP
+  (`crates/chv-agent-core/src/agent_server.rs:181-188`). **The agent has no TCP
   gRPC listener.** Its only TCP listeners are the console (`:8444`) and
   metrics (`:9901`) bindings.
 
 Consequence: **a control plane cannot reach an agent on another host as
 coded.** This is the decisive multi-host constraint; see UC-6 and decision D1.
+
+#### 3.3.1 Proposed multi-host dispatch (ADR-029 — not implemented)
+
+[ADR-029](specs/adr/029-multi-host-dispatch.md) proposes replacing the path
+resolution with a `NodeEndpoint` resolver (`Unix { path }` |
+`Tcp { host, port, server_name }`) backed by node-advertised state, plus the
+optional agent TCP listener listed in §3.1. None of this is implemented.
+
+Until ADR-029 is accepted and its P1 gate passes, every statement in §3.3
+remains true, UC-6 remains [UNSUPPORTED/ABSENT], and no multi-host claim may
+be made.
 
 ### 3.4 Certificate and identity model
 
@@ -195,10 +213,16 @@ coded.** This is the decisive multi-host constraint; see UC-6 and decision D1.
 |---|---|---|
 | CA | `/etc/chv/certs/ca.crt` + `ca.key`, held by the control plane | `docs/examples/controlplane.toml` `[tls]`; [m4.1](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.1-harness.md) |
 | Node certificates | Issued by the control plane at enrollment; subject `CN = <node_id>`; serial recorded in the nodes table | `crates/chv-controlplane-service/src/enrollment.rs`; `peer_identity.rs` |
-| Enrollment client cert | Pre-placed by the operator/installer at `/run/chv/agent/agent.crt` (+ key); used only for the EnrollNode handshake | `scripts/install.sh:1241`; m4.1 harness invariants |
+| Enrollment client cert | Pre-placed by the operator/installer at `/run/chv/agent/agent.crt` (+ key); used only for the EnrollNode handshake | `scripts/install.sh:918-920` (issued), `:1409-1410` (installed); m4.1 harness invariants |
 | Steady-state agent TLS | `/run/chv/agent/agent.crt`, `agent.key` (control-plane-issued material replaces the enrollment cert) | `docs/examples/agent.toml` |
-| Bootstrap token | One-time; minted/rotated over loopback `/internal/bootstrap-token` | `scripts/install.sh:1178`; m4.1 asserts single consumption |
+| Bootstrap token | One-time; minted/rotated over loopback `/internal/bootstrap-token` | `scripts/install.sh:1188-1192` (mint), `:1346` (API seed); m4.1 asserts single consumption |
 | Peer identity enforcement | stord↔stord migration peers authenticate by certificate identity; negative cases fail closed with zero bytes leaving the source | [m4.6](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.6-migration.md) |
+
+**Proposed (ADR-029, not implemented):** split node identities
+(`node-client` / `node-server`), a dedicated control-plane client CA for
+CP→agent dispatch, explicit EKUs, and an IP SAN for `advertise_addr`. The
+table above describes the shipped model and remains accurate until ADR-029 is
+accepted.
 
 ## 4. Security-provisioning model
 
@@ -317,7 +341,8 @@ re-qualification; it is not an operator install path.
 
 **Status: [UNSUPPORTED/ABSENT] as a qualified capability — and
 architecturally blocked as coded. Single-host is the declared posture for
-now (decision D1, option (b)).**
+now (decision D1, option (b)). ADR-029 is Proposed and does not change this
+status.**
 
 | Aspect | Statement |
 |---|---|
@@ -328,6 +353,7 @@ now (decision D1, option (b)).**
 | Declaration | MULTI-HOST-VERIFIED is **unprovable** on this infrastructure (declaration §5); multi-host migration and multi-node network semantics are not claimed. |
 | Posture | **Single-host is the declared posture for now (decision D1, option (b)).** The opt-in TCP gRPC listener that multi-host needs is an unstarted project; no multi-host claim may be made without MULTI-HOST-VERIFIED evidence. |
 | Options | Decision **D1** (and D2). D1 is resolved as option (b); D2 (the `chv-node` dependency) follows from that choice. |
+| Proposed change | [ADR-029](specs/adr/029-multi-host-dispatch.md) (Status: **Proposed**, not ratified) would implement a refined option (a): opt-in agent TCP gRPC with mandatory mTLS, split node identities, a dedicated control-plane client CA, learned endpoints, and a CP gRPC management bind. It is **not implemented**; the posture and status above are unchanged until the ADR is accepted and the P1 gate passes. |
 
 ### UC-7 — Multi-host stretched-L2 fabric (VXLAN over WireGuard)
 
@@ -420,8 +446,8 @@ options, the trade-offs, and what would unblock it.
 
 | # | Decision | Options | Trade-offs | What unblocks it |
 |---|---|---|---|---|
-| D1 | Multi-host dispatch: how can a control plane reach remote agents? | (a) Add an opt-in TCP gRPC listener to `chv-agent` (mTLS, node-cert identity). (b) Declare single-host-only and document it. (c) Stage both: document single-host now, land the listener behind a feature flag later. | (a) Unblocks real multi-host but adds an exposed listener, new attack surface, and requires MULTI-HOST-VERIFIED evidence that the current infrastructure cannot produce (declaration §5). (b) Honest and cheap, but strands the code-supported enrollment protocol and the documented console routing. (c) Keeps both paths open, but carries undecided surface area longer. | Maintainer choice plus a qualification topology with a second host (or an explicit re-scoping of the claim). **Declared posture 2026-10-30 — option (b), pending maintainer ratification of the decision record: single-host is the declared posture for now. The opt-in TCP gRPC listener remains an unstarted project; any multi-host claim requires MULTI-HOST-VERIFIED evidence.** |
-| D2 | `chv-node` package dependency: keep or relax the hard dependency on `chv-controlplane`? | (a) Keep. (b) Drop to `recommends`/`suggests`. (c) Split a `chv-node-common` and make the CP dependency explicit only in a meta-package. | (a) Simple, matches the qualified single-host topology; installs a useless control plane on every future node host. (b) Correct shape for node-only hosts, but changes tested install semantics and can produce half-provisioned hosts (CP fails closed anyway). (c) Cleanest dependency graph, most packaging work. | D1: node-only hosts only matter if multi-host dispatch exists. |
+| D1 | Multi-host dispatch: how can a control plane reach remote agents? | (a) Add an opt-in TCP gRPC listener to `chv-agent` (mTLS, node-cert identity). (b) Declare single-host-only and document it. (c) Stage both: document single-host now, land the listener behind a feature flag later. | (a) Unblocks real multi-host but adds an exposed listener, new attack surface, and requires MULTI-HOST-VERIFIED evidence that the current infrastructure cannot produce (declaration §5). (b) Honest and cheap, but strands the code-supported enrollment protocol and the documented console routing. (c) Keeps both paths open, but carries undecided surface area longer. | Maintainer choice plus a qualification topology with a second host (or an explicit re-scoping of the claim). **Declared posture 2026-10-30 — option (b), pending maintainer ratification of the decision record: single-host is the declared posture for now. The opt-in TCP gRPC listener remains an unstarted project; any multi-host claim requires MULTI-HOST-VERIFIED evidence.** [2026-11-02: **Proposed supersession** — [ADR-029](specs/adr/029-multi-host-dispatch.md) (Status: Proposed, not ratified) selects a refined option (a): an opt-in agent TCP gRPC listener with mandatory mTLS, split node identities, a dedicated control-plane client CA, and learned endpoints. If accepted it replaces option (b); until then option (b) stands.] |
+| D2 | `chv-node` package dependency: keep or relax the hard dependency on `chv-controlplane`? | (a) Keep. (b) Drop to `recommends`/`suggests`. (c) Split a `chv-node-common` and make the CP dependency explicit only in a meta-package. | (a) Simple, matches the qualified single-host topology; installs a useless control plane on every future node host. (b) Correct shape for node-only hosts, but changes tested install semantics and can produce half-provisioned hosts (CP fails closed anyway). (c) Cleanest dependency graph, most packaging work. | D1: node-only hosts only matter if multi-host dispatch exists. [2026-11-02: ADR-029 does not decide D2. The transition plan sequences the package split after remote dispatch; option (c) is the planned shape.] |
 | D3 | Serving the UI from packages | (a) Headless-only posture: document `chvctl` as the package-mode interface; UI requires install.sh. (b) Document an operator-provided reverse proxy against `/usr/share/chv/ui` + the BFF/console proxies. (c) The deb configures nginx itself (or ships a snippet). (d) Serve the UI from `chv-controlplane` itself (tower-http `ServeDir` from disk, opt-in `[webui]` config section). | (a) Cheapest, narrows the product. (b) Flexible, pushes TLS/edge concerns to the operator with no contract. (c) Best out-of-box parity with install.sh, but adds a web-server dependency and edge ownership to the packages. (d) Out-of-box parity without an edge dependency, but adds a serving surface to the binary and needs its own qualification. | **Resolved 2026-10-03, phased: interim (b), target (d); (c) rejected.** Interim: the packages ship an example nginx conf (`/usr/share/chv/examples/chv-example.conf`) plus operator docs ([DEPLOYMENT.md](DEPLOYMENT.md) "Serving the Web UI in package mode"); serving-from-packages is [CODE-SUPPORTED, UNQUALIFIED] until a container qualification leg exists. Target: serve from the binary — tracked in #447. (c) is rejected permanently: it breaks the fail-closed "packages provide layout only" contract (§4) and forces nginx onto every host. [2026-10-07, #447:] target (d) implemented — `tower-http` `ServeDir` from disk behind an opt-in `[webui]` config section (`enabled`, default `false`; `dir`, default `/usr/share/chv/ui`), prefix-guarded static fallback with SPA and cache headers in `admin_router`; `install_nginx` and the example conf shrunk to proxy-only edges; the `/ws/` console proxy stays at the edge by decision (maintainer-ratified 2026-10-07). [2026-10-08, #549:] the container package-smoke leg ran and passed (`scripts/package/smoke-webui.sh`, wired into `package-pr.yml`) — serving-from-packages moved [CODE-SUPPORTED, UNQUALIFIED] → [CONTAINER-VERIFIED] (§5 UC-3). |
 | D4 | Air-gapped support | (a) Not supported; state it. (b) Document an offline recipe from the existing escape hatches (`INSTALL_CHV_TARBALL_PATH`, `INSTALL_CHV_SKIP_DEPS`, `INSTALL_CHV_SKIP_CLOUD_HV`, pre-staged images). (c) Add a first-class offline mode to the installer. | (a) Free, loses sovereign/edge adopters the positioning targets. (b) Cheap documentation work; the hatches exist but are untested as a recipe. (c) Real installer work plus a qualification leg. | Maintainer priority; a qualification leg if (b) or (c). |
 | D5 | Edge / resource profiles | (a) None; the current units and defaults are the only profile. (b) Document one "small" profile (documented unit overrides). (c) Ship alternate unit/config variants in the packages. | (a) Honest, no false edge signal. (b) Documentation-only, unqualified. (c) Real surface area, needs evidence on constrained hardware. | Field evidence from Prompt-06; ADR-011 positioning vs. actual demand. |

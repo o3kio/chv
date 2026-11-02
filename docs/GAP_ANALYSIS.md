@@ -34,6 +34,13 @@ table above or with `DEPLOYMENT-ARCHITECTURE.md` §7, the latter wins. In
 particular, §1.2 (backup engine "complete"), §1.3 (iSCSI/Ceph "resolved"), and
 §4.2 (Docker Compose "resolved") are no longer accurate.
 
+**Proposed work (not implementation):** the multi-host and native-Volvisor
+path is planned in
+[2026-11-02-multihost-and-volvisor-transition.md](plans/2026-11-02-multihost-and-volvisor-transition.md),
+with [ADR-029](specs/adr/029-multi-host-dispatch.md) (Proposed) and
+[`chv-volume-backend-v1`](specs/contracts/chv-volume-backend-v1.md)
+(Proposed). Planning artifacts do not change any status in the table above.
+
 ---
 
 ## Executive Summary
