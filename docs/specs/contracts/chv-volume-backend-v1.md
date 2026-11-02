@@ -223,8 +223,8 @@ Optional consumer attestation, available only when the backend advertises
   journal-only diagnostic context, never part of the projection.
 - **MUST NOT:** downgrade state, advance the detach-fencing generation, treat
   the untrusted `reporter` as authentication, or claim `active` from a host
-  configuration/path check. The `reporter` label is bounded to 1024 bytes and
-  must not contain ASCII control characters.
+  configuration/path check. The `reporter` label is non-empty when present,
+  bounded to 1024 bytes, and must not contain control characters.
 
 A post-detach or unknown attachment is `NOT_FOUND` for a new `operation_id`;
 replaying a recorded `operation_id` returns its recorded outcome (including a
