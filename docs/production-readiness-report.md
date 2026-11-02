@@ -10,10 +10,12 @@
 > §7 ("Supported envelope"). The original content below is preserved as a
 > historical snapshot, not as a current verdict.
 >
-> **Fixed since this report (verified on this branch):** Prometheus metrics
-> for `chv-stord` and `chv-nwd`; migration-reaper resume of paused VMs; the
-> `StorageMigrationService` implementation; DHCP `network_id` sanitization;
-> and the drain gate on in-flight migrations.
+> **Fixed since this report (verified on this branch):** in-process
+> `chv_observability::Metrics` counters for `chv-stord` and `chv-nwd` (still
+> not scrapeable — neither daemon serves an HTTP endpoint; see
+> [OBSERVABILITY.md](OBSERVABILITY.md)); migration-reaper resume of paused VMs;
+> the `StorageMigrationService` implementation; DHCP `network_id`
+> sanitization; and the drain gate on in-flight migrations.
 >
 > **Still open:** the backup execution engine (backup/restore is excluded
 > from the supported matrix — `backup_worker.rs` refuses every job);

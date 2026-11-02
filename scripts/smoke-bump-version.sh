@@ -113,6 +113,17 @@ EOF
 <!-- Trap: 10.200.0.1/24 -->
 EOF
 
+    # Root-level copies published by hand alongside scripts/hosting/.
+    cat > "${FIXTURE}/cloudflare-worker.js" <<'EOF'
+// chv fixture root worker — v0.2.0
+// Trap: 10.200.0.1/24
+EOF
+
+    cat > "${FIXTURE}/github-pages-index.html" <<'EOF'
+<span>v0.2.0</span>
+<!-- Trap: 10.200.0.1/24 -->
+EOF
+
     cat > "${FIXTURE}/cmd/chv-fixture/Cargo.toml" <<'EOF'
 [package]
 name = "chv-fixture"
@@ -177,6 +188,8 @@ assert_fixture() {
     assert_contains "${FIXTURE}/scripts/install.sh" 'INSTALL_CHV_VERSION="0.3.0"'
     assert_contains "${FIXTURE}/scripts/hosting/cloudflare-worker.js" 'v0.3.0'
     assert_contains "${FIXTURE}/scripts/hosting/github-pages-index.html" 'v0.3.0'
+    assert_contains "${FIXTURE}/cloudflare-worker.js" 'v0.3.0'
+    assert_contains "${FIXTURE}/github-pages-index.html" 'v0.3.0'
     assert_contains "${FIXTURE}/cmd/chv-fixture/Cargo.toml" 'version = "0.3.0"'
     assert_contains "${FIXTURE}/ui/package.json" '"version": "0.3.0"'
     assert_contains "${FIXTURE}/ui/package-lock.json" '"version": "0.3.0"'
@@ -186,6 +199,8 @@ assert_fixture() {
     assert_not_contains "${FIXTURE}/README.md" '0.2.0'
     assert_not_contains "${FIXTURE}/docs/DEPLOYMENT.md" '0.2.0'
     assert_not_contains "${FIXTURE}/scripts/install.sh" '0.2.0'
+    assert_not_contains "${FIXTURE}/cloudflare-worker.js" '0.2.0'
+    assert_not_contains "${FIXTURE}/github-pages-index.html" '0.2.0'
     assert_not_contains "${FIXTURE}/cmd/chv-fixture/Cargo.toml" '0.2.0'
     assert_not_contains "${FIXTURE}/ui/package.json" '"version": "0.2.0"'
     assert_not_contains "${FIXTURE}/ui/package-lock.json" '"version": "0.2.0"'
@@ -197,6 +212,8 @@ assert_fixture() {
     assert_line_unchanged "${FIXTURE}/docs/DEPLOYMENT.md" '| `INSTALL_CHV_BRIDGE_CIDR` | `10.200.0.1/24` | Gateway IP / subnet |'
     assert_line_unchanged "${FIXTURE}/docs/DEPLOYMENT.md" 'BRIDGE_CIDR="10.200.0.1/24"'
     assert_line_unchanged "${FIXTURE}/scripts/install.sh" 'INSTALL_CHV_BRIDGE_CIDR="${INSTALL_CHV_BRIDGE_CIDR:-10.200.0.1/24}"'
+    assert_line_unchanged "${FIXTURE}/cloudflare-worker.js" '// Trap: 10.200.0.1/24'
+    assert_line_unchanged "${FIXTURE}/github-pages-index.html" '<!-- Trap: 10.200.0.1/24 -->'
 
     # ...including the installer's runtime default — the exact line the bug
     # corrupted in the 0.3.0 release cut — and the known corruption outputs

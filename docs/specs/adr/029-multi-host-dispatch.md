@@ -239,13 +239,15 @@ Console is not multiplexed onto the gRPC listener.
 
 | Value | Required listeners | Refused |
 |---|---|---|
-| `single-host` | CP gRPC loopback | remote agent TCP |
-| `multi-host` | CP gRPC on management bind; per-node agent TCP | loopback-only CP gRPC; wildcard bind without advertise; `CHV_ALLOW_INSECURE`; legacy EKU mode |
+| `single-host` | CP gRPC loopback | remote agent TCP (the agent refuses `[agent.grpc]` without a `multi-host` declaration; the CP also refuses to dial TCP endpoints) |
+| `multi-host` | CP gRPC on management bind; per-node agent TCP | loopback-only CP gRPC; wildcard bind without advertise; `CHV_ALLOW_INSECURE`; legacy EKU mode (certificates with no explicit extended key usage) |
 
 Startup validation compares the declaration against the actual configuration
 and exits non-zero on mismatch. The declaration is also written into
 inventory so the control plane can refuse to place workloads on a node that
-claims a topology it does not implement.
+claims a topology it does not implement. The agent enforces its half locally:
+it refuses `[agent.grpc]` unless its own config declares
+`deployment.topology = multi-host`.
 
 ## Invariants
 

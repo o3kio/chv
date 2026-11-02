@@ -14,12 +14,13 @@ what to alert on, and how to investigate incidents.
 | `chv-agent` | `/metrics` | `metrics_bind` in agent config; packaged/installer default `127.0.0.1:9901`; code fallback when unset `127.0.0.1:9100` (loopback) |
 | `chv-stord` | **no HTTP endpoint today** | in-process `chv_observability::Metrics` counters only — not scrapeable |
 | `chv-nwd` | **no HTTP endpoint today** | in-process `chv_observability::Metrics` counters only — not scrapeable |
-| `chv-webui-bff` | served on same port as the backend-for-frontend (BFF; default `127.0.0.1:8443`) | via `/metrics` route |
+| `chv-webui-bff` | served on the `chv-controlplane` HTTP listener (default `127.0.0.1:8080`) | via `/metrics` route |
 
-> Only `chv-agent` exposes an HTTP `/metrics` endpoint. `chv-stord` and
-> `chv-nwd` record `chv_observability::Metrics` counters in-process, but neither
-> daemon serves them, and the `metrics_bind` key in their config structs is
-> currently not read by any daemon — do not expect a scrape target there.
+> Of the node daemons, only `chv-agent` exposes an HTTP `/metrics` endpoint.
+> `chv-stord` and `chv-nwd` record `chv_observability::Metrics` counters
+> in-process, but neither daemon serves them, and the `metrics_bind` key in
+> their config structs is currently not read by any daemon — do not expect a
+> scrape target there.
 > **Never bind `metrics_bind` to a public interface**; the qualified and packaged
 > posture is loopback (`127.0.0.1:9901`). The control plane always exposes
 > `/metrics` on its `http_bind` address.
@@ -258,8 +259,12 @@ Pending runbooks should be filed as follow-up issues before the first production
 
 ## Prometheus scrape configuration
 
+Prometheus must run on the same host as the scraped daemons (or reach them
+through an operator-managed relay): the packaged/installer posture for the
+agent and the control plane is loopback.
+
 ```yaml
-# Minimal prometheus.yml scrape config for CHV.
+# Minimal prometheus.yml scrape config for CHV on the local host.
 # Adjust job names, targets, and TLS settings to match your deployment.
 
 scrape_configs:
@@ -268,21 +273,21 @@ scrape_configs:
       - targets: ['127.0.0.1:8080']
 
   - job_name: chv-agent
+    # Packaged/installer default. Qualification and unset-fallback configs
+    # bind 127.0.0.1:9100 instead.
     static_configs:
-      - targets: ['<agent-host>:9090']
-
-  - job_name: chv-stord
-    static_configs:
-      - targets: ['<agent-host>:9091']
-
-  - job_name: chv-nwd
-    static_configs:
-      - targets: ['<agent-host>:9092']
+      - targets: ['127.0.0.1:9901']
 
 rule_files:
   - 'monitoring/rules/chv.yml'
   - 'monitoring/rules/recording.yml'
 ```
+
+`chv-stord` and `chv-nwd` expose no HTTP endpoint today, so there are no
+scrape jobs for them. To scrape the agent from another host, set
+`metrics_bind` explicitly to a reachable address (for example
+`0.0.0.0:9901`) and restrict access at the network layer; do not expose it
+publicly. See the loopback caveat under “Metrics endpoints” above.
 
 ---
 

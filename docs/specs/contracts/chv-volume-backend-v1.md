@@ -1,7 +1,7 @@
 # CHV volume backend contract v1
 
 **Status:** Proposed — not implemented; requires ADR-028 runtime integration
-and ratification of the multi-host plan
+and ratification of the Volvisor decisions (D-VS1–D-VS7)
 **Authority:** [ADR-028](../adr/028-volvisor-storage-orchestration.md) (storage
 authority and ownership split), [ADR-002](../adr/002-control-plane-boundary.md)
 (control-plane → agent boundary), [ADR-029](../adr/029-multi-host-dispatch.md)
@@ -20,7 +20,7 @@ This contract defines:
 - capability advertisement and the refusal behaviour for unsupported
   operations;
 - identity, idempotency, and generation rules;
-- the attachment-phase honesty rules;
+- the attachment-state honesty rules;
 - the error taxonomy CHV uses and how backend errors map onto it;
 - the Volvisor Volume API v2 binding for `native-local`;
 - the legacy `chv-stord` binding, preserved unchanged.
@@ -46,7 +46,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | Attachment generation | The backend's detach-fencing counter for one attachment instance; it never advances on an evidence report. |
 | Volume generation | The backend's monotonic counter for a volume's state transitions. |
 | Attachment state revision | The backend's monotonic counter for an attachment's evidence state; it advances only on an applied report. |
-| Observed attachment phase | The strongest attachment fact CHV can prove, never stronger than the backend can report. |
+| Observed attachment state | The strongest attachment fact CHV can prove, never stronger than the backend can report. |
 
 Do not use "storage class" to mean owner. A class is a backend vocabulary
 value; an owner is an authority decision.
@@ -158,7 +158,10 @@ Releases host-side resources for an attachment that ended without a VM detach
 - **Input:** `volume_id`, `attachment_id` (when known), `operation_id`.
 - **Postcondition:** idempotent; closing an already-closed or never-attached
   handle succeeds without side effects.
-- **MUST NOT:** delete the volume.
+- **MUST NOT:** delete the volume. `close` has no drain proof of its own: it is
+  a no-op once the attachment record is gone, and on a create unwind (the VM
+  never started) the Volvisor binding uses the detach path with the truthful
+  `vm_stopped` proof (§11.2). It never fabricates `io_drained`.
 
 ### 4.5 `grow`
 
@@ -167,7 +170,8 @@ Increases logical size.
 - **Input:** `volume_id`, `new_size_bytes`, `expected_generation`,
   `operation_id`.
 - **Precondition:** `new_size_bytes` is strictly greater and aligned to the
-  backend's required granularity (Volvisor: 512 bytes).
+  backend's required granularity (512 bytes, and the volume's logical block
+  size — 4096 bytes in v1, §11.3).
 - **Postcondition:** provisioned size is the new size; generation advances.
 - **MUST NOT:** shrink through this operation. The legacy `resize` RPC keeps
   its existing (backend-dependent) behaviour and is not redefined here.
@@ -244,7 +248,7 @@ attributed to a new one.
 ### 4.9 Unsupported operations
 
 `snapshot`, `clone`, `restore`, `delete_snapshot`, and
-`same_host_live_backing_move` are **not implemented by any v1 backend**. The
+`same-host-backing-move` are **not implemented by any v1 backend**. The
 capability vocabulary in §5 includes tokens for them so a future backend can
 advertise them truthfully, but v1 MUST refuse the operations via capabilities
 (§5), not by returning an empty success.
@@ -255,20 +259,25 @@ advertise them truthfully, but v1 MUST refuse the operations via capabilities
 
 A backend MUST advertise a set of CHV capability tokens:
 
-`ensure`, `attach`, `detach`, `grow`, `destroy`, `inspect`, `snapshot`,
-`clone`, `restore`, `live-migrate`, `offline-copy`, `same-host-backing-move`,
-`report-attachment-state`.
+`ensure`, `attach`, `detach`, `close`, `grow`, `destroy`, `inspect`,
+`snapshot`, `clone`, `restore`, `delete-snapshot`, `live-migrate`,
+`offline-copy`, `same-host-backing-move`, `report-attachment-state`.
 
 `inspect` is mandatory for every backend and MUST NOT be treated as optional;
 the other tokens may be absent. Absence of a token is authoritative: the
 operation MUST be refused with `UNIMPLEMENTED` before any journal write or
-backend call.
+backend call. `close` is gated on `attach` (it releases the same host-side
+attachment): a backend that advertises `attach` MUST also advertise `close`.
+`delete-snapshot` is gated on `snapshot` and is not advertised by any v1
+backend.
 
 ### 5.2 Negotiation
 
 1. At startup, the agent queries the backend's capability set.
-2. The set MUST be intersected with the classes the backend serves and the
-   operator's enabled classes.
+2. The set MUST be intersected with the classes the backend serves and with
+   backend-level enablement (`[storage.legacy-stord] enabled` /
+   `[storage.volvisor] enabled`). There is no per-class enablement key in v1;
+   a disabled backend advertises no classes.
 3. The agent reports only the intersection in node inventory.
 4. The control plane MUST refuse to place an operation on a node whose
    advertised set lacks the required token.
@@ -298,6 +307,13 @@ backing-move and attachment-state-report rows are dormant and the operations
 stay refused. The corrected `attachment_state_report` implementation exists on
 a Volvisor feature branch; it is not part of the CHV pin until the issue is
 dispositioned, merged and consciously re-pinned (§8).
+
+`destroy` and `inspect` have no separate Volvisor capability: the pinned v2
+route set always provides both for `native-local`, so a class that passes the
+`create` handshake advertises `destroy` and `inspect` as baseline. `close` is
+gated on `attach` and is an agent-local no-op when no attachment record exists;
+`delete-snapshot` is dormant because no v1 backend advertises `snapshot`.
+`inspect` remains mandatory for every backend.
 
 The v1 Volvisor binding requires `create`, `attach`, and `resize` present for
 the `native-local` class. A missing token MUST disable the class, not degrade
@@ -342,21 +358,27 @@ CHV MUST supply a stable `operation_id` for every mutation.
 
 ```text
 operation_id = "chv:" + verb + ":" + lowercase_hex(sha256(canonical_payload))
-verb ∈ { ens, att, det, clo, grw, des }
+verb ∈ { ens, att, det, clo, grw, des, rpt }
 canonical_payload = UTF-8 JSON, no insignificant whitespace, keys in exactly
   this order:
   {"v":1,"verb":<verb>,"volume_id":<string>,"vm_id":<string|null>,
-   "attachment_id":<string|null>,"generation":<u64>,"size_bytes":<u64|null>}
+   "attachment_id":<string|null>,"generation":<u64>,"size_bytes":<u64|null>,
+   "state":<string|null>,"evidence":<string|null>}
 ```
 
+- `generation` is the expected volume generation for `ens`/`att`/`grw`/`des`,
+  the expected attachment generation for `det`/`rpt`, and `0` for `clo`
+  (close carries no generation input; the attachment id, when known, is the
+  discriminator).
+- `state` and `evidence` are non-null only for `rpt`. Including them keeps two
+  different reports on the same attachment instance and generation from
+  collapsing onto one recorded outcome.
 - The derived id MUST fit 128 bytes (the fixed `chv:` prefix, a three-letter
   verb, and 64 hex characters is 72 bytes).
 - The derived id MUST NOT use the reserved `derived:` prefix, which Volvisor
   reserves for its own engine-derived ids and refuses from consumers.
 - A random UUID MUST NOT be used for a retried mutation. A random id makes a
   crash-replay create a second attachment.
-- `generation` is the expected volume generation for `ens`/`att`/`grw`/`des`,
-  and the expected attachment generation for `det`.
 
 ### 6.3 Idempotency semantics
 
@@ -388,7 +410,7 @@ canonical_payload = UTF-8 JSON, no insignificant whitespace, keys in exactly
    NOT be mapped to `BackendUnavailable` (which retries) or to success.
 6. A backend MUST NOT advance a generation on a refused operation.
 
-## 8. Attachment phase and observability truthfulness
+## 8. Attachment state and observability truthfulness
 
 Volvisor's corrected attachment-state design ([o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34))
 separates three honest facts per attachment instance:
@@ -413,7 +435,7 @@ still pending. This contract does **not** assume a released upstream surface.
 Until the CHV pin's Volvisor build advertises `attachment_state_report` and its
 conformance evidence is reviewed:
 
-1. CHV MUST record the attachment as `phase = prepared`, `observed = false`.
+1. CHV MUST record the attachment as `state = prepared`, `observed = false`.
 2. CHV MUST NOT report `advertised` or `active` for a Volvisor-owned
    attachment.
 3. CHV MAY corroborate the returned `host_device_path` with a host-side
@@ -423,7 +445,8 @@ conformance evidence is reviewed:
 5. Health and evidence MUST default to `unknown` unless the backend reports a
    proven value. `unknown` MUST NOT be rendered as healthy.
 6. Once the pin advertises `attachment_state_report` and the capability is
-   re-reviewed and re-pinned (§10.1.1, §13), CHV MAY report `advertised` from a
+   re-reviewed and re-pinned (transition plan §10.1.1; §13 below), CHV MAY
+   report `advertised` from a
    truthful `vmm_configured` attestation — after CHV has actually installed the
    returned frontend into the VMM. CHV MUST NOT report `active` in v1: the
    default CHV install has no guest agent/confirmation path
@@ -510,6 +533,7 @@ operations, and they MUST NOT be re-attempted by a reaper.
 | ensure (create) | `POST /v2/volumes` |
 | attach | `POST /v2/volumes/{volume_id}/attach` |
 | detach | `POST /v2/volumes/{volume_id}/detach` |
+| close (only when an attachment record exists) | `POST /v2/volumes/{volume_id}/detach` with the truthful `vm_stopped` proof; otherwise agent-local no-op |
 | report attachment state (optional, capability-gated) | `POST /v2/volumes/{volume_id}/attachment-state` |
 | grow | `POST /v2/volumes/{volume_id}/grow` |
 | destroy | `DELETE /v2/volumes/{volume_id}` |
@@ -520,18 +544,19 @@ the mobility routes. They are outside this contract.
 
 ### 11.3 Request fields
 
-All requests carry `"api_version": "volvisor.volume.v2"` and an
-`operation_id`.
+All mutating requests carry `"api_version": "volvisor.volume.v2"` and an
+`operation_id`. GETs carry no body; compatibility for them is established by
+the `/v2` route set (§11.5).
 
 Create (`ensure` on `404`):
 
 | Field | Source |
 |---|---|
-| `project_id` | VM tenant (`StorageAttachmentRef.project_id`) — required |
+| `project_id` | VM tenant (`StorageAttachmentRef.project_id`, to be added — transition plan §5.7) — required |
 | `volume_id` | CHV volume id |
 | `class` | `native-local` |
-| `size_bytes` | requested size; MUST be a multiple of 512 and of `logical_block_size` |
-| `logical_block_size` | 4096 unless the volume definition says otherwise (allowed: 512/1024/2048/4096) |
+| `size_bytes` | requested size; MUST be a multiple of 512 and of the fixed 4096-byte logical block size |
+| `logical_block_size` | `4096` (fixed for v1; there is no volume-definition field yet) |
 | `provisioning` | definition value, else omit (provider default) |
 
 Attach:
@@ -553,6 +578,10 @@ Detach:
 | `attachment_id` | the attachment being released (required in the JSON body; the path carries only `volume_id`) |
 | `expected_attachment_generation` | attach response / last inspect |
 | `vm_stopped_or_io_drained_proof` | `vm_stopped` when the VM is stopped; `io_drained` only after CHV's own drain check |
+
+Close uses the same request shape when an attachment record exists, always with
+`vm_stopped` (a create unwind only runs before the VM starts). With no record,
+close makes no backend call.
 
 Grow:
 
@@ -610,9 +639,9 @@ The agent MUST, before advertising the `native-local` class:
 2. fetch `/v2/capabilities`;
 3. verify API compatibility. The capabilities payload carries no
    `api_version`; compatibility is established by the `/v2` route set and by
-   the `volvisor.volume.v2` envelope that every request carries (a rejected
-   envelope is `INVALID_REQUEST`). The agent MUST fail the handshake rather
-   than retry an incompatible revision;
+   the `volvisor.volume.v2` envelope that every mutating request carries (a
+   rejected envelope is `INVALID_REQUEST`). The agent MUST fail the handshake
+   rather than retry an incompatible revision;
 4. verify the provider is `lvm`; `fake` is refused outside dev/test builds;
 5. verify the required capability tokens are present.
 
@@ -669,9 +698,8 @@ passing run against a different revision is not evidence.
    honest failure; it MUST NOT be papered over by opening the volume with
    stord.
 4. The agent MUST refuse to start with a volume row whose owner cannot be
-   served, unless the operator explicitly marks the node as
-   `storage-degraded` (operations on that owner fail closed; other owners
-   continue).
+   served. The operator resolves this by enabling the backend or by not
+   running an agent on that node; there is no silent per-owner bypass.
 
 ## 15. Non-goals
 

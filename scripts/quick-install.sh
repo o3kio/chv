@@ -646,7 +646,7 @@ install_artifacts_tarball() {
     install -m 0755 "${extract_dir}/bin/chv-nwd" /usr/bin/
     install -m 0755 "${extract_dir}/bin/chvctl" /usr/bin/
 
-    rm -rf "$CHV_UI_DIR"
+    rm -rf "${CHV_UI_DIR:?}"
     mkdir -p "$CHV_UI_DIR"
     cp -r "${extract_dir}/ui/"* "$CHV_UI_DIR/"
     chown -R "$CHV_USER:$CHV_USER" "$CHV_UI_DIR"

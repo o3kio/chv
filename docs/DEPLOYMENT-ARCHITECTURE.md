@@ -103,7 +103,7 @@ KVM-VERIFIED, and multi-host behavior is reported as unproven.
 | Dependency | Version fact | Notes |
 |---|---|---|
 | Cloud Hypervisor | Qualified pin **v53.0** (moved from v43.0 by the #448 re-qualification campaign — decision D6, option (b); `scripts/integration/kvm-smoke.sh` default `v53.0`) | `scripts/install.sh` downloads the same **v53.0** and verifies the qualified sha256 digests before install (campaign evidence: [v53.0 tree](evidence/vmm-requalification/v53.0/README.md)). |
-| rust-hypervisor-firmware | 0.5.0 (qualification firmware; `scripts/install.sh` `FIRMWARE_URL`) | `scripts/install.sh` uses a pre-placed `/root/CLOUDHV.fd` when present; otherwise it downloads the pinned 0.5.0 build to `/var/lib/chv/hypervisor-fw`. The former commented-out download is fixed in this branch — a clean host now gets firmware. |
+| rust-hypervisor-firmware | 0.5.0 (qualification firmware; `scripts/install.sh` `FIRMWARE_URL`) | `scripts/install.sh` uses a pre-placed `/root/CLOUDHV.fd` when present; otherwise it downloads and sha256-verifies the pinned 0.5.0 build to `/var/lib/chv/hypervisor-fw`. The former commented-out download is fixed in this branch — a clean host now gets firmware. |
 | fabric-linux | v0.1.5 (`Cargo.toml` git tag pin) | Consumed by `chv-nwd` for the (design-only) fabric. |
 | Host OS | Linux x86_64; `.deb` (Debian/Ubuntu) + `.rpm` | Qualified on Ubuntu noble amd64; `.rpm` built but untested in prompt-04 (declaration §3, m4.2). |
 
@@ -191,7 +191,8 @@ socket**:
 - The agent serves gRPC from a `UnixListener`
   (`crates/chv-agent-core/src/agent_server.rs:181-188`). **The agent has no TCP
   gRPC listener.** Its only TCP listeners are the console (`:8444`) and
-  metrics (`:9901`) bindings.
+  metrics (`metrics_bind`: packaged/installer `:9901`, qualification and
+  unset-fallback `:9100`) bindings.
 
 Consequence: **a control plane cannot reach an agent on another host as
 coded.** This is the decisive multi-host constraint; see UC-6 and decision D1.

@@ -1,11 +1,11 @@
 # CHV Production Docker Compose Stack
 # =====================================
 # LEGACY / UNMAINTAINED: this compose stack predates the #323 ownership
-# model (stord runs as `chv`, storage `chv:chv-stord 0770`) and the
-# prompt-02 agent authority cutover, and its ownership layout differs
-# deliberately (chv-stord:chv-stord). It is NOT part of the qualified
-# production topology — use the .deb packages or scripts/install.sh
-# (see docs/DEPLOYMENT.md). Kept for existing experimental deployments.
+# model and the prompt-02 agent authority cutover. Its runtime directories
+# follow the image's #323 ownership (stord runs as `chv`; storage is
+# `chv:chv-stord 0770`). It is NOT part of the qualified production topology
+# — use the .deb packages or scripts/install.sh (see docs/DEPLOYMENT.md).
+# Kept for existing experimental deployments.
 #
 # Unmaintained and unverified: nothing in this stack is exercised by CI or by
 # the release gates, and fixing the image build does not make it supported.
@@ -14,13 +14,11 @@
 #   - Docker 24+ with Compose v2
 #   - /dev/kvm available on the host
 #   - Linux bridge (e.g. chvbr0) pre-created on the host
-#   - Cloud Hypervisor binary installed on the host
 #
 # Before first start:
 #   1. Create the Linux bridge on the host (host networking setup)
-#   2. Install Cloud Hypervisor to /usr/bin/cloud-hypervisor
-#   3. Generate a bootstrap token: openssl rand -hex 32 > bootstrap.token
-#   4. Set CHV_JWT_SECRET in your environment (or a .env file)
+#   2. Generate a bootstrap token: openssl rand -hex 32 > bootstrap.token
+#   3. Set CHV_JWT_SECRET in your environment (or a .env file)
 #
 # Start:
 #   docker compose -f docker-compose.prod.yml up -d
@@ -92,7 +90,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    user: "chv-stord:chv-stord"
+    user: "chv:chv"
     command: |
       sh -c '
         mkdir -p /run/chv/stord /tmp;
@@ -219,7 +217,6 @@ services:
       - chv-run:/run/chv
       - chv-certs:/etc/chv/certs
       - ./bootstrap.token:/etc/chv/bootstrap.token:ro
-      - /usr/bin/cloud-hypervisor:/usr/local/bin/cloud-hypervisor:ro
     networks:
       - chv
     restart: unless-stopped
@@ -259,7 +256,7 @@ services:
         root /opt/chv/ui;
         index index.html;
         location / {
-          try_files $$uri $$uri/ /index.html;
+          try_files \$$uri \$$uri/ /index.html;
         }
         location = /index.html {
           add_header Cache-Control "no-cache, no-store, must-revalidate";
@@ -270,27 +267,27 @@ services:
         location /api/ {
           proxy_pass http://chv-controlplane:8080;
           proxy_http_version 1.1;
-          proxy_set_header Host $$host;
-          proxy_set_header X-Real-IP $$remote_addr;
-          proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
-          proxy_set_header X-Forwarded-Proto $$scheme;
+          proxy_set_header Host \$$host;
+          proxy_set_header X-Real-IP \$$remote_addr;
+          proxy_set_header X-Forwarded-For \$$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto \$$scheme;
           proxy_intercept_errors off;
         }
         location /v1/ {
           proxy_pass http://chv-controlplane:8080;
           proxy_http_version 1.1;
-          proxy_set_header Host $$host;
-          proxy_set_header X-Real-IP $$remote_addr;
-          proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
-          proxy_set_header X-Forwarded-Proto $$scheme;
+          proxy_set_header Host \$$host;
+          proxy_set_header X-Real-IP \$$remote_addr;
+          proxy_set_header X-Forwarded-For \$$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto \$$scheme;
           proxy_intercept_errors off;
         }
         location /ws/vms/ {
           proxy_pass http://chv-agent:8444/vms/;
           proxy_http_version 1.1;
-          proxy_set_header Upgrade $$http_upgrade;
+          proxy_set_header Upgrade \$$http_upgrade;
           proxy_set_header Connection "upgrade";
-          proxy_set_header Host $$host;
+          proxy_set_header Host \$$host;
           proxy_read_timeout 3600s;
           proxy_send_timeout 3600s;
         }

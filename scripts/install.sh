@@ -549,6 +549,12 @@ BASE_IMAGE_PATH="${CHV_DATA_DIR}/images/ubuntu-noble-${CHV_ARCH}.img"
 FIRMWARE_ARCH="${ARCH}"
 FIRMWARE_URL="https://github.com/kubedoio/rust-hypervisor-firmware/releases/download/v0.5.0/hypervisor-fw-${FIRMWARE_ARCH}"
 FIRMWARE_PATH="${CHV_DATA_DIR}/hypervisor-fw"
+# Digests from the v0.5.0 release API; version, URL and digests move together.
+case "$FIRMWARE_ARCH" in
+    x86_64)  FIRMWARE_SHA256="50e2c9c55476c1c43f63a9c5aee722655ba6a114029ddad8b2f5f5fa32a5fdb5" ;;
+    aarch64) FIRMWARE_SHA256="3fb96c65438377096bb42ba15e32d3c4eaf9fc49c6c0b5e91764205af8604221" ;;
+    *)       FIRMWARE_SHA256="" ;;
+esac
 
 download_base_image() {
     info "Checking for base OS image..."
@@ -667,13 +673,27 @@ download_firmware() {
     info "Downloading cloud-hypervisor firmware for ${FIRMWARE_ARCH}..."
     info "URL: ${FIRMWARE_URL}"
 
-    if curl -fsSL --retry 3 --retry-delay 5 "$FIRMWARE_URL" -o "$FIRMWARE_PATH"; then
+    if [ -z "$FIRMWARE_SHA256" ]; then
+        warn "No pinned firmware digest for architecture ${FIRMWARE_ARCH};"
+        warn "skipping the download. VMs that request firmware will fail to start."
+        return
+    fi
+
+    local fw_tmp
+    fw_tmp=$(mktemp)
+    if curl -fsSL --retry 3 --retry-delay 5 "$FIRMWARE_URL" -o "$fw_tmp"; then
+        if ! echo "${FIRMWARE_SHA256}  ${fw_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+            rm -f "$fw_tmp"
+            fatal "Firmware v0.5.0 digest mismatch (expected ${FIRMWARE_SHA256}); aborting install"
+        fi
+        install -m 644 "$fw_tmp" "$FIRMWARE_PATH"
+        rm -f "$fw_tmp"
         chown "${CHV_USER}:${CHV_USER}" "$FIRMWARE_PATH"
-        chmod 755 "$FIRMWARE_PATH"
         local fw_size
         fw_size=$(du -h "$FIRMWARE_PATH" | cut -f1)
-        info "Firmware downloaded (${fw_size}) -> ${FIRMWARE_PATH}"
+        info "Firmware downloaded and verified (${fw_size}) -> ${FIRMWARE_PATH}"
     else
+        rm -f "$fw_tmp"
         warn "Failed to download firmware from ${FIRMWARE_URL}"
         warn "No firmware will be present at ${FIRMWARE_PATH}: VMs that request"
         warn "firmware will fail to start with 'firmware not found: ${FIRMWARE_PATH}'."

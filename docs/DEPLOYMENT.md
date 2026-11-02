@@ -65,7 +65,8 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh |
   producing an **off-pin, unqualified** install.
 - **Firmware.** `/root/CLOUDHV.fd` is used when present. Otherwise the
   installer downloads the pinned rust-hypervisor-firmware 0.5.0 build to
-  `/var/lib/chv/hypervisor-fw`. Without firmware, VMs that request it fail to
+  `/var/lib/chv/hypervisor-fw` and verifies its sha256 digest (x86_64 or
+  aarch64) before installing it. Without firmware, VMs that request it fail to
   start with `firmware not found`.
 - **Version fallback.** If the GitHub API cannot be reached, the installer
   warns explicitly and falls back to the `0.3.0` offline pin instead of

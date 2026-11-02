@@ -145,10 +145,9 @@ sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" scripts/install.sh
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" scripts/hosting/cloudflare-worker.js
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" scripts/hosting/github-pages-index.html
 
-# Root-level copies of the hosting templates (published by hand, see
+# Root-level copies of the hosting templates (published by hand; see
 # docs/release/release-engineering-plan.md). They are duplicates of the
-# scripts/hosting/ files and must not drift; guard on presence because the
-# smoke fixture only materialises the canonical paths.
+# scripts/hosting/ files and must not drift.
 for f in cloudflare-worker.js github-pages-index.html; do
   if [ -f "$f" ]; then
     sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" "$f"

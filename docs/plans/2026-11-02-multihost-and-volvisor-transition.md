@@ -65,7 +65,7 @@ Every claim below is checkable in the tree at the time of writing.
 | B6 | The CP server certificate has no address a remote node could validate. | `scripts/install.sh` issues `CN=chv-controlplane` with SAN `localhost,127.0.0.1` only. |
 | B7 | Node certificates are not usable as agent *server* identities for a remote control plane. | `crates/chv-controlplane-service/src/enrollment.rs` `issue_node_certificate`: CN=`<node_id>`, DNS SAN `<node_id>`, no explicit EKU, no IP SAN, no advertise address. |
 | B8 | Packaging hard-couples node and control plane. | `docs/DEPLOYMENT-ARCHITECTURE.md` §8 D2: `chv-node` depends on `chv-controlplane`; a node-only host installs a control plane it does not use. `packaging/nfpm/chv-node.yaml`. |
-| B9 | Placement is "the most recently enrolled node". | `crates/chv-webui-bff/src/handlers/vms.rs:357` — `SELECT node_id FROM nodes ORDER BY enrolled_at DESC LIMIT 1`. |
+| B9 | Placement is "the most recently enrolled node". | `crates/chv-webui-bff/src/handlers/vms.rs:357` and `crates/chv-webui-bff/src/handlers/templates.rs:301-304` — both run `SELECT node_id FROM nodes ORDER BY enrolled_at DESC LIMIT 1` ("Pick default node"). |
 | B10 | Console tokens use one shared symmetric secret. | `crates/chv-config/src/lib.rs` `resolve_jwt_secret` reads `/etc/chv/jwt_secret`; `scripts/install.sh` writes the same `JWT_SECRET` into every service config. Any node could mint a console token for any other node. |
 | B11 | Tenant networking across hosts is design-only and unqualified. | ADR-021 is accepted and `FABRIC_IMPLEMENTATION_PLAN.md` is "In execution". The control-plane side exists: `fabric_planner.rs` compiles per-node plans, `orchestrator.rs:735-739` has the `UpdateOverlay` fan-out arm, and `vtep_repo.allocate_vni` is called from that path. But the agent still reports `vtep_ip: ""`, the fabric datapath is disabled and fails closed in the qualified configuration (`DEPLOYMENT-ARCHITECTURE.md` §2), and there is no cross-host L2 evidence. |
 | B12 | Fleet-wide networks (`networks.node_id IS NULL`) have no qualified L2 realization. | Schema permits it; the plan compiler handles it for `UpdateOverlay`, but no datapath evidence exists (B11). |
@@ -81,7 +81,7 @@ Every claim below is checkable in the tree at the time of writing.
 | S5 | Class vocabularies are disjoint and must not be mapped. | CHV: `local`, `lvm`, `iscsi`, `ceph`. Volvisor: `native-local`, `nearline-replicated`, `ceph-rbd`. |
 | S6 | Volvisor has no snapshot/clone/restore routes. | `crates/volvisor-api/src/router.rs`: create, list, inspect, attach, detach, grow, move-backing, delete, capabilities, healthz, admin, mobility. |
 | S6b | Volvisor *does* have a mobility surface, but it is not enabled for `native-local`. | `POST /v2/vms/{vm_id}/check-mobility` and the `/v2/migrations/*` routes exist, but `volvisord` wires the handoff only for the `drbd` provider. With the `lvm` provider, `check-mobility` answers 404 `NOT_FOUND` ("handoff surface not available for this provider") and the migration routes answer 404 `NOT_FOUND` ("the mobility surface is not enabled on this deployment"). The typed `MIGRATION_UNSUPPORTED_LOCAL_STORAGE` code exists but is not reached in this configuration. |
-| S7 | Volvisor's pinned v1 cannot report attachment phase beyond `prepared`. | The pinned implementation returns `state = prepared` and has no route that advances it. A **corrected** design is tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) and implemented on a Volvisor feature branch (not merged/released/pinned): `POST /v2/volumes/{id}/attachment-state`, a per-attachment `attachments[]` inspect view, monotonic `state_revision` (the detach-fencing `attachment_generation` never advances), and the `attachment_state_report` capability. ADR-028 requires observed attachment reporting; the pinned gap remains until the upstream disposition and a conscious re-pin. |
+| S7 | The pinned revision (API v2) cannot report attachment phase beyond `prepared`. | The pinned implementation returns `state = prepared` and has no route that advances it. A **corrected** design is tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) and implemented on a Volvisor feature branch (not merged/released/pinned): `POST /v2/volumes/{id}/attachment-state`, a per-attachment `attachments[]` inspect view, monotonic `state_revision` (the detach-fencing `attachment_generation` never advances), and the `attachment_state_report` capability. ADR-028 requires observed attachment reporting; the pinned gap remains until the upstream disposition and a conscious re-pin. |
 | S8 | Volvisor is a prototype with no CHV production qualification. | `volvisor/README.md`, `volvisor/AGENTS.md`, ADR-028 "Volvisor is a prototype". |
 | S9 | There is no in-place adoption route from stord state. | `POST /v2/admin/nearline/{volume_id}/adopt` is DRBD failover promotion, not foreign-volume adoption. |
 | S10 | Volvisor's privileged API is loopback + bearer token. | `volvisor/docs/configuration.md`: `listen` must be loopback without `admin_token`; privileged requests still `401` without it. |
@@ -253,10 +253,18 @@ Rules enforced at startup (fail closed, no warnings-and-continue):
    fabric provider).
 6. Unix serving remains available concurrently when configured, so the
    single-host tooling path is never broken by enabling TCP.
+7. A TCP listener requires the node config to declare
+   `deployment.topology = multi-host`; under `single-host` (or with no
+   declaration) `[agent.grpc]` is a startup error and the agent serves Unix
+   only. The CP independently refuses to dial a TCP endpoint under
+   `single-host` (ADR-029 §7).
 
 `AgentConfig` gains:
 
 ```toml
+[deployment]
+topology = "multi-host"           # required for [agent.grpc]
+
 [agent.grpc]
 listen = "10.20.0.11:9443"        # opt-in
 advertise_addr = "10.20.0.11"     # required with TCP
@@ -322,27 +330,38 @@ architecture change to §3.1 and is part of D-MH5.
 is descriptive, never a dispatcher for ownership.
 
 **Seam.** New `crates/chv-storage-api` (or a module in
-`chv-hypervisor-api`) with a narrow trait:
+`chv-hypervisor-api`) with a narrow trait. The request structs mirror the
+contract §4 inputs — they carry `operation_id`, the expected volume or
+attachment generation, `attachment_id`, and the drain proof — so the seam can
+enforce the contract's fencing rules:
 
 ```rust
 #[async_trait]
 pub trait VolumeBackend: Send + Sync + 'static {
     fn owner(&self) -> StorageOwner;                    // LegacyStord | Volvisor
     fn classes(&self) -> &'static [&'static str];
+    fn capabilities(&self) -> &CapabilitySet;           // contract §5.1 tokens
     async fn ensure_volume(&self, req: EnsureVolume) -> Result<VolumeHandle, ChvError>;
-    async fn attach(&self, h: &VolumeHandle, vm: &VmId) -> Result<AttachResult, ChvError>;
-    async fn detach(&self, h: &VolumeHandle, vm: &VmId) -> Result<(), ChvError>;
-    async fn close(&self, h: VolumeHandle) -> Result<(), ChvError>;
-    async fn destroy(&self, id: &VolumeId, op: Option<&str>) -> Result<(), ChvError>;
-    async fn grow(&self, id: &VolumeId, size: u64, op: Option<&str>) -> Result<(), ChvError>;
+    async fn attach(&self, req: AttachVolume) -> Result<AttachResult, ChvError>;
+    async fn detach(&self, req: DetachVolume) -> Result<(), ChvError>;
+    async fn close(&self, req: CloseVolume) -> Result<(), ChvError>;
+    async fn grow(&self, req: GrowVolume) -> Result<GrowResult, ChvError>;
+    async fn destroy(&self, req: DestroyVolume) -> Result<(), ChvError>;
     async fn inspect(&self, id: &VolumeId) -> Result<VolumeObservation, ChvError>;
+    // Capability-gated; returns UNIMPLEMENTED unless report-attachment-state is advertised.
+    async fn report_attachment_state(&self, req: ReportAttachmentState)
+        -> Result<AttachmentReport, ChvError>;
 }
 ```
 
-Capability methods (`supports_snapshot`, `supports_clone`,
-`supports_migration`, `supports_shrink`) are answered by the backend and
-surfaced to the CP, which refuses unsupported operations **before** journaling
-them. A refused operation must be terminal, not retried.
+`EnsureVolume`, `AttachVolume`, `DetachVolume`, `CloseVolume`, `GrowVolume`,
+`DestroyVolume`, and `ReportAttachmentState` are the contract §4 input types;
+`CapabilitySet` is the §5.1 vocabulary (`ensure`, `attach`, `detach`, `close`,
+`grow`, `destroy`, `inspect`, `snapshot`, `clone`, `restore`,
+`delete-snapshot`, `live-migrate`, `offline-copy`, `same-host-backing-move`,
+`report-attachment-state`). A backend answers capabilities as a set, not as
+ad-hoc `supports_*` booleans, so the CP can refuse an operation **before**
+journaling it. A refused operation must be terminal, not retried.
 
 `AgentResourceController` (Core) and the legacy `reconcile.rs` /
 `agent_server.rs` call sites both construct the same router and select the
@@ -390,9 +409,9 @@ fallback.
 | `open_volume` (Core) / first open (legacy) | `GET /v2/volumes/{id}`; if `404`, `POST /v2/volumes` with `volume_id = CHV volume_id`, `project_id` from the attachment ref, `class = native-local`, `size_bytes`, `provisioning` | Volume creation is *ensure-exists*, idempotent on `operation_id`. `seed_from` is not a Volvisor field: CHV must either pre-seed outside Volvisor or refuse `seed_from` for Volvisor-owned volumes in P4. |
 | `attach_volume_to_vm` | `POST /v2/volumes/{id}/attach` with `attachment_id = CHV attachment_id`, `host_id = node_id`, `vm_id`, `expected_volume_generation`, `requested_frontend = "virtio-blk"` | Returns `frontend.host_device_path`, `attachment_generation`, and `volume_generation`. A stale expected generation is a typed conflict. |
 | `detach_volume_from_vm` | `POST /v2/volumes/{id}/detach` with `attachment_id`, `expected_attachment_generation`, and `vm_stopped_or_io_drained_proof` | Stale generation → conflict, never forced. The drain proof must be truthful: `io_drained` only after CHV's own drain check. |
-| `close_volume` | idempotent detach (or no-op if already detached) | Never deletes the volume. |
+| `close_volume` | no-op when no attachment record exists; otherwise `POST /v2/volumes/{id}/detach` with `attachment_id` and the truthful `vm_stopped` proof (create unwind only; the VM never started) | Never deletes the volume. Never fabricates `io_drained`. |
 | `destroy_volume` | `DELETE /v2/volumes/{id}` with `expected_generation` and an explicit `data_erasure_policy` | Refused unless owner = volvisor and the volume is detached. There is no implicit erasure policy. |
-| `resize_volume` (grow) | `POST /v2/volumes/{id}/grow` | Grow-only; shrink refused. `new_size_bytes` must be 512-aligned. |
+| `resize_volume` (grow) | `POST /v2/volumes/{id}/grow` | Grow-only; shrink refused. `new_size_bytes` must be 512-aligned and aligned to the fixed 4096-byte logical block size. |
 | `snapshot_volume`, `clone_volume`, `restore_volume`, `delete_volume_snapshot` | none | Refused with `Unimplemented` for volvisor-owned volumes, advertised via capabilities. |
 | disk migration RPCs | none | CHV does not call Volvisor mobility routes for `native-local`: `check-mobility` and `/v2/migrations/*` are disabled for the LVM provider (404). The VM is marked migration-ineligible by CHV policy and the scheduler refuses before journaling. |
 
@@ -465,15 +484,16 @@ Backfill rules:
 |---|---|---|
 | CP | `deployment.topology` | `single-host` / `multi-host`; validated against listeners |
 | CP | `[grpc] bind`, `advertise_addr`, `client_ca_path` | remote agent reachability |
-| CP | `[agent_transport] mode`, `socket_pattern`, `tcp_port`, `server_name_template` | resolver selection |
+| CP | `[agent_transport] mode`, `socket_pattern` | resolver selection; TCP endpoints come only from persisted `nodes.agent_grpc_address` / `agent_grpc_server_name` (ADR-029 I4), never from a port/template key |
 | CP | `[agent_transport.tls] client_cert_path/client_key_path/ca_cert_path` | CP client identity |
-| Agent | `[agent.grpc]` (see §5.3) | opt-in listener |
+| Agent | `deployment.topology`, `[agent.grpc]` (see §5.3) | topology declaration + opt-in listener |
 | Agent | `advertise_addr` | inventory fact |
 | Agent | `[storage.volvisor] enabled`, `endpoint`, `admin_token_file`, `api_version`, `request_timeout_ms` | Volvisor |
 | Agent | `[storage.ownership] mode = legacy-stord \| volvisor \| both` | operator switch, default `legacy-stord` in P3/P4 |
 
 `mode = both` exists only for migration windows and is refused when
-`deployment.topology = multi-host` if any volume has an ambiguous owner.
+`deployment.topology = multi-host` if any volume's owner cannot be served by
+an enabled backend on its node.
 
 ---
 
@@ -540,6 +560,8 @@ code merged that assumes an unratified option.
    behavior identical to the Unix path.
 6. Single-host install with no `[agent.grpc]` behaves exactly as before
    (regression suite green).
+7. A revoked node certificate serial cannot reconnect to the CP or to an agent
+   listener.
 
 ### P2 — Node lifecycle and operability (4–5 weeks)
 
@@ -549,9 +571,9 @@ code merged that assumes an unratified option.
 | P2.2 | `install.sh --role` and remote enrollment (token, CP address, no local CA) | `scripts/install.sh` |
 | P2.3 | Console routing to remote nodes via `agent_ws_address`; per-node TLS/token | BFF handlers, nginx examples, `config.rs` |
 | P2.4 | CP-signed console tokens (`aud=node:<id>`) replacing the shared `jwt_secret` for cross-host | `chv-config`, agent console auth |
-| P2.5 | Explicit placement; remove newest-node default for multi-node; required `node_id` | BFF `vms.rs`, CP placement module |
+| P2.5 | Explicit placement; remove newest-node default for multi-node; required `node_id` | BFF `vms.rs`, `templates.rs`, CP placement module |
 | P2.6 | Drain/maintenance semantics for local-storage VMs (block, not evacuate) | orchestrator, `DrainNode`/`EnterMaintenance` |
-| P2.7 | Node removal/revocation: cert serial denylist, endpoint tombstone, in-flight operation reaping | enrollment, reaper |
+| P2.7 | Node removal/revocation: endpoint tombstone, in-flight operation reaping | enrollment, reaper |
 | P2.8 | Node health/last-seen surfacing in CLI and UI | `chvctl`, BFF |
 
 **Gate P2:** a three-node fleet can be installed from packages (no source
@@ -635,6 +657,7 @@ encapsulation; a third host joining mid-flight converges.
 | P6.5 | Observability truthfulness: no `Active` without evidence, no `Healthy` without proof, metrics for backend/op/result |
 | P6.6 | Upgrade/downgrade: mixed-version fleet (N-1 agent, N CP) under the compat matrix |
 | P6.7 | Security review: listener exposure, token handling, cert boundary, log redaction |
+| P6.8 | Guest flush/FUA ordering, clean and dirty host reboot with attached volumes, and device loss at each operation boundary |
 
 **Gate P6:** the failure campaign report is published with exact
 source/hardware/versions; every failure is classified (fixed, documented,
@@ -737,6 +760,17 @@ it in CI.
 | Routes refused by CHV | `/v2/admin/*`, `/v2/migrations/*`, `/v2/vms/*/check-mobility`, nearline adopt |
 | Upstream design (P0.5) | [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) — corrected design implemented on a Volvisor feature branch; filed, disposition/merge/release pending; **not** part of this pin |
 
+Volvisor source is not vendored in this repository. Re-verify the Volvisor
+claims (S6/S6b/S10 and “rule 20”) against the exact pin with:
+
+```bash
+git clone https://github.com/o3kio/volvisor
+git -C volvisor checkout 286f038c99db5aba29243acd7d3e0bfdb25bf50a
+```
+
+Paths such as `crates/volvisor-api/src/router.rs` and
+`volvisor/docs/configuration.md` in §2 are relative to that checkout.
+
 ### 10.2 Rollback
 
 | Change | Rollback |
@@ -801,9 +835,9 @@ calendar, decides progression.
 ```
 P0 decisions
    │
-   ├──► P1 remote dispatch ──► P2 node lifecycle ──► (MH-A)
-   │                                   │
-   │                                   └──► P3 seam/shadow ──► P4 native-local ──► (VS-A)
+   ├──► P1 remote dispatch ──┬──► P2 node lifecycle ──► (MH-A)
+   │                         │
+   │                         └──► P3 seam/shadow ──► P4 native-local ──► (VS-A)
    │                                                                     │
    └──► P5 fabric (parallel, ADR-021) ──────────────────────────────────► (MH-B)
                                                                          │
@@ -827,7 +861,7 @@ Ordering rules:
 
 ---
 
-## 14. Open questions (resolve in P0)
+## 14. Open questions (tagged with the gate that resolves them)
 
 Resolved by this draft:
 
@@ -839,23 +873,24 @@ Resolved by this draft:
 
 Still open:
 
-1. **Management network assumption.** Is there a dedicated management
-   network/VLAN, or must the agent listener coexist with tenant traffic?
-   This changes the exposure rule and the firewall model.
-2. **`project_id` source.** VM tenant id, or a new first-class project
-   concept? Recommendation: VM tenant id in P4, first-class project later.
-   Contract v1 §11.3 encodes the recommendation; ratification is still
-   required.
-3. **`seed_from` for Volvisor-owned volumes.** Refuse in P4 (recommended), or
-   build an explicit pre-seed job? Contract v1 §10 encodes the refusal;
-   ratification is still required.
-4. **Volvisor packaging.** Build from the pinned SHA into `chv-node`, or a
-   separate `chv-volvisord` package with its own upgrade cadence?
-5. **LVM pool claiming.** Which operator workflow claims devices
-   (`/v2/admin/devices/claim`) and who holds the claim token? This is
+1. **Management network assumption (Gate P0).** Is there a dedicated
+   management network/VLAN, or must the agent listener coexist with tenant
+   traffic? This changes the exposure rule and the firewall model.
+2. **`project_id` source (Gate P0 for the decision; P4 for carriage).** VM
+   tenant id, or a new first-class project concept? Recommendation: VM tenant
+   id in P4, first-class project later. Contract v1 §11.3 encodes the
+   recommendation; ratification is still required.
+3. **`seed_from` for Volvisor-owned volumes (Gate P0 for the decision; P4 for
+   enforcement).** Refuse in P4 (recommended), or build an explicit pre-seed
+   job? Contract v1 §10 encodes the refusal; ratification is still required.
+4. **Volvisor packaging (Gate P3).** Build from the pinned SHA into
+   `chv-node`, or a separate `chv-volvisord` package with its own upgrade
+   cadence?
+5. **LVM pool claiming (before Gate P4).** Which operator workflow claims
+   devices (`/v2/admin/devices/claim`) and who holds the claim token? This is
    destructive and needs a written procedure before P4.
-6. **Console transport.** BFF → agent console over the management network
-   with mTLS (recommended), or tunnel through the gRPC stream later?
+6. **Console transport (Gate P2).** BFF → agent console over the management
+   network with mTLS (recommended), or tunnel through the gRPC stream later?
 
 ---
 
