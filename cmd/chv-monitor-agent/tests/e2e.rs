@@ -403,11 +403,17 @@ async fn g4_families_checks_and_discovery_flow_end_to_end() {
             let Ok((mut sock, _)) = http_listener.accept().await else {
                 return;
             };
+            // Drain the request before answering. Closing a socket with
+            // unread input makes the kernel send RST, which can discard
+            // the response before the client reads it.
+            let mut request = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut request).await;
             let _ = tokio::io::AsyncWriteExt::write_all(
                 &mut sock,
-                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
             )
             .await;
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut sock).await;
         }
     });
     let tcp_server = tokio::spawn(async move {

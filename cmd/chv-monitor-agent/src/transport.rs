@@ -149,7 +149,9 @@ impl VsockStream {
             }
             OwnedFd::from_raw_fd(fd)
         };
-        let fd = AsyncFd::new(fd)?;
+        // SAFETY: `fd` is a freshly-created `OwnedFd`; ownership moves into
+        // the `AsyncFd`, which keeps it open and unchanged for its lifetime.
+        let fd = unsafe { AsyncFd::register(fd) }?;
         loop {
             let mut guard = fd.writable().await?;
             let mut so_error: libc::c_int = 0;
