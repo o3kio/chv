@@ -6,7 +6,8 @@ use crate::auth::{require_admin, require_operator_or_admin, BearerToken};
 use crate::router::AppState;
 use crate::BffError;
 use chv_controlplane_store::{
-    CertificateRevocationRepository, EventAppendInput, RevokeCertificateInput,
+    normalize_chv_certificate_serial, CertificateRevocationRepository, EventAppendInput,
+    RevokeCertificateInput,
 };
 use chv_controlplane_types::domain::{
     ActorId, EventSeverity, EventType, NodeId, ResourceId, ResourceKind,
@@ -477,7 +478,16 @@ pub async fn revoke_node_certificate(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(serial) => serial.to_string(),
+        Some(raw) => normalize_chv_certificate_serial(raw).ok_or_else(|| {
+            BffError::BadRequest(format!(
+                "certificate_serial must be the canonical CHV serial stored in \
+                 nodes.certificate_serial: exactly 8 lowercase hex characters (e.g. \
+                 \"0a3f7b2c\"). Got {raw:?}. Note: `openssl x509 -serial` prints the DER \
+                 integer as HEX (typically 16+ characters), which is a different value; \
+                 revoking it would create a row that no certificate matches. Read \
+                 nodes.certificate_serial instead."
+            ))
+        })?,
         None => recorded_serial.clone().ok_or_else(|| {
             BffError::BadRequest(format!(
                 "node {node_id} has no recorded certificate serial (legacy enrollment); \
@@ -485,11 +495,6 @@ pub async fn revoke_node_certificate(
             ))
         })?,
     };
-    if certificate_serial.len() > 256 {
-        return Err(BffError::BadRequest(
-            "certificate_serial must not exceed 256 bytes".into(),
-        ));
-    }
 
     let repo = CertificateRevocationRepository::new(state.pool.clone());
     let outcome = repo

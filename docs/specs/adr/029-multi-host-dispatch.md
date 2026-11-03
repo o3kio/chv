@@ -194,9 +194,14 @@ Certificate content rules:
    of truth; a startup-loaded, atomically refreshed in-memory snapshot keeps the
    synchronous interceptor off the database hot path. Production startup fails
    closed if the snapshot cannot be loaded. There is no CRL/OCSP infrastructure
-   in v1; short lifetimes plus the denylist are the revocation story. Revoking a
-   serial also burns rotation for it — the store's compare-and-swap refuses to
-   exchange a revoked serial for a new certificate — so the node must re-enroll.
+   in v1; **bounded certificate lifetimes** (not-before = now − 5 min,
+   not-after = now + 90 days) plus the denylist are the revocation story.
+   Revoking a serial also burns rotation for it — the store's compare-and-swap
+   refuses to exchange a revoked serial for a new certificate — so the node must
+   re-enroll. The enrollment service uses an identity-only interceptor so a
+   revoked node can present a one-time bootstrap token to `EnrollNode` (the
+   token is the authentication factor); `RotateNodeCertificate` re-checks the
+   denylist and every steady-state service keeps full enforcement.
    Operators revoke through the admin-only `POST /v1/nodes/revoke-certificate`
    route (`chvctl node revoke-certificate`); see
    [`docs/runbooks/node-certificate-compromise.md`](../../runbooks/node-certificate-compromise.md).

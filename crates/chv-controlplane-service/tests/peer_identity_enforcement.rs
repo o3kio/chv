@@ -68,6 +68,12 @@ impl chv_controlplane_service::CertificateIssuer for StubIssuer {
 }
 
 async fn build_enrollment_server() -> (EnrollmentServer, NodeRepository) {
+    build_enrollment_server_with_revocation(&[]).await
+}
+
+async fn build_enrollment_server_with_revocation(
+    revoked_serials: &[&str],
+) -> (EnrollmentServer, NodeRepository) {
     let pool = create_test_pool().await;
     let node_repo = NodeRepository::new(pool.clone());
     let token_repo = BootstrapTokenRepository::new(pool.clone());
@@ -98,7 +104,11 @@ async fn build_enrollment_server() -> (EnrollmentServer, NodeRepository) {
     .with_certificate_revocations(
         chv_controlplane_store::CertificateRevocationRepository::new(pool.clone()),
     );
-    (EnrollmentServer::new(Arc::new(svc)), node_repo)
+    let revocation = RevocationSnapshot::from_serials(revoked_serials.iter().copied());
+    (
+        EnrollmentServer::new(Arc::new(svc)).with_revocation(revocation),
+        node_repo,
+    )
 }
 
 fn request_with_peer<T>(payload: T, peer_node_id: &str) -> Request<T> {
@@ -245,6 +255,94 @@ async fn rotate_node_certificate_rejects_stale_serial_without_mutation() {
     );
 }
 
+/// B1 (#661): a revoked certificate must be able to reach `EnrollNode` with a
+/// fresh one-time bootstrap token — that is the documented recovery path. The
+/// enrollment service uses an identity-only interceptor; the token is the
+/// authentication factor.
+#[tokio::test]
+async fn revoked_serial_can_enroll_with_valid_bootstrap_token() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, repo) = build_enrollment_server_with_revocation(&["revoked-serial"]).await;
+    // sha256("123")
+    sqlx::query("INSERT INTO bootstrap_tokens (token_hash, one_time_use) VALUES (?, true)")
+        .bind("a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3")
+        .execute(repo.pool())
+        .await
+        .unwrap();
+
+    // Shape produced by the identity-only enrollment interceptor: identity and
+    // serial are bound, but the revoked serial was not rejected.
+    let req = request_with_peer_serial(
+        enroll_payload("123", "node-reenroll"),
+        "node-reenroll",
+        Some("revoked-serial"),
+    );
+
+    let resp = server
+        .enroll_node(req)
+        .await
+        .expect("revoked certificate + valid one-time token must enroll");
+    assert!(!resp.into_inner().certificate_pem.is_empty());
+}
+
+/// A revoked certificate alone is not an enrollment credential: without a
+/// valid bootstrap token the call is unauthenticated.
+#[tokio::test]
+async fn revoked_serial_enroll_without_valid_bootstrap_token_is_unauthenticated() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, _repo) = build_enrollment_server_with_revocation(&["revoked-serial"]).await;
+
+    for token in ["", "not-a-real-token"] {
+        let req = request_with_peer_serial(
+            enroll_payload(token, "node-reenroll"),
+            "node-reenroll",
+            Some("revoked-serial"),
+        );
+        let status = server
+            .enroll_node(req)
+            .await
+            .expect_err("enrollment must require a valid bootstrap token");
+        assert_eq!(
+            status.code(),
+            Code::Unauthenticated,
+            "invalid token must be unauthenticated; got: {} ({})",
+            status.code(),
+            status.message()
+        );
+    }
+}
+
+fn enroll_payload(token: &str, node_id: &str) -> proto::EnrollmentRequest {
+    proto::EnrollmentRequest {
+        bootstrap_token: token.into(),
+        inventory: Some(proto::NodeInventory {
+            node_id: node_id.into(),
+            hostname: "host-reenroll".into(),
+            architecture: "x86_64".into(),
+            cpu_threads: 2,
+            memory_bytes: 1024,
+            storage_classes: vec![],
+            network_capabilities: vec![],
+            hypervisor_capabilities: vec![],
+            labels: Default::default(),
+            vtep_ip: String::new(),
+            wireguard_public_key: String::new(),
+            underlay_mtu: 0,
+            authority_mode: Default::default(),
+        }),
+        versions: Some(proto::ServiceVersions {
+            node_id: node_id.into(),
+            chv_agent_version: "1.0.0".into(),
+            chv_stord_version: "1.0.0".into(),
+            chv_nwd_version: "1.0.0".into(),
+            cloud_hypervisor_version: "40.0.0".into(),
+            host_bundle_version: "1.2.3".into(),
+        }),
+    }
+}
+
 /// A revoked serial must not rotate, even though it still matches the stored
 /// active serial. Otherwise a thief holding the stolen certificate could
 /// exchange it for a fresh, unrevoked certificate and defeat revocation.
@@ -252,7 +350,7 @@ async fn rotate_node_certificate_rejects_stale_serial_without_mutation() {
 async fn rotate_node_certificate_rejects_revoked_serial() {
     use proto::enrollment_service_server::EnrollmentService as _;
 
-    let (server, repo) = build_enrollment_server().await;
+    let (server, repo) = build_enrollment_server_with_revocation(&["old-serial"]).await;
     chv_controlplane_store::CertificateRevocationRepository::new(repo.pool().clone())
         .revoke(&chv_controlplane_store::RevokeCertificateInput {
             certificate_serial: "old-serial",
@@ -277,16 +375,12 @@ async fn rotate_node_certificate_rejects_revoked_serial() {
         .expect_err("revoked serial must not rotate");
     assert_eq!(
         status.code(),
-        Code::PermissionDenied,
-        "revoked serial must produce permission_denied; got: {} ({})",
+        Code::Unauthenticated,
+        "revoked serial must produce unauthenticated; got: {} ({})",
         status.code(),
         status.message()
     );
-    assert!(
-        status.message().contains("revoked"),
-        "operator-actionable message expected, got: {}",
-        status.message()
-    );
+    assert_eq!(status.message(), "peer certificate is revoked");
     assert_eq!(
         repo.get_certificate_serial(&NodeId::new("node-a").unwrap())
             .await

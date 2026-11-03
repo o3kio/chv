@@ -222,6 +222,16 @@ impl ControlPlaneService {
         let interceptor =
             PeerIdentityInterceptor::new(self.runtime.allow_insecure(), revocation.clone())?;
 
+        // Enrollment is the controlled recovery path: a node whose certificate
+        // was revoked must still be able to present a fresh one-time bootstrap
+        // token. This interceptor extracts/binds the peer identity but skips
+        // the denylist; rotation is re-checked in EnrollmentServer. Every other
+        // service keeps full revocation enforcement.
+        let enrollment_interceptor = PeerIdentityInterceptor::for_enrollment(
+            self.runtime.allow_insecure(),
+            revocation.clone(),
+        )?;
+
         // Refresh the denylist in the background. In dev mode revocation is
         // bypassed entirely, so no reload task is needed.
         let refresh_handle = if self.runtime.allow_insecure() {
@@ -230,7 +240,7 @@ impl ControlPlaneService {
             let refresh_shutdown = self.runtime.shutdown_rx.clone();
             Some(tokio::spawn(run_refresh_loop(
                 revocation_repo,
-                revocation,
+                revocation.clone(),
                 crate::revocation::refresh_interval_from_env(),
                 refresh_shutdown,
             )))
@@ -243,12 +253,19 @@ impl ControlPlaneService {
             move |req: tonic::Request<()>| interceptor.intercept(req)
         };
 
+        let make_enrollment_intercept = || {
+            let interceptor = enrollment_interceptor.clone();
+            #[allow(clippy::result_large_err)]
+            move |req: tonic::Request<()>| interceptor.intercept(req)
+        };
+
         let enrollment_server =
             proto::enrollment_service_server::EnrollmentServiceServer::with_interceptor(
                 crate::server::EnrollmentServer::new(Arc::new(
                     self.components.enrollment_service.clone(),
-                )),
-                make_intercept(),
+                ))
+                .with_revocation(revocation.clone()),
+                make_enrollment_intercept(),
             );
 
         let inventory_server =

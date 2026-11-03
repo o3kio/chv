@@ -52,8 +52,8 @@ pub use backups::{
 };
 pub use bootstrap_tokens::{BootstrapTokenRepository, BootstrapTokenValidation};
 pub use certificate_revocations::{
-    CertificateRevocationRepository, NodeCertificateRevocation, RevokeCertificateInput,
-    RevokeCertificateOutcome,
+    normalize_chv_certificate_serial, CertificateRevocationRepository, NodeCertificateRevocation,
+    RevokeCertificateInput, RevokeCertificateOutcome, CHV_CERTIFICATE_SERIAL_HEX_LEN,
 };
 pub use db::{
     connect_pool, migrations_path, migrator, run_migrations, ControlPlaneStoreConfig, StoreError,

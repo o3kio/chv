@@ -272,14 +272,22 @@ chvctl node revoke-certificate <NODE_ID> \
 
 The serial is added to the durable `node_certificate_revocations` denylist and
 rejected with `UNAUTHENTICATED` by the gRPC peer-identity interceptor on every
-node-facing RPC. Revocation also **burns rotation** for that serial: it cannot
-be exchanged for a fresh certificate, so the node must re-enroll with a new
-bootstrap token. The endpoint is admin-only and idempotent, and writes an audit
-event.
+steady-state node-facing RPC. Revocation also **burns rotation** for that
+serial: it cannot be exchanged for a fresh certificate, so the node must
+re-enroll with a new one-time bootstrap token. Enrollment deliberately remains
+reachable with the revoked certificate (the token is the authentication factor);
+enrollment rotation is still rejected. The endpoint is admin-only and
+idempotent, and writes an audit event.
+
+Use the canonical 8-character lowercase hex value from
+`nodes.certificate_serial` when passing `--certificate-serial`;
+`openssl x509 -serial` prints a different HEX encoding and is rejected.
 
 - Propagation to authentication is bounded by the snapshot refresh interval
-  (`CHV_REVOCATION_REFRESH_SECS`, default 5 s).
+  (`CHV_REVOCATION_REFRESH_SECS`, default 5 s); rotation is database-immediate.
 - Production startup fails closed if the denylist cannot be loaded.
+- After a database restore, diff the denylist against incident records and
+  re-revoke any missing serials.
 - `CHV_ALLOW_INSECURE=1` (dev-feature builds only) bypasses revocation.
 
 Full procedure (verify, rotation recovery, re-enrollment, rollback, failure

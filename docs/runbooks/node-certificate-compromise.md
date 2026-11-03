@@ -18,7 +18,8 @@ This runbook covers:
 
 ## Background
 
-CHV v1 has no CRL or OCSP responder. Node certificates are short-lived and the
+CHV v1 has no CRL or OCSP responder. Node certificates are short-lived
+(issued with a ~90-day lifetime; agents rotate every 12 hours) and the
 control plane keeps a durable **denylist keyed by certificate serial**
 (`node_certificate_revocations`). Every production mTLS request is checked
 against an in-memory snapshot of that table by the gRPC peer-identity
@@ -36,10 +37,20 @@ Revocation is therefore two independent guarantees:
 The snapshot refreshes every **5 seconds** by default
 (`CHV_REVOCATION_REFRESH_SECS`, 1–300). Revocation of *rotation* is immediate
 (database-enforced); authentication changes take at most one refresh interval.
+There is no operator-triggered immediate reload.
 
 > `CHV_ALLOW_INSECURE=1` (dev-only builds with the `dev` Cargo feature)
 > bypasses mTLS peer identity **and revocation entirely**. Never use it in
 > production. Production builds reject the flag at startup.
+
+**Recovery exemption.** The enrollment service uses an identity-only
+interceptor: it still requires and parses the mTLS leaf certificate, but it
+does not consult the denylist for `EnrollNode`. That is deliberate — a node
+whose certificate is revoked must be able to re-enroll with a **high-entropy,
+one-time, admin-issued bootstrap token**. The token is the authentication
+factor for enrollment; the old certificate merely satisfies the TLS client-
+authentication layer. Revocation is never bypassed for steady-state RPCs, and
+`RotateNodeCertificate` re-checks the serial at the handler.
 
 ---
 
@@ -58,6 +69,15 @@ chvctl node revoke-certificate <NODE_ID> \
   --certificate-serial <SERIAL> \
   --reason "stolen backup of agent-client.crt"
 ```
+
+> **The `--certificate-serial` value is the canonical DB serial, not the
+> `openssl` display.** CHV stores an 8-character lowercase hex string in
+> `nodes.certificate_serial` (e.g. `0a3f7b2c`). `openssl x509 -serial` prints
+> the DER integer as **HEX** (typically 16+ characters, e.g.
+> `0a:3f:7b:2c:...`), which is a *different* value encoding. Passing that value
+> is rejected with a 400 rather than creating a denylist row that matches no
+> certificate. Read `nodes.certificate_serial` (or omit
+> `--certificate-serial` to use the node's active serial).
 
 Equivalent API call:
 
@@ -133,6 +153,11 @@ per-serial, not fleet-wide.
 - Metric `chv_revocation_snapshot_reload_total{result="ok"}` increments every
   refresh interval. `result="error"` means the last reload failed and the
   previous snapshot is still enforced — investigate the store immediately.
+- Metric `chv_revocation_snapshot_shrink_total` must normally stay flat. A
+  step down in `chv_node_certificate_revocations_active` (snapshot shrinkage)
+  can mean a database restore or a manual delete resurrected revoked serials.
+  **Alarm on any unexpected drop**; compare the table against incident records
+  before assuming the drop is legitimate.
 - Control-plane logs contain
   `rejecting request: peer certificate serial is revoked` with the node id and
   serial.
@@ -144,8 +169,10 @@ grpcurl ... EnrollmentService/RotateNodeCertificate \
   -d '{"node_id":"<NODE_ID>","meta":{"operation_id":"verify-rotation-burn"}}'
 ```
 
-Expected: `PermissionDenied: the presented certificate has been revoked;
-re-enroll the node with a fresh bootstrap token`.
+Expected: `Unauthenticated: peer certificate is revoked`. (The enrollment
+service's interceptor is identity-only so enrollment can recover, but its
+`RotateNodeCertificate` handler re-checks the denylist and rejects before any
+key material is minted.)
 
 ---
 
@@ -155,33 +182,56 @@ Use this path when a node is healthy but its credential is due for normal
 rotation (the agent rotates automatically every 12 hours) or an operator wants a
 fresh credential **without** suspecting compromise.
 
+### 3.1 Normal rotation
+
 - **Normal rotation requires no operator action.** `chv-agent` checks the
   certificate age and calls `RotateNodeCertificate` when due. The control plane
   requires proof of possession: the presented mTLS leaf serial must equal the
   node's recorded `nodes.certificate_serial`. A stale or foreign certificate is
   rejected with `PermissionDenied` and no key material is minted.
-- **If rotation was interrupted** (agent restarted mid-flight, or the control
-  plane lost the response), the agent retries on the next cycle. The serial in
-  `nodes.certificate_serial` is authoritative. If the agent repeatedly fails
-  with `presented certificate serial does not match`, the local cache and the
-  control plane disagree:
-  1. Check `nodes.certificate_serial` and the serial in the node's
-     `/etc/chv/certs/agent-client.crt` (`openssl x509 -noout -serial -in ...`).
-  2. If the node holds the current serial but the stored one is stale, the
-     previous rotation committed late — wait one agent cycle and retry.
-  3. If the node cannot present the recorded serial, it must re-enroll
-     ([step 4](#4-re-enroll-a-compromised-node)). Do **not** delete or edit the
-     serial in the database to force a rotation.
 - **A revoked serial never recovers by rotation.** Revocation deliberately burns
   that serial. Re-enrollment is the only path back to service.
+
+### 3.2 Recovering an interrupted rotation
+
+If rotation was interrupted (agent restarted mid-flight, or the control plane
+lost the response), the agent retries on the next cycle. The serial in
+`nodes.certificate_serial` is authoritative. If the agent repeatedly fails with
+`presented certificate serial does not match`, the local cache and the control
+plane disagree:
+
+1. Compare `nodes.certificate_serial` with the **canonical textual serial**, not
+   the `openssl` HEX rendering:
+   - Canonical value: the 8-character lowercase hex string in
+     `nodes.certificate_serial` (e.g. `0a3f7b2c`).
+   - `openssl x509 -noout -serial -in /etc/chv/certs/agent-client.crt` prints
+     the DER integer as HEX (e.g. `serial=0A3F7B2C2F9E1B4D`). Do not paste that
+     into `--certificate-serial`; it is a different encoding and will be
+     rejected. Convert it only if you can map it unambiguously to the DB value,
+     or read the DB value directly.
+2. If the node holds the current serial but the stored one is stale, the
+   previous rotation committed late — wait one agent cycle and retry.
+3. If the node cannot present the recorded serial, it must re-enroll
+   ([step 4](#4-re-enroll-a-compromised-node)). Do **not** delete or edit the
+   serial in the database to force a rotation.
 
 ---
 
 ## 4. Re-enroll a compromised node
 
 Do this after containment (host rebuilt/restored from trusted media, malware
-removed, credentials rotated). The revoked certificate cannot authenticate, so
-enrollment uses the bootstrap-token path, which is independent of mTLS.
+removed, credentials rotated). The revoked certificate cannot authenticate to
+steady-state RPCs, but the enrollment service uses an identity-only interceptor:
+it still requires a client certificate at the TLS layer (the revoked leaf is
+normally sufficient), while authentication for `EnrollNode` is the **one-time
+bootstrap token** — high-entropy, generated by an admin, consumed atomically,
+and independent of the old certificate. Possession of a revoked certificate
+alone cannot enroll.
+
+If the revoked certificate and key are gone entirely, the node cannot complete
+the production mTLS handshake. Restore the certificate/key from trusted backup
+before re-enrolling, or use the deployment's bootstrap credential mechanism;
+production does not accept unauthenticated TLS clients.
 
 1. **Keep the node isolated** until you have rebuilt/verified it. Revocation
    blocks control-plane access; it does not stop the host from running local
@@ -235,8 +285,13 @@ enrollment uses the bootstrap-token path, which is independent of mTLS.
 **Does:**
 
 - Rejects the leaf certificate at the gRPC peer-identity interceptor with
-  `UNAUTHENTICATED` on all production mTLS node RPCs (enrollment rotation,
-  inventory, telemetry, reconcile, lifecycle, monitoring ingest).
+  `UNAUTHENTICATED` on steady-state production mTLS node RPCs (inventory,
+  telemetry, reconcile, lifecycle, monitoring ingest).
+- Rejects the revoked serial on `RotateNodeCertificate` at the handler
+  (`UNAUTHENTICATED: peer certificate is revoked`).
+- Allows `EnrollNode` to proceed **only** with a valid one-time bootstrap token;
+  the revoked certificate satisfies TLS client authentication but is not the
+  enrollment factor.
 - Prevents that serial from being rotated into a new certificate.
 - Persists across control-plane restarts (table-backed, loaded before the gRPC
   listener starts).
@@ -253,6 +308,11 @@ enrollment uses the bootstrap-token path, which is independent of mTLS.
 - Withdraw a certificate from a third-party system that trusts the same CA.
 - Purge the denylist row. `expires_at` is optional pruning metadata only — a row
   whose `expires_at` has passed still denies the serial.
+- Attribute traffic to a physical host. Until the stolen serial is identified
+  and revoked, the attacker can act as that certificate's node id (peer
+  identity pins requests to the cert's CN/SAN, not to a machine); audit records
+  will say `node-a` even if the request came from an attacker's host. Treat
+  actions by that node id as untrusted during an incident.
 - Protect a deployment running `CHV_ALLOW_INSECURE=1` (dev only).
 
 ---
@@ -267,19 +327,23 @@ the row. If you believe a row is wrong, capture evidence first, then re-enroll.
 |---|---|---|
 | All node RPCs fail after upgrade | Control plane refused to start | Check logs for `cannot load node certificate revocation snapshot`. Fix store/DB; do not start with unknown state. |
 | `chv_revocation_snapshot_reload_total{result="error"}` | Store hiccup during refresh | Last-known-good snapshot still enforced. Restore store health; revocations already loaded stay active. New revocations may be delayed. |
+| `chv_revocation_snapshot_shrink_total` increments / active gauge drops | Denylist lost rows (restore, manual delete, wrong DB) | Treat as potential resurrection of revoked certs. Diff `node_certificate_revocations` against incident records and re-revoke every missing serial immediately. |
+| Database restored / disaster recovery | Restored DB may predate recent revocations | After **any** restore, diff `node_certificate_revocations` against incident records (and audit events) and re-revoke missing serials before returning the control plane to service. The snapshot gauge and shrink metric are the alarms; a silent drop is not proof of safety. |
 | Node rejected immediately after revoke | Expected | Re-enroll (step 4). |
 | Node rejected but no denylist row | Another cause (expired cert, CN/SAN mismatch, missing serial) | Check control-plane logs for `peer mTLS certificate required` vs `peer certificate is revoked`. |
-| Rotation returns `presented certificate serial does not match` | Agent holds a stale/foreign certificate | See step 3; re-enroll if it cannot present the recorded serial. |
-| Rotation returns `the presented certificate has been revoked` | Expected for a burned serial | Re-enroll. |
+| Rotation returns `presented certificate serial does not match` | Agent holds a stale/foreign certificate | See §3.2; re-enroll if it cannot present the recorded serial. |
+| Rotation returns `peer certificate is revoked` | Expected for a burned serial | Re-enroll. |
 
 ### Migration / rollback of the feature itself
 
-- Migration `0064_node_certificate_revocations.sql` adds a new table and two
+- Migration `0067_node_certificate_revocations.sql` adds a new table and two
   indexes; it does not alter existing tables. Rollback of the binary leaves the
   table in place (inert). Do not drop it while an incident is live.
 - Refresh interval: set `CHV_REVOCATION_REFRESH_SECS` (1–300) in the control
   plane's environment file and restart. Lowering it shortens the revocation
   propagation window; it does not affect rotation, which is database-enforced.
+  There is no operator-triggered immediate reload, so authentication changes
+  take up to one interval.
 - Dev/test: `CHV_ALLOW_INSECURE=1` with a `dev`-feature build bypasses
   revocation. Production builds reject that configuration at startup.
 

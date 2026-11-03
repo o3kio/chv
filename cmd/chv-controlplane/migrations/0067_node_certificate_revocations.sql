@@ -7,8 +7,12 @@
 --
 -- Enforcement is at the gRPC peer-identity interceptor: every production
 -- mTLS request is checked against an in-memory snapshot of this table before
--- the handler runs. The table is the source of truth; the snapshot is
--- refreshed on an interval and on operator revocation.
+-- the handler runs. The table is the source of truth. The snapshot is loaded
+-- before the listener binds and reloaded on a fixed interval
+-- (CHV_REVOCATION_REFRESH_SECS, default 5s, max 300s) -- there is no
+-- operator-triggered immediate reload, so a new row takes up to one interval
+-- to affect authentication. Rotation is enforced directly in SQL and is
+-- immediate.
 --
 -- `expires_at` is optional bookkeeping for pruning: it records the revoked
 -- certificate's own not-after time so an operator can subsequently delete

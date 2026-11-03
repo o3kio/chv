@@ -3,6 +3,7 @@ use crate::inventory::InventoryService;
 use crate::lifecycle::LifecycleService;
 use crate::peer_identity::{verify_peer_matches, InsecurePeer, PeerCertificateSerial, PeerNodeId};
 use crate::reconcile::ReconcileService;
+use crate::revocation::RevocationSnapshot;
 use crate::telemetry::TelemetryService;
 use chv_controlplane_types::domain::NodeId;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -76,11 +77,27 @@ fn authoritative_peer_node_id<T>(
 
 pub struct EnrollmentServer {
     service: Arc<dyn EnrollmentService>,
+    /// Denylist used to re-check `RotateNodeCertificate`. The enrollment
+    /// service interceptor is identity-only (so a revoked certificate can
+    /// re-enroll with a bootstrap token), so rotation enforcement happens here.
+    revocation: Option<RevocationSnapshot>,
 }
 
 impl EnrollmentServer {
     pub fn new(service: Arc<dyn EnrollmentService>) -> Self {
-        Self { service }
+        Self {
+            service,
+            revocation: None,
+        }
+    }
+
+    /// Enforce the certificate denylist on `RotateNodeCertificate`.
+    ///
+    /// `EnrollNode` remains reachable with a revoked certificate (token-
+    /// authenticated recovery); rotation must not be.
+    pub fn with_revocation(mut self, revocation: RevocationSnapshot) -> Self {
+        self.revocation = Some(revocation);
+        self
     }
 }
 
@@ -111,11 +128,6 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
         request: Request<proto::RotateNodeCertificateRequest>,
     ) -> Result<Response<proto::RotateNodeCertificateResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
-            "rotate_node_certificate",
-        )?;
         // Read the peer certificate serial and security-mode marker before
         // `into_inner()` consumes the request. In secure mode the serial is
         // proof that the caller possesses the currently trusted certificate;
@@ -125,6 +137,31 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             .get::<PeerCertificateSerial>()
             .and_then(|serial| serial.0.clone());
         let allow_insecure = request.extensions().get::<InsecurePeer>().is_some();
+
+        // The enrollment service uses an identity-only interceptor so a
+        // revoked certificate can still present a one-time bootstrap token to
+        // `EnrollNode`. Rotation is *not* a recovery path: re-check the
+        // denylist here before any handler logic, mirroring the steady-state
+        // interceptor's UNAUTHENTICATED response.
+        if !allow_insecure {
+            if let Some(revocation) = &self.revocation {
+                if revocation.is_revoked(presented_serial.as_deref()) {
+                    metrics::counter!("chv_revoked_peer_rejected_total").increment(1);
+                    tracing::warn!(
+                        node_id = %request.get_ref().node_id,
+                        certificate_serial = ?presented_serial,
+                        "rejecting certificate rotation: peer certificate serial is revoked"
+                    );
+                    return Err(Status::unauthenticated("peer certificate is revoked"));
+                }
+            }
+        }
+
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "rotate_node_certificate",
+        )?;
         let _span = tracing::info_span!("rotate_node_certificate", %op_id);
         let resp = self
             .service

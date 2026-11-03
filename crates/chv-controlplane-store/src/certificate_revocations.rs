@@ -1,5 +1,27 @@
 use crate::{StoreError, StorePool};
 
+/// Canonical CHV node-certificate serial length: eight lowercase hex
+/// characters, as produced by `chv_common::gen_short_id`.
+pub const CHV_CERTIFICATE_SERIAL_HEX_LEN: usize = 8;
+
+/// Normalize operator-supplied certificate serial input.
+///
+/// CHV node certificates store `chv_common::gen_short_id()` as the DER
+/// INTEGER's ASCII bytes, so the canonical value is **exactly eight lowercase
+/// hex characters** (for example `0a3f7b2c`). Uppercase input is normalized;
+/// anything else (including the 16-hex `openssl x509 -serial` rendering or a
+/// pasted node id) is rejected so an operator cannot silently create a
+/// denylist row for a serial that does not exist.
+pub fn normalize_chv_certificate_serial(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != CHV_CERTIFICATE_SERIAL_HEX_LEN
+        || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
 /// One revoked node certificate serial.
 ///
 /// The row is a durable denylist entry: as long as it exists, the matching
@@ -195,5 +217,42 @@ impl CertificateRevocationRepository {
             return Ok(false);
         }
         Ok(self.get(certificate_serial).await?.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_chv_certificate_serial;
+
+    #[test]
+    fn canonical_serial_is_eight_lowercase_hex() {
+        assert_eq!(
+            normalize_chv_certificate_serial("0a3f7b2c").as_deref(),
+            Some("0a3f7b2c")
+        );
+        assert_eq!(
+            normalize_chv_certificate_serial(" 0A3F7B2C ").as_deref(),
+            Some("0a3f7b2c"),
+            "uppercase/whitespace is normalized, not rejected"
+        );
+    }
+
+    #[test]
+    fn openssl_hex_and_malformed_serials_are_rejected() {
+        for invalid in [
+            "0a3f7b2c2f9e1b4d6a", // openssl -serial HEX DER rendering
+            "0a:3f:7b:2c",
+            "0a3f7b2",   // too short
+            "0a3f7b2cc", // too long
+            "0a3f7b2g",  // non-hex
+            "node-a",
+            "",
+        ] {
+            assert_eq!(
+                normalize_chv_certificate_serial(invalid),
+                None,
+                "{invalid:?} must not be accepted as a CHV serial"
+            );
+        }
     }
 }

@@ -257,12 +257,28 @@ pub async fn run_refresh_loop(
     // First tick fires immediately; the snapshot is already loaded at startup,
     // but an immediate re-read closes the window between load and server start.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_count = snapshot.len();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 match snapshot.reload(&repo).await {
                     Ok(count) => {
+                        if count < last_count {
+                            // A drop in denylist size is usually a restore or a
+                            // manual delete and can resurrect revoked serials.
+                            // Surface it for alerting; never auto-correct.
+                            metrics::counter!("chv_revocation_snapshot_shrink_total")
+                                .increment(1);
+                            tracing::warn!(
+                                previous = last_count,
+                                current = count,
+                                "certificate revocation snapshot shrank; a database restore or \
+                                 manual deletion may have resurrected revoked certificates. \
+                                 Compare node_certificate_revocations against incident records."
+                            );
+                        }
+                        last_count = count;
                         metrics::gauge!("chv_node_certificate_revocations_active")
                             .set(count as f64);
                         metrics::counter!(

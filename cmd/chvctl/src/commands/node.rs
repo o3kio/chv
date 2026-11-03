@@ -26,7 +26,7 @@ pub enum NodeCommands {
         #[arg(long)]
         enable: bool,
     },
-    /// Revoke a node certificate (admin; denylist, checked at mTLS handshake)
+    /// Revoke a node certificate (admin; denylist checked per-RPC by the gRPC interceptor)
     RevokeCertificate {
         /// Node identifier
         node_id: String,

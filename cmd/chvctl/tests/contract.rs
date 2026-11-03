@@ -1886,7 +1886,7 @@ async fn node_maintenance_exit_row() {
 #[tokio::test]
 async fn node_revoke_certificate_row() {
     let h = Harness::start().await;
-    h.seed_node_with_serial("n-1", "serial-live").await;
+    h.seed_node_with_serial("n-1", "0a3f7b2c").await;
     let token = h.seed_jwt_as("admin").await;
     let client = h.client(Some(token));
 
@@ -1907,7 +1907,7 @@ async fn node_revoke_certificate_row() {
     let repo = chv_controlplane_store::CertificateRevocationRepository::new(h.pool.clone());
     let rows = repo.list_for_node("n-1").await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].certificate_serial, "serial-live");
+    assert_eq!(rows[0].certificate_serial, "0a3f7b2c");
     assert_eq!(rows[0].reason, "host compromise");
 }
 

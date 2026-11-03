@@ -26,6 +26,16 @@
 //! 5. Provides [`verify_peer_matches`] for handlers to reject any request whose
 //!    asserted `node_id` does not match the peer's certificate-derived identity.
 //!
+//! ## Enrollment recovery exemption
+//!
+//! [`PeerIdentityInterceptor::for_enrollment`] keeps steps 1–3 and 5 but skips
+//! the denylist (step 4) for the enrollment service. A revoked node must be
+//! able to present a fresh, high-entropy, one-time bootstrap token to
+//! `EnrollNode`; the token is the authentication factor there, not the old
+//! certificate. `RotateNodeCertificate` re-checks the serial at its handler and
+//! every other service uses [`PeerIdentityInterceptor::new`], so steady-state
+//! RPCs never bypass revocation.
+//!
 //! ## Insecure-mode passthrough
 //!
 //! When `CHV_ALLOW_INSECURE=1` is set (dev/test mode, gated behind the `dev`
@@ -77,6 +87,16 @@ pub struct PeerCertificateSerial(pub Option<String>);
 #[derive(Debug, Clone, Copy)]
 pub struct InsecurePeer;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevocationPolicy {
+    /// Reject a peer whose serial is denied (steady-state RPCs).
+    Enforce,
+    /// Extract/bind the peer identity but do not consult the denylist. Used
+    /// only by the enrollment service so a node holding a revoked certificate
+    /// can present a fresh one-time bootstrap token (see [`PeerIdentityInterceptor::for_enrollment`]).
+    Skip,
+}
+
 /// Tonic interceptor that pins the request's peer identity from the mTLS
 /// client certificate.
 ///
@@ -96,6 +116,7 @@ pub struct InsecurePeer;
 pub struct PeerIdentityInterceptor {
     allow_insecure: bool,
     revocation: RevocationSnapshot,
+    revocation_policy: RevocationPolicy,
 }
 
 impl PeerIdentityInterceptor {
@@ -122,11 +143,50 @@ impl PeerIdentityInterceptor {
         allow_insecure: bool,
         revocation: RevocationSnapshot,
     ) -> Result<Self, ControlPlaneServiceError> {
+        Self::with_policy(allow_insecure, revocation, RevocationPolicy::Enforce)
+    }
+
+    /// Construct an identity-only interceptor for the enrollment service.
+    ///
+    /// It still requires a parseable mTLS leaf certificate in secure mode and
+    /// binds [`PeerNodeId`]/[`PeerCertificateSerial`] exactly like
+    /// [`Self::new`], but it deliberately **skips the revocation denylist**.
+    /// This is the controlled recovery path (#661): a node whose certificate
+    /// was revoked must be able to call `EnrollNode` with a fresh, high-entropy,
+    /// one-time bootstrap token. The token — not the old certificate — is the
+    /// authentication factor for enrollment.
+    ///
+    /// This exemption is scoped to the enrollment service:
+    /// `RotateNodeCertificate` re-checks the serial at its handler, and every
+    /// other node-facing service uses [`Self::new`] (full enforcement).
+    pub fn for_enrollment(
+        allow_insecure: bool,
+        revocation: RevocationSnapshot,
+    ) -> Result<Self, ControlPlaneServiceError> {
+        Self::with_policy(allow_insecure, revocation, RevocationPolicy::Skip)
+    }
+
+    fn with_policy(
+        allow_insecure: bool,
+        revocation: RevocationSnapshot,
+        revocation_policy: RevocationPolicy,
+    ) -> Result<Self, ControlPlaneServiceError> {
         validate_security_mode(allow_insecure)?;
         Ok(Self {
             allow_insecure,
             revocation,
+            revocation_policy,
         })
+    }
+
+    /// Check a serial against the denylist using the current snapshot.
+    ///
+    /// Exposed so RPC handlers that sit behind the identity-only enrollment
+    /// interceptor can still enforce revocation (notably
+    /// `RotateNodeCertificate`). Steady-state services rely on
+    /// [`Self::intercept`] instead.
+    pub fn is_revoked(&self, certificate_serial: Option<&str>) -> bool {
+        self.revocation.is_revoked(certificate_serial)
     }
 
     /// Apply the interceptor to a request, mutating its extensions in-place.
@@ -141,22 +201,14 @@ impl PeerIdentityInterceptor {
             return Ok(request);
         }
 
-        let peer_node_id = match extract_peer_node_id_from_extensions(request.extensions()) {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::warn!(error = %err, "rejecting request: peer identity extraction failed");
-                return Err(tonic::Status::unauthenticated(
-                    "peer mTLS certificate required",
-                ));
-            }
-        };
-
-        let peer_serial = match extract_peer_certificate_serial_from_extensions(
+        // Parse the leaf certificate once and derive both the node identity
+        // and serial from that single X.509 parse (L2 review finding).
+        let (peer_node_id, peer_serial) = match extract_peer_identity_from_extensions(
             request.extensions(),
         ) {
-            Ok(serial) => serial,
+            Ok(identity) => identity,
             Err(err) => {
-                tracing::warn!(error = %err, "rejecting request: peer certificate serial extraction failed");
+                tracing::warn!(error = %err, "rejecting request: peer identity extraction failed");
                 return Err(tonic::Status::unauthenticated(
                     "peer mTLS certificate required",
                 ));
@@ -179,6 +231,28 @@ impl PeerIdentityInterceptor {
         peer_node_id: NodeId,
         peer_serial: Option<String>,
     ) -> Result<tonic::Request<T>, tonic::Status> {
+        // Enrollment recovery exemption: `EnrollNode` is authenticated by a
+        // one-time bootstrap token, not by the old certificate. Bind the
+        // identity/serial so downstream checks still work, but do not consult
+        // the denylist here. Log loudly when the admitted peer is revoked so
+        // the recovery path is auditable.
+        if self.revocation_policy == RevocationPolicy::Skip {
+            if self.revocation.is_revoked(peer_serial.as_deref()) {
+                metrics::counter!("chv_enrollment_revoked_peer_admitted_total").increment(1);
+                tracing::warn!(
+                    peer_node_id = %peer_node_id,
+                    certificate_serial = ?peer_serial,
+                    "admitting revoked certificate to the enrollment service; \
+                     a valid one-time bootstrap token is still required"
+                );
+            }
+            request.extensions_mut().insert(PeerNodeId(peer_node_id));
+            request
+                .extensions_mut()
+                .insert(PeerCertificateSerial(peer_serial));
+            return Ok(request);
+        }
+
         // Revocation is keyed by serial. A certificate whose serial cannot be
         // represented cannot be checked against the denylist, so it is not a
         // usable production credential: fail closed instead of admitting an
@@ -261,18 +335,19 @@ pub enum PeerIdentityError {
     InvalidNodeId(String),
 }
 
-/// Extract the peer's authoritative `NodeId` from the leaf certificate found in
-/// the request's [`TlsConnectInfo`] extension.
+/// Extract the peer's authoritative [`NodeId`] and leaf certificate serial
+/// with a **single** X.509 parse.
 ///
 /// Identity is taken from (in order of preference):
 /// 1. The first DNS-type SAN entry.
 /// 2. The certificate Subject's CommonName.
 ///
 /// This matches how `CaBackedCertificateIssuer` mints node certs (CN = node_id,
-/// SAN = DNS:node_id).
-pub fn extract_peer_node_id_from_extensions(
+/// SAN = DNS:node_id). The serial uses the same textual form stored in
+/// `nodes.certificate_serial` (see [`parse_serial_from_der`]).
+pub fn extract_peer_identity_from_extensions(
     extensions: &tonic::Extensions,
-) -> Result<NodeId, PeerIdentityError> {
+) -> Result<(NodeId, Option<String>), PeerIdentityError> {
     use tonic::transport::server::TcpConnectInfo;
 
     let tls_info: &TlsConnectInfo<TcpConnectInfo> = extensions
@@ -287,7 +362,15 @@ pub fn extract_peer_node_id_from_extensions(
         .first()
         .ok_or(PeerIdentityError::NoClientCertificate)?;
 
-    parse_node_id_from_der(leaf.as_ref())
+    parse_peer_identity_from_der(leaf.as_ref())
+}
+
+/// Extract the peer's authoritative `NodeId` from the leaf certificate found in
+/// the request's [`TlsConnectInfo`] extension.
+pub fn extract_peer_node_id_from_extensions(
+    extensions: &tonic::Extensions,
+) -> Result<NodeId, PeerIdentityError> {
+    extract_peer_identity_from_extensions(extensions).map(|(node_id, _)| node_id)
 }
 
 /// Extract the peer's leaf certificate serial from the request's
@@ -298,50 +381,26 @@ pub fn extract_peer_node_id_from_extensions(
 pub fn extract_peer_certificate_serial_from_extensions(
     extensions: &tonic::Extensions,
 ) -> Result<Option<String>, PeerIdentityError> {
-    use tonic::transport::server::TcpConnectInfo;
-
-    let tls_info: &TlsConnectInfo<TcpConnectInfo> = extensions
-        .get::<TlsConnectInfo<TcpConnectInfo>>()
-        .ok_or(PeerIdentityError::MissingTlsInfo)?;
-
-    let certs: Arc<Vec<_>> = tls_info
-        .peer_certs()
-        .ok_or(PeerIdentityError::NoClientCertificate)?;
-
-    let leaf = certs
-        .first()
-        .ok_or(PeerIdentityError::NoClientCertificate)?;
-
-    parse_serial_from_der(leaf.as_ref())
+    extract_peer_identity_from_extensions(extensions).map(|(_, serial)| serial)
 }
 
-/// Parse a DER-encoded X.509 certificate and return its serial in the same
-/// textual form `CaBackedCertificateIssuer` records in
-/// `nodes.certificate_serial`.
+/// Parse a DER-encoded X.509 certificate **once** and return both the asserted
+/// node_id and the textual serial.
 ///
-/// `CaBackedCertificateIssuer` stores `chv_common::gen_short_id()` (an
-/// 8-character lowercase-ASCII hex string) as the DER INTEGER's big-endian
-/// bytes. `x509_parser`'s `cert.raw_serial()` returns those DER content
-/// octets, not a decimal/hex display string, so for CHV-issued certs it is
-/// byte-for-byte the original ASCII serial.
-///
-/// Two DER normalization rules must be undone explicitly:
-/// - A positive INTEGER whose high bit is set is encoded with one `0x00` sign
-///   byte. That padding is not part of the serial and is stripped here.
-/// - `yasna` (via `rcgen`) strips leading `0x00` bytes before encoding, so an
-///   original serial with leading zero bytes cannot be recovered — for CHV
-///   ASCII serials this is irrelevant because ASCII `'0'` is `0x30`, not
-///   `0x00`. A serial of only zero bytes therefore yields [`None`].
-///
-/// A certificate carrying a non-ASCII/binary serial cannot be compared to the
-/// stored textual serial; it is rendered as lowercase hex so handlers still
-/// see a deterministic value and fail closed on the mismatch.
-pub fn parse_serial_from_der(der: &[u8]) -> Result<Option<String>, PeerIdentityError> {
+/// Production interception uses this instead of parsing the leaf twice (node
+/// id + serial), which halves the X.509 work on the mTLS hot path.
+pub fn parse_peer_identity_from_der(
+    der: &[u8],
+) -> Result<(NodeId, Option<String>), PeerIdentityError> {
     use x509_parser::prelude::*;
 
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|e| PeerIdentityError::InvalidCertificate(e.to_string()))?;
 
+    Ok((node_id_from_cert(&cert)?, serial_from_cert(&cert)))
+}
+
+fn serial_from_cert(cert: &x509_parser::certificate::X509Certificate<'_>) -> Option<String> {
     let raw = cert.raw_serial();
     // Strip exactly one DER sign-padding byte. Any other leading zero was
     // already removed by the issuer's DER encoder before the cert was minted.
@@ -351,27 +410,22 @@ pub fn parse_serial_from_der(der: &[u8]) -> Result<Option<String>, PeerIdentityE
     };
 
     if unsigned.is_empty() || unsigned.iter().all(|b| *b == 0) {
-        return Ok(None);
+        return None;
     }
 
     // CHV serials are printable ASCII; decode those exactly so equality with
     // the stored `certificate_serial` is byte-for-byte. Anything else is
     // canonicalized to lowercase hex rather than lossy-decoded.
-    Ok(Some(match std::str::from_utf8(unsigned) {
+    Some(match std::str::from_utf8(unsigned) {
         Ok(text) if text.bytes().all(|b| b.is_ascii_graphic()) => text.to_string(),
         _ => unsigned.iter().map(|b| format!("{b:02x}")).collect(),
-    }))
+    })
 }
 
-/// Parse a DER-encoded X.509 certificate and return its asserted node_id.
-///
-/// Exposed for unit tests. Production code goes through
-/// [`extract_peer_node_id_from_extensions`].
-pub fn parse_node_id_from_der(der: &[u8]) -> Result<NodeId, PeerIdentityError> {
+fn node_id_from_cert(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<NodeId, PeerIdentityError> {
     use x509_parser::prelude::*;
-
-    let (_, cert) = X509Certificate::from_der(der)
-        .map_err(|e| PeerIdentityError::InvalidCertificate(e.to_string()))?;
 
     // Prefer DNS SAN — that's what `CaBackedCertificateIssuer` populates.
     if let Ok(Some(ext)) = cert.subject_alternative_name() {
@@ -401,6 +455,49 @@ pub fn parse_node_id_from_der(der: &[u8]) -> Result<NodeId, PeerIdentityError> {
     }
 
     Err(PeerIdentityError::NoNodeIdInCertificate)
+}
+
+/// Parse a DER-encoded X.509 certificate and return its serial in the same
+/// textual form `CaBackedCertificateIssuer` records in
+/// `nodes.certificate_serial`.
+///
+/// `CaBackedCertificateIssuer` stores `chv_common::gen_short_id()` (an
+/// 8-character lowercase-ASCII hex string) as the DER INTEGER's big-endian
+/// bytes. `x509_parser`'s `cert.raw_serial()` returns those DER content
+/// octets, not a decimal/hex display string, so for CHV-issued certs it is
+/// byte-for-byte the original ASCII serial.
+///
+/// Two DER normalization rules must be undone explicitly:
+/// - A positive INTEGER whose high bit is set is encoded with one `0x00` sign
+///   byte. That padding is not part of the serial and is stripped here.
+/// - `yasna` (via `rcgen`) strips leading `0x00` bytes before encoding, so an
+///   original serial with leading zero bytes cannot be recovered — for CHV
+///   ASCII serials this is irrelevant because ASCII `'0'` is `0x30`, not
+///   `0x00`. A serial of only zero bytes therefore yields [`None`].
+///
+/// A certificate carrying a non-ASCII/binary serial cannot be compared to the
+/// stored textual serial; it is rendered as lowercase hex so handlers still
+/// see a deterministic value and fail closed on the mismatch.
+pub fn parse_serial_from_der(der: &[u8]) -> Result<Option<String>, PeerIdentityError> {
+    use x509_parser::prelude::*;
+
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| PeerIdentityError::InvalidCertificate(e.to_string()))?;
+
+    Ok(serial_from_cert(&cert))
+}
+
+/// Parse a DER-encoded X.509 certificate and return its asserted node_id.
+///
+/// Exposed for unit tests. Production code goes through
+/// [`extract_peer_node_id_from_extensions`].
+pub fn parse_node_id_from_der(der: &[u8]) -> Result<NodeId, PeerIdentityError> {
+    use x509_parser::prelude::*;
+
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| PeerIdentityError::InvalidCertificate(e.to_string()))?;
+
+    node_id_from_cert(&cert)
 }
 
 /// Verify that the asserted `requested` node_id matches the peer's
@@ -668,6 +765,68 @@ mod tests {
         assert_eq!(
             request.extensions().get::<PeerCertificateSerial>(),
             Some(&PeerCertificateSerial(Some("good-serial".into())))
+        );
+    }
+
+    #[test]
+    fn enrollment_interceptor_admits_revoked_serial_but_binds_identity() {
+        // B1 (#661): a revoked node must be able to reach `EnrollNode` with a
+        // fresh one-time bootstrap token. The enrollment interceptor skips the
+        // denylist but still binds the certificate-derived identity so
+        // downstream handler checks keep working.
+        let interceptor = PeerIdentityInterceptor::for_enrollment(
+            false,
+            RevocationSnapshot::from_serials(["revoked-serial"]),
+        )
+        .unwrap();
+
+        let request = interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                Some("revoked-serial".into()),
+            )
+            .expect("enrollment recovery path must accept the revoked certificate");
+
+        assert_eq!(
+            request
+                .extensions()
+                .get::<PeerNodeId>()
+                .map(|id| id.as_node_id().to_string()),
+            Some("node-a".into())
+        );
+        assert_eq!(
+            request.extensions().get::<PeerCertificateSerial>(),
+            Some(&PeerCertificateSerial(Some("revoked-serial".into())))
+        );
+        // The same serial is still denied by the steady-state interceptor.
+        let steady = PeerIdentityInterceptor::new(
+            false,
+            RevocationSnapshot::from_serials(["revoked-serial"]),
+        )
+        .unwrap();
+        assert!(steady.is_revoked(Some("revoked-serial")));
+    }
+
+    #[test]
+    fn enrollment_interceptor_admits_missing_serial_identity_only() {
+        // Enrollment does not need the serial for authentication; the token
+        // is the factor. A foreign cert without a representable serial must
+        // still enroll rather than be locked out by the revocation check.
+        let interceptor =
+            PeerIdentityInterceptor::for_enrollment(false, RevocationSnapshot::empty()).unwrap();
+
+        let request = interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                None,
+            )
+            .expect("identity-only enrollment must not require a serial");
+
+        assert_eq!(
+            request.extensions().get::<PeerCertificateSerial>(),
+            Some(&PeerCertificateSerial(None))
         );
     }
 
