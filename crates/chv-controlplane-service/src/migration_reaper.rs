@@ -121,10 +121,6 @@ impl MigrationReaper {
             reason: format!("migration reaper: failed to query stalled migrations: {e}"),
         })?;
 
-        if stalled.is_empty() {
-            return Ok(());
-        }
-
         let candidates = stalled.len();
         let mut reaped = 0usize;
         for row in &stalled {
@@ -175,10 +171,99 @@ impl MigrationReaper {
                     "migration reaper: failed to update operation record"
                 );
             }
+        }
 
-            // Best-effort: resume the source VM so it doesn't stay permanently
-            // paused — but only after proving the sender is quiescent.
-            match self.resume_source_vm(row).await {
+        if reaped > 0 {
+            metrics::counter!("migration_reaper_reaped_total").increment(reaped as u64);
+            metrics::counter!("migration_reaper_stalled_total").increment(reaped as u64);
+            info!(
+                count = reaped,
+                candidates, "migration reaper: reaped stalled migrations"
+            );
+        }
+
+        // Resume is a separate, durable pass: the reap is final (the row is
+        // terminal and will never be scanned again), so every unresolved
+        // resume must be retried on subsequent ticks. Throttling, the
+        // quiescence gate, and node liveness are re-evaluated each time.
+        self.drain_pending_resumes().await?;
+
+        Ok(())
+    }
+
+    /// Rows whose source-VM resume has not reached a final state.
+    ///
+    /// `stalled_secs` is the *effective* silence, not merely the gap measured
+    /// when the reaper failed the row. `fail_migration` overwrites
+    /// `updated_at` with the reap time, so `reaper_stalled_secs` freezes the
+    /// pre-reap progress gap. If the gate only ever compared that frozen value
+    /// against `resume_quiescence_secs()` (which has a `STALE_ROW_SECS`
+    /// floor), a reaper configured below the floor — e.g. the 60 s test
+    /// timeout — would defer the resume forever even though the sender has
+    /// been silent for far longer by then. Adding the time elapsed since the
+    /// reap makes the effective silence grow monotonically and lets the retry
+    /// pass eventually satisfy the floor.
+    async fn pending_resumes(&self) -> Result<Vec<StuckMigrationRow>, ChvError> {
+        sqlx::query_as(
+            r#"
+            SELECT
+                m.migration_id,
+                m.operation_id,
+                m.vm_id,
+                m.source_node_id,
+                m.phase,
+                m.started_at,
+                m.updated_at AS last_progress_at,
+                CAST(
+                    (julianday('now') - julianday(m.started_at)) * 86400
+                    AS INTEGER
+                ) AS started_age_secs,
+                COALESCE(m.reaper_stalled_secs, 0)
+                    + CAST(
+                        (julianday('now') - julianday(m.updated_at)) * 86400
+                        AS INTEGER
+                    ) AS stalled_secs
+            FROM migrations m
+            WHERE m.reaper_resume_state = 'pending'
+            ORDER BY m.updated_at ASC
+            LIMIT 64
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ChvError::Internal {
+            reason: format!("migration reaper: failed to query pending resumes: {e}"),
+        })
+    }
+
+    /// Retry every source-VM resume that has not reached a final state.
+    ///
+    /// A `SkippedSenderActive` refusal is not permanent: the quiescence window
+    /// may simply not have elapsed yet. Likewise a source node that is not
+    /// heartbeating now may report in a minute. Keeping the intent in the
+    /// database (rather than the reaper's loop stack) is what prevents a
+    /// transient refusal from stranding the VM paused forever.
+    async fn drain_pending_resumes(&self) -> Result<(), ChvError> {
+        let pending = self.pending_resumes().await?;
+
+        for row in &pending {
+            if let Err(e) = sqlx::query(
+                "UPDATE migrations SET reaper_resume_attempts = reaper_resume_attempts + 1 \
+                 WHERE migration_id = ?",
+            )
+            .bind(&row.migration_id)
+            .execute(&self.pool)
+            .await
+            {
+                warn!(
+                    migration_id = %row.migration_id,
+                    error = %e,
+                    "migration reaper: failed to record resume attempt"
+                );
+            }
+
+            let outcome = self.resume_source_vm(row).await;
+            let state = match &outcome {
                 Ok(ResumeOutcome::Resumed) => {
                     info!(
                         migration_id = %row.migration_id,
@@ -186,8 +271,14 @@ impl MigrationReaper {
                         source_node_id = %row.source_node_id,
                         "migration reaper: resumed source VM after migration stall"
                     );
+                    Some("resumed")
                 }
-                Ok(outcome) => {
+                Ok(ResumeOutcome::SkippedNotTerminal { .. }) => Some("cancelled"),
+                Ok(ResumeOutcome::SkippedMissing) => Some("missing"),
+                Ok(
+                    outcome @ (ResumeOutcome::SkippedSenderActive { .. }
+                    | ResumeOutcome::SkippedSourceNodeNotReporting { .. }),
+                ) => {
                     metrics::counter!(
                         "migration_reaper_resume_skipped_total",
                         "reason" => outcome.reason()
@@ -198,8 +289,9 @@ impl MigrationReaper {
                         vm_id = %row.vm_id,
                         source_node_id = %row.source_node_id,
                         outcome = ?outcome,
-                        "migration reaper: refusing to resume source VM (sender liveness not proven); VM may remain paused until an operator intervenes"
+                        "migration reaper: deferring source VM resume (sender liveness not yet proven); retrying next tick"
                     );
+                    None
                 }
                 Err(e) => {
                     warn!(
@@ -207,19 +299,29 @@ impl MigrationReaper {
                         vm_id = %row.vm_id,
                         source_node_id = %row.source_node_id,
                         error = %e,
-                        "migration reaper: failed to resume source VM after timeout — VM may be stuck paused"
+                        "migration reaper: failed to resume source VM; will retry next tick"
+                    );
+                    None
+                }
+            };
+
+            if let Some(state) = state {
+                if let Err(e) = sqlx::query(
+                    "UPDATE migrations SET reaper_resume_state = ? WHERE migration_id = ?",
+                )
+                .bind(state)
+                .bind(&row.migration_id)
+                .execute(&self.pool)
+                .await
+                {
+                    warn!(
+                        migration_id = %row.migration_id,
+                        state,
+                        error = %e,
+                        "migration reaper: failed to persist resume state"
                     );
                 }
             }
-        }
-
-        if reaped > 0 {
-            metrics::counter!("migration_reaper_reaped_total").increment(reaped as u64);
-            metrics::counter!("migration_reaper_stalled_total").increment(reaped as u64);
-            info!(
-                count = reaped,
-                candidates, "migration reaper: reaped stalled migrations"
-            );
         }
 
         Ok(())
@@ -240,12 +342,15 @@ impl MigrationReaper {
                SET phase = 'Failed',
                    error_message = ?,
                    completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   reaper_resume_state = 'pending',
+                   reaper_stalled_secs = ?
                WHERE migration_id = ?
                  AND phase NOT IN ('Completed', 'Failed', 'RolledBack')
                  AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' seconds')"#,
         )
         .bind(&error_msg)
+        .bind(row.stalled_secs)
         .bind(&row.migration_id)
         .bind(format!("-{}", self.stall_timeout_secs))
         .execute(&self.pool)
@@ -271,7 +376,7 @@ impl MigrationReaper {
                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                    completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                WHERE operation_id = ?
-                 AND status NOT IN ('Succeeded', 'Failed', 'Rejected', 'Stale', 'Conflict', 'AwaitingOperatorInput')"#,
+                 AND status NOT IN ('Succeeded', 'Failed', 'Rejected', 'Cancelled', 'Stale', 'Conflict')"#,
         )
         .bind(operation_id)
         .execute(&self.pool)
@@ -637,6 +742,146 @@ mod tests {
         assert!(
             error_message.contains("stalled"),
             "reap reason should distinguish a stall from a long-running migration: {error_message}"
+        );
+
+        // The resume intent must be durable and retried: the row is terminal
+        // now, so a one-shot attempt inside the reap loop would strand the
+        // source VM whenever the first attempt is refused.
+        let (state, stalled_secs, attempts): (Option<String>, Option<i64>, i64) = sqlx::query_as(
+            "SELECT reaper_resume_state, reaper_stalled_secs, reaper_resume_attempts \
+             FROM migrations WHERE migration_id = ?",
+        )
+        .bind("stalled")
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read resume bookkeeping");
+        assert_eq!(state.as_deref(), Some("pending"));
+        assert_eq!(stalled_secs, Some(3_600));
+        assert!(attempts >= 1, "the reap tick must attempt the resume");
+
+        reaper
+            .reap_stuck_migrations()
+            .await
+            .expect("second reaper tick should succeed");
+        let (state_after, attempts_after): (Option<String>, i64) = sqlx::query_as(
+            "SELECT reaper_resume_state, reaper_resume_attempts FROM migrations WHERE migration_id = ?",
+        )
+        .bind("stalled")
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read attempts");
+        assert!(
+            attempts_after > attempts,
+            "an unresolved resume must be retried on the next tick ({attempts} -> {attempts_after}, state={state_after:?})"
+        );
+    }
+
+    /// A resume whose frozen pre-reap gap is below the quiescence floor must
+    /// not defer forever: the effective silence grows with the time elapsed
+    /// since the reap, so a later retry tick can satisfy the floor.
+    #[tokio::test]
+    async fn pending_resume_effective_silence_grows_after_reap() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "slow-retry", "MemoryMigration", -10_800, -70).await;
+
+        // 60 s is below STALE_ROW_SECS (90): the frozen pre-reap gap alone
+        // can never satisfy the resume gate.
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        reaper
+            .reap_stuck_migrations()
+            .await
+            .expect("reaper tick should succeed");
+
+        let frozen: Option<i64> =
+            sqlx::query_scalar("SELECT reaper_stalled_secs FROM migrations WHERE migration_id = ?")
+                .bind("slow-retry")
+                .fetch_one(&test_db.pool)
+                .await
+                .expect("read frozen stall");
+        let frozen = frozen.expect("reap must record the pre-reap gap");
+        assert!(
+            frozen < reaper.resume_quiescence_secs(),
+            "scenario requires a frozen gap below the floor ({frozen} < {})",
+            reaper.resume_quiescence_secs()
+        );
+
+        let before = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes");
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0].stalled_secs >= frozen,
+            "effective silence starts at the frozen gap ({} >= {frozen})",
+            before[0].stalled_secs
+        );
+
+        // Simulate 45 s of retry ticks by aging the reap timestamp.
+        sqlx::query(
+            "UPDATE migrations \
+             SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-45 seconds') \
+             WHERE migration_id = ?",
+        )
+        .bind("slow-retry")
+        .execute(&test_db.pool)
+        .await
+        .expect("age the reap timestamp");
+
+        let after = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes");
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].stalled_secs >= frozen + 45,
+            "effective silence must grow with time since the reap ({} -> {}, frozen {frozen})",
+            before[0].stalled_secs,
+            after[0].stalled_secs
+        );
+        assert!(
+            after[0].stalled_secs >= reaper.resume_quiescence_secs(),
+            "after enough retry time the resume gate must become satisfiable ({} >= {})",
+            after[0].stalled_secs,
+            reaper.resume_quiescence_secs()
+        );
+    }
+
+    /// `fail_operation` must use the same terminal set as
+    /// `OperationStatus::is_terminal()`: a cancelled operation stays cancelled,
+    /// while an active `AwaitingOperatorInput` operation is failed (the
+    /// migration it tracks is dead, so waiting for an operator forever is a
+    /// stall).
+    #[tokio::test]
+    async fn fail_operation_matches_operation_status_terminal_set() {
+        let test_db = TestDb::new().await;
+        for (id, status) in [
+            ("cancelled", "Cancelled"),
+            ("awaiting", "AwaitingOperatorInput"),
+        ] {
+            seed_migration(&test_db.pool, id, "ConvergingDisk", -10_800, -3_600).await;
+            sqlx::query("UPDATE operations SET status = ? WHERE operation_id = ?")
+                .bind(status)
+                .bind(format!("op-{id}"))
+                .execute(&test_db.pool)
+                .await
+                .expect("set operation status");
+        }
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        reaper
+            .reap_stuck_migrations()
+            .await
+            .expect("reaper tick should succeed");
+
+        assert_eq!(
+            operation_status(&test_db.pool, "cancelled").await,
+            "Cancelled",
+            "a terminal Cancelled operation must not be rewritten"
+        );
+        assert_eq!(
+            operation_status(&test_db.pool, "awaiting").await,
+            "Failed",
+            "an active AwaitingOperatorInput operation must be failed with its migration"
         );
     }
 

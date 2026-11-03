@@ -3,9 +3,9 @@
 > **Status: historical roadmap, not a capability claim.** This document records
 > sprint-era intent. Delivered/partial statements can lag the code; the
 > authoritative supported envelope is
-> [`docs/DEPLOYMENT-ARCHITECTURE.md`](docs/DEPLOYMENT-ARCHITECTURE.md) §7 with
-> the capability table in §9. Stale entries that were verified against the code
-> are corrected inline below.
+> [`docs/DEPLOYMENT-ARCHITECTURE.md`](docs/DEPLOYMENT-ARCHITECTURE.md) §7 and
+> the known boundaries are in §9. Stale entries that were verified against the
+> code are corrected inline below.
 
 Based on the comprehensive repository review and existing roadmap, the following is a detailed, phased implementation plan to bring the CHV platform to production readiness.
 

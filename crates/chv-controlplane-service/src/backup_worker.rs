@@ -132,6 +132,14 @@ impl BackupWorker {
                 .unwrap_or(now)
         });
 
+        // Retention is independent of the execution fence and of whether this
+        // schedule is due: it only prunes rows whose retention policy has
+        // expired. It used to run only inside the "created a new job" branch,
+        // which the #654 fence made unreachable — so old rows (and their
+        // artifact records) accumulated forever while the feature was
+        // fenced. Run it for every schedule on every scheduler pass.
+        self.enforce_retention(schedule).await;
+
         // Find the next occurrence after the reference time
         let next_due = cron.after(&reference_time).next();
 
@@ -204,120 +212,117 @@ impl BackupWorker {
                     "created scheduled backup job"
                 );
 
-                // Enforce retention: prune old completed jobs beyond retention_count.
-                // List the jobs first, clean up remote artifacts, then batch-delete DB rows.
-                if schedule.retention_count > 0 {
-                    match self
-                        .backup_repo
-                        .list_old_jobs_for_count_retention(
-                            &schedule.schedule_id,
-                            schedule.retention_count,
-                        )
-                        .await
-                    {
-                        Ok(old_jobs) if !old_jobs.is_empty() => {
-                            let mut job_ids: Vec<&str> = Vec::new();
-                            for old_job in &old_jobs {
-                                if !Self::artifact_removal_allows_row_delete(
-                                    old_job,
-                                    schedule.s3_access_key.clone(),
-                                    schedule.s3_secret_key.clone(),
-                                )
-                                .await
-                                {
-                                    // Delete failed: keep the row so the
-                                    // artifact is recorded and the next pass
-                                    // retries (#655).
-                                    continue;
-                                }
-                                job_ids.push(old_job.job_id.as_str());
-                            }
-                            match self.backup_repo.delete_jobs_by_ids(&job_ids).await {
-                                Ok(deleted) if deleted > 0 => {
-                                    info!(
-                                        schedule_id = %schedule.schedule_id,
-                                        vm_id = %schedule.vm_id,
-                                        pruned_count = deleted,
-                                        retention_count = schedule.retention_count,
-                                        "pruned old backup jobs by count"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        schedule_id = %schedule.schedule_id,
-                                        error = %e,
-                                        "failed to delete old backup jobs by count"
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                schedule_id = %schedule.schedule_id,
-                                error = %e,
-                                "failed to list old backup jobs for count retention"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Enforce retention: prune old completed jobs beyond retention_days
-                if schedule.retention_days > 0 {
-                    match self
-                        .backup_repo
-                        .list_old_jobs_for_retention(&schedule.schedule_id, schedule.retention_days)
-                        .await
-                    {
-                        Ok(old_jobs) if !old_jobs.is_empty() => {
-                            for old_job in &old_jobs {
-                                // Attempt to delete the remote artifact if
-                                // shipping was used. A failed delete keeps the
-                                // row (and its record of the artifact) so the
-                                // next retention pass retries instead of
-                                // silently orphaning the object (#655).
-                                if !Self::artifact_removal_allows_row_delete(
-                                    old_job,
-                                    schedule.s3_access_key.clone(),
-                                    schedule.s3_secret_key.clone(),
-                                )
-                                .await
-                                {
-                                    continue;
-                                }
-
-                                if let Err(e) =
-                                    self.backup_repo.delete_job_by_id(&old_job.job_id).await
-                                {
-                                    warn!(
-                                        job_id = %old_job.job_id,
-                                        error = %e,
-                                        "failed to delete old backup job during retention cleanup"
-                                    );
-                                } else {
-                                    info!(
-                                        job_id = %old_job.job_id,
-                                        retention_days = schedule.retention_days,
-                                        "pruned old backup job by age"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                schedule_id = %schedule.schedule_id,
-                                error = %e,
-                                "failed to list old backup jobs for retention cleanup"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                // Retention was enforced above (before the fence), so no
+                // pruning is duplicated here.
             }
         }
 
         Ok(())
+    }
+
+    /// Apply the schedule's count- and age-based retention policies.
+    ///
+    /// Best-effort by design: a retention failure must not stop the scheduler
+    /// from evaluating other schedules or (in an unfenced build) creating the
+    /// next run. Every failure is logged and leaves the row in place, so the
+    /// next pass retries the artifact delete instead of orphaning it (#655).
+    async fn enforce_retention(&self, schedule: &chv_controlplane_store::BackupScheduleRow) {
+        if schedule.retention_count > 0 {
+            match self
+                .backup_repo
+                .list_old_jobs_for_count_retention(&schedule.schedule_id, schedule.retention_count)
+                .await
+            {
+                Ok(old_jobs) if !old_jobs.is_empty() => {
+                    let mut job_ids: Vec<&str> = Vec::new();
+                    for old_job in &old_jobs {
+                        if !Self::artifact_removal_allows_row_delete(
+                            old_job,
+                            schedule.s3_access_key.clone(),
+                            schedule.s3_secret_key.clone(),
+                        )
+                        .await
+                        {
+                            // Delete failed: keep the row so the artifact is
+                            // recorded and the next pass retries (#655).
+                            continue;
+                        }
+                        job_ids.push(old_job.job_id.as_str());
+                    }
+                    match self.backup_repo.delete_jobs_by_ids(&job_ids).await {
+                        Ok(deleted) if deleted > 0 => {
+                            info!(
+                                schedule_id = %schedule.schedule_id,
+                                vm_id = %schedule.vm_id,
+                                pruned_count = deleted,
+                                retention_count = schedule.retention_count,
+                                "pruned old backup jobs by count"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                schedule_id = %schedule.schedule_id,
+                                error = %e,
+                                "failed to delete old backup jobs by count"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        schedule_id = %schedule.schedule_id,
+                        error = %e,
+                        "failed to list old backup jobs for count retention"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if schedule.retention_days > 0 {
+            match self
+                .backup_repo
+                .list_old_jobs_for_retention(&schedule.schedule_id, schedule.retention_days)
+                .await
+            {
+                Ok(old_jobs) if !old_jobs.is_empty() => {
+                    for old_job in &old_jobs {
+                        if !Self::artifact_removal_allows_row_delete(
+                            old_job,
+                            schedule.s3_access_key.clone(),
+                            schedule.s3_secret_key.clone(),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+
+                        if let Err(e) = self.backup_repo.delete_job_by_id(&old_job.job_id).await {
+                            warn!(
+                                job_id = %old_job.job_id,
+                                error = %e,
+                                "failed to delete old backup job during retention cleanup"
+                            );
+                        } else {
+                            info!(
+                                job_id = %old_job.job_id,
+                                retention_days = schedule.retention_days,
+                                "pruned old backup job by age"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        schedule_id = %schedule.schedule_id,
+                        error = %e,
+                        "failed to list old backup jobs for retention cleanup"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn run_executor(&self) -> Result<(), ChvError> {
@@ -511,10 +516,22 @@ impl BackupWorker {
         }
     }
 
+    /// Does this destination denote an off-host artifact?
+    ///
+    /// Must be conservative: returning `false` for a scheme the shipper later
+    /// rejects would delete the database row while leaving the artifact
+    /// orphaned. So anything URI-shaped (`scheme://`, plus the `nfs+…` family
+    /// the shipper accepts) is treated as remote; an unsupported scheme then
+    /// fails in `shipper_from_destination` and keeps the row for an operator
+    /// to resolve. Local filesystem paths have no scheme and are safe to
+    /// forget.
     fn is_remote_destination(destination: &str) -> bool {
-        destination.starts_with("s3://")
-            || destination.starts_with("nfs://")
-            || destination.eq_ignore_ascii_case("null")
+        let destination = destination.trim();
+        if destination.is_empty() {
+            return false;
+        }
+        let lower = destination.to_ascii_lowercase();
+        lower == "null" || lower.starts_with("nfs+") || destination.contains("://")
     }
 }
 
@@ -589,6 +606,133 @@ mod tests {
         assert!(
             BackupWorker::artifact_removal_allows_row_delete(&row, None, None).await,
             "a local row has no remote artifact to delete"
+        );
+    }
+
+    #[test]
+    fn remote_destination_detection_is_conservative() {
+        for remote in [
+            "s3://bucket/prefix",
+            "S3://bucket/prefix",
+            "nfs:///mnt/backups",
+            "nfs+tcp://server/export",
+            "gs://bucket/prefix",
+            "null",
+        ] {
+            assert!(
+                BackupWorker::is_remote_destination(remote),
+                "{remote} must be treated as remote (an unsupported scheme keeps the row)"
+            );
+        }
+        for local in [
+            "",
+            "   ",
+            "/var/lib/chv/backups",
+            "./artifact",
+            "relative/path",
+        ] {
+            assert!(
+                !BackupWorker::is_remote_destination(local),
+                "{local:?} is a local/absent destination"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_remote_scheme_keeps_row_instead_of_orphaning_artifact() {
+        let row = job(Some("gs://bucket/prefix"), Some("prefix/artifact"));
+        assert!(
+            !BackupWorker::artifact_removal_allows_row_delete(&row, None, None).await,
+            "an unsupported remote scheme cannot confirm deletion, so the row must stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_runs_while_execution_is_fenced() {
+        use chv_controlplane_store::test_util::TestDb;
+
+        let test_db = TestDb::new().await;
+        sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES ('vm-ret', 'vm-ret')")
+            .execute(&test_db.pool)
+            .await
+            .expect("insert vm");
+        let repo = BackupRepository::new(test_db.pool.clone());
+
+        for i in 0..3 {
+            let id = repo
+                .create_job(&BackupJobCreateInput {
+                    vm_id: "vm-ret".into(),
+                    volume_id: None,
+                    schedule_id: Some("sch-ret".into()),
+                    status: "Succeeded".into(),
+                    backup_type: "full".into(),
+                    target_path: Some(format!("/var/lib/chv/backups/{i}")),
+                    storage_backend: None,
+                    started_at: None,
+                    completed_at: None,
+                    error_message: None,
+                    size_bytes: None,
+                    checksum: None,
+                    checksum_algorithm: None,
+                    destination: Some(format!("/var/lib/chv/backups/{i}")),
+                })
+                .await
+                .expect("create job");
+            sqlx::query("UPDATE backup_jobs SET created_at = ? WHERE job_id = ?")
+                .bind(format!("2020-01-0{}T00:00:00Z", i + 1))
+                .bind(&id)
+                .execute(&test_db.pool)
+                .await
+                .expect("age job");
+        }
+
+        let worker = BackupWorker::new(
+            test_db.pool.clone(),
+            repo.clone(),
+            "/tmp/agent.sock".into(),
+            NodeClientPool::new(),
+            PathBuf::from("/tmp"),
+        );
+        let schedule = chv_controlplane_store::BackupScheduleRow {
+            schedule_id: "sch-ret".into(),
+            vm_id: "vm-ret".into(),
+            volume_id: None,
+            name: "retention".into(),
+            cron_expression: "0 0 2 * * *".into(),
+            retention_count: 2,
+            retention_days: 0,
+            destination: Some("/var/lib/chv/backups".into()),
+            enabled: true,
+            created_at: "2020-01-01T00:00:00Z".into(),
+            updated_at: "2020-01-01T00:00:00Z".into(),
+            last_run_at: None,
+            s3_access_key: None,
+            s3_secret_key: None,
+        };
+
+        worker
+            .process_schedule(&schedule, chrono::Utc::now())
+            .await
+            .expect("process schedule");
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs WHERE schedule_id = 'sch-ret'")
+                .fetch_one(&test_db.pool)
+                .await
+                .expect("count jobs");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM backup_jobs WHERE schedule_id = 'sch-ret' AND status = 'Pending'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("count pending");
+        assert_eq!(
+            remaining, 2,
+            "count retention must prune to the configured floor even while execution is fenced"
+        );
+        assert_eq!(
+            pending, 0,
+            "the hard fence must still prevent new backup work"
         );
     }
 

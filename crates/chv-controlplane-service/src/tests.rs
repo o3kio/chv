@@ -5993,12 +5993,27 @@ async fn webui_enabled_does_not_change_v1_auth_or_csrf() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], "UNAUTHORIZED");
 
-    // And the CSRF middleware's content-type gate is untouched: a
-    // form-native POST to a matched legacy route still dies in the
-    // middleware with 415 before any handler runs.
+    // Authentication now runs before the backup fence (the fence replaced
+    // handlers that each required `BearerToken`): an anonymous request gets
+    // 401, never the 501 posture message.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/api/v1/backup-history")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // And the CSRF middleware's content-type gate is untouched for an
+    // authenticated caller: a form-native POST to a matched legacy route
+    // still dies in the middleware with 415 before the fence/handler runs.
     let response = app
         .oneshot(
             axum::http::Request::post("/api/v1/backup-jobs")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -6010,6 +6025,25 @@ async fn webui_enabled_does_not_change_v1_auth_or_csrf() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], "CSRF_REJECTED");
+
+    // With a valid credential the fence still answers deterministically: the
+    // route exists (501), it did not move (404).
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let app = crate::api::router::admin_router(
+        test_app_state(test_db.pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/api/v1/backup-history")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]

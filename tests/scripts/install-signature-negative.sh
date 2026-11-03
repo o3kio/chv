@@ -30,6 +30,19 @@ fi
 WORK="$(mktemp -d)"
 SIGNER_HOME="${WORK}/signer"
 mkdir -m 700 "${SIGNER_HOME}"
+
+# Source the installer functions without running main. This must happen
+# BEFORE defining the test cleanup: scripts/install.sh defines its own
+# `cleanup` (which writes the live database), and a trap installed earlier
+# would silently be replaced by it.
+# shellcheck source=/dev/null
+source "${REPO_ROOT}/scripts/install.sh"
+
+# Never let the installer's EXIT cleanup touch a real database from a test.
+# shellcheck disable=SC2034  # consumed by the sourced cleanup/reset functions.
+CHV_DB_PATH="${WORK}/does-not-exist.db"
+reset_must_change_password() { :; }
+
 cleanup() {
     rm -rf "${WORK}"
     if [ -n "${RELEASE_GPG_HOME:-}" ]; then
@@ -37,10 +50,6 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-
-# Source the installer functions without running main.
-# shellcheck source=/dev/null
-source "${REPO_ROOT}/scripts/install.sh"
 
 failures=0
 FAIL() {
@@ -94,6 +103,7 @@ fi
 stub_dir="${WORK}/stub"
 mkdir -p "${stub_dir}"
 : > "${stub_dir}/chv-9.9.9-linux-amd64.tar.gz.sha256"
+# shellcheck disable=SC2317  # these overrides are invoked indirectly by verify_release_tarball.
 if (
     release_signature_configured() { return 0; }
     curl() {
@@ -113,6 +123,39 @@ if (
         "${stub_dir}"
 ) >/dev/null 2>&1; then
     FAIL "missing signature did not abort the tarball verification path"
+fi
+
+# 6. A VALID signature over a sidecar whose digest does not match the tarball
+#    must still abort. This is the case that proves the checksum verification
+#    runs after authenticity, not instead of it.
+wrong_dir="${WORK}/wrong-digest"
+mkdir -p "${wrong_dir}"
+tarball="chv-9.9.9-linux-amd64.tar.gz"
+printf 'tarball bytes\n' > "${wrong_dir}/${tarball}"
+printf '%064d  %s\n' 0 "${tarball}" > "${wrong_dir}/${tarball}.sha256"
+GNUPGHOME="${SIGNER_HOME}" gpg --batch --yes --armor --detach-sign \
+    -o "${wrong_dir}/${tarball}.sha256.sig" "${wrong_dir}/${tarball}.sha256"
+cp "${wrong_dir}/${tarball}.sha256.sig" "${WORK}/sig-for-stub"
+# shellcheck disable=SC2317  # these overrides are invoked indirectly by verify_release_tarball.
+if (
+    release_signature_configured() { return 0; }
+    curl() {
+        local out=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -o) out="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        [ -z "$out" ] || cp "${WORK}/sig-for-stub" "$out"
+        printf '200'
+    }
+    verify_release_tarball \
+        "${tarball}" \
+        "https://example.invalid/releases/download/v9.9.9/${tarball}" \
+        "${wrong_dir}"
+) >/dev/null 2>&1; then
+    FAIL "a valid signature over a mismatched checksum sidecar was accepted"
 fi
 
 if [ "$failures" -ne 0 ]; then

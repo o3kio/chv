@@ -262,6 +262,7 @@ impl ControlPlaneClient {
     pub async fn dispatch_pending_message(
         &mut self,
         message: &PendingControlPlaneMessage,
+        local_node_id: &str,
     ) -> Result<(), ChvError> {
         match message.kind {
             PendingControlPlaneMessageKind::NodeStateReport => {
@@ -293,8 +294,16 @@ impl ControlPlaneClient {
                     .await?;
             }
             PendingControlPlaneMessageKind::MigrationProgressReport => {
-                self.report_migration_progress(message.decode_migration_progress()?)
-                    .await?;
+                let mut progress = message.decode_migration_progress()?;
+                // Back-compat: the queue is persisted JSON. An agent upgraded
+                // from a build that predates the `node_id` field deserialises
+                // old entries with `""`; send our identity rather than a value
+                // the control plane must reject (which would stall the whole
+                // ordered queue behind this message).
+                if progress.node_id.is_empty() {
+                    progress.node_id = local_node_id.to_string();
+                }
+                self.report_migration_progress(progress).await?;
             }
         }
         Ok(())
@@ -370,14 +379,15 @@ async fn drain_pending_control_plane_queue_with_timeout(
     // outside it. The batch is only taken from memory here — the
     // on-disk cache still holds it until the post-dispatch save, so a
     // crash mid-dispatch loses nothing (the queue is at-least-once).
-    let batch = {
+    let (batch, local_node_id) = {
         let mut locked = cache.lock().await;
         let batch = locked.pending_control_plane_messages().to_vec();
         if batch.is_empty() {
-            None
+            (None, String::new())
         } else {
+            let node_id = locked.node_id.clone();
             locked.replace_pending_control_plane_messages(Vec::new());
-            Some(batch)
+            (Some(batch), node_id)
         }
     };
     let Some(batch) = batch else {
@@ -396,7 +406,11 @@ async fn drain_pending_control_plane_queue_with_timeout(
     let mut failed_from = None;
     for (i, message) in batch.iter().enumerate() {
         let kind = format!("{:?}", message.kind);
-        match tokio::time::timeout(dispatch_timeout, client.dispatch_pending_message(message)).await
+        match tokio::time::timeout(
+            dispatch_timeout,
+            client.dispatch_pending_message(message, &local_node_id),
+        )
+        .await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -730,7 +744,11 @@ mod tests {
             .unwrap();
 
         // The shape the agent_server migration reporter produces:
-        // progress enqueued into the cache's pending queue.
+        // progress enqueued into the cache's pending queue. `node_id` is
+        // deliberately empty: this is what an entry persisted by an agent
+        // build that predates field 9 looks like after an upgrade, and the
+        // drain must fill it from the cache identity instead of sending a
+        // value the control plane rejects.
         let mut cache_inner = NodeCache::new("node-1");
         cache_inner.enqueue_pending_message(PendingControlPlaneMessage::migration_progress(
             proto::MigrationProgress {
@@ -742,7 +760,7 @@ mod tests {
                 convergence_round: 1,
                 dirty_blocks_remaining: 500,
                 progress_percent: 45.0,
-                node_id: "node-1".to_string(),
+                node_id: String::new(),
             },
         ));
         let cache = Arc::new(tokio::sync::Mutex::new(cache_inner));
@@ -774,6 +792,10 @@ mod tests {
         assert_eq!(delivered.operation_id, "op-1");
         assert_eq!(delivered.convergence_round, 1);
         assert_eq!(delivered.dirty_blocks_remaining, 500);
+        assert_eq!(
+            delivered.node_id, "node-1",
+            "an empty legacy node_id must be filled from the agent's own identity"
+        );
 
         // The next tick drains an empty queue: no-op — the client is
         // kept, nothing further is dispatched, no connectivity change,

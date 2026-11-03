@@ -149,11 +149,13 @@ journalctl -u chv-nwd -f
 > removed wholesale (#514): the BFF `/v1/storage-pools` routes, the CP
 > stub routes, the UI page, and the table are gone (old clients calling
 > those routes get 404; the storage inventory lives at `/volumes` and
-> `chvctl volume list`). The `backup` group's removal remains
-> CLI-surface only (backup execution is a guaranteed-fail no-op, "Backup
-> is not DR"; the BFF's `/v1/backups/*` routes, the UI's backup pages,
-> and the backup worker are unchanged). Invoking either removed group
-> now fails at argument parsing with "unrecognized subcommand".
+> `chvctl volume list`). The `backup` group's removal is part of the same
+> posture as the hard fence below: backup execution has no engine, every
+> `/v1/backups/*`, `/v1/backup-jobs`, `/v1/backup-history`, and legacy
+> `/api/v1/backup*` route answers `501 NOT_IMPLEMENTED` after authentication,
+> the WebUI exposes no backup navigation or actions, and the scheduler creates
+> no new jobs. Invoking either removed group now fails at argument parsing
+> with "unrecognized subcommand".
 
 ### Examples
 
@@ -215,11 +217,15 @@ regenerated on upgrade.
 
 - **Back it up together with the database.** A database restore without the
   matching key leaves stored S3 credentials unreadable (they are treated as
-  missing and must be re-entered in the backup schedule settings).
+  missing). While backup/restore is hard-fenced there is no supported UI or
+  API path to re-enter them: the removed backup pages cannot be used, and the
+  fence rejects schedule/job mutation with `501`. Treat any restored
+  ciphertext as unrecoverable and keep the key with the database backup.
 - **Rotation** is manual: write a new key to `/etc/chv/encryption.env`
-  (0600 root), `systemctl restart chv-controlplane`, then re-enter the S3
-  credentials — values encrypted under the old key read as missing, not
-  corrupted, so the re-entry is safe.
+  (0600 root) and `systemctl restart chv-controlplane`. Values encrypted
+  under the old key read as missing, not corrupted. Re-entering guest-backup
+  S3 credentials requires a backup implementation; it is not an operator
+  action in this release.
 - If the file is absent (or the key is present but empty), the control
   plane logs a warning and stores S3 credentials in **plaintext** — do
   not run production deployments that way.

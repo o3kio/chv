@@ -92,33 +92,81 @@ The `chv-node` package installs `chv-agent`, `chv-stord`, and `chv-nwd`.
 
 ### 3b. Configure Agent
 
-```bash
-cat > /etc/chv/agent.toml <<'EOF'
-[agent]
-node_id = "<ORIGINAL_NODE_ID_OR_NEW>"
-control_plane_url = "https://new-cp.example.com:443"
-runtime_dir = "/var/lib/chv/agent"
+The `chv-node` package ships `/etc/chv/agent.toml`. Edit the top-level keys
+(there is no `[agent]` table, and credentials are not nested under `[agent.tls]`):
 
-[agent.tls]
-ca_cert = "/etc/chv/certs/ca.crt"
-client_cert = "/etc/chv/certs/agent.crt"
-client_key = "/etc/chv/certs/agent.key"
-EOF
+```bash
+# /etc/chv/agent.toml
+sudo sed -i \
+  -e 's|^control_plane_addr = .*|control_plane_addr = "https://new-cp.example.com:8443"|' \
+  -e 's|^node_id = .*|node_id = ""   # assigned by the control plane during enrollment|' \
+  /etc/chv/agent.toml
+```
+
+Enrollment itself is an mTLS RPC, so before the first start the node needs the
+control-plane CA **and** a client certificate/key: the agent presents that
+identity for the EnrollNode handshake (`EnrollmentClient::connect_with_tls`
+reads `tls_cert_path`/`tls_key_path` when both are set). Restore the enrollment
+identity from the certificate backup:
+
+```bash
+sudo install -d -m 0755 /etc/chv/certs /run/chv/agent
+sudo install -m 0644 /path/to/recovered/ca.crt /etc/chv/certs/ca.crt
+sudo install -m 0644 /path/to/recovered/agent-client.crt /run/chv/agent/agent.crt
+sudo install -m 0640 /path/to/recovered/agent-client.key /run/chv/agent/agent.key
+sudo chown chv:chv /run/chv/agent/agent.crt /run/chv/agent/agent.key
+```
+
+If the backup has no `agent-client.{crt,key}`, issue a new enrollment client
+certificate from the recovered CA (the same identity `install.sh` creates):
+
+```bash
+cd /etc/chv/certs
+sudo openssl genrsa -out agent-client.key 2048
+sudo openssl req -new -key agent-client.key -out agent-client.csr -subj "/O=CHV/CN=chv-agent"
+sudo openssl x509 -req -in agent-client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out agent-client.crt -days 825 -sha256 \
+  -extfile <(printf "keyUsage=digitalSignature\nextendedKeyUsage=clientAuth")
+sudo rm -f agent-client.csr
+sudo install -m 0644 agent-client.crt /run/chv/agent/agent.crt
+sudo install -m 0640 agent-client.key /run/chv/agent/agent.key
+sudo chown chv:chv /run/chv/agent/agent.crt /run/chv/agent/agent.key
+```
+
+`tls_cert_path`/`tls_key_path`/`ca_cert_path` in `agent.toml` are only the
+pre-enrollment identity. Confirm they point at the files above:
+
+```bash
+grep -E '^(control_plane_addr|node_id|bootstrap_token_path|tls_cert_path|tls_key_path|ca_cert_path)' \
+  /etc/chv/agent.toml
 ```
 
 ### 3c. Enroll with Control Plane
 
+There is no `chvctl agent enroll` command. Enrollment is agent-driven: mint a
+one-time token on the control plane (loopback-only endpoint), place it where
+`bootstrap_token_path` points, then start the agent.
+
 ```bash
-# Generate a bootstrap token on the control plane
+# On the control plane (loopback only)
 TOKEN=$(openssl rand -hex 32)
-echo "$TOKEN" | sudo tee /etc/chv/bootstrap.token.new
+curl -fsS -X POST http://127.0.0.1:8080/internal/bootstrap-token \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\":\"${TOKEN}\",\"description\":\"FSR node rebuild\",\"one_time_use\":true}"
 
-# Enroll agent
-sudo chvctl agent enroll --token "$TOKEN" --server https://new-cp.example.com:443
-
-# Start agent
+# On the rebuilt node: deliver the token out-of-band (never shell history /
+# a public URL), then start the agent.
+printf '%s\n' "$TOKEN" | sudo install -m 0600 /dev/stdin /etc/chv/bootstrap.token
 sudo systemctl enable --now chv-agent
+sudo journalctl -u chv-agent -n 50 --no-pager   # "enrollment complete"
 ```
+
+On success the control plane issues the node certificate. The agent writes it,
+its key, and the CA into `runtime_dir` — `/var/lib/chv/agent/agent.crt`,
+`agent.key`, and `ca.crt` for the packaged configuration — and records those
+paths in `cache_path`. The recorded paths take precedence over
+`tls_cert_path`/`tls_key_path` on later starts, so the pre-enrollment client
+certificate is used only for the EnrollNode handshake.
 
 ### 3d. Verify Agent Registration
 

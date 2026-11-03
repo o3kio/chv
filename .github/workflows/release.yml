@@ -439,6 +439,9 @@ jobs:
   sign:
     name: Sign artifacts
     runs-on: ubuntu-latest
+    # A hung key-import/cosign download must not hold the protected
+    # environment open indefinitely.
+    timeout-minutes: 20
     needs: [build, package]
     if: needs.build.outputs.should_release == 'true'
     environment: ${{ needs.build.outputs.is_prerelease == 'true' && 'rc' || 'production' }}
@@ -463,6 +466,8 @@ jobs:
           path: dist/packages/
 
       - name: Verify checksum inputs
+        # Fail before signing if either input is missing/empty: an empty
+        # checksum file would otherwise be signed and published as authentic.
         run: |
           set -euo pipefail
           test -s "dist/${TARBALL_NAME}.sha256" || {
@@ -473,6 +478,7 @@ jobs:
             echo "Missing dist/packages/SHA256SUMS — refusing to sign" >&2
             exit 1
           }
+          wc -l "dist/${TARBALL_NAME}.sha256" dist/packages/SHA256SUMS
 
       - name: Sign SHA256SUMS
         run: ./scripts/release/sign-checksums.sh dist/packages/SHA256SUMS
@@ -567,6 +573,18 @@ jobs:
         run: |
           ls -la dist/
           ls -la dist/packages/
+
+      - name: Verify artifacts against their checksums
+        # The checksum sidecars are what the installer trusts. Verify the
+        # downloaded tarball and packages against them immediately before
+        # publishing so a truncated/mixed artifact set cannot be released
+        # under a valid signature.
+        env:
+          TARBALL_NAME: ${{ needs.build.outputs.tarball_name }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c --strict "${TARBALL_NAME}.sha256")
+          (cd dist/packages && sha256sum -c --strict SHA256SUMS)
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0 (pinned 2026-09-30)

@@ -20,7 +20,7 @@ Open gaps as of 2026-10-30 (verified against this branch):
 
 | Area | Honest status | Evidence |
 |---|---|---|
-| Backup / restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** There is no execution engine: `execute_job` always fails with "backup execution engine not yet implemented". The ship/fetch path was removed in #213; the shipper retains only `delete`. Every backup/restore API route is fenced and the WebUI exposes no backup navigation; tenant-data protection is the operator's responsibility. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7, §5 UC-9; `crates/chv-webui-bff/src/handlers/backups.rs` (`BACKUP_NOT_IMPLEMENTED`); `crates/chv-controlplane-service/src/backup_worker.rs` (`execute_job`); `crates/chv-controlplane-service/src/backup_shipper.rs` (`BackupShipper::delete` only) |
+| Backup / restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** There is no execution engine: `execute_job` fails every job with "backup/restore is not implemented in this release (hard-fenced, #654)". The ship/fetch path was removed in #213; the shipper retains only `delete`. Every backup/restore API route is fenced and the WebUI exposes no backup navigation; tenant-data protection is the operator's responsibility. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7, §5 UC-9; `crates/chv-webui-bff/src/handlers/backups.rs` (`BACKUP_NOT_IMPLEMENTED`); `crates/chv-controlplane-service/src/backup_worker.rs` (`execute_job`); `crates/chv-controlplane-service/src/backup_shipper.rs` (`BackupShipper::delete` only) |
 | Multi-host | **Architecturally impossible as coded.** Dispatch resolves a local filesystem `agent_socket_pattern` path and connects with `UnixStream::connect`; the agent serves gRPC from a `UnixListener` only (no TCP gRPC listener). Single-host is the declared posture for now. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §3.3, §5 UC-6, §8 D1; `crates/chv-controlplane-service/src/migration.rs` (`resolve_agent_socket`); `crates/chv-controlplane-service/src/node_client.rs` (`UnixStream::connect`); `crates/chv-agent-core/src/agent_server.rs` (`UnixListener::bind`) |
 | Volvisor storage backend | **Design direction only.** Accepted by ADR-028 and the 2026-10-13 adoption plan, but there are **zero** `volvisor` references in `crates/`, `cmd/`, `proto/`, or `Cargo.toml`; storage is still `chv-stord`. | [ADR-028](specs/adr/028-volvisor-storage-orchestration.md); [adoption plan](plans/2026-10-13-volvisor-storage-adoption.md); `grep -rni volvisor crates cmd proto Cargo.toml` → no matches |
 | iSCSI / Ceph RBD | **Coded but unqualified; `destroy()` is explicitly unimplemented** and refuses loudly. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7; `crates/chv-stord-backends/src/iscsi.rs`; `crates/chv-stord-backends/src/ceph.rs` |
@@ -108,7 +108,7 @@ status in the table above; no multi-host or Volvisor code exists.
   What still exists is the *schema* and a worker that drains legacy rows
   honestly (marking them failed rather than pretending). Retention now refuses
   to delete a DB row when the remote artifact delete fails, so a legacy
-  artifact cannot be silently orphaned (fixed with #654).
+  artifact cannot be silently orphaned (fixed with #655).
 - **Evidence:** `crates/chv-webui-bff/src/handlers/backups.rs` (`BACKUP_NOT_IMPLEMENTED`), `crates/chv-controlplane-service/src/backup_worker.rs`, `crates/chv-controlplane-service/src/backup_shipper.rs`, `docs/DEPLOYMENT-ARCHITECTURE.md` §7
 - **Priority:** P2 (post-pre-production)
 
