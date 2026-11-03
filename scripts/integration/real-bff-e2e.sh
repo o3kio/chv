@@ -230,16 +230,33 @@ PY
 if ! curl -fsS -X POST "http://127.0.0.1:${PORT}/v1/auth/login" \
     -H 'Content-Type: application/json' \
     --data @"${ROOT}/login-request.json" \
+    -D "${ROOT}/login-headers.txt" \
     -o "${ROOT}/login-response.json"; then
     fail "real BFF login preflight failed (log: ${CP_LOG})"
 fi
-python3 - "${ROOT}/login-response.json" <<'PY' || fail "login response did not contain a JWT"
+python3 - "${ROOT}/login-response.json" "${ROOT}/login-headers.txt" <<'PY' || fail "login preflight did not find an HttpOnly session JWT"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     body = json.load(handle)
-assert isinstance(body.get("token"), str) and body["token"].count(".") == 2, body
+# #660: the JWT is never returned to JavaScript. The body must not expose
+# it; the only credential is the HttpOnly `chv_session` cookie.
+assert "token" not in body, body
+cookies = []
+with open(sys.argv[2], encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "set-cookie":
+            cookies.append(value.strip())
+session = [c for c in cookies if c.startswith("chv_session=")]
+assert len(session) == 1, cookies
+token = session[0].split(";", 1)[0].split("=", 1)[1]
+assert token.count(".") == 2, "chv_session is not a JWT"
+assert "HttpOnly" in session[0], session[0]
+assert "SameSite=Strict" in session[0], session[0]
+for hint in ("chv_role=", "chv_logged_in="):
+    assert any(c.startswith(hint) for c in cookies), cookies
 PY
-log "real BFF login preflight passed"
+log "real BFF login preflight passed (HttpOnly session cookie, no JWT in body)"
 
 export REAL_BFF_BASE_URL="http://127.0.0.1:${PORT}"
 export REAL_BFF_E2E_USER="$USERNAME"
