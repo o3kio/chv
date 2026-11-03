@@ -1,3 +1,5 @@
+mod instance_lock;
+
 use chv_config::{ControlPlaneConfig, ControlPlaneTlsConfig};
 use chv_controlplane_service::{
     alert_evaluator::{AlertEvaluatorWorker, EvaluatorChannels},
@@ -20,6 +22,15 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Process-lifetime guard for the single-instance advisory lock.
+///
+/// `build_service` is expected to run once per process, but the lock must be
+/// tied to the process, not to a function frame: keeping it in a `OnceLock`
+/// means it cannot be dropped accidentally when bootstrap returns while the
+/// service is still running. The OS releases the underlying flock on process
+/// exit (graceful, SIGTERM, or crash).
+static INSTANCE_LOCK: std::sync::OnceLock<instance_lock::InstanceLock> = std::sync::OnceLock::new();
 
 /// Validate the TLS configuration for the control plane.
 ///
@@ -248,6 +259,23 @@ pub async fn build_service(
     // interceptor constructor repeats this check as defense-in-depth.
     validate_security_mode(allow_insecure)?;
     validate_tls(&config.tls, allow_insecure)?;
+
+    // Single-instance guard (#653): take the exclusive lock before the SQLite
+    // database is opened or migrated. Two control planes sharing one database
+    // would race migrations, seeding, and every lifecycle worker. The guard is
+    // stored process-wide so it survives `build_service` returning; the kernel
+    // releases it when this process exits, including on SIGTERM/crash.
+    let instance_lock = instance_lock::InstanceLock::acquire(&config.runtime_dir)
+        .map_err(|e| ControlPlaneServiceError::Internal(e.to_string()))?;
+    tracing::info!(
+        path = %instance_lock.path().display(),
+        "acquired control-plane single-instance lock"
+    );
+    if INSTANCE_LOCK.set(instance_lock).is_err() {
+        return Err(ControlPlaneServiceError::Internal(
+            instance_lock::ALREADY_RUNNING_MESSAGE.to_string(),
+        ));
+    }
 
     let store_config = ControlPlaneStoreConfig {
         database_url: config.database.url.clone(),
@@ -956,11 +984,35 @@ pub async fn build_service(
             tokio::spawn(async {})
         };
 
-    let migration_reaper = chv_controlplane_service::MigrationReaper::new(
+    let mut migration_reaper = chv_controlplane_service::MigrationReaper::new(
         pool.clone(),
         node_client_pool.clone(),
         config.agent_socket_pattern.clone(),
     );
+    // Operator override for the no-progress (stall) timeout. This is not a
+    // total-runtime cap: a migration may run for hours as long as it keeps
+    // reporting progress. Invalid or non-positive values fall back to the
+    // service default rather than disabling the reaper.
+    if let Ok(raw) = std::env::var("CHV_MIGRATION_STALL_TIMEOUT_SECS") {
+        match raw.parse::<i64>() {
+            Ok(secs) if secs > 0 => {
+                tracing::info!(
+                    stall_timeout_secs = secs,
+                    "migration reaper stall timeout overridden by CHV_MIGRATION_STALL_TIMEOUT_SECS"
+                );
+                migration_reaper = migration_reaper.with_timeout_secs(secs);
+            }
+            Ok(secs) => tracing::warn!(
+                value = secs,
+                "CHV_MIGRATION_STALL_TIMEOUT_SECS must be positive; using default"
+            ),
+            Err(e) => tracing::warn!(
+                value = %raw,
+                error = %e,
+                "CHV_MIGRATION_STALL_TIMEOUT_SECS is not an integer; using default"
+            ),
+        }
+    }
     let reaper_handle = tokio::spawn(migration_reaper.run(shutdown_rx));
 
     Ok(ControlPlaneService::new(
