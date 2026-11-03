@@ -250,7 +250,23 @@ impl PhaseTimeouts {
 }
 
 /// Maximum allowed age of a source node heartbeat for migration to proceed.
-const SOURCE_NODE_HEARTBEAT_MAX_AGE_SECS: i64 = 30;
+pub(crate) const SOURCE_NODE_HEARTBEAT_MAX_AGE_SECS: i64 = 30;
+
+/// Hard cap on the disk-convergence loop.
+const MAX_TOTAL_SECS: u64 = 7200;
+
+/// Maximum age of a migration row before its agent is considered to have
+/// stopped reporting. The agent's disk-poll loop reports every ~5 s, so a row
+/// this old means ~18 consecutive missed reports — the agent (or its telemetry
+/// path) is dead or wedged. Bulk-copy progress is invisible in the row
+/// (stord's `bytes_transferred` only accumulates dirty re-send bytes), so
+/// freshness — not byte movement — is the liveness signal.
+///
+/// Shared with the migration reaper: it uses this as the minimum quiescence
+/// window before it is willing to resume a source VM after a reap. Resuming
+/// while the sender may still be streaming would unpause a VM whose memory is
+/// still being transferred.
+pub(crate) const STALE_ROW_SECS: i64 = 90;
 
 /// Validate preconditions before starting a migration.
 ///
@@ -1013,13 +1029,6 @@ pub(crate) async fn wait_for_convergence(
     let mut poll_count: u32 = 0;
     let mut dirty_sync_polls: u32 = 0;
     let started = tokio::time::Instant::now();
-    const MAX_TOTAL_SECS: u64 = 7200;
-    // The agent's disk-poll loop reports every ~5 s, so a row this old
-    // means ~18 consecutive missed reports — the agent (or its telemetry
-    // path) is dead or wedged. Bulk-copy progress is invisible in the row
-    // (stord's `bytes_transferred` only accumulates dirty re-send bytes),
-    // so freshness — not byte movement — is the liveness signal.
-    const STALE_ROW_SECS: i64 = 90;
 
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
