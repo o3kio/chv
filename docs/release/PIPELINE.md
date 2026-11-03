@@ -135,16 +135,41 @@ scripts/package/lifecycle-rpm.sh → same for RPM
 
 | Workflow | Trigger | What it does | Runner |
 |----------|---------|--------------|--------|
-| `ci.yml` | push/PR to `main`; `workflow_call` | fmt, check, clippy `--all-targets`, workspace tests via nextest + doctests, non-blocking llvm-cov coverage baseline, UI build/check, Vitest unit tests, Playwright e2e | `ubuntu-latest` |
+| `ci.yml` | push/PR to `main`; `workflow_call` | fmt, check, clippy `--all-targets`, workspace tests via nextest + doctests, UI build/check, Vitest unit tests, mock-BFF Playwright e2e; when called by `release.yml` it receives `skip_optional_checks: true`, so the PR-only coverage floor (≥76%, main baseline 78.97%) and real-BFF Playwright flow are skipped | `ubuntu-latest` |
 | `package-pr.yml` | PR to `main`, push to other branches | build, package, smoke deb/rpm/webui | `ubuntu-22.04` (glibc 2.35 pin — oldest smoke target is debian:12/glibc 2.36) |
 | `package-nightly.yml` | push to `main`, dispatch | build, package, smoke, lifecycle, publish pre-release | `ubuntu-22.04` (build job; same glibc pin) |
 | `security.yml` | push/PR to `main`, daily schedule | `cargo audit`, `cargo deny` (advisories/bans/licenses/sources) | `ubuntu-22.04` |
 | `release.yml` | tag `v*`, dispatch | quality gate, supply-chain preflight, build, package, sign, GitHub Release, optional repo publish | quality/security `ubuntu-latest`/`ubuntu-22.04`; build `ubuntu-22.04` (glibc pin); package/sign/release jobs `ubuntu-latest` (binaries only run in containers) |
-| `integration-kvm.yml` | dispatch, PR label, push `main` | host diagnostics, KVM tests, package install | self-hosted `chv-kvm` |
+| `integration-kvm.yml` | dispatch, PR label, push `main` | host diagnostics, KVM smoke test, package install | self-hosted `chv-kvm` |
+| `nightly-kvm-qualification.yml` | daily 02:00 UTC (m4.7 chaos), Monday 03:00 UTC (m4.3–m4.8), dispatch | real-KVM qualification scenarios; per-scenario logs + evidence artifacts | self-hosted `chv-kvm` |
 
 The `UI unit tests (Vitest)` job runs `npm ci` + `npm run test` in `ui/`.
 Making that check *required* for merges is a GitHub ruleset/branch-protection
 setting, not repository configuration.
+
+`Rust coverage (ratchet, lines >= 76%)` runs `cargo llvm-cov nextest ...
+--profile coverage --fail-under-lines 76 --no-fail-fast` on direct PR/push
+runs, publishes the lcov artifact `rust-coverage-lcov` plus a job-summary
+table, and fails the job when line coverage drops below 76%. `release.yml`
+passes `skip_optional_checks: true`, so the release `workflow_call` skips this
+lane. The dedicated `coverage` nextest profile carries `retries = 2` and
+`fail-fast = false`; the default profile (used by `Rust checks`) keeps
+`retries = 0` so the merge gate does not absorb intermittent failures.
+`--no-fail-fast` preserves the full failure blast radius.
+
+The reproducible `main` baseline is **78.97% lines**, measured from the lcov
+artifact of run
+[41669901088](https://github.com/o3kio/chv/actions/runs/41669901088/job/126035158484).
+This is a **floor, not a trend ratchet**: there is no per-PR delta comparison,
+so slow drift between baseline refreshes is invisible. Refresh the number from
+a `main` artifact and raise it deliberately. A per-PR delta check is a
+follow-up (it needs a stable main-baseline service and is intentionally not
+added here).
+
+The `Real-BFF E2E` job uses the same `skip_optional_checks` gate, so
+`release.yml` skips it while direct PR/push runs execute it. Adding either
+check to the `protect-main` ruleset's required checks is an **admin step** —
+see [../governance/BRANCH_PROTECTION.md](../governance/BRANCH_PROTECTION.md).
 
 **Workflow dependencies:**
 ```

@@ -40,6 +40,9 @@ cargo nextest run --workspace --no-fail-fast
 # Doctests are not run by nextest, so CI runs them separately
 cargo test --workspace --doc
 
+# Coverage floor (same command CI uses; main baseline 78.97%, threshold 76%)
+cargo llvm-cov nextest --workspace --profile coverage --lcov --output-path lcov.info --fail-under-lines 76 --no-fail-fast
+
 # Rust linting
 cargo clippy --workspace -- -D warnings
 

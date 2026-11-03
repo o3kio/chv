@@ -490,9 +490,13 @@ mod tests {
             .await
             .unwrap();
         let mut buf = [0u8; 16];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+        // This asserts eventual EOF, not a 5 s latency SLO: libtest
+        // scheduling on a loaded CI runner can delay the forwarder wake-up
+        // past the old 5 s bound. A generous 30 s still fails on a real hang
+        // while removing the timing flake that blocked the coverage job.
+        let n = tokio::time::timeout(std::time::Duration::from_secs(30), conn.read(&mut buf))
             .await
-            .expect("the failed dial must close the loopback connection within 5 s")
+            .expect("the failed dial must close the loopback connection eventually (30 s bound)")
             .unwrap();
         assert_eq!(n, 0, "EOF, not data and not a hang");
     }

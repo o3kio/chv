@@ -1,0 +1,19 @@
+# Shared nextest configuration for `cargo nextest` and
+# `cargo llvm-cov nextest`.
+#
+# The default profile is the main `Rust checks` gate: retries MUST stay 0 so
+# an intermittent failure is visible there instead of being silently absorbed.
+# `Rust checks` still passes `--no-fail-fast` to report the full blast radius;
+# that does not add retries.
+[profile.default]
+retries = 0
+
+# Coverage is the only lane that opts into retries. Nextest runs each test in
+# its own process, so the coverage profile can absorb known scheduling flakes
+# (for example the vsock forwarder close test on a loaded runner) without
+# weakening the merge gate. A genuinely broken test still fails after the
+# retries are exhausted. `fail-fast = false` matches the coverage command's
+# `--no-fail-fast` so the report is not aborted by the first failure.
+[profile.coverage]
+retries = 2
+fail-fast = false

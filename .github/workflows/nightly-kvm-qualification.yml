@@ -1,0 +1,245 @@
+name: Nightly KVM Qualification
+
+# Real-KVM qualification on the self-hosted runner fleet (#659).
+#
+#   - nightly (02:00 UTC): m4.7 fault/interruption matrix (chaos)
+#   - weekly  (Monday 03:00 UTC): full m4.3–m4.8 qualification sequence
+#   - manual: pick either lane
+#
+# These scenarios need /dev/kvm, root (taps/nft/netns), cloud-hypervisor, the
+# patched guest image, and the staged candidate binaries. They CANNOT run on
+# github-hosted runners. There is deliberately no ubuntu-latest fallback and
+# no "skip = pass" branch: if the self-hosted runner is offline the run stays
+# queued (visible as queued, never green), and if the runner is present but
+# the prerequisites are missing the driver fails with an annotation.
+#
+# Prerequisites (runner image, not repository secrets):
+#   - runner labels: self-hosted, linux, x64, chv-kvm
+#   - /dev/kvm exposed; passwordless sudo
+#   - cloud-hypervisor + guest image are provisioned by
+#     scripts/integration/qual/env-preflight.sh (downloads are cached under
+#     CHV_QUAL_ROOT)
+#   - disk headroom for the release build + VM images (see
+#     docs/release/self-hosted-runner-requirements.md)
+#
+# Evidence: every run uploads per-scenario logs, results.tsv, and the
+# scenario evidence directories (m4.N-artifacts) as an artifact, on success
+# or failure. See docs/dev/test-evidence-tiers.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Qualification lane'
+        required: true
+        default: 'chaos'
+        type: choice
+        options:
+          - chaos  # m4.7 fault/interruption matrix (~25 min)
+          - full   # m4.3–m4.8 sequence (hours; includes soak)
+
+  schedule:
+    # Nightly chaos: the m4.7 fault & interruption matrix.
+    - cron: '0 2 * * *'
+    # Weekly full sequence, offset from the nightly run.
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+# Serialize runs: scenario scripts share /var/lib/chv/qual and bind host
+# ports; overlapping runs would corrupt each other's evidence and teardown.
+#
+# GitHub keeps at most one running and one pending run per concurrency group.
+# With cancel-in-progress: false the active run is never killed, but a newer
+# queued run replaces an older *queued* run in this group. That is intentional
+# for the scheduled lanes: we do not want an unbounded backlog of stale
+# nightly/weekly runs, and the replacement is still visible in the Actions UI.
+concurrency:
+  group: nightly-kvm-qualification
+  cancel-in-progress: false
+
+jobs:
+  chaos:
+    name: Nightly chaos (m4.7 fault matrix)
+    runs-on: [self-hosted, linux, x64, chv-kvm]
+    timeout-minutes: 240
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.lane == 'chaos') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
+    env:
+      CHV_QUAL_ROOT: /var/lib/chv/qual
+      QUAL_ARTIFACT_ROOT: /var/lib/chv/qual/ci-artifacts/run-${{ github.run_id }}-chaos
+    steps:
+      - name: Verify runner prerequisites
+        # Fail with an actionable annotation before checkout, setup, or the
+        # long build starts. No runner = queued; present runner without KVM =
+        # a real, visible failure (never a skip-as-pass).
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::Nightly KVM qualification requires /dev/kvm on the self-hosted chv-kvm runner; this run cannot pass."
+            exit 1
+          fi
+          if ! sudo -E -n true 2>/dev/null; then
+            echo "::error::Nightly KVM qualification requires passwordless sudo with env preservation (-E) on the self-hosted chv-kvm runner."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Record runner cargo/rustup homes
+        # nightly-run.sh stages release binaries as root through sudo -E. Pin
+        # the runner-owned homes in GITHUB_ENV so root does not fall back to
+        # /root/.cargo and /root/.rustup (the ownership hazard this fixes).
+        run: |
+          mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}" "${CARGO_HOME:-$HOME/.cargo}"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned 2026-09-30)
+
+      - name: Install protoc
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Run m4.7 chaos scenario
+        run: |
+          sudo -E env "PATH=$PATH" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            CARGO_HOME="$CARGO_HOME" \
+            CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
+            QUAL_ARTIFACT_ROOT="$QUAL_ARTIFACT_ROOT" \
+            ./scripts/integration/qual/nightly-run.sh --scenarios "m4.7-faults"
+
+      - name: Restore runner ownership after root staging
+        # env-preflight.sh builds with an isolated --target-dir under
+        # CHV_QUAL_ROOT, so the ownership risk is not the workspace target/:
+        # it is root writing into the runner-owned CARGO_HOME/RUSTUP_HOME
+        # registries. Hand those back so later caching/checkouts do not fail.
+        if: always()
+        run: |
+          for path in "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
+            if [ -e "$path" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$path"
+            fi
+          done
+
+      - name: Upload qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nightly-kvm-chaos-m4.7-${{ github.run_id }}
+          path: ${{ env.QUAL_ARTIFACT_ROOT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload required results marker
+        # results.tsv is written before the first scenario and appended on
+        # every failure; if it is missing the run produced no usable
+        # evidence at all, so fail the upload instead of silently passing.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nightly-kvm-chaos-m4.7-${{ github.run_id }}-results
+          path: ${{ env.QUAL_ARTIFACT_ROOT }}/results.tsv
+          if-no-files-found: error
+          retention-days: 30
+
+  full:
+    name: Weekly full qualification (m4.3–m4.8)
+    runs-on: [self-hosted, linux, x64, chv-kvm]
+    timeout-minutes: 720
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.lane == 'full') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1')
+    env:
+      CHV_QUAL_ROOT: /var/lib/chv/qual
+      QUAL_ARTIFACT_ROOT: /var/lib/chv/qual/ci-artifacts/run-${{ github.run_id }}-full
+    steps:
+      - name: Verify runner prerequisites
+        # Same fail-fast gate as the chaos lane, before checkout/setup/build.
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::Nightly KVM qualification requires /dev/kvm on the self-hosted chv-kvm runner; this run cannot pass."
+            exit 1
+          fi
+          if ! sudo -E -n true 2>/dev/null; then
+            echo "::error::Nightly KVM qualification requires passwordless sudo with env preservation (-E) on the self-hosted chv-kvm runner."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Record runner cargo/rustup homes
+        # Keep root's staging writes in the runner-owned home instead of
+        # /root/.cargo and /root/.rustup; ownership is restored after the run.
+        run: |
+          mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}" "${CARGO_HOME:-$HOME/.cargo}"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned 2026-09-30)
+
+      - name: Install protoc
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Run m4.3–m4.8 qualification sequence
+        # One deploy per scenario; the results file and per-scenario evidence
+        # directories are uploaded below even if an early scenario fails.
+        run: |
+          sudo -E env "PATH=$PATH" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            CARGO_HOME="$CARGO_HOME" \
+            CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
+            QUAL_ARTIFACT_ROOT="$QUAL_ARTIFACT_ROOT" \
+            ./scripts/integration/qual/nightly-run.sh \
+              --scenarios "m4.3-lifecycle m4.4-network m4.5-storage m4.6-migration m4.7-faults m4.8-perf-soak"
+
+      - name: Restore runner ownership after root staging
+        # The build targets CHV_QUAL_ROOT/target (isolated), not the workspace
+        # target/. Return the runner-owned CARGO_HOME/RUSTUP_HOME registries
+        # even when an early scenario failed.
+        if: always()
+        run: |
+          for path in "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
+            if [ -e "$path" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$path"
+            fi
+          done
+
+      - name: Upload qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nightly-kvm-full-${{ github.run_id }}
+          path: ${{ env.QUAL_ARTIFACT_ROOT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload required results marker
+        # Fail the run's evidence upload when results.tsv is missing; there is
+        # no usable qualification record in that case.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nightly-kvm-full-${{ github.run_id }}-results
+          path: ${{ env.QUAL_ARTIFACT_ROOT }}/results.tsv
+          if-no-files-found: error
+          retention-days: 30
