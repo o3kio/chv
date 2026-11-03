@@ -216,6 +216,51 @@ jobs:
             cmp "$f" "scripts/hosting/$f"
           done
 
+  promtool:
+    name: Prometheus rules (promtool)
+    runs-on: ubuntu-latest
+    # Independent of the Rust build: this only downloads a pinned promtool
+    # and parses monitoring/rules/*.yml. A hang can only come from the
+    # release download, so fail fast rather than burn a runner.
+    timeout-minutes: 10
+    env:
+      PROMETHEUS_VERSION: v3.15.1
+      PROMETHEUS_SHA256: 6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Install promtool (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          tarball="prometheus-${PROMETHEUS_VERSION#v}.linux-amd64.tar.gz"
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o "$tmpdir/${tarball}" \
+            "https://github.com/prometheus/prometheus/releases/download/${PROMETHEUS_VERSION}/${tarball}"
+          (
+            cd "$tmpdir"
+            echo "${PROMETHEUS_SHA256}  ${tarball}" | sha256sum -c -
+          )
+          tar -xzf "$tmpdir/${tarball}" -C "$tmpdir"
+          sudo install -m 0755 \
+            "$tmpdir/prometheus-${PROMETHEUS_VERSION#v}.linux-amd64/promtool" \
+            /usr/local/bin/promtool
+          promtool --version
+
+      - name: promtool check rules
+        # nullglob makes an empty match an explicit failure instead of
+        # passing a literal "monitoring/rules/*.yml" to promtool.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(monitoring/rules/*.yml)
+          if (( ${#files[@]} == 0 )); then
+            echo "No rule files matched monitoring/rules/*.yml" >&2
+            exit 1
+          fi
+          promtool check rules "${files[@]}"
+
   ui:
     name: UI checks
     runs-on: ubuntu-latest
