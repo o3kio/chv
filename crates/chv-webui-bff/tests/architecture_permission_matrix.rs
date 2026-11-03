@@ -335,6 +335,7 @@ async fn build_state() -> AppState {
     chv_controlplane_store::run_migrations(&pool, None)
         .await
         .expect("run migrations");
+    chv_controlplane_store::test_util::seed_test_users(&pool).await;
 
     AppState {
         pool: pool.clone(),
@@ -389,6 +390,7 @@ fn token_for(state: &AppState, role: &str) -> String {
         role: role.to_string(),
         exp,
         must_change_password: false,
+        aud: None,
         token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);

@@ -96,6 +96,16 @@ fn test_admin_token() -> String {
 }
 
 fn test_token_for_role(role: &str) -> String {
+    test_token_claims(&format!("test-{role}-id"), role, role)
+}
+
+/// Token with an explicit `sub` and admin role, for tests that need a
+/// synthetic user id (e.g. deleted-user revocation paths, #660).
+fn test_token_for(sub: &str) -> String {
+    test_token_claims(sub, "admin", "admin")
+}
+
+fn test_token_claims(sub: &str, username: &str, role: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,11 +113,12 @@ fn test_token_for_role(role: &str) -> String {
         .as_secs()
         + 3600;
     let claims = chv_webui_bff::auth::Claims {
-        sub: format!("test-{role}-id"),
-        username: role.to_string(),
+        sub: sub.to_string(),
+        username: username.to_string(),
         role: role.to_string(),
         exp,
         must_change_password: false,
+        aud: None,
         token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -4510,6 +4521,48 @@ async fn test_logout_clears_session_cookie() {
             .unwrap_or_else(|| panic!("logout must clear {hint}: {set_cookies:?}"));
         assert!(cookie.contains("Max-Age=0"), "got: {cookie}");
         assert!(cookie.contains("Path=/"), "got: {cookie}");
+    }
+}
+
+#[tokio::test]
+async fn test_logout_for_deleted_user_still_clears_cookies() {
+    // M2: the presented account no longer exists, so bump_token_version
+    // returns NotFound. Logout must be idempotent — 200 plus every cookie
+    // cleared — rather than 500 with the browser stuck on a stale session.
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let app = crate::api::router::admin_router(
+        test_app_state(test_db.pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+
+    let orphan = test_token_for("test-user-deleted");
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/api/v1/auth/logout")
+                .header("authorization", format!("Bearer {orphan}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookies: Vec<&str> = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(set_cookies.len(), 3, "got: {set_cookies:?}");
+    for name in ["chv_session=;", "chv_role=;", "chv_logged_in=;"] {
+        assert!(
+            set_cookies.iter().any(|c| c.starts_with(name)),
+            "logout must clear {name}, got: {set_cookies:?}"
+        );
     }
 }
 

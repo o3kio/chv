@@ -183,7 +183,8 @@ fn token(state: &AppState, sub: &str, username: &str, role: &str) -> String {
         role: role.to_string(),
         exp,
         must_change_password: false,
-            token_version: None,
+        aud: None,
+        token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     jsonwebtoken::encode(

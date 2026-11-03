@@ -100,7 +100,7 @@ struct UserRow {
     /// install.sh sets this to 1 on the seeded admin row so the operator
     /// is forced to rotate the credential on first login.
     must_change_password: i64,
-    /// Session revocation counter (#660, migration 0064). Embedded in the
+    /// Session revocation counter (#660, migration 0066). Embedded in the
     /// issued JWT and re-checked on every request by the auth extractor.
     token_version: i64,
 }
@@ -196,6 +196,7 @@ pub async fn login(
         username: user.username.clone(),
         role: user.role.clone(),
         exp,
+        aud: Some(crate::auth::SESSION_AUDIENCE.to_string()),
         must_change_password,
         token_version: Some(token_version),
     };
@@ -271,13 +272,25 @@ pub async fn logout(
     if let Some(token) = crate::auth::request_token(&headers) {
         match crate::auth::validate_token(&token, &state.jwt_secret) {
             Ok(claims) => {
-                chv_controlplane_store::UserRepository::new(state.pool.clone())
+                match chv_controlplane_store::UserRepository::new(state.pool.clone())
                     .bump_token_version(&claims.sub)
                     .await
-                    .map_err(|e| {
+                {
+                    Ok(_) => {}
+                    // The account is already gone: there is no session left
+                    // to revoke. Treat logout as successful and still clear
+                    // every cookie (M2).
+                    Err(chv_controlplane_store::StoreError::NotFound { .. }) => {
+                        tracing::debug!(
+                            sub = %claims.sub,
+                            "logout for deleted user: nothing to revoke, clearing cookies"
+                        );
+                    }
+                    Err(e) => {
                         tracing::error!(error = %e, "logout failed to bump token_version");
-                        BffError::Internal("failed to revoke session".into())
-                    })?;
+                        return Err(BffError::Internal("failed to revoke session".into()));
+                    }
+                }
             }
             Err(e) => {
                 // Already invalid/expired: clearing the cookie is the whole
@@ -671,6 +684,7 @@ mod tests {
             role: "admin".to_string(),
             exp,
             must_change_password: must_change,
+            aud: None,
             token_version,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -1337,5 +1351,195 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "a versioned token with no backing user must fail closed"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_token_for_missing_user_is_rejected() {
+        // M3: pre-#660 tokens have no version claim, but a deleted user's
+        // token must not survive on the legacy path.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+        let orphan = admin_token_with_version(&state, "u-deleted-legacy", false, None);
+
+        let (status, body) = overview_status(&app, Some(&orphan)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a legacy token with no backing user must fail closed"
+        );
+        assert_eq!(body["code"], "SESSION_REVOKED");
+    }
+
+    #[tokio::test]
+    async fn logout_for_deleted_user_returns_200_and_clears_cookies() {
+        // M2: the account is already gone, so there is nothing to revoke.
+        // Logout must still succeed and clear every cookie instead of
+        // returning 500 with the browser stuck holding a stale session.
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = build_test_state().await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+        let orphan = admin_token_with_version(&state, "u-deleted-logout", false, None);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/logout")
+                    .header(
+                        axum::http::header::COOKIE,
+                        format!("{}={orphan}", crate::auth::SESSION_COOKIE_NAME),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cleared: Vec<&str> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        for name in ["chv_session=;", "chv_role=;", "chv_logged_in=;"] {
+            assert!(
+                cleared.iter().any(|c| c.starts_with(name)),
+                "logout must clear {name}, got: {cleared:?}"
+            );
+        }
+    }
+
+    async fn admin_update_user(
+        app: &axum::Router,
+        caller_token: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                json_post("/v1/users/update")
+                    .header("authorization", format!("Bearer {caller_token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn admin_password_reset_revokes_the_target_session() {
+        // H2: the standard compromise response is an admin password reset.
+        // It must bump token_version so a stolen session dies immediately.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        seed_user(
+            &state.pool,
+            "u-admin-reset",
+            "reseter",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        seed_user(
+            &state.pool,
+            "u-target-reset",
+            "target",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+
+        let caller = admin_token_for(&state, "u-admin-reset", false);
+        let target = admin_token_for(&state, "u-target-reset", false);
+
+        // Target token works before the reset.
+        let (status, _) = overview_status(&app, Some(&target)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = admin_update_user(
+            &app,
+            &caller,
+            serde_json::json!({
+                "user_id": "u-target-reset",
+                "password": "brand-new-password-12",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin reset failed: {body}");
+
+        let (status, body) = overview_status(&app, Some(&target)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the target's pre-reset session must be revoked"
+        );
+        assert_eq!(body["code"], "SESSION_REVOKED");
+    }
+
+    #[tokio::test]
+    async fn admin_role_demotion_revokes_the_target_session() {
+        // H2: a demoted account must not keep an admin-scoped token.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        seed_user(
+            &state.pool,
+            "u-admin-demote",
+            "demoter",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        seed_user(
+            &state.pool,
+            "u-target-demote",
+            "demotee",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+
+        let caller = admin_token_for(&state, "u-admin-demote", false);
+        let target = admin_token_for(&state, "u-target-demote", false);
+
+        let (status, _) = overview_status(&app, Some(&target)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = admin_update_user(
+            &app,
+            &caller,
+            serde_json::json!({
+                "user_id": "u-target-demote",
+                "role": "viewer",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "role update failed: {body}");
+        assert_eq!(body["role"], "viewer");
+
+        let (status, body) = overview_status(&app, Some(&target)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the demoted user's prior session must be revoked"
+        );
+        assert_eq!(body["code"], "SESSION_REVOKED");
     }
 }

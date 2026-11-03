@@ -198,7 +198,8 @@ fn claims(sub: &str, role: &str) -> Claims {
         role: role.to_string(),
         exp,
         must_change_password: false,
-            token_version: None,
+        aud: None,
+        token_version: None,
     }
 }
 
@@ -214,7 +215,8 @@ fn token_for(state: &AppState, role: &str) -> String {
         role: role.to_string(),
         exp,
         must_change_password: false,
-            token_version: None,
+        aud: None,
+        token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     jsonwebtoken::encode(
@@ -318,6 +320,7 @@ fn bearer(claims: &Claims) -> BearerToken {
         role: claims.role.clone(),
         exp: claims.exp,
         must_change_password: claims.must_change_password,
+        aud: claims.aud.clone(),
         token_version: claims.token_version,
     })
 }

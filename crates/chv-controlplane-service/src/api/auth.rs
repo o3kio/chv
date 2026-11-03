@@ -146,6 +146,7 @@ pub async fn login_handler(
         username: username.to_string(),
         role: row.role.clone(),
         exp,
+        aud: Some(chv_webui_bff::auth::SESSION_AUDIENCE.to_string()),
         must_change_password,
         token_version: Some(token_version),
     };
@@ -189,11 +190,12 @@ pub async fn me_handler(
     )
 }
 
-/// Logout terminates the cookie session: the `chv_session` cookie minted
-/// by `/api/v1/auth/login` (and the BFF's `/v1/auth/login`) is cleared with
+/// Logout terminates the browser session: the HttpOnly `chv_session`
+/// cookie minted by the **BFF's** `/v1/auth/login` is cleared with
 /// `Max-Age=0` and the same attributes it was set with (`Path=/`,
-/// `HttpOnly`, `SameSite=Strict`), so the browser stops sending the JWT on
-/// subsequent requests.
+/// `HttpOnly`, `SameSite=Strict`), and the two non-credential UX hint
+/// cookies are cleared too. (`/api/v1/auth/login` is the API-only token
+/// path and never sets a cookie.)
 ///
 /// Server-side revocation (#660): when the request presents a valid
 /// session JWT (cookie or `Authorization: Bearer`), the user's
@@ -206,19 +208,30 @@ pub async fn logout_handler(
 ) -> impl axum::response::IntoResponse {
     if let Some(token) = chv_webui_bff::auth::request_token(&headers) {
         if let Ok(claims) = chv_webui_bff::auth::validate_token(&token, &state.jwt_secret) {
-            if let Err(e) = chv_controlplane_store::UserRepository::new(state.pool.clone())
+            match chv_controlplane_store::UserRepository::new(state.pool.clone())
                 .bump_token_version(&claims.sub)
                 .await
             {
-                tracing::error!(error = %e, "logout failed to bump token_version");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "message": "failed to revoke session",
-                        "code": "INTERNAL"
-                    })),
-                )
-                    .into_response();
+                Ok(_) => {}
+                // The account is already gone: nothing left to revoke, so
+                // logout succeeds and still clears every cookie (M2).
+                Err(chv_controlplane_store::StoreError::NotFound { .. }) => {
+                    tracing::debug!(
+                        sub = %claims.sub,
+                        "logout for deleted user: nothing to revoke, clearing cookies"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "logout failed to bump token_version");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "message": "failed to revoke session",
+                            "code": "INTERNAL"
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
     }
@@ -260,6 +273,6 @@ struct UserRow {
     /// sets it to 1 on the seeded admin row so the operator is forced to
     /// rotate the credential on first login.
     must_change_password: i64,
-    /// Session revocation counter (#660, migration 0064).
+    /// Session revocation counter (#660, migration 0066).
     token_version: i64,
 }

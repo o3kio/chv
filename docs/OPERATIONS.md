@@ -939,30 +939,44 @@ The UI no longer writes tokens to `localStorage` or `sessionStorage`. Non-browse
 clients that need a bearer token (for example `chvctl`) must use the separate
 API-only endpoint `POST /api/v1/auth/login`.
 
-**Server-side revocation.** Migration `0064_user_token_version.sql` adds
+**Server-side revocation.** Migration `0066_user_token_version.sql` adds
 `users.token_version INTEGER NOT NULL DEFAULT 0`. Every newly issued session
 JWT carries a `token_version` claim; the auth extractor compares it with the
-database on every request. `POST /v1/auth/logout` and a successful password
-change increment the counter, so every token issued earlier — including a
-copied one — fails immediately with:
+database on **every authenticated request**, so revocation is immediate.
+`POST /v1/auth/logout`, a successful password change, and an admin
+password reset or role change (including demotion) increment the counter, so
+every token issued earlier — including a copied one — fails immediately with:
 
 - `401 SESSION_REVOKED` — the token's version is stale, or the user row is gone.
-- `503 AUTH_UNAVAILABLE` — the version lookup itself failed (database outage).
+- `503 AUTH_UNAVAILABLE` — the lookup itself failed (database outage).
 
-Pre-#660 tokens carry no `token_version` claim and are accepted without a
-database lookup until their 24-hour `exp` fires. This is the documented
-rollout gap: it avoids logging every operator out on deploy, but those legacy
-tokens cannot be revoked server-side. To close the gap immediately after an
-upgrade, ask users to log out and back in (or rotate the JWT secret, which
-invalidates all tokens). Rolling the migration back is safe — older binaries
-ignore the extra column — but it disables revocation until the column and the
-#660 binary are restored.
+The per-request read is deliberate fail-closed behavior: if the database is
+unavailable, a cookie that looks valid still yields `503 AUTH_UNAVAILABLE`
+rather than being trusted without a revocation check.
 
-**API-token scopes fail closed.** `api_tokens.scope` accepts exactly `full`
-(user's role) and `readonly` (viewer). Any other value — `NULL`/empty,
-mixed case, or an unknown future scope — is rejected with
-`403 INVALID_TOKEN_SCOPE`; it never falls back to the user's role. Audit
-existing rows before upgrading:
+Pre-#660 tokens carry no `token_version` claim (and no `aud`). During the
+rollout they are still accepted for users that exist — the extractor does a
+cheap existence/version lookup and rejects a legacy token whose `sub` has no
+user row. They cannot be revoked server-side, so they remain a bounded
+24-hour `exp` gap. To close it immediately:
+
+1. Ask users to log out and back in, or rotate the JWT secret (invalidates
+   all tokens); or
+2. Set `CHV_REQUIRE_TOKEN_VERSION=1` on the BFF/control plane. This rejects
+   **every** token without a `token_version` claim outright (401
+   `SESSION_REVOKED`). Default is off during rollout; enable it after the
+   upgrade window or after a suspected compromise.
+
+Rolling the migration back is safe — older binaries ignore the extra column —
+but it disables revocation until the column and the #660 binary are restored.
+
+**API-token scopes fail closed.** `api_tokens.scope` is `NOT NULL` and
+accepts exactly `full` (user's role) and `readonly` (viewer). Any other
+value — empty, mixed case, or an unknown future scope — is rejected with
+`403 INVALID_TOKEN_SCOPE`; it never falls back to the user's role. (A NULL
+is impossible through the schema; a hand-edited NULL row fails token
+deserialization as `401` before the scope check.) Audit existing rows
+before upgrading:
 
 ```sql
 SELECT scope, COUNT(*) FROM api_tokens GROUP BY scope;
@@ -971,10 +985,12 @@ SELECT scope, COUNT(*) FROM api_tokens GROUP BY scope;
 Fix or recreate any row whose scope is not `full` or `readonly`.
 
 **Console tickets are audience-bound and out-of-URL.** Console tickets are
-minted with `aud: "chv:console"` and a 60-second TTL. The agent console server
-requires that audience (a session JWT or API token cannot open a console) and
-reads the ticket from the `Sec-WebSocket-Protocol` handshake header, not from
-`?token=`. The BFF returns the URL and ticket separately; the UI calls
+minted with `aud: "chv:console"` and a 60-second TTL; session JWTs carry
+`aud: "chv:session"`. Each side enforces its own audience, so a session JWT
+or API token cannot open a console and a console ticket cannot be replayed
+against the session API. The agent reads the ticket from the
+`Sec-WebSocket-Protocol` handshake header, not from `?token=`. The BFF
+returns the URL and ticket separately; the UI calls
 `new WebSocket(url, [ticket])`. nginx forwards the subprotocol header by
 default.
 

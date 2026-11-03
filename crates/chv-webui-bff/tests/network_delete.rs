@@ -214,6 +214,7 @@ async fn seed_jwt_as(state: &AppState, role: &str) -> String {
         role: role.to_string(),
         exp,
         must_change_password: false,
+        aud: None,
         token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);

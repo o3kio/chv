@@ -26,12 +26,24 @@ pub const SESSION_COOKIE_NAME: &str = "chv_session";
 pub const ROLE_COOKIE_NAME: &str = "chv_role";
 pub const AUTH_HINT_COOKIE_NAME: &str = "chv_logged_in";
 
+/// Audience bound into every session JWT (#660). The console server mints
+/// tickets with a different audience (`chv:console`), so a session token
+/// cannot be replayed against a console and a console ticket cannot be
+/// replayed against the session API. Local to the BFF for now; sibling work
+/// adds a shared `chv_common` constant and this will be unified at rebase.
+pub const SESSION_AUDIENCE: &str = "chv:session";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
     pub username: String,
     pub role: String,
     pub exp: u64,
+    /// Audience claim. `None` on pre-#660 tokens; those are accepted for the
+    /// documented rollout window (see `docs/OPERATIONS.md`). A token with a
+    /// different audience — notably a `chv:console` ticket — is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
     /// True if the user must rotate their password before performing any
     /// other action. Marked `serde(default)` so JWTs issued before this
     /// field existed deserialize cleanly with `false` — no migration of
@@ -69,8 +81,8 @@ pub enum SessionAuthError {
     /// The token is well-formed but its `token_version` is behind the
     /// user's current value — logout or password change revoked it.
     Revoked,
-    /// The user row no longer exists (deleted account) or the version
-    /// lookup failed. Both fail closed.
+    /// The token version lookup itself failed (database outage). A
+    /// missing user row is [`SessionAuthError::Revoked`], not this.
     Unavailable,
 }
 
@@ -86,26 +98,84 @@ impl std::fmt::Display for SessionAuthError {
 
 impl std::error::Error for SessionAuthError {}
 
+/// Environment switch for the hard-close of pre-#660 session tokens.
+///
+/// Default `false` during rollout: legacy tokens are still accepted for
+/// existing users (they expire within the 24-hour session TTL). Setting it
+/// to `1`/`true`/`yes` rejects every token without a `token_version` claim
+/// immediately. Operators flip it once the rollout window has passed or
+/// after a suspected leak. See `docs/OPERATIONS.md`.
+pub const REQUIRE_TOKEN_VERSION_ENV: &str = "CHV_REQUIRE_TOKEN_VERSION";
+
+fn parse_env_flag(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// True when the operator has opted into rejecting legacy session tokens.
+pub fn require_token_version() -> bool {
+    parse_env_flag(std::env::var(REQUIRE_TOKEN_VERSION_ENV).ok().as_deref())
+}
+
 /// Decode a session JWT and enforce server-side revocation.
 ///
-/// Crypto validation is delegated to [`validate_token`]; if the token
-/// carries a `token_version` claim (every token issued after #660) the
-/// claim must match `users.token_version` exactly. A missing user row is
-/// rejected. Legacy tokens without the claim are accepted without a DB
-/// lookup — they expire within the 24-hour session TTL and cannot be
-/// revoked; the rollout is documented in `docs/OPERATIONS.md`.
+/// Crypto and audience validation are delegated to [`validate_token`]. A
+/// token with a `token_version` claim (every token issued after #660) must
+/// match `users.token_version` exactly. A missing user row is rejected.
+///
+/// Legacy tokens without the claim are accepted only while their `sub`
+/// still has a user row, unless [`require_token_version`] is enabled. That
+/// keeps the rollout from logging every operator out on deploy while still
+/// rejecting a deleted user's pre-upgrade token instead of trusting it
+/// until `exp`. A database lookup failure is a hard `AUTH_UNAVAILABLE` —
+/// auth fails closed.
 pub async fn validate_session_token(
     pool: &chv_controlplane_store::StorePool,
     token: &str,
     secret: &str,
 ) -> Result<Claims, SessionAuthError> {
+    validate_session_token_with_policy(pool, token, secret, require_token_version()).await
+}
+
+/// Policy-explicit form of [`validate_session_token`], split out so tests
+/// can exercise both sides of the rollout switch without mutating process
+/// environment.
+pub async fn validate_session_token_with_policy(
+    pool: &chv_controlplane_store::StorePool,
+    token: &str,
+    secret: &str,
+    require_version: bool,
+) -> Result<Claims, SessionAuthError> {
     let claims = validate_token(token, secret).map_err(SessionAuthError::Invalid)?;
-
-    let Some(expected) = claims.token_version else {
-        return Ok(claims);
-    };
-
     let repo = chv_controlplane_store::UserRepository::new(pool.clone());
+
+    // `is_legacy_session` is the single definition of "pre-#660".
+    if claims.is_legacy_session() {
+        if require_version {
+            tracing::warn!(
+                sub = %claims.sub,
+                env = REQUIRE_TOKEN_VERSION_ENV,
+                "legacy session token rejected by rollout switch"
+            );
+            return Err(SessionAuthError::Revoked);
+        }
+        return match repo.token_version(&claims.sub).await {
+            Ok(Some(_)) => Ok(claims),
+            // Deleted user: a legacy token must not outlive the account.
+            Ok(None) => Err(SessionAuthError::Revoked),
+            Err(e) => {
+                tracing::error!(error = %e, "legacy token user lookup failed");
+                Err(SessionAuthError::Unavailable)
+            }
+        };
+    }
+
+    let expected = claims
+        .token_version
+        .expect("non-legacy session token always carries token_version");
+
     match repo.token_version(&claims.sub).await {
         Ok(Some(current)) if current == expected => Ok(claims),
         Ok(Some(_)) => Err(SessionAuthError::Revoked),
@@ -178,10 +248,11 @@ pub fn has_apply_permission(role: &Role) -> bool {
 /// - `"readonly"` — the token is demoted to the `viewer` role, regardless
 ///   of the user's own role: read-only endpoints only, every mutating route
 ///   rejects it at the role middleware.
-/// - anything else (including `NULL` → `""` from legacy rows, typo'd, or
-///   future/unknown values) — the token is REJECTED. There is no fallback
-///   to the user's role: an unrecognized scope must never inherit mutation
-///   authority. Fail closed.
+/// - anything else (empty string, typo'd, mis-cased, or future/unknown
+///   values) — the token is REJECTED. There is no fallback to the user's
+///   role: an unrecognized scope must never inherit mutation authority.
+///   Fail closed. (`scope` is `NOT NULL`; a hand-edited NULL row cannot be
+///   read as a token at all, so it fails earlier with 401.)
 fn effective_role_for_scope(scope: &str, user_role: &str) -> Option<String> {
     match scope {
         "full" => Some(user_role.to_string()),
@@ -280,9 +351,20 @@ pub fn require_admin(claims: &Claims) -> Result<(), BffError> {
 pub fn validate_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
     let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    // Audience is checked manually below so pre-#660 tokens (no `aud`) keep
+    // working during the documented rollout window.
     validation.validate_aud = false;
     let token_data = jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation)?;
-    Ok(token_data.claims)
+    let claims = token_data.claims;
+
+    if let Some(aud) = claims.aud.as_deref() {
+        if aud != SESSION_AUDIENCE {
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidAudience,
+            ));
+        }
+    }
+    Ok(claims)
 }
 
 /// Parse the `chv_session` cookie value out of the request's `Cookie`
@@ -530,6 +612,8 @@ pub(crate) async fn authenticate_headers(
                     // service credentials minted explicitly by an authenticated
                     // user, not the seeded bootstrap admin row.
                     must_change_password: false,
+                    // API tokens are not JWTs and carry no audience claim.
+                    aud: None,
                     // API tokens are already resolved through the DB on every
                     // request; no JWT revocation counter applies.
                     token_version: None,
@@ -638,6 +722,7 @@ mod tests {
             role: "admin".to_string(),
             exp,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
@@ -657,6 +742,7 @@ mod tests {
             role: "admin".to_string(),
             exp: 1, // expired in 1970
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
@@ -683,6 +769,7 @@ mod tests {
             role: "admin".to_string(),
             exp,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let token = encode_claims(&claims, "wrong-secret");
@@ -725,6 +812,7 @@ mod tests {
             role: "viewer".into(),
             exp,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let forged = Claims {
@@ -733,6 +821,7 @@ mod tests {
             role: "admin".into(), // privilege escalation attempt
             exp,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let original_token = encode_claims(&original, &secret);
@@ -766,6 +855,7 @@ mod tests {
             role: "admin".into(),
             exp: future_exp(),
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let token = encode_claims(&claims, &secret);
@@ -793,6 +883,7 @@ mod tests {
             role: "admin".into(),
             exp: future_exp(),
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS512);
@@ -825,6 +916,7 @@ mod tests {
             role: "admin".into(),
             exp: now - 300,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
@@ -845,6 +937,7 @@ mod tests {
             role: "operator".into(),
             exp: u64::MAX / 2,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
@@ -1005,5 +1098,177 @@ mod tests {
             result.is_err(),
             "token missing required claim must be rejected"
         );
+    }
+
+    // ── session/console audience separation (#660 M1) ────────────────────
+
+    #[test]
+    fn session_audience_is_accepted() {
+        let claims = Claims {
+            sub: "user-1".into(),
+            username: "alice".into(),
+            role: "admin".into(),
+            exp: future_exp(),
+            must_change_password: false,
+            aud: Some(SESSION_AUDIENCE.into()),
+            token_version: Some(0),
+        };
+        let token = encode_claims(&claims, &test_secret());
+        let validated = validate_token(&token, &test_secret()).expect("session audience valid");
+        assert_eq!(validated.aud.as_deref(), Some(SESSION_AUDIENCE));
+    }
+
+    #[test]
+    fn console_ticket_cannot_validate_as_a_session() {
+        // A stolen console ticket carries `chv:console`; it must never be
+        // accepted by the session API.
+        let claims = Claims {
+            sub: "user-1".into(),
+            username: "alice".into(),
+            role: "admin".into(),
+            exp: future_exp(),
+            must_change_password: false,
+            aud: Some("chv:console".into()),
+            token_version: Some(0),
+        };
+        let token = encode_claims(&claims, &test_secret());
+        assert!(
+            validate_token(&token, &test_secret()).is_err(),
+            "console ticket must not validate as a session"
+        );
+    }
+
+    #[test]
+    fn legacy_token_without_aud_still_validates_cryptographically() {
+        // The rollout window accepts pre-#660 tokens with no `aud`.
+        let claims = Claims {
+            sub: "user-1".into(),
+            username: "alice".into(),
+            role: "admin".into(),
+            exp: future_exp(),
+            must_change_password: false,
+            aud: None,
+            token_version: None,
+        };
+        let token = encode_claims(&claims, &test_secret());
+        assert!(validate_token(&token, &test_secret()).is_ok());
+    }
+
+    // ── legacy-token existence lookup / hard close (#660 M3) ─────────────
+
+    async fn test_pool() -> chv_controlplane_store::StorePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        chv_controlplane_store::run_migrations(&pool, None)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    async fn seed_user(pool: &chv_controlplane_store::StorePool, user_id: &str, version: i64) {
+        sqlx::query(
+            "INSERT INTO users (user_id, username, password_hash, role, token_version) \
+             VALUES (?, ?, 'x', 'admin', ?)",
+        )
+        .bind(user_id)
+        .bind(format!("user-{user_id}"))
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("seed user");
+    }
+
+    fn signed(sub: &str, aud: Option<&str>, version: Option<u64>) -> String {
+        encode_claims(
+            &Claims {
+                sub: sub.into(),
+                username: "alice".into(),
+                role: "admin".into(),
+                exp: future_exp(),
+                must_change_password: false,
+                aud: aud.map(str::to_string),
+                token_version: version,
+            },
+            &test_secret(),
+        )
+    }
+
+    #[tokio::test]
+    async fn legacy_token_for_existing_user_is_accepted() {
+        let pool = test_pool().await;
+        seed_user(&pool, "u-legacy", 0).await;
+        let token = signed("u-legacy", None, None);
+        let claims = validate_session_token_with_policy(&pool, &token, &test_secret(), false)
+            .await
+            .expect("legacy token for an existing user must validate");
+        assert_eq!(claims.sub, "u-legacy");
+    }
+
+    #[tokio::test]
+    async fn legacy_token_for_deleted_user_is_revoked() {
+        let pool = test_pool().await;
+        let token = signed("u-deleted", None, None);
+        assert!(matches!(
+            validate_session_token_with_policy(&pool, &token, &test_secret(), false).await,
+            Err(SessionAuthError::Revoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_token_is_rejected_when_hard_close_is_enabled() {
+        let pool = test_pool().await;
+        seed_user(&pool, "u-legacy", 0).await;
+        let token = signed("u-legacy", None, None);
+        assert!(matches!(
+            validate_session_token_with_policy(&pool, &token, &test_secret(), true).await,
+            Err(SessionAuthError::Revoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_token_version_is_accepted() {
+        let pool = test_pool().await;
+        seed_user(&pool, "u-1", 3).await;
+        let token = signed("u-1", Some(SESSION_AUDIENCE), Some(3));
+        let claims = validate_session_token_with_policy(&pool, &token, &test_secret(), true)
+            .await
+            .expect("current version must validate");
+        assert_eq!(claims.sub, "u-1");
+    }
+
+    #[tokio::test]
+    async fn stale_token_version_is_revoked() {
+        let pool = test_pool().await;
+        seed_user(&pool, "u-1", 3).await;
+        let token = signed("u-1", Some(SESSION_AUDIENCE), Some(2));
+        assert!(matches!(
+            validate_session_token_with_policy(&pool, &token, &test_secret(), true).await,
+            Err(SessionAuthError::Revoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn versioned_token_for_deleted_user_is_revoked() {
+        let pool = test_pool().await;
+        let token = signed("u-deleted", Some(SESSION_AUDIENCE), Some(0));
+        assert!(matches!(
+            validate_session_token_with_policy(&pool, &token, &test_secret(), false).await,
+            Err(SessionAuthError::Revoked)
+        ));
+    }
+
+    #[test]
+    fn audit_flag_parsing_accepts_only_truthy_values() {
+        assert!(parse_env_flag(Some("1")));
+        assert!(parse_env_flag(Some("true")));
+        assert!(parse_env_flag(Some("TRUE")));
+        assert!(parse_env_flag(Some("yes")));
+        assert!(!parse_env_flag(Some("0")));
+        assert!(!parse_env_flag(Some("false")));
+        assert!(!parse_env_flag(Some("")));
+        assert!(!parse_env_flag(None));
     }
 }

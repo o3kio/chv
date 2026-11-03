@@ -522,6 +522,7 @@ impl Harness {
             role: role.to_string(),
             exp,
             must_change_password: false,
+            aud: None,
             token_version: None,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
