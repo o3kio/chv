@@ -12,6 +12,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Release gate entry point (#650). release.yml calls this workflow so the
+  # checks that gate merges are exactly the checks that gate publication —
+  # no second, drifting copy of the quality gate. A tag push does not match
+  # the push/pull_request triggers above, so it only runs when called.
+  workflow_call:
 
 jobs:
   rust:
@@ -44,7 +49,10 @@ jobs:
         run: cargo check --workspace
 
       - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+        # --all-targets also lints tests/benches/examples. The release quality
+        # gate (release.yml calls this workflow, #650) must not publish code
+        # that only fails when compiled in a non-default target.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: ADR-009 println!/eprintln! ban (library crates)
         run: ./scripts/check-no-println.sh
@@ -233,6 +241,29 @@ jobs:
           else
             echo "check script not found in package.json, skipping"
           fi
+
+  ui-unit:
+    name: UI unit tests (Vitest)
+    runs-on: ubuntu-latest
+    # Vitest over src/**/*.test.ts (jsdom). Same install/runner shape as the
+    # UI job; kept separate so a unit-test failure is distinguishable from a
+    # build/type-check failure. Normal runtime ~1-2 min.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 (pinned 2026-09-30)
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        run: cd ui && npm ci
+
+      - name: Run unit tests
+        run: cd ui && npm run test
 
   e2e:
     name: E2E tests
