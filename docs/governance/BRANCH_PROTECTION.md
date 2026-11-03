@@ -39,6 +39,15 @@ mechanism actually in use — the legacy branch-protection API is not).
 > leaves its checks unreported ("Expected") on PRs outside the filter and
 > blocks their merge once the check is required.
 
+> **Pending admin step (from #659, not yet applied):** `ci.yml` now also emits
+> `Rust coverage (ratchet, lines >= 76%)` and `Real-BFF E2E`. They are
+> blocking within the workflow, but they are **not** in the live `protect-main`
+> ruleset's required-check list yet. `apply-branch-protection.sh` now declares
+> both contexts, so an admin can add them by re-applying the ruleset
+> (`--enforce`, or the rulesets UI); this repository change alone cannot make a
+> check required. Until that step runs, a red coverage/real-BFF job is visible
+> but does not itself block merge.
+
 ---
 
 ## Tag Ruleset: `protect-tags`

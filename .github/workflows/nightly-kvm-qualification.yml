@@ -1,0 +1,167 @@
+name: Nightly KVM Qualification
+
+# Real-KVM qualification on the self-hosted runner fleet (#659).
+#
+#   - nightly (02:00 UTC): m4.7 fault/interruption matrix (chaos)
+#   - weekly  (Monday 03:00 UTC): full m4.3–m4.8 qualification sequence
+#   - manual: pick either lane
+#
+# These scenarios need /dev/kvm, root (taps/nft/netns), cloud-hypervisor, the
+# patched guest image, and the staged candidate binaries. They CANNOT run on
+# github-hosted runners. There is deliberately no ubuntu-latest fallback and
+# no "skip = pass" branch: if the self-hosted runner is offline the run stays
+# queued (visible as queued, never green), and if the runner is present but
+# the prerequisites are missing the driver fails with an annotation.
+#
+# Prerequisites (runner image, not repository secrets):
+#   - runner labels: self-hosted, linux, x64, chv-kvm
+#   - /dev/kvm exposed; passwordless sudo
+#   - cloud-hypervisor + guest image are provisioned by
+#     scripts/integration/qual/env-preflight.sh (downloads are cached under
+#     CHV_QUAL_ROOT)
+#   - disk headroom for the release build + VM images (see
+#     docs/release/self-hosted-runner-requirements.md)
+#
+# Evidence: every run uploads per-scenario logs, results.tsv, and the
+# scenario evidence directories (m4.N-artifacts) as an artifact, on success
+# or failure. See docs/dev/test-evidence-tiers.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Qualification lane'
+        required: true
+        default: 'chaos'
+        type: choice
+        options:
+          - chaos  # m4.7 fault/interruption matrix (~25 min)
+          - full   # m4.3–m4.8 sequence (hours; includes soak)
+
+  schedule:
+    # Nightly chaos: the m4.7 fault & interruption matrix.
+    - cron: '0 2 * * *'
+    # Weekly full sequence, offset from the nightly run.
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+# Serialize runs: scenario scripts share /var/lib/chv/qual and bind host
+# ports; overlapping runs would corrupt each other's evidence and teardown.
+concurrency:
+  group: nightly-kvm-qualification
+  cancel-in-progress: false
+
+jobs:
+  chaos:
+    name: Nightly chaos (m4.7 fault matrix)
+    runs-on: [self-hosted, linux, x64, chv-kvm]
+    timeout-minutes: 240
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.lane == 'chaos') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
+    env:
+      CHV_QUAL_ROOT: /var/lib/chv/qual
+      QUAL_ARTIFACT_ROOT: /var/lib/chv/qual/ci-artifacts/run-${{ github.run_id }}-chaos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned 2026-09-30)
+
+      - name: Install protoc
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Verify runner prerequisites
+        # Fail with an actionable annotation before the long build starts.
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::Nightly KVM qualification requires /dev/kvm on the self-hosted chv-kvm runner; this run cannot pass."
+            exit 1
+          fi
+          if ! sudo -n true 2>/dev/null; then
+            echo "::error::Nightly KVM qualification requires passwordless sudo on the self-hosted chv-kvm runner."
+            exit 1
+          fi
+
+      - name: Run m4.7 chaos scenario
+        run: |
+          sudo -E env "PATH=$PATH" \
+            CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
+            QUAL_ARTIFACT_ROOT="$QUAL_ARTIFACT_ROOT" \
+            ./scripts/integration/qual/nightly-run.sh --scenarios "m4.7-faults"
+
+      - name: Upload qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nightly-kvm-chaos-m4.7-${{ github.run_id }}
+          path: ${{ env.QUAL_ARTIFACT_ROOT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  full:
+    name: Weekly full qualification (m4.3–m4.8)
+    runs-on: [self-hosted, linux, x64, chv-kvm]
+    timeout-minutes: 720
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.lane == 'full') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1')
+    env:
+      CHV_QUAL_ROOT: /var/lib/chv/qual
+      QUAL_ARTIFACT_ROOT: /var/lib/chv/qual/ci-artifacts/run-${{ github.run_id }}-full
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned 2026-09-30)
+
+      - name: Install protoc
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Verify runner prerequisites
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::Nightly KVM qualification requires /dev/kvm on the self-hosted chv-kvm runner; this run cannot pass."
+            exit 1
+          fi
+          if ! sudo -n true 2>/dev/null; then
+            echo "::error::Nightly KVM qualification requires passwordless sudo on the self-hosted chv-kvm runner."
+            exit 1
+          fi
+
+      - name: Run m4.3–m4.8 qualification sequence
+        # One deploy per scenario; the results file and per-scenario evidence
+        # directories are uploaded below even if an early scenario fails.
+        run: |
+          sudo -E env "PATH=$PATH" \
+            CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
+            QUAL_ARTIFACT_ROOT="$QUAL_ARTIFACT_ROOT" \
+            ./scripts/integration/qual/nightly-run.sh \
+              --scenarios "m4.3-lifecycle m4.4-network m4.5-storage m4.6-migration m4.7-faults m4.8-perf-soak"
+
+      - name: Upload qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nightly-kvm-full-${{ github.run_id }}
+          path: ${{ env.QUAL_ARTIFACT_ROOT }}
+          if-no-files-found: warn
+          retention-days: 30

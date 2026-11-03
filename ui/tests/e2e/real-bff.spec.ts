@@ -1,0 +1,109 @@
+import { test, expect, type Page } from '@playwright/test';
+
+/**
+ * Real-BFF flow (#659).
+ *
+ * Every other Playwright spec stubs /v1/** with `page.route` or the mock BFF,
+ * which means none of them can catch a serde field rename between the Rust
+ * BFF and the SvelteKit parsers. This spec talks to an actual
+ * `chv-controlplane` process:
+ *
+ *   scripts/integration/real-bff-e2e.sh
+ *     -> disposable SQLite + migrations
+ *     -> seeded admin (bcrypt, must_change_password=0)
+ *     -> REAL_BFF_BASE_URL / REAL_BFF_E2E_USER / REAL_BFF_E2E_PASSWORD
+ *
+ * It is skipped when REAL_BFF_BASE_URL is unset, so the fast mock-BFF suite
+ * and local `npm run test:e2e` keep working without a Rust build.
+ */
+
+const REAL_BFF = process.env.REAL_BFF_BASE_URL ?? '';
+const USERNAME = process.env.REAL_BFF_E2E_USER ?? 'admin';
+const PASSWORD = process.env.REAL_BFF_E2E_PASSWORD ?? '';
+
+/**
+ * The UI is a static build, so its `/v1/**` fetches hit the preview origin.
+ * Forward them to the real BFF without changing method/body/headers; the
+ * browser still executes the real UI parsers on the real response bytes.
+ */
+async function forwardToRealBff(page: Page): Promise<void> {
+	await page.route('**/v1/**', async (route) => {
+		const incoming = new URL(route.request().url());
+		// SSE endpoints (e.g. /v1/tasks/stream) are never-ending responses;
+		// route.fetch would buffer them forever and hang test teardown. The
+		// dashboard assertions do not depend on live events, so return a
+		// clean closed stream.
+		const accept = route.request().headers()['accept'] ?? '';
+		if (accept.includes('text/event-stream')) {
+			await route.fulfill({
+				status: 200,
+				headers: { 'content-type': 'text/event-stream' },
+				body: ''
+			});
+			return;
+		}
+		const response = await route.fetch({
+			url: `${REAL_BFF}${incoming.pathname}${incoming.search}`
+		});
+		await route.fulfill({ response });
+	});
+}
+
+test.describe('Real Rust BFF', () => {
+	test.skip(
+		!REAL_BFF || !PASSWORD,
+		'REAL_BFF_BASE_URL/REAL_BFF_E2E_PASSWORD unset — runs in the dedicated real-BFF CI job'
+	);
+
+	test('operator signs in and the dashboard parses the real overview response', async ({ page }) => {
+		await forwardToRealBff(page);
+
+		await page.goto('/login');
+		await page.getByLabel(/operator identity/i).fill(USERNAME);
+		await page.getByLabel(/access credential/i).fill(PASSWORD);
+		await page.getByRole('button', { name: /authenticate session/i }).click();
+
+		await expect(page).toHaveURL('/');
+
+		// The token is minted by the Rust BFF (HS256 JWT), not a fixture.
+		const token = await page.evaluate(() => localStorage.getItem('chv-api-token'));
+		expect(token?.split('.')).toHaveLength(3);
+
+		// The seeded database is empty, so a correct real-BFF response drives
+		// the honest empty state. A serde drift or a failed /v1/overview call
+		// renders the "Telemetry Failure" error state instead.
+		await expect(page.getByText('Fleet Overview')).toBeVisible();
+		await expect(page.getByText('Empty Fleet')).toBeVisible();
+		await expect(page.getByText('Telemetry Failure')).toHaveCount(0);
+	});
+
+	test('real BFF serializes the documented overview contract as JSON', async ({ request }) => {
+		const login = await request.post(`${REAL_BFF}/v1/auth/login`, {
+			data: { username: USERNAME, password: PASSWORD }
+		});
+		expect(login.status()).toBe(200);
+		const loginBody = await login.json();
+		expect(typeof loginBody.token).toBe('string');
+
+		const overview = await request.post(`${REAL_BFF}/v1/overview`, {
+			headers: { Authorization: `Bearer ${loginBody.token}` },
+			data: {}
+		});
+		expect(overview.status()).toBe(200);
+		expect(overview.headers()['content-type']).toContain('application/json');
+
+		const body = await overview.json();
+		expect(typeof body.nodes_total).toBe('number');
+		expect(typeof body.vms_total).toBe('number');
+		expect(typeof body.active_tasks).toBe('number');
+		expect(Array.isArray(body.alerts)).toBe(true);
+		expect(Array.isArray(body.recent_tasks)).toBe(true);
+	});
+
+	test('real BFF fails closed on invalid credentials', async ({ request }) => {
+		const response = await request.post(`${REAL_BFF}/v1/auth/login`, {
+			data: { username: USERNAME, password: `${PASSWORD}-wrong` }
+		});
+		expect(response.status()).toBe(401);
+	});
+});

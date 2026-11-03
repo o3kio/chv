@@ -79,6 +79,9 @@ TOOL_PACKAGES=(
     "jq:jq"
     "dnsmasq:dnsmasq"
     "genisoimage:genisoimage"
+    # patch-guest-image.sh converts the stock cloud image into the bootable
+    # qualification image; the nightly driver always calls it (#659).
+    "qemu-img:qemu-utils"
 )
 MISSING_PACKAGES=""
 for tp in "${TOOL_PACKAGES[@]}"; do
@@ -94,7 +97,7 @@ fi
 for tp in "${TOOL_PACKAGES[@]}"; do
     command -v "${tp%%:*}" >/dev/null 2>&1 || qual_die "required tool missing after install: ${tp%%:*} (package ${tp##*:})"
 done
-qual_pass "host tools present (openssl, curl, python3, htpasswd, jq, dnsmasq, genisoimage)"
+qual_pass "host tools present (openssl, curl, python3, htpasswd, jq, dnsmasq, genisoimage, qemu-img)"
 
 # The dnsmasq package's systemd unit must NOT run as a host DNS resolver:
 # with its stock (all-comments) config it binds :53 broadly and forwards

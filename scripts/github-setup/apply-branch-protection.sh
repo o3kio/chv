@@ -27,10 +27,10 @@
 #   - require_code_owner_review + 1 approval: a PR author cannot self-approve;
 #     the second CODEOWNERS maintainer must be available to review.
 #
-# The required status checks (Rust checks, UI checks, E2E tests from ci.yml;
-# cargo audit + the cargo deny matrix from security.yml) all report on every
-# PR — security.yml deliberately has no pull_request path filter for this
-# reason (see its header comment).
+# The required status checks (Rust checks, UI checks, E2E tests, Rust coverage
+# and Real-BFF E2E from ci.yml; cargo audit + the cargo deny matrix from
+# security.yml) all report on every PR — security.yml deliberately has no
+# pull_request path filter for this reason (see its header comment).
 
 set -euo pipefail
 
@@ -133,7 +133,7 @@ fi
 # The ruleset definition (idempotent PUT — replaces the definition).
 #
 # Required status checks must report on every PR:
-#   - ci.yml: Rust checks, UI checks, E2E tests
+#   - ci.yml: Rust checks, UI checks, E2E tests, Rust coverage, Real-BFF E2E
 #   - security.yml: cargo audit, cargo deny (advisories|bans|licenses|sources)
 # ---------------------------------------------------------------------------
 ENFORCEMENT="${LIVE_ENFORCEMENT}"
@@ -176,6 +176,8 @@ gh api --method PUT "repos/${REPO_SLUG}/rulesets/${RULESET_ID}" \
           { "context": "Rust checks" },
           { "context": "UI checks" },
           { "context": "E2E tests" },
+          { "context": "Rust coverage (ratchet, lines >= 76%)" },
+          { "context": "Real-BFF E2E" },
           { "context": "cargo audit" },
           { "context": "cargo deny (advisories)" },
           { "context": "cargo deny (bans)" },

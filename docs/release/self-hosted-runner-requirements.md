@@ -134,6 +134,45 @@ If the runner has strict iptables/nftables rules:
 - Allow loopback traffic on test ports (8080, 8443, 9100)
 - Allow bridge-local traffic for `chv-test-*` interfaces
 
+## Nightly Qualification Lane
+
+`.github/workflows/nightly-kvm-qualification.yml` uses the same
+`[self-hosted, linux, x64, chv-kvm]` labels for the M4.3–M4.8 qualification
+scenarios:
+
+| Schedule (UTC) | Scenarios |
+|----------------|-----------|
+| Daily 02:00 | `m4.7-faults.sh` (fault/interruption matrix) |
+| Monday 03:00 | `m4.3-lifecycle`, `m4.4-network`, `m4.5-storage`, `m4.6-migration`, `m4.7-faults`, `m4.8-perf-soak` |
+
+`scripts/integration/qual/nightly-run.sh` calls
+`env-preflight.sh --stage-binaries` (release build from a clean checkout,
+pinned cloud-hypervisor/firmware/guest image), then `patch-guest-image.sh`
+(the stock cloud image cannot boot through the CHV firmware chain; all
+M4.3–M4.8 evidence used `noble-qual-patched.img`), and runs each scenario
+through `deploy.sh --exec`. It writes `logs/<scenario>.log`, `results.tsv`,
+`summary.md`, and copies each `m4.N-artifacts` evidence directory into the
+uploaded artifact. `env-preflight.sh` now installs `qemu-utils` for the patch
+step.
+
+Operational requirements:
+
+- **No repository secrets.** The lane uses loopback-only services and the
+  runner's local qualification assets.
+- **Offline runner = queued, never green.** There is no hosted-runner fallback
+  and no skip-as-pass branch. A scheduled run with no matching runner remains
+  queued and visible in the Actions UI.
+- **Missing prerequisites = failure.** If `/dev/kvm` or passwordless sudo is
+  absent, the workflow emits an `::error::` annotation and exits non-zero; the
+  driver does the same for failed staging or scenario errors.
+- **Disk and time.** The full weekly sequence includes the m4.8 soak and runs
+  for hours; keep the disk headroom in the table above and do not run two
+  qualification jobs concurrently (the workflow has a concurrency group, and
+  the scenario scripts share `/var/lib/chv/qual` and host ports).
+- **Runner ownership.** The driver runs as root while the workspace is owned
+  by the runner user; it sets `safe.directory` for the checkout so
+  `env-preflight.sh` can record the candidate SHA.
+
 ## Test User Expectations
 
 The user account running the GitHub Actions runner service should:

@@ -229,11 +229,18 @@ cargo build --workspace
 
 GitHub Actions runs on every push and PR:
 - `cargo check`, `cargo clippy -- -D warnings`, `cargo nextest run --workspace --no-fail-fast`, plus `cargo test --workspace --doc` for doctests
-- A non-blocking `cargo llvm-cov` line-coverage report per PR (lcov artifact + job summary); no threshold yet
-- UI `npm ci`, `npm run build`, `npm run check`, and Playwright tests against the mock BFF (`ui/tests/e2e/mock-bff.mjs`) — not a live stack
+- A blocking `cargo llvm-cov` line-coverage ratchet (minimum 76%; recorded `main` baseline 78.92%), with lcov artifact + job summary
+- UI `npm ci`, `npm run build`, `npm run check`, and Playwright tests against the mock BFF (`ui/tests/e2e/mock-bff.mjs`)
+- A real-BFF Playwright flow against a disposable-SQLite `chv-controlplane` (real router/auth/serialization), plus a fail-closed bad-credential case
 - `chvctl` smoke test and VERSION validation
 
-See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
+The nightly/weekly self-hosted `chv-kvm` lanes run the M4.3–M4.8 qualification
+scripts (m4.7 chaos nightly, the full sequence weekly). The exact split between
+PR, scheduled, and manual evidence — and what remains unverified — is documented
+in [`docs/dev/test-evidence-tiers.md`](./docs/dev/test-evidence-tiers.md).
+
+See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) and
+[`.github/workflows/nightly-kvm-qualification.yml`](./.github/workflows/nightly-kvm-qualification.yml).
 
 ## Version
 

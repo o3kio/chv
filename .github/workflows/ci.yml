@@ -278,21 +278,25 @@ jobs:
           fi
           promtool check rules "${files[@]}"
   coverage:
-    name: Rust coverage (non-blocking baseline)
+    name: Rust coverage (ratchet, lines >= 76%)
     runs-on: ubuntu-latest
-    # Non-blocking baseline for #659: publish a per-PR line-coverage report
-    # before any threshold exists. The follow-up ratchet turns this into a
-    # blocking check once the baseline is stable; until then a coverage
-    # tooling failure must not block a merge. Do not add this job to the
-    # required checks list until that ratchet lands.
-    continue-on-error: true
+    # Blocking ratchet for #659. The recorded `main` cargo-llvm-cov baseline
+    # is 78.92% lines; 76% leaves ~2.9 points of
+    # headroom for unrelated refactors while still catching a real regression.
+    # Raise the threshold as the baseline rises — never lower it to make a
+    # red PR green. A coverage-tooling failure is a real failure now; there is
+    # no continue-on-error escape hatch.
+    # Making this check *required* for merges is a GitHub ruleset admin step
+    # (see docs/governance/BRANCH_PROTECTION.md); the workflow itself cannot
+    # express that.
     # Same hang guard as the rust job: a stuck apt/protoc install must fail
     # fast rather than burn a runner until the 6-hour cap. Cold instrumented
     # builds are slower than plain tests, hence the same 45-minute budget.
     timeout-minutes: 45
     # Only report on the normal PR/push triggers. release.yml calls this
-    # workflow (workflow_call) as its merge gate; a non-blocking baseline
-    # must not lengthen that path or appear in its required-job set.
+    # workflow (workflow_call) as its release gate; keeping coverage on the
+    # PR surface avoids lengthening that path. Add it to workflow_call if the
+    # release gate should also enforce the ratchet.
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
@@ -319,19 +323,22 @@ jobs:
         # with this rustup component for the pinned toolchain.
         run: rustup component add llvm-tools-preview
 
-      - name: Run coverage (lcov)
-        # No --no-report: the command builds, runs the suite, and writes the
-        # report. Its exit code reflects build/test failures (meaningful even
-        # while the job itself is continue-on-error).
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Run coverage (lcov, ratchet at 76% lines)
+        # --fail-under-lines makes this job blocking: the command exits
+        # non-zero when line coverage drops below the ratchet, in addition to
+        # failing on build/test errors. Keep the lcov output so the artifact
+        # and summary below still publish on a ratchet failure.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 76
 
       - name: Publish coverage summary
         if: always()
         run: |
           {
-            echo "## Rust coverage (non-blocking baseline, #659)"
+            echo "## Rust coverage ratchet (minimum 76% lines, #659)"
             echo ""
-            echo "Full lcov report is attached to this run as \`rust-coverage-lcov\`."
+            echo "Baseline recorded on \`main\`: **78.92% lines**. This job fails"
+            echo "below **76%** (\`--fail-under-lines 76\`). Full lcov report is"
+            echo "attached to this run as \`rust-coverage-lcov\`."
             echo ""
             echo '```'
             cargo llvm-cov report --summary-only \
@@ -435,3 +442,82 @@ jobs:
         run: cd ui && npm run test:e2e
         env:
           BFF_BASE_URL: http://localhost:8888
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwright-mock-bff-report
+          path: |
+            ui/playwright-report/
+            ui/test-results/
+          if-no-files-found: warn
+
+  # One real wire, not a stub: this lane boots the actual Rust control plane
+  # (BFF router + serialization) against a disposable SQLite database with a
+  # seeded admin user, then drives the SvelteKit login + dashboard through
+  # Playwright. The mock-BFF suite above stays fast and independent; this job
+  # is the contract tripwire for wire-shape drift (#659).
+  real-bff-e2e:
+    name: Real-BFF E2E
+    runs-on: ubuntu-latest
+    # Only on the normal PR/push triggers, matching the coverage job: the
+    # release gate should not gain a second, longer instrumented build path.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned 2026-09-30)
+
+      - name: Install protoc and htpasswd
+        # protoc is required by the workspace build scripts; htpasswd (from
+        # apache2-utils) generates the seeded admin's bcrypt hash. The
+        # real-bff harness also accepts python3-bcrypt when present.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler apache2-utils
+
+      - name: Build control plane with the dev feature
+        # CHV_ALLOW_INSECURE=1 (loopback, ephemeral SQLite) is only accepted
+        # by a build that carries the `dev` feature; the fail-closed gate is
+        # documented in crates/chv-controlplane-service/src/peer_identity.rs.
+        run: cargo build --package chv-controlplane --features dev
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 (pinned 2026-09-30)
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        run: cd ui && npm ci
+
+      - name: Install Playwright browsers
+        run: cd ui && npx playwright install --with-deps
+
+      - name: Run real-BFF Playwright flow
+        # The harness owns the control-plane lifecycle: migrations, admin
+        # seeding, readiness, Playwright, then teardown + log collection.
+        env:
+          REAL_BFF_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/real-bff
+        run: |
+          ./scripts/integration/real-bff-e2e.sh \
+            --binary target/debug/chv-controlplane \
+            -- bash -c 'cd ui && npx playwright test tests/e2e/real-bff.spec.ts'
+
+      - name: Upload real-BFF artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: real-bff-e2e-report
+          path: |
+            ui/playwright-report/
+            ui/test-results/
+            artifacts/real-bff/
+          if-no-files-found: warn
