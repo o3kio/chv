@@ -487,6 +487,7 @@ impl StordClient {
         volume_id: &str,
         attachment_handle: &str,
         dest_endpoint: &str,
+        migration_authorization: &str,
         pause_first: bool,
         operation_id: Option<&str>,
     ) -> Result<String, ChvError> {
@@ -502,6 +503,7 @@ impl StordClient {
             attachment_handle: attachment_handle.to_string(),
             dest_endpoint: dest_endpoint.to_string(),
             pause_first,
+            migration_authorization: migration_authorization.to_string(),
         };
         let span = tracing::info_span!(
             "trigger_disk_migration",
@@ -1883,6 +1885,7 @@ mod tests {
                 "vol-pf",
                 "handle-pf",
                 "https://10.0.0.5:50052",
+                "token-pf",
                 true,
                 Some("op-pf"),
             )
@@ -1897,6 +1900,10 @@ mod tests {
         assert!(
             req.pause_first,
             "the stop-the-world opt-in must ride the trigger request"
+        );
+        assert_eq!(
+            req.migration_authorization, "token-pf",
+            "the control-plane migration authorization must ride the trigger request"
         );
         assert_eq!(
             req.meta.expect("meta present").operation_id,
@@ -1951,6 +1958,7 @@ mod tests {
                 "vol-pf",
                 "handle-pf",
                 "https://10.0.0.5:50052",
+                "token-pf",
                 true,
                 Some("op-pf"),
             )
@@ -1985,6 +1993,7 @@ mod tests {
                 "vol-def",
                 "handle-def",
                 "https://10.0.0.5:50052",
+                "token-def",
                 false,
                 Some("op-def"),
             )

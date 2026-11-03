@@ -530,6 +530,11 @@ curl -X POST http://127.0.0.1:8080/v1/nodes/mutate \
 | `deadline_exceeded waiting for Ack` | Receiver not acknowledging | Check receiver node health; disk I/O saturation on destination |
 | Migration stalled (reaper will clean up) | `chv_migration_phase` gauge stuck and no progress reports | Wait for the reaper's no-progress timeout (default 7200 s, `CHV_MIGRATION_STALL_TIMEOUT_SECS`) or manually fail the row. The reaper resumes the source VM only when the sender is proven quiescent; otherwise the VM may stay paused for operator review |
 | Backpressure throttling | `slow_down_factor` in logs | Receiver is overwhelmed; reduce concurrent migrations or add I/O capacity |
+| `UNAUTHENTICATED: missing control-plane migration authorization token` | Token did not reach stord (agent/stord version skew, or a manual `TriggerDiskMigration` without `migration_authorization`) | Upgrade the agent and stord together; never hand-drive the stord migration API without a CP-minted token |
+| `PERMISSION_DENIED: migration authorization rejected: ...` | Signature/claim failure: wrong destination node id, wrong volume/size, expired, not-yet-valid, or replayed token | Ensure both sides use the *same* dedicated `[migration].signing_secret_file`; check `migration.node_id` matches the agent's node id; check clock skew (≤ 60 s) and that the token TTL is ≤ 900 s. A replay means the same token was used twice — inspect for a retried dispatch reusing the old token |
+| `FAILED_PRECONDITION: this stord has no migration authorization verifier configured` | Destination stord has no secret (`DenyAll`) | Set `migration.node_id` and `migration.signing_secret_file` (or `CHV_MIGRATION_SIGNING_SECRET`) on the destination and restart stord |
+| CP logs `disk migration requires a dedicated migration signing secret` | Control plane has attached volumes to migrate but no secret | Set `[migration].signing_secret_file` on the control plane (same secret as destination stords), or explicitly set the development-only `allow_insecure_unauthenticated` on both sides |
+| `RESOURCE_EXHAUSTED: migration admission rejected: ...` | Destination hit `max_inflight_receiving` or `max_inflight_receiving_bytes` | Wait for active migrations to finish (capacity is released on stream close), reduce migration concurrency, or raise the limits on the destination. Rejected attempts do not consume the token, so the CP can retry after capacity frees |
 
 **Check active migrations:**
 ```bash
@@ -614,6 +619,36 @@ openssl s_client -connect <PEER_IP>:8444 \
   -key /etc/chv/certs/node-key.pem \
   -CAfile /etc/chv/certs/ca.pem
 ```
+
+**Verify migration authorization (issue #663):**
+
+The control plane and every destination stord must load the *same* dedicated
+migration-signing secret. It is separate from the user JWT secret, the
+enrollment secret, and the TLS keys.
+
+```bash
+# Secret file: at least 32 bytes, root:chv 0640, no trailing content
+sudo install -d -m 0750 -o root -g chv /etc/chv/migration
+sudo sh -c 'openssl rand -hex 32 > /etc/chv/migration/signing-secret'
+sudo chown root:chv /etc/chv/migration/signing-secret
+sudo chmod 0640 /etc/chv/migration/signing-secret
+sudo test "$(tr -d '\r\n' < /etc/chv/migration/signing-secret | wc -c)" -ge 32 && echo ok
+
+# Destination stord config
+grep -A12 '^\[migration\]' /etc/chv/stord.toml | grep -E \
+  'node_id|signing_secret_file|max_inflight'
+
+# Startup log should say minting/verification is enabled, and must NOT contain
+# the insecure-bypass warning.
+journalctl -u chv-controlplane -u chv-stord | grep -i 'migration authorization\|allow_insecure'
+```
+
+Never set `allow_insecure_unauthenticated = true` in production on either
+side; it disables the control-plane binding and lets any CA-certified peer
+create receiving volumes. Rotate the secret by updating the file on the
+control plane and all stords and restarting them; tokens minted with the old
+secret are rejected immediately (maximum exposure is the 900 s token
+lifetime).
 
 ### Stuck Operations After Agent Crash (InspectRequired)
 

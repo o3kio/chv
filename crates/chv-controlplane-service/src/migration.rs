@@ -4,6 +4,9 @@
 //! Handles rollback at each phase according to spec.
 
 use crate::node_client_pool::NodeClientPool;
+use chv_common::migration_auth::{
+    MigrationTokenCodec, DEFAULT_MIGRATION_TOKEN_TTL, MAX_MIGRATION_TOKEN_TTL,
+};
 use chv_controlplane_store::{
     InterruptedMigrationOutcome, InterruptedMigrationUpdate, MigrationRecord, MigrationRepository,
     StorePool,
@@ -137,6 +140,8 @@ impl MigrationConfig {
             block_size_bytes: self.block_size_bytes,
             total_timeout_seconds: self.total_timeout_seconds,
             pause_first: self.pause_first,
+            // Transient dispatch data, never part of the persisted config.
+            volume_authorizations: Vec::new(),
         }
     }
 
@@ -647,6 +652,94 @@ async fn validate_preconditions(pool: &StorePool, state: &MigrationState) -> Res
     Ok(())
 }
 
+/// Mint one short-lived migration authorization per attached volume
+/// (issue #663).
+///
+/// The control plane is the only minter. The tokens are transient dispatch
+/// data: they are never written to the operations row, migrations table, or
+/// correlation_id. A missing signing secret fails closed before the agent is
+/// contacted unless the deployment explicitly opted into the development-only
+/// insecure mode on both sides.
+async fn build_migration_volume_authorizations(
+    pool: &StorePool,
+    state: &MigrationState,
+    signing_secret: Option<&[u8]>,
+    token_ttl: Duration,
+    allow_insecure_unauthenticated: bool,
+) -> Result<Vec<proto::MigrationVolumeAuthorization>, ChvError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT v.volume_id, v.capacity_bytes
+           FROM volume_desired_state vds
+           JOIN volumes v ON v.volume_id = vds.volume_id
+           WHERE vds.attached_vm_id = ?
+           ORDER BY v.volume_id"#,
+    )
+    .bind(&state.vm_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ChvError::Internal {
+        reason: format!("failed to query attached volumes for migration authorization: {e}"),
+    })?;
+
+    if rows.is_empty() {
+        // A diskless VM has no destination volume creation to authorize.
+        return Ok(Vec::new());
+    }
+
+    let Some(secret) = signing_secret else {
+        if allow_insecure_unauthenticated {
+            warn!(
+                migration_id = %state.migration_id,
+                vm_id = %state.vm_id,
+                "SECURITY: dispatching a disk migration WITHOUT control-plane authorizations \
+                 (migration.allow_insecure_unauthenticated = true, development-only)"
+            );
+            return Ok(Vec::new());
+        }
+        return Err(ChvError::Unauthorized {
+            reason: "disk migration requires a dedicated migration signing secret, but none is \
+                     configured on the control plane; set [migration].signing_secret_file (or \
+                     CHV_MIGRATION_SIGNING_SECRET). Refusing to dispatch an unauthorized \
+                     migration"
+                .to_string(),
+        });
+    };
+
+    let codec = MigrationTokenCodec::new(secret).map_err(|e| ChvError::Unauthorized {
+        reason: format!("invalid migration signing secret: {e}"),
+    })?;
+    let ttl = if token_ttl.is_zero() {
+        DEFAULT_MIGRATION_TOKEN_TTL
+    } else {
+        token_ttl.min(MAX_MIGRATION_TOKEN_TTL)
+    };
+
+    let mut authorizations = Vec::with_capacity(rows.len());
+    for (volume_id, capacity_bytes) in rows {
+        let size_bytes = u64::try_from(capacity_bytes).map_err(|_| ChvError::Internal {
+            reason: format!(
+                "volume {volume_id} has a negative capacity ({capacity_bytes}); cannot authorize \
+                 its migration"
+            ),
+        })?;
+        let token = codec
+            .mint(
+                &state.source_node_id,
+                &state.dest_node_id,
+                &volume_id,
+                size_bytes,
+                ttl,
+            )
+            .map_err(|e| ChvError::Internal {
+                reason: format!(
+                    "failed to mint migration authorization for volume {volume_id}: {e}"
+                ),
+            })?;
+        authorizations.push(proto::MigrationVolumeAuthorization { volume_id, token });
+    }
+    Ok(authorizations)
+}
+
 /// Execute the full migration state machine.
 ///
 /// This drives the migration through all phases:
@@ -671,6 +764,9 @@ pub async fn execute_migration(
     node_client_pool: &NodeClientPool,
     agent_socket_pattern: &str,
     state: &mut MigrationState,
+    migration_signing_secret: Option<&[u8]>,
+    migration_token_ttl: Duration,
+    allow_insecure_unauthenticated: bool,
 ) -> Result<(), ChvError> {
     info!(
         migration_id = %state.migration_id,
@@ -700,6 +796,19 @@ pub async fn execute_migration(
         Duration::from_secs(timeouts.total_secs)
     };
 
+    // Issue #663: mint per-volume authorizations BEFORE contacting the
+    // source agent. If the secret is missing/misconfigured this fails here,
+    // so no unauthorized migration can start and no destination volume can
+    // be provisioned.
+    let volume_authorizations = build_migration_volume_authorizations(
+        pool,
+        state,
+        migration_signing_secret,
+        migration_token_ttl,
+        allow_insecure_unauthenticated,
+    )
+    .await?;
+
     let migration_result = tokio::time::timeout(total_timeout, async {
         // Phase 1: PreCopyDisk - dispatch migrate_vm to source agent
         transition_phase(pool, state, MigrationPhase::PreCopyDisk).await?;
@@ -727,6 +836,11 @@ pub async fn execute_migration(
             .get_or_connect(&state.source_node_id, &source_socket)
             .await?;
 
+        // Tokens ride the transient MigrateVm request only. They are never
+        // written to the operation row/correlation_id.
+        let mut dispatch_config = state.config.to_proto();
+        dispatch_config.volume_authorizations = volume_authorizations;
+
         let precopy_result = tokio::time::timeout(
             Duration::from_secs(timeouts.precopy_disk_secs),
             source_client.migrate_vm(
@@ -735,7 +849,7 @@ pub async fn execute_migration(
                 &vm_generation,
                 &state.source_node_id,
                 &state.dest_node_id,
-                state.config.to_proto(),
+                dispatch_config,
                 &state.operation_id,
                 None,
             ),
@@ -2352,6 +2466,7 @@ mod tests {
             block_size_bytes: 8_388_608,
             total_timeout_seconds: 7200,
             pause_first: true,
+            volume_authorizations: Vec::new(),
         };
         let config = MigrationConfig::from_proto(&proto_config);
 
@@ -2370,6 +2485,7 @@ mod tests {
             block_size_bytes: 0,
             total_timeout_seconds: 0,
             pause_first: false,
+            volume_authorizations: Vec::new(),
         };
         let config = MigrationConfig::from_proto(&proto_config);
         let defaults = MigrationConfig::default();

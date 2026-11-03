@@ -1298,6 +1298,7 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
         let endpoint = req.dest_endpoint.clone();
         let volume_id = req.volume_id.clone();
         let handle = req.attachment_handle.clone();
+        let migration_authorization = req.migration_authorization.clone();
         let tasks = self.migration_tasks.clone();
         let mig_id = migration_id.clone();
         // Issue #394 Option C: the opt-in stop-the-world mode threads from
@@ -1327,6 +1328,7 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
                 backend,
                 tls_config,
                 Some(task_clone),
+                migration_authorization,
                 req_pause_first,
                 // Default bound (30 s) for the FinalizeAck wait; operators
                 // can tune it in a later config PR.

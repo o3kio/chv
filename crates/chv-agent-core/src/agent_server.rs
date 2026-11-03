@@ -3412,10 +3412,24 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     (volumes, dest_stord_endpoint)
                 };
 
+                let volume_authorizations = inner
+                    .config
+                    .as_ref()
+                    .map(|config| {
+                        config
+                            .volume_authorizations
+                            .iter()
+                            .filter(|auth| !auth.token.is_empty())
+                            .map(|auth| (auth.volume_id.clone(), auth.token.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 let disk_config = crate::migration::DiskPrecopyConfig {
                     stord_socket: self.stord_socket.clone(),
                     dest_stord_endpoint,
                     volumes,
+                    volume_authorizations,
                     // Issue #394 Option C: the operator's opt-in
                     // stop-the-world mode. The config message's tuning
                     // fields remain defaults-only (0 = "use stord's

@@ -150,6 +150,12 @@ pub struct DiskPrecopyConfig {
     pub dest_stord_endpoint: String,
     /// Volumes to migrate.
     pub volumes: Vec<MigrationVolume>,
+    /// Control-plane-issued migration authorizations keyed by volume id
+    /// (issue #663). The agent forwards each token to stord's
+    /// TriggerDiskMigration; the destination verifies it before creating
+    /// the receiving volume. A volume with no matching token fails before
+    /// the trigger rather than attempting an unauthorized migration.
+    pub volume_authorizations: std::collections::HashMap<String, String>,
     /// Issue #394 Option C: opt-in stop-the-world mode — the VM is paused
     /// before stord's bulk copy begins (the PAUSED_PRE_COPY handshake)
     /// instead of only at final sync. Downtime equals the full transfer;
@@ -582,6 +588,21 @@ pub async fn source_migration_with_disk_precopy(
             // Phase boundary 2: before each volume's pre-copy trigger.
             check_cancel!("pre-disk-trigger");
 
+            // Issue #663: never trigger an unauthorized migration. Missing
+            // authorization is a control-plane/version-skew error, not a
+            // reason to let stord fall back to the old unauthenticated path.
+            let migration_authorization =
+                match disk_config.volume_authorizations.get(&volume.volume_id) {
+                    Some(token) if !token.is_empty() => token.clone(),
+                    _ => {
+                        return Err(format!(
+                            "disk pre-copy refused for volume {}: no control-plane migration \
+                         authorization was supplied (the control plane must mint one per volume)",
+                            volume.volume_id
+                        ));
+                    }
+                };
+
             info!(
                 vm_id = %vm_id,
                 operation_id = %operation_id,
@@ -595,6 +616,7 @@ pub async fn source_migration_with_disk_precopy(
                     &volume.volume_id,
                     &volume.attachment_handle,
                     &disk_config.dest_stord_endpoint,
+                    &migration_authorization,
                     disk_config.pause_first,
                     Some(&operation_id),
                 )
@@ -851,6 +873,7 @@ mod tests {
             stord_socket: std::path::PathBuf::from("/run/chv/stord.sock"),
             dest_stord_endpoint: "http://10.0.0.5:50052".to_string(),
             pause_first: false,
+            volume_authorizations: std::collections::HashMap::new(),
             volumes: vec![
                 MigrationVolume {
                     volume_id: "vol-1".to_string(),
@@ -876,6 +899,7 @@ mod tests {
             stord_socket: std::path::PathBuf::from("/run/chv/stord.sock"),
             dest_stord_endpoint: "http://10.0.0.5:50052".to_string(),
             pause_first: false,
+            volume_authorizations: std::collections::HashMap::new(),
             volumes: vec![],
         };
         assert!(config.volumes.is_empty());

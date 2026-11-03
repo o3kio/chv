@@ -58,8 +58,10 @@
 //! a real, parseable checksum; the corruption test pins the other
 //! direction (garbage in the destination ⇒ Failed, never Completed).
 
+use chv_common::migration_auth::MigrationTokenCodec;
 use chv_common::types::{BackendLocator, DevicePolicy};
 use chv_stord_backends::{LocalFileBackend, StorageBackend};
+use chv_stord_core::migration::auth::{MigrationLimits, MigrationReceiverAuthorization};
 use chv_stord_core::migration::sender::{MigrationSender, MigrationTlsConfig};
 use chv_stord_core::migration::service::StorageMigrationServiceImpl;
 use chv_stord_core::migration::task::{MigrationPhase, MigrationTask, MigrationTaskTable};
@@ -81,6 +83,28 @@ fn install_crypto_provider() {
 /// Migration block size (must match the backends' dirty-tracking block size
 /// so bitmap bits map 1:1 to migration chunks).
 const BLOCK: u64 = 4 * 1024 * 1024;
+
+/// Dedicated migration-signing secret shared by the in-test control-plane
+/// minter and the receiver (issue #663). Never reused for anything else.
+const MIGRATION_SIGNING_SECRET: &[u8] = b"e2e-migration-signing-secret-0123456789abcdef";
+
+/// Node id the receiver expects in the token's destination claim.
+const DESTINATION_NODE_ID: &str = "stord-receiver";
+
+/// Mint the control-plane authorization a real `MigrateVm` dispatch would
+/// attach to `InitMigration`.
+fn migration_token(volume_id: &str, size_bytes: u64) -> String {
+    MigrationTokenCodec::new(MIGRATION_SIGNING_SECRET)
+        .expect("test signing secret is long enough")
+        .mint(
+            "stord-sender",
+            DESTINATION_NODE_ID,
+            volume_id,
+            size_bytes,
+            Duration::from_secs(300),
+        )
+        .expect("token mint must succeed")
+}
 
 /// Overall guard so a protocol regression fails fast instead of hanging.
 const MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -170,7 +194,13 @@ async fn spawn_receiver(dest_dir: &Path) -> (SocketAddr, TestCa) {
         client_ca_pem: ca.cert_pem.clone(),
     };
     let backend = Arc::new(LocalFileBackend::new(dest_dir.to_path_buf()));
-    let service = StorageMigrationServiceImpl::new(backend, dest_dir.to_path_buf());
+    let service = StorageMigrationServiceImpl::new(
+        backend,
+        dest_dir.to_path_buf(),
+        MigrationReceiverAuthorization::required(MIGRATION_SIGNING_SECRET, DESTINATION_NODE_ID)
+            .expect("test authorization must construct"),
+        MigrationLimits::default(),
+    );
     tokio::spawn(async move {
         if let Err(e) = serve_migration_tls(listener, tls, service).await {
             panic!("migration TLS listener failed: {e:?}");
@@ -309,6 +339,7 @@ async fn small_volume_completes_and_matches() {
     spawn_auto_pause(task.clone());
 
     let sender = MigrationSender::new(src_backend, "vol-e2e-small".to_string(), handle)
+        .with_migration_authorization(migration_token("vol-e2e-small", 2 * BLOCK))
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
 
@@ -386,7 +417,9 @@ async fn dirty_rounds_converge_preseeded_writes() {
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
     spawn_auto_pause(task.clone());
 
+    let authorization = migration_token(&volume_id, blocks * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -490,7 +523,9 @@ async fn concurrent_source_write_fails_fast() {
         }
     });
 
+    let authorization = migration_token(&volume_id, blocks * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -562,7 +597,9 @@ async fn source_write_during_pause_window_fails_at_finalize_digest() {
     let (task, mut pause_rx) =
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
 
+    let authorization = migration_token(&volume_id, 2 * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -676,7 +713,9 @@ async fn pause_handshake_releases_final_sync() {
     table.insert("mig-e2e-pause".to_string(), task.clone());
     let task = table.get("mig-e2e-pause").unwrap();
 
+    let authorization = migration_token(&volume_id, 2 * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -785,7 +824,9 @@ async fn pause_first_pauses_before_bulk_copy() {
     table.insert("mig-e2e-pause-first".to_string(), task.clone());
     let task = table.get("mig-e2e-pause-first").unwrap();
 
+    let authorization = migration_token(&volume_id, 2 * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone())
         .with_pause_first();
@@ -977,6 +1018,7 @@ async fn pause_signal_latches_for_senders_not_yet_at_their_gate() {
             attachment_handle: handle,
             dest_endpoint: format!("https://{silent_addr}"),
             pause_first: true,
+            migration_authorization: migration_token("vol-latch", 2 * BLOCK),
         }),
     )
     .await
@@ -1105,6 +1147,7 @@ async fn resume_after_completion_is_a_benign_noop() {
             attachment_handle: handle,
             dest_endpoint: format!("https://{addr}"),
             pause_first: true,
+            migration_authorization: migration_token("vol-resume", 2 * BLOCK),
         }),
     )
     .await
@@ -1242,7 +1285,9 @@ async fn corrupted_destination_fails_at_finalize() {
     let (task, _pause_rx) =
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
 
+    let authorization = migration_token(&volume_id, blocks * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");

@@ -450,6 +450,51 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// Resolve the dedicated migration-signing secret from exactly one source:
+/// an inline config value, a file, or an environment variable (in that
+/// precedence after rejecting inline+file). Never logs the value.
+///
+/// A configured-but-empty source is a startup error, not "unset": silently
+/// falling through would turn an operator typo into unauthenticated
+/// migrations on the dev path or an opaque dispatch failure on the CP path.
+pub fn resolve_migration_signing_secret(
+    inline: Option<&str>,
+    file: Option<&Path>,
+    env_var: &str,
+) -> Result<Option<Vec<u8>>, ConfigError> {
+    if inline.is_some() && file.is_some() {
+        return Err(ConfigError::Invalid(
+            "migration signing_secret and signing_secret_file are mutually exclusive".to_string(),
+        ));
+    }
+
+    let (secret, source) = if let Some(inline) = inline {
+        (inline.to_string(), "config")
+    } else if let Some(file) = file {
+        let contents = std::fs::read_to_string(file)?;
+        (contents.trim().to_string(), "file")
+    } else {
+        match std::env::var(env_var) {
+            Ok(value) => (value, "environment"),
+            Err(_) => return Ok(None),
+        }
+    };
+
+    if secret.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "migration signing secret from {source} is empty; refusing to start/run with \
+             an unusable migration authorization secret"
+        )));
+    }
+    if secret.len() < 32 {
+        return Err(ConfigError::Invalid(format!(
+            "migration signing secret from {source} is shorter than 32 bytes; use a \
+             dedicated high-entropy secret (never the JWT/enrollment secret)"
+        )));
+    }
+    Ok(Some(secret.into_bytes()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StordConfig {
     pub socket_path: PathBuf,
@@ -493,7 +538,7 @@ pub struct StordConfig {
 /// Explicitly distinguishes "migration disabled" (daemon may start without
 /// credentials; migration actions fail unavailable) from "migration enabled but
 /// broken" (missing/invalid TLS material is a startup error).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StordMigrationConfig {
     /// Master switch. When `true`, at least one half below must be
     /// configured: the client identity fields (source half) and/or the
@@ -546,6 +591,70 @@ pub struct StordMigrationConfig {
     /// certificates) on the receiver listener.
     #[serde(default)]
     pub client_ca_path: Option<PathBuf>,
+    /// This stord's node id, used to verify that a migration authorization
+    /// (issue #663) names THIS node as the destination. Required when a
+    /// receiver half is configured and authorization is not explicitly
+    /// disabled; must match the owning agent's `node_id`.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Dedicated HMAC secret for migration authorizations (issue #663).
+    /// Never the user JWT/enrollment secret. Prefer `signing_secret_file`;
+    /// the value is never logged. With a receiver half configured, one of
+    /// `signing_secret`, `signing_secret_file`, or the
+    /// `CHV_MIGRATION_SIGNING_SECRET` environment variable is required
+    /// unless `allow_insecure_unauthenticated = true` is set explicitly.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
+    /// File containing the dedicated migration-signing secret (trimmed).
+    /// Mutually exclusive with `signing_secret`. The file should be
+    /// root:chv 0640 (same posture as the TLS key material).
+    #[serde(default)]
+    pub signing_secret_file: Option<PathBuf>,
+    /// Explicit development-only escape hatch (issue #663). When true,
+    /// inbound migration streams do not require a control-plane token.
+    /// NEVER enable this in production: any CA-certified peer could create
+    /// receiving volumes. Default false = fail closed.
+    #[serde(default)]
+    pub allow_insecure_unauthenticated: bool,
+    /// Maximum number of concurrently active inbound receiving migrations
+    /// on this stord (issue #663). Default 2. Rejected migrations never
+    /// reach `create_receiving_volume`.
+    #[serde(default = "default_max_inflight_receiving")]
+    pub max_inflight_receiving: usize,
+    /// Maximum total bytes reserved by concurrently active inbound
+    /// receiving migrations on this stord (issue #663). Default 2 TiB.
+    #[serde(default = "default_max_inflight_receiving_bytes")]
+    pub max_inflight_receiving_bytes: u64,
+}
+
+fn default_max_inflight_receiving() -> usize {
+    2
+}
+
+fn default_max_inflight_receiving_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024 * 1024
+}
+
+impl Default for StordMigrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_cert_path: None,
+            client_key_path: None,
+            ca_cert_path: None,
+            dest_server_name: None,
+            listen_addr: None,
+            server_cert_path: None,
+            server_key_path: None,
+            client_ca_path: None,
+            node_id: None,
+            signing_secret: None,
+            signing_secret_file: None,
+            allow_insecure_unauthenticated: false,
+            max_inflight_receiving: default_max_inflight_receiving(),
+            max_inflight_receiving_bytes: default_max_inflight_receiving_bytes(),
+        }
+    }
 }
 
 /// iSCSI backend configuration embedded in StordConfig.
@@ -1893,6 +2002,48 @@ pub struct ControlPlaneTlsConfig {
     pub ca_key_path: Option<PathBuf>,
 }
 
+/// Control-plane half of the stord migration-authorization configuration
+/// (issue #663). The signing secret is dedicated to migration tokens and
+/// is deliberately separate from `jwt_secret`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlPlaneMigrationConfig {
+    /// Dedicated HMAC secret used to mint short-lived migration
+    /// authorizations. Prefer `signing_secret_file`; the value is never
+    /// logged.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
+    /// File containing the dedicated migration-signing secret (trimmed).
+    /// Mutually exclusive with `signing_secret`.
+    #[serde(default)]
+    pub signing_secret_file: Option<PathBuf>,
+    /// Lifetime of a minted authorization. Default 300 s, hard-capped by
+    /// the stord verifier at 900 s.
+    #[serde(default = "default_migration_token_ttl_seconds")]
+    pub token_ttl_seconds: u64,
+    /// Explicit development-only escape hatch: dispatch migrations without
+    /// minting tokens. Requires the destination stord to set the matching
+    /// insecure flag too. NEVER enable this in production (default false,
+    /// fail closed: a migration dispatch without a configured secret
+    /// errors before contacting the agent).
+    #[serde(default)]
+    pub allow_insecure_unauthenticated: bool,
+}
+
+fn default_migration_token_ttl_seconds() -> u64 {
+    300
+}
+
+impl Default for ControlPlaneMigrationConfig {
+    fn default() -> Self {
+        Self {
+            signing_secret: None,
+            signing_secret_file: None,
+            token_ttl_seconds: default_migration_token_ttl_seconds(),
+            allow_insecure_unauthenticated: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlPlaneConfig {
     pub grpc_bind: SocketAddr,
@@ -1926,6 +2077,9 @@ pub struct ControlPlaneConfig {
     pub database: ControlPlaneDatabaseConfig,
     #[serde(default)]
     pub tls: ControlPlaneTlsConfig,
+    /// Dedicated migration-authorization configuration (issue #663).
+    #[serde(default)]
+    pub migration: ControlPlaneMigrationConfig,
     #[serde(default = "default_agent_socket_pattern")]
     pub agent_socket_pattern: String,
     #[serde(default = "default_agent_runtime_dir")]
@@ -2026,6 +2180,7 @@ impl Default for ControlPlaneConfig {
             tls: ControlPlaneTlsConfig::default(),
             monitoring: MonitoringConfig::default(),
             http_tls: None,
+            migration: ControlPlaneMigrationConfig::default(),
             agent_socket_pattern: default_agent_socket_pattern(),
             agent_runtime_dir: default_agent_runtime_dir(),
             kernel_path: default_kernel_path(),
@@ -2778,6 +2933,17 @@ log_level = "info"
         assert_eq!(cfg.migration.server_cert_path, None);
         assert_eq!(cfg.migration.server_key_path, None);
         assert_eq!(cfg.migration.client_ca_path, None);
+        // Issue #663 defaults: no authorization material, fail-closed
+        // insecure flag off, conservative admission limits.
+        assert_eq!(cfg.migration.node_id, None);
+        assert_eq!(cfg.migration.signing_secret, None);
+        assert_eq!(cfg.migration.signing_secret_file, None);
+        assert!(!cfg.migration.allow_insecure_unauthenticated);
+        assert_eq!(cfg.migration.max_inflight_receiving, 2);
+        assert_eq!(
+            cfg.migration.max_inflight_receiving_bytes,
+            2 * 1024 * 1024 * 1024 * 1024
+        );
 
         // With receiver fields set: every field round-trips as configured
         // (listen_addr stays a String; it is parsed by the fail-closed
@@ -2798,6 +2964,10 @@ listen_addr = "127.0.0.1:50052"
 server_cert_path = "/etc/chv/tls/stord-server.crt"
 server_key_path = "/etc/chv/tls/stord-server.key"
 client_ca_path = "/etc/chv/tls/chv-ca.crt"
+node_id = "node-b"
+signing_secret_file = "/etc/chv/migration/signing-secret"
+max_inflight_receiving = 5
+max_inflight_receiving_bytes = 1099511627776
 "#,
         )
         .expect("parse with receiver fields");
@@ -2818,6 +2988,56 @@ client_ca_path = "/etc/chv/tls/chv-ca.crt"
             cfg.migration.client_ca_path,
             Some(PathBuf::from("/etc/chv/tls/chv-ca.crt"))
         );
+        assert_eq!(cfg.migration.node_id.as_deref(), Some("node-b"));
+        assert_eq!(
+            cfg.migration.signing_secret_file,
+            Some(PathBuf::from("/etc/chv/migration/signing-secret"))
+        );
+        assert_eq!(cfg.migration.max_inflight_receiving, 5);
+        assert_eq!(
+            cfg.migration.max_inflight_receiving_bytes,
+            1_099_511_627_776
+        );
+    }
+
+    #[test]
+    fn controlplane_migration_authorization_config_defaults_and_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("controlplane.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+grpc_bind = "127.0.0.1:8443"
+http_bind = "127.0.0.1:8080"
+log_level = "info"
+runtime_dir = "/run/chv/controlplane"
+jwt_secret = "a]Kx8v2mN!pR7qYsW3dF6gH9jL0nBcTe"
+
+[database]
+url = "sqlite:///tmp/test.db"
+migrations_dir = "migrations"
+
+[migration]
+signing_secret_file = "/etc/chv/migration/signing-secret"
+token_ttl_seconds = 120
+allow_insecure_unauthenticated = false
+"#,
+        )
+        .expect("write config");
+
+        let config = load_controlplane_config(Some(&config_path)).expect("config should load");
+        assert_eq!(
+            config.migration.signing_secret_file,
+            Some(PathBuf::from("/etc/chv/migration/signing-secret"))
+        );
+        assert_eq!(config.migration.token_ttl_seconds, 120);
+        assert!(!config.migration.allow_insecure_unauthenticated);
+
+        let defaults = ControlPlaneMigrationConfig::default();
+        assert_eq!(defaults.signing_secret, None);
+        assert_eq!(defaults.signing_secret_file, None);
+        assert_eq!(defaults.token_ttl_seconds, 300);
+        assert!(!defaults.allow_insecure_unauthenticated);
     }
 
     fn load_stord_config_from_str(

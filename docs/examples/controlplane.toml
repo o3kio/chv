@@ -44,6 +44,32 @@ production = true
 # changes the token sent to agents. agent_auth_allowed_peer_uids is an
 # agent-only key and is ignored here.
 
+# Dedicated migration-authorization secret (issue #663). The control plane
+# mints one short-lived token per attached volume; destination stords verify
+# it before creating a receiving volume. This secret is deliberately separate
+# from jwt_secret: rotating user auth must not invalidate in-flight
+# migrations, and a leak of one domain must not compromise the other.
+#
+# Required for a control plane that migrates VMs with attached volumes. A
+# missing secret is allowed at startup (a deployment that never migrates
+# still boots) but migration dispatch then fails closed before contacting
+# the agent. Generate a >= 32-byte secret and share the same file with every
+# destination stord:
+#   openssl rand -hex 32 > /etc/chv/migration/signing-secret
+#   chown root:chv /etc/chv/migration/signing-secret && chmod 0640 ...
+#
+# [migration]
+# signing_secret_file = "/etc/chv/migration/signing-secret"
+# token_ttl_seconds = 300          # default; receiver hard-caps at 900
+# signing_secret = "..."           # inline alternative, mutually exclusive
+# CHV_MIGRATION_SIGNING_SECRET is the environment fallback.
+#
+# Development-only: dispatch disk migrations without tokens. NEVER enable in
+# production (destination stords must also opt in, and any CA-certified peer
+# could then create receiving volumes).
+#
+# allow_insecure_unauthenticated = true
+
 [database]
 url = "sqlite:///var/lib/chv/controlplane.db"
 migrations_dir = "/usr/local/share/chv/migrations"

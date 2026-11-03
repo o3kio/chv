@@ -172,7 +172,12 @@ async fn spawn_receiver(
     assert_eq!(tls.listen_addr, addr);
 
     let backend = Arc::new(LocalFileBackend::new(dir.to_path_buf()));
-    let service = StorageMigrationServiceImpl::new(backend, dir.to_path_buf());
+    let service = StorageMigrationServiceImpl::new(
+        backend,
+        dir.to_path_buf(),
+        chv_stord_core::migration::auth::MigrationReceiverAuthorization::DenyAll,
+        chv_stord_core::migration::auth::MigrationLimits::default(),
+    );
     tokio::spawn(async move {
         if let Err(e) = serve_migration_tls(listener, tls, service).await {
             panic!("migration TLS listener failed: {e:?}");
@@ -308,7 +313,12 @@ async fn migration_tls_listener_requires_client_certificates() {
     // Serve with the production path: a real tonic server with
     // ServerTlsConfig (client_ca_root, no client_auth_optional).
     let backend = Arc::new(LocalFileBackend::new(dir.path().to_path_buf()));
-    let service = StorageMigrationServiceImpl::new(backend, dir.path().to_path_buf());
+    let service = StorageMigrationServiceImpl::new(
+        backend,
+        dir.path().to_path_buf(),
+        chv_stord_core::migration::auth::MigrationReceiverAuthorization::DenyAll,
+        chv_stord_core::migration::auth::MigrationLimits::default(),
+    );
     tokio::spawn(async move {
         if let Err(e) = serve_migration_tls(listener, tls, service).await {
             panic!("migration TLS listener failed: {e:?}");

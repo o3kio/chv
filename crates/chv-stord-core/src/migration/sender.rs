@@ -106,6 +106,11 @@ pub struct MigrationSender<B: StorageBackend> {
     /// Without it a destination that accepts the stream but never answers
     /// finalization leaves the sender (and the VM) paused forever.
     finalize_ack_timeout: Duration,
+    /// Control-plane-issued authorization for this migration (issue #663).
+    /// Forwarded verbatim in `InitMigration`; the destination verifies it
+    /// before creating the receiving volume. Empty means the destination
+    /// will reject the stream (unless it is explicitly in insecure mode).
+    migration_authorization: String,
 }
 
 impl<B: StorageBackend> MigrationSender<B> {
@@ -123,7 +128,15 @@ impl<B: StorageBackend> MigrationSender<B> {
             canary_baseline: None,
             pause_first: false,
             finalize_ack_timeout: DEFAULT_FINALIZE_ACK_TIMEOUT,
+            migration_authorization: String::new(),
         }
+    }
+
+    /// Attach the control-plane-issued migration authorization forwarded in
+    /// `InitMigration` (issue #663).
+    pub fn with_migration_authorization(mut self, authorization: String) -> Self {
+        self.migration_authorization = authorization;
+        self
     }
 
     /// Attach a shared migration task for progress reporting and pause coordination.
@@ -287,6 +300,7 @@ impl<B: StorageBackend> MigrationSender<B> {
                 block_size: self.block_size as u32,
                 format: "raw".to_string(),
                 checksum_type: "crc32".to_string(),
+                authorization: self.migration_authorization.clone(),
             })),
         };
         tx.send(init_msg)
@@ -1124,10 +1138,12 @@ pub async fn start_migration_to_peer<B: StorageBackend>(
     backend: Arc<B>,
     tls_config: Option<MigrationTlsConfig>,
     task: Option<Arc<MigrationTask>>,
+    migration_authorization: String,
     pause_first: bool,
     finalize_ack_timeout: Option<Duration>,
 ) -> Result<(), tonic::Status> {
-    let mut sender = MigrationSender::new(backend, volume_id, handle);
+    let mut sender = MigrationSender::new(backend, volume_id, handle)
+        .with_migration_authorization(migration_authorization);
     if let Some(tls) = tls_config {
         sender = sender.with_tls(tls);
     }

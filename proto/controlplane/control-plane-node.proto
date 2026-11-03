@@ -701,6 +701,18 @@ message MigrationConfig {
   // PAUSED_PRE_COPY handshake) instead of only at final sync. Downtime
   // equals the full disk+memory transfer; correctness by construction.
   bool pause_first = 5;
+  // Control-plane-issued, short-lived authorizations for each attached
+  // disk the agent must migrate (issue #663). TRANSIENT: the control plane
+  // mints these per dispatch and never persists them (the correlation_id
+  // does not carry tokens); the source agent passes each token to stord's
+  // TriggerDiskMigration and the destination stord verifies it before
+  // creating the receiving volume.
+  repeated MigrationVolumeAuthorization volume_authorizations = 6;
+}
+
+message MigrationVolumeAuthorization {
+  string volume_id = 1;
+  string token = 2;
 }
 
 message MigrationProgress {

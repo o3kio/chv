@@ -78,9 +78,9 @@ returns when #394 is proven; this gate is not a capability claim.
 
 **Actions:**
 1. CP validates preconditions (`validate_preconditions`, `crates/chv-controlplane-service/src/migration.rs`): source node heartbeat fresh (≤ 30 s), dest node in a schedulable state (not Maintenance/Draining/Failed/Unreachable, not scheduling-paused), no other migration in progress for the VM. There is no destination capacity (CPU/memory/disk) check
-2. CP dispatches `MigrateVm` to the source agent; the agent calls the local stord's `TriggerDiskMigration` (stord Unix socket) once per attached volume, passing the destination stord's endpoint (`crates/chv-agent-core/src/migration.rs`)
+2. CP mints one short-lived migration authorization per attached volume and dispatches `MigrateVm` to the source agent (issue #663). The token binds source node, destination node, volume id, size, issue time, expiry, and a unique nonce. Minting happens **before** the agent is contacted: attached volumes with no configured signing secret fail the dispatch closed unless the development-only insecure flag is explicitly set. The agent refuses a volume that has no matching token and calls the local stord's `TriggerDiskMigration` (stord Unix socket) once per attached volume, passing the destination stord's endpoint and token (`crates/chv-controlplane-service/src/migration.rs`, `crates/chv-agent-core/src/migration.rs`)
 3. Overlay participation for the destination node is not part of the migration flow: fabric plans are fanned out by the orchestrator's overlay arm (ADR-021, `crates/chv-controlplane-service/src/overlay.rs`); the migration flow's only overlay interaction is the post-migration gratuitous ARP (Phase 5)
-4. Source stord: validates the destination endpoint against `migration_dest_allowlist`, checks volume health, enables dirty tracking on the volume, and spawns the migration sender, which connects to the destination stord's mTLS migration receiver and opens the gRPC block stream (`crates/chv-stord-core/src/handlers.rs`, `crates/chv-stord-core/src/migration/sender.rs`)
+4. Source stord: validates the destination endpoint against `migration_dest_allowlist`, checks volume health, enables dirty tracking on the volume, and spawns the migration sender, which connects to the destination stord's mTLS migration receiver, forwards the token in `InitMigration.authorization`, and opens the gRPC block stream (`crates/chv-stord-core/src/handlers.rs`, `crates/chv-stord-core/src/migration/sender.rs`). The destination verifies the signature/claims, reserves a per-node in-flight slot/byte budget, and consumes the nonce **before** creating the receiving volume (`crates/chv-stord-core/src/migration/service.rs`, `crates/chv-stord-core/src/migration/auth.rs`)
 5. Progress: the agent polls stord's `GetDiskMigrationStatus` (phase, convergence_round, dirty_blocks_remaining, bytes_transferred, total_bytes) and reports `MigrationProgress` to the CP, which persists it in the migrations table (`crates/chv-agent-core/src/migration.rs`, `crates/chv-controlplane-service/src/migration.rs`)
 
 **Note:** the source agent derives the destination stord endpoint as
@@ -235,10 +235,12 @@ operator-initiated migration is stop-the-world until #394 is proven.
 
 ## Configuration
 
-The operator-facing migration config surface is the stord `[migration]` section
-(`StordMigrationConfig`, `crates/chv-config/src/lib.rs`) plus the stord-level
-`migration_dest_allowlist`. There are no `migration.*` tuning knobs: the
-protocol parameters below are hardcoded constants.
+The operator-facing migration config surface is the stord `[migration]`
+section (`StordMigrationConfig`), the control-plane `[migration]` section
+(`ControlPlaneMigrationConfig`), and the stord-level
+`migration_dest_allowlist` — all in `crates/chv-config/src/lib.rs`. The
+authorization secret, token TTL, and receiver admission limits are
+configurable; the flow-control internals below are hardcoded constants.
 
 ### `[migration]` (stord config, `crates/chv-config/src/lib.rs`)
 
@@ -259,8 +261,14 @@ startup error, never a plaintext or skipped-verify fallback.
 | migration.server_cert_path | any receiver field set | PEM server certificate presented to migration peers |
 | migration.server_key_path | any receiver field set | PEM private key for the server certificate |
 | migration.client_ca_path | any receiver field set | PEM CA bundle used to authenticate peer client certificates on the receiver listener (client-cert auth is mandatory) |
+| migration.node_id | receiver enabled and authorization not explicitly disabled | This stord's node id; must match the token's `destination_node` claim and the owning agent's node id |
+| migration.signing_secret | alternative to `signing_secret_file` | Dedicated migration HMAC secret (≥ 32 bytes), never the JWT/enrollment secret. Prefer the file form |
+| migration.signing_secret_file | required for a receiver unless `signing_secret`/`CHV_MIGRATION_SIGNING_SECRET` is set | File containing the dedicated migration-signing secret (trimmed), root:chv 0640 |
+| migration.allow_insecure_unauthenticated | development only | Explicit bypass: inbound streams need no token. Default false = fail closed; logged loudly. The control plane needs its matching flag to dispatch without tokens |
+| migration.max_inflight_receiving | no (default 2) | Max concurrent inbound receiving migrations. Zero aborts startup |
+| migration.max_inflight_receiving_bytes | no (default 2 TiB) | Max total bytes reserved by concurrent inbound receiving migrations. Zero aborts startup |
 
-Fail-closed gating rules (issues #390, #395, #401):
+Fail-closed gating rules (issues #390, #395, #401, #663):
 
 - `enabled = false` with **any** client identity field set → startup error
 - `enabled = false` with **any** receiver field set → startup error (an
@@ -276,11 +284,34 @@ Fail-closed gating rules (issues #390, #395, #401):
   enabled migration section that configures nothing is a misconfiguration)
 - Receiver files unreadable, keypair mismatch, empty/invalid CA bundle, or an
   unparseable `listen_addr` → startup error
+- A configured receiver with no signing secret/node id, a secret shorter
+  than 32 bytes, both secret sources set, or zero admission limits →
+  startup error. The only bypass is the explicit
+  `allow_insecure_unauthenticated = true`
 
 Stord additionally enforces `migration_dest_allowlist` (top-level stord key,
 not under `[migration]`): the destination endpoint host of every
 `TriggerDiskMigration` must be listed (empty list = allow all)
 (`crates/chv-stord-core/src/handlers.rs`).
+
+### `[migration]` (control-plane config, `ControlPlaneMigrationConfig`)
+
+The control plane is the only migration-token minter. Its secret must be
+the same dedicated secret configured on destination stords; it is
+deliberately separate from `jwt_secret` so rotating user auth does not
+invalidate in-flight authorizations and a leak of one domain does not
+compromise the other.
+
+| Parameter | Required when | Description |
+|---|---|---|
+| migration.signing_secret | alternative to `signing_secret_file` | Dedicated HMAC secret (≥ 32 bytes) used to mint per-volume tokens |
+| migration.signing_secret_file | yes for production disk migration | File containing the dedicated secret (trimmed). Mutually exclusive with `signing_secret` |
+| migration.token_ttl_seconds | no (default 300) | Minted token lifetime; clamped to the receiver's 900 s maximum |
+| migration.allow_insecure_unauthenticated | development only | Dispatch disk migrations without minting tokens. Default false: a VM with attached volumes and no secret fails closed before the agent is contacted |
+
+`CHV_MIGRATION_SIGNING_SECRET` is the fallback when neither secret config key
+is set. Missing secret at CP startup is allowed (a deployment that never
+migrates still boots); migration dispatch then fails closed.
 
 ### Hardcoded protocol constants (not config)
 
@@ -330,6 +361,8 @@ constants above.
 | Ack protocol (interval + boundary acks) | receiver.rs, sender.rs | DONE — ack every 64 chunks, round ack on `RoundComplete`, window flush at `FinalSync`/pre-`FinalizeAck` (issue #391) |
 | mTLS on migration channel (client half) | sender.rs, tls_config.rs | DONE — sender refuses to run without `MigrationTlsConfig` (no plaintext fallback); identity loaded and validated at startup |
 | mTLS on migration channel (receiver half) | server.rs `serve_migration_tls`, tls_config.rs | DONE — TLS TCP listener with mandatory client-cert auth, all-or-nothing receiver fields (issue #390) |
+| CP-issued migration authorization | migration.rs (CP), migration/auth.rs, chv-common/migration_auth.rs | DONE — dedicated-secret HMAC token binds node/volume/size/time, single-use nonce, fail-closed receiver (issue #663) |
+| Receiver admission limits | migration/auth.rs, service.rs | DONE — per-node in-flight count and byte budget checked before volume creation, RAII release on stream close (issue #663) |
 | gRPC message size limit (8 MiB, both serving paths) | migration/mod.rs, server.rs | DONE — raised above tonic's 4 MiB default so real 4 MiB chunks decode |
 | Stord disk-migration control API | handlers.rs | DONE — `TriggerDiskMigration` (allowlist + dirty-tracking enable), `GetDiskMigrationStatus`, `ResumeDiskMigration` |
 | Agent pause coordination | agent-core/migration.rs | DONE — `PausedVmGuard`: pauses VM on stord's `needs_vm_pause`, best-effort resume on every post-pause failure path |

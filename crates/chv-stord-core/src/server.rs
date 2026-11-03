@@ -1,4 +1,5 @@
 use crate::handlers::StorageServiceImpl;
+use crate::migration::auth::{MigrationLimits, MigrationReceiverAuthorization};
 use crate::migration::sender::MigrationTlsConfig;
 use crate::migration::service::StorageMigrationServiceImpl;
 use crate::migration::tls_config::MigrationServerTls;
@@ -46,6 +47,8 @@ impl<B: StorageBackend> StorageServer<B> {
         migration_dest_allowlist: Vec<String>,
         migration_tls: Option<MigrationTlsConfig>,
         migration_server_tls: Option<MigrationServerTls>,
+        migration_authorization: MigrationReceiverAuthorization,
+        migration_limits: MigrationLimits,
         store: Option<SessionStore>,
     ) -> Self {
         let backend = Arc::new(backend);
@@ -64,7 +67,12 @@ impl<B: StorageBackend> StorageServer<B> {
         if let Some(store) = store {
             inner.set_store(store);
         }
-        let migration_service = StorageMigrationServiceImpl::new(backend, runtime_dir);
+        let migration_service = StorageMigrationServiceImpl::new(
+            backend,
+            runtime_dir,
+            migration_authorization,
+            migration_limits,
+        );
         Self {
             inner,
             migration_service,

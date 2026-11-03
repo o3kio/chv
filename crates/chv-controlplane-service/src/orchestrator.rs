@@ -40,6 +40,13 @@ pub struct Orchestrator {
     overlay_manager: Option<OverlayManager>,
     fabric_planner: FabricPlanner,
     convergence_metrics: SharedConvergenceMetrics,
+    /// Dedicated secret for minting short-lived migration authorizations
+    /// (issue #663), plus its token lifetime. `None` means disk migrations
+    /// fail closed at dispatch unless the explicit development-only
+    /// insecure flag is set.
+    migration_signing_secret: Option<Vec<u8>>,
+    migration_token_ttl: Duration,
+    allow_insecure_migration_authorization: bool,
 }
 
 impl Orchestrator {
@@ -64,7 +71,25 @@ impl Orchestrator {
             overlay_manager: None,
             fabric_planner,
             convergence_metrics,
+            migration_signing_secret: None,
+            migration_token_ttl: chv_common::migration_auth::DEFAULT_MIGRATION_TOKEN_TTL,
+            allow_insecure_migration_authorization: false,
         }
+    }
+
+    /// Configure control-plane migration authorization minting (issue #663).
+    /// The secret should be resolved once at startup from the dedicated
+    /// `[migration]` config section.
+    pub fn with_migration_authorization(
+        mut self,
+        signing_secret: Option<Vec<u8>>,
+        token_ttl: Duration,
+        allow_insecure_unauthenticated: bool,
+    ) -> Self {
+        self.migration_signing_secret = signing_secret;
+        self.migration_token_ttl = token_ttl;
+        self.allow_insecure_migration_authorization = allow_insecure_unauthenticated;
+        self
     }
 
     /// Set the overlay manager for post-migration FDB updates and gratuitous ARP.
@@ -1214,6 +1239,9 @@ impl Orchestrator {
                     &self.node_client_pool,
                     &self.agent_socket_pattern,
                     &mut state,
+                    self.migration_signing_secret.as_deref(),
+                    self.migration_token_ttl,
+                    self.allow_insecure_migration_authorization,
                 )
                 .await;
 
