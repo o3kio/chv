@@ -19,7 +19,8 @@ The Rust toolchain is pinned by `rust-toolchain.toml` (single source of truth â€
 ```bash
 # Rust workspace
 cargo build --workspace
-cargo test --workspace
+cargo nextest run --workspace --no-fail-fast  # unit + integration (CI runner)
+cargo test --workspace --doc                 # doctests (not supported by nextest)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all
 
@@ -126,4 +127,8 @@ cargo clippy -p <package> --all-targets -- -D warnings
 
 For UI-only work, stay under `ui/` until a cross-boundary check is needed. For proto changes, validate the affected generated API/consumer before widening to the workspace.
 
-Run the repository's full required checks (`cargo test --workspace`, workspace clippy/build, frontend build, release gates, or task-specific Make targets) once the targeted checks pass and before declaring the task complete. This section changes validation order, not the final quality gate.
+Run the repository's full required checks (`cargo nextest run --workspace
+--no-fail-fast`, `cargo test --workspace --doc`, workspace clippy/build, frontend
+build, release gates, or task-specific Make targets) once the targeted checks
+pass and before declaring the task complete. This section changes validation
+order, not the final quality gate.

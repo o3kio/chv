@@ -167,8 +167,10 @@ See [`docs/install/channels.md`](./docs/install/channels.md) for stable, RC, nig
 # Build the entire workspace
 cargo build --workspace
 
-# Run all Rust tests
-cargo test --workspace
+# Run all Rust tests (unit + integration)
+cargo nextest run --workspace --no-fail-fast
+# Doctests are not run by nextest
+cargo test --workspace --doc
 
 # Build the Web UI
 cd ui && npm install && npm run build
@@ -226,7 +228,8 @@ cargo build --workspace
 ## CI / CD
 
 GitHub Actions runs on every push and PR:
-- `cargo check`, `cargo clippy -- -D warnings`, `cargo test --workspace`
+- `cargo check`, `cargo clippy -- -D warnings`, `cargo nextest run --workspace --no-fail-fast`, plus `cargo test --workspace --doc` for doctests
+- A non-blocking `cargo llvm-cov` line-coverage report per PR (lcov artifact + job summary); no threshold yet
 - UI `npm ci`, `npm run build`, `npm run check`, and Playwright tests against the mock BFF (`ui/tests/e2e/mock-bff.mjs`) — not a live stack
 - `chvctl` smoke test and VERSION validation
 
