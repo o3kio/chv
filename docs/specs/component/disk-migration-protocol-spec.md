@@ -167,8 +167,11 @@ can never be replayed after it expires regardless of cache state.
 
 A receiver that has authorized a peer but then sees no message closes the
 stream after a 300 s idle timeout (`RECEIVER_IDLE_TIMEOUT`), releasing its
-admission slot. Without that bound a stalled authorized peer could pin a
-slot until TCP eventually gave up.
+admission slot. The same idle bound covers the **pre-Init** first read: an
+authenticated peer that opens the stream and then never sends `InitMigration`
+cannot pin a connection (or leak a per-connection task) indefinitely.
+Without that bound a stalled authorized peer could pin a slot until TCP
+eventually gave up.
 
 `source_node` is signed but is **not** compared against the TLS peer
 certificate identity. It is defense-in-depth metadata only; the enforced
@@ -186,6 +189,18 @@ then the source agent refuses the tokenless dispatch unless
 `allow_insecure_migration_dispatch = true` in its own config, and the
 destination stord must also be in insecure mode.
 
+**Residual mixed-config edge (diskless VMs):** the control plane sets the
+transient `allow_insecure_unauthenticated` dispatch marker whenever its own
+development flag is on and no volume tokens were minted. A diskless VM mints
+no tokens by construction (there is no destination volume to authorize), so
+the marker is still set even though the receiver never needs a token. If the
+source agent's `allow_insecure_migration_dispatch` is off — the production
+default — it refuses that `MigrateVm` with `FAILED_PRECONDITION` before any
+disk or memory work. This is a configuration edge, not a security bypass (no
+receiving volume is created), but operators who enable the control-plane
+development flag must also enable the agent gate on every source node, or
+must not combine that flag with diskless VMs.
+
 ### Admission limits
 
 Each destination stord bounds inbound migrations independently of the token:
@@ -202,6 +217,24 @@ storage. Both are checked before volume creation and must be non-zero (zero
 aborts startup rather than meaning "unlimited"). Over-limit streams get
 `RESOURCE_EXHAUSTED` and create nothing; the token is not consumed, so the
 source may retry after capacity is released.
+
+The source stord `TriggerDiskMigration` handler awaits this initial
+handshake for up to 10 s and returns the destination's status synchronously,
+which is what lets the source agent's bounded retry act on a capacity
+rejection. If the TLS/Init handshake or receiving-volume creation exceeds
+that bound, the trigger reports the migration as started and any later
+admission or authorization failure surfaces only through the asynchronous
+migration task — no automatic retry in that case.
+
+**Residual shape risk:** because the count is node-wide, one VM with 16
+attached volumes consumes the entire default stream budget, and two
+concurrent 8-volume VM migrations on the same destination exhaust it as
+well. A rejected source retries only a bounded number of times (four
+attempts); a long-lived backlog at the destination therefore fails the
+migration with an actionable `RESOURCE_EXHAUSTED` after the retry budget
+rather than waiting indefinitely. Size the two limits for the largest
+*simultaneous* set of receiving volumes the node should accept, not for a
+single VM.
 
 ## Protocol Phases
 
@@ -546,7 +579,7 @@ process on nodes that run both, and must still be a dedicated secret.
 Fail-closed gating rules (issues #390, #395, #401, #663):
 
 - `enabled = false` with **any** client identity field (`client_cert_path`, `client_key_path`, `ca_cert_path`, `dest_server_name`) set → startup error
-- `enabled = false` with **any** receiver TLS field (`listen_addr`, `server_cert_path`, `server_key_path`, `client_ca_path`) set → startup error (an operator who believes migration is off must not get an inbound TCP listener). Authorization/admission keys (`node_id`, `signing_secret*`, `max_inflight_*`, `allow_insecure_unauthenticated`) are not TLS-listener fields and remain inert while `enabled = false`
+- `enabled = false` with **any** receiver TLS field (`listen_addr`, `server_cert_path`, `server_key_path`, `client_ca_path`) set → startup error (an operator who believes migration is off must not get an inbound TCP listener). Authorization/admission keys (`node_id`, `signing_secret*`, `max_inflight_*`, `allow_insecure_unauthenticated`) are not TLS-listener fields: they never configure the listener and remain inert for it while `enabled = false`. They are still loaded and enforced by the always-present UDS migration service, so the authorization/admission policy applies to `StreamBlocks` on the local socket regardless of `enabled`
 - `enabled = true` with **no** client fields → destination-only stord: no client identity, outbound migration actions fail with a `failed_precondition` error (issue #401). The client half is all-or-nothing *when any client field is set*. The receiver half is all-or-nothing *when any receiver field is set*; `enabled = true` with **no** receiver fields is a legitimate source-only stord (no listener, logged at startup)
 - `enabled = true` with **neither** half configured → startup error (an enabled migration section that configures nothing is a misconfiguration)
 - Receiver files unreadable, keypair mismatch, empty/invalid CA bundle, or an unparseable `listen_addr` → startup error

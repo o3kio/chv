@@ -275,7 +275,10 @@ Fail-closed gating rules (issues #390, #395, #401, #663):
   (`listen_addr`, `server_cert_path`, `server_key_path`, `client_ca_path`) →
   startup error (an operator who believes migration is off must not get an
   inbound TCP listener). Authorization/admission keys are not listener
-  fields and remain inert while `enabled = false`
+  fields: they do not configure the listener and remain inert for it while
+  `enabled = false`. They are still loaded and enforced by the always-present
+  UDS migration service, so the authorization/admission policy applies to
+  `StreamBlocks` on the local socket regardless of `enabled`
 - `enabled = true` with **no** client fields → destination-only stord: no
   client identity, outbound migration actions fail with a
   `failed_precondition` error (issue #401). The client half is

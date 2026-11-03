@@ -1,7 +1,7 @@
 use crate::migration::auth::{
     MigrationAdmission, MigrationLimits, MigrationReceiverAuthorization, MigrationReplayCache,
 };
-use crate::migration::receiver::MigrationReceiver;
+use crate::migration::receiver::{MigrationReceiver, RECEIVER_IDLE_TIMEOUT};
 use chv_common::migration_auth::MigrationAuthError;
 use chv_stord_api::chv_stord_api::{
     migration_message, storage_migration_service_server::StorageMigrationService, MigrationMessage,
@@ -211,11 +211,25 @@ impl<B: StorageBackend> StorageMigrationService for StorageMigrationServiceImpl<
     ) -> Result<Response<Self::StreamBlocksStream>, Status> {
         let mut inbound = request.into_inner();
 
-        // Read the first message to determine role
-        let first_msg = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("stream closed without sending a message"))?;
+        // Read the first message to determine role. Bound the wait: an
+        // authenticated peer that opens the stream and then never sends
+        // `InitMigration` must not pin this connection (and its per-connection
+        // task) forever. Same idle budget as the post-handshake loop.
+        let first_msg = match tokio::time::timeout(RECEIVER_IDLE_TIMEOUT, inbound.message()).await {
+            Ok(result) => result?.ok_or_else(|| {
+                Status::invalid_argument("stream closed without sending a message")
+            })?,
+            Err(_) => {
+                warn!(
+                    idle_timeout_secs = RECEIVER_IDLE_TIMEOUT.as_secs(),
+                    "migration stream idle before InitMigration; closing connection"
+                );
+                return Err(Status::deadline_exceeded(format!(
+                    "migration receiver idle for {}s before InitMigration; closing connection",
+                    RECEIVER_IDLE_TIMEOUT.as_secs()
+                )));
+            }
+        };
 
         let init = match first_msg.payload {
             Some(migration_message::Payload::Init(init)) => init,

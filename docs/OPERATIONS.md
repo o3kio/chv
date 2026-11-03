@@ -654,11 +654,21 @@ are rejected immediately (maximum exposure is the 900 s token lifetime).
 
 Admission defaults are per-destination-node aggregates: 16 concurrent
 receiving streams and 64 TiB (70,368,744,177,664 bytes) of summed
-token-authorized volume size. The replay cache is memory-only and bounded by
-token TTL, and `source_node` is signed but not matched to the TLS peer
-identity (defense-in-depth metadata only). A stalled authorized receiver is
-closed after a 300 s idle timeout so its admission slot is not pinned
-forever.
+token-authorized volume size — one 16-volume VM, or two 8-volume VM
+migrations, can exhaust the default stream budget. The replay cache is
+memory-only and bounded by token TTL, and `source_node` is signed but not
+matched to the TLS peer identity (defense-in-depth metadata only). An
+authenticated peer that never sends `InitMigration`, or stalls mid-stream, is
+closed after a 300 s idle timeout so it cannot pin a connection or admission
+slot forever.
+
+Development-only insecure mode has a diskless-VM edge: the control plane sets
+its transient tokenless marker when no tokens were minted, and a diskless VM
+mints none by construction. An agent whose
+`allow_insecure_migration_dispatch` is false therefore refuses that
+`MigrateVm` with `FAILED_PRECONDITION` even though no volume needed a token.
+Enable the agent gate on every source node, or do not combine the
+control-plane flag with diskless VMs.
 
 ### Stuck Operations After Agent Crash (InspectRequired)
 

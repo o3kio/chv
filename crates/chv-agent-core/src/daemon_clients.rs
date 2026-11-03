@@ -1518,6 +1518,11 @@ mod tests {
         /// it answers OK but never echoes `pause_first` back (proto3
         /// default false) — the shape the T=0 skew guard must catch.
         skew_no_echo: bool,
+        /// Reject this many initial trigger calls with
+        /// `RESOURCE_EXHAUSTED` before behaving normally. Models a
+        /// destination at its admission ceiling whose slot is later
+        /// released, so the agent's bounded retry can be exercised.
+        resource_exhausted_first: std::sync::atomic::AtomicU32,
     }
 
     #[tonic::async_trait]
@@ -1612,6 +1617,17 @@ mod tests {
             req: Request<chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest>,
         ) -> Result<Response<chv_stord_api::chv_stord_api::TriggerDiskMigrationResponse>, Status>
         {
+            if self
+                .resource_exhausted_first
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                self.resource_exhausted_first
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(Status::resource_exhausted(
+                    "migration admission rejected: concurrency limit reached (mock)",
+                ));
+            }
             if let Some(capture) = &self.capture_trigger {
                 let inner = req.into_inner();
                 // Mirror the real stord's echo (#582): the response
@@ -1873,6 +1889,7 @@ mod tests {
         let mock = MockStord {
             capture_trigger: Some(captured.clone()),
             skew_no_echo: false,
+            resource_exhausted_first: std::sync::atomic::AtomicU32::new(0),
         };
 
         let uds = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1944,6 +1961,7 @@ mod tests {
         let mock = MockStord {
             capture_trigger: Some(captured.clone()),
             skew_no_echo: true,
+            resource_exhausted_first: std::sync::atomic::AtomicU32::new(0),
         };
 
         let uds = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -2008,6 +2026,116 @@ mod tests {
             )
             .await
             .expect("default-mode trigger must not require the echo");
+    }
+
+    /// Spawn a mock stord UDS server that rejects the first
+    /// `resource_exhausted_first` triggers with `RESOURCE_EXHAUSTED` and
+    /// then behaves normally. Returns the connected client plus the
+    /// request-capture slot used by the mock.
+    async fn retry_mock_stord(
+        resource_exhausted_first: u32,
+    ) -> (
+        tempfile::TempDir,
+        StordClient,
+        std::sync::Arc<
+            std::sync::Mutex<Option<chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest>>,
+        >,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stord.sock");
+
+        let captured: std::sync::Arc<
+            std::sync::Mutex<Option<chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mock = MockStord {
+            capture_trigger: Some(captured.clone()),
+            skew_no_echo: false,
+            resource_exhausted_first: std::sync::atomic::AtomicU32::new(resource_exhausted_first),
+        };
+
+        let uds = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    chv_stord_api::chv_stord_api::storage_service_server::StorageServiceServer::new(
+                        mock,
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds))
+                .await
+                .ok();
+        });
+
+        (dir, StordClient::connect(&socket).await.unwrap(), captured)
+    }
+
+    fn retry_test_volume() -> crate::migration::MigrationVolume {
+        crate::migration::MigrationVolume {
+            volume_id: "vol-retry".to_string(),
+            attachment_handle: "handle-retry".to_string(),
+        }
+    }
+
+    /// Issue #663 follow-up: a transient destination admission rejection
+    /// (`RESOURCE_EXHAUSTED`) must be retried with the SAME authorization
+    /// token — rejection happens before nonce consumption, so the token is
+    /// still valid once a slot frees.
+    #[tokio::test]
+    async fn stord_trigger_retries_resource_exhausted_then_succeeds() {
+        let (_dir, mut client, captured) = retry_mock_stord(2).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let id = crate::migration::trigger_disk_migration_with_admission_retry(
+            &mut client,
+            &retry_test_volume(),
+            "https://10.0.0.5:50052",
+            "token-retry",
+            false,
+            "op-retry",
+            &cancel,
+        )
+        .await
+        .expect("the third trigger (two rejections then capacity) must succeed");
+        assert_eq!(id, "dm-mock-1");
+
+        let req = captured.lock().unwrap().take().expect("request captured");
+        assert_eq!(
+            req.migration_authorization, "token-retry",
+            "the retry must reuse the same unconsumed authorization token"
+        );
+    }
+
+    /// The retry is bounded: a destination that stays at its admission
+    /// ceiling must fail after exactly the configured attempt count with
+    /// actionable text, rather than retrying forever.
+    #[tokio::test]
+    async fn stord_trigger_fails_after_bounded_resource_exhausted_retries() {
+        let (_dir, mut client, _captured) = retry_mock_stord(u32::MAX).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let err = crate::migration::trigger_disk_migration_with_admission_retry(
+            &mut client,
+            &retry_test_volume(),
+            "https://10.0.0.5:50052",
+            "token-retry",
+            false,
+            "op-retry",
+            &cancel,
+        )
+        .await
+        .expect_err("a permanently full destination must fail");
+        assert!(
+            err.contains("after 4 attempt(s)"),
+            "the error must report the bounded attempt count: {err}"
+        );
+        assert!(
+            err.contains("no authorization token was consumed"),
+            "the error must state the token remained usable: {err}"
+        );
+        assert!(
+            err.contains("max_inflight_receiving"),
+            "the error must name the destination admission ceiling: {err}"
+        );
     }
 
     #[tokio::test]

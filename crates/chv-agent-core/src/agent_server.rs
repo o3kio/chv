@@ -4073,6 +4073,42 @@ mod tests {
         assert!(tonic::service::Interceptor::call(&mut auth, Request::new(()),).is_ok());
     }
 
+    /// Issue #663 follow-up (N-2): the control plane's explicit tokenless
+    /// marker is never honored by an agent whose own development gate is
+    /// off — even before any volume or stord call is considered.
+    #[tokio::test]
+    async fn migrate_vm_refuses_cp_tokenless_marker_without_agent_gate() {
+        let server = test_server();
+        assert!(
+            !server.allow_insecure_migration_dispatch,
+            "the test server must model a production agent"
+        );
+
+        let req = proto::MigrateVmRequest {
+            meta: Some(test_meta("1")),
+            node_id: "node-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            source_node_id: "node-1".to_string(),
+            destination_node_id: "node-2".to_string(),
+            config: Some(proto::MigrationConfig {
+                allow_insecure_unauthenticated: true,
+                ..Default::default()
+            }),
+        };
+        let err = proto::lifecycle_service_server::LifecycleService::migrate_vm(
+            &server,
+            Request::new(req),
+        )
+        .await
+        .expect_err("a production agent must refuse a tokenless CP dispatch");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("allow_insecure_migration_dispatch"),
+            "the refusal must name the agent gate: {}",
+            err.message()
+        );
+    }
+
     #[tokio::test]
     async fn apply_vm_desired_state_updates_generation_and_fragment() {
         let server = test_server();

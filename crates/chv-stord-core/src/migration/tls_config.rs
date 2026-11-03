@@ -33,7 +33,9 @@
 //!   `enabled = false`, any receiver TLS field set is a startup error;
 //!   authorization/admission keys (`node_id`, `signing_secret*`,
 //!   `max_inflight_*`, `allow_insecure_unauthenticated`) are not listener
-//!   fields and stay inert in that case.
+//!   fields: they never configure the listener and stay inert for it in that
+//!   case. They are still loaded and enforced by the always-present UDS
+//!   migration service.
 //! - `enabled = true` with **neither** half configured → startup **error**
 //!   (see [`ensure_migration_half_configured`], issue #401): an enabled
 //!   migration section that configures nothing is a misconfiguration — the

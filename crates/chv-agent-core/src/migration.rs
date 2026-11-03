@@ -558,7 +558,7 @@ fn migration_authorization_for_volume(
 /// consumed, so a rejected attempt leaves the token usable. Any other error
 /// (auth, transport, not-found) fails immediately.
 #[allow(clippy::too_many_arguments)]
-async fn trigger_disk_migration_with_admission_retry(
+pub(crate) async fn trigger_disk_migration_with_admission_retry(
     stord_client: &mut StordClient,
     volume: &MigrationVolume,
     dest_endpoint: &str,

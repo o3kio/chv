@@ -349,8 +349,11 @@ fn load_migration_materials(
     ensure_migration_half_configured(migration.enabled, client_tls.as_ref(), server_tls.as_ref())?;
     // Only reachable for a *clean* disabled section: `enabled = false`
     // with any client/receiver *TLS* field set already failed above.
-    // Authorization/admission keys are not listener fields and remain
-    // inert here.
+    // Authorization/admission keys are not listener fields: they are inert
+    // for this TLS-material loader, but `load_migration_authorization` /
+    // `load_migration_limits` below still load and enforce them on the UDS
+    // migration service (the local socket serves `StreamBlocks` regardless
+    // of `enabled`).
     if !migration.enabled {
         info!(
             "storage migration is disabled (migration.enabled = false): migration actions will be unavailable"

@@ -318,6 +318,38 @@ async fn unconfigured_receiver_rejects_before_volume_creation() {
     assert_no_volume(dir.path(), "vol-authz-denyall");
 }
 
+/// The explicit development-only `DisabledInsecure` mode accepts a stream
+/// with no token and provisions the volume. It is unreachable from a default
+/// config (only the explicit `allow_insecure_unauthenticated = true` selects
+/// it), so this pins the intentional bypass side of the policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabled_insecure_accepts_untokened_stream_when_explicitly_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _server) = start_receiver(
+        dir.path(),
+        MigrationReceiverAuthorization::DisabledInsecure,
+        MigrationLimits::default(),
+    )
+    .await;
+    let mut client = client(addr).await;
+
+    let volume_id = "vol-authz-insecure";
+    let (result, tx) = begin(&mut client, init(volume_id, BLOCK, String::new())).await;
+    let response = result.expect("explicit insecure mode must accept an untokened stream");
+    let mut inbound = response.into_inner();
+    expect_ready(&mut inbound, volume_id).await;
+
+    let path = dir.path().join(format!("{volume_id}.img"));
+    assert!(
+        path.exists(),
+        "the explicitly insecure receiver must provision the volume"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), BLOCK);
+
+    drop(tx);
+    drop(inbound);
+}
+
 /// A control-plane token naming exactly this destination/volume/size is
 /// accepted and the receiver provisions the volume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
