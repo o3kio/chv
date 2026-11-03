@@ -30,9 +30,11 @@
 //! terminal [`CLIENT_CANCELLED_STATUS`] (`"client_cancelled"`) sample. It is
 //! deliberately distinct from `"unknown"`: the handler ran, but the client went
 //! away before the terminal status arrived, so this is a client-side event, not
-//! a protocol violation. The pending sample is taken on every path (headers,
-//! trailer, end-of-stream, error, drop), so each request is recorded exactly
-//! once.
+//! a protocol violation. Once a response has been produced, the pending sample
+//! is taken on every path (headers, trailer, end-of-stream, error, drop), so
+//! that request is recorded exactly once. A request whose service future is
+//! dropped before it resolves never produces a response and is not recorded
+//! (pre-existing behavior).
 //!
 //! ### Service / method extraction
 //!

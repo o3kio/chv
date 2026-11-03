@@ -52,9 +52,11 @@ groups:
     interval: 30s
     rules:
       - alert: ControlPlaneGrpcErrorRateHigh
+        # `client_cancelled` is a client-side disconnect / RST_STREAM, not a
+        # server error; exclude it so routine agent reconnects cannot page.
         expr: |
           (
-            sum(rate(chv_grpc_server_requests_total{grpc_status!~"^(0|OK)$"}[5m]))
+            sum(rate(chv_grpc_server_requests_total{grpc_status!~"^(0|OK|client_cancelled)$"}[5m]))
             /
             sum(rate(chv_grpc_server_requests_total[5m]))
           ) > 0.05
@@ -67,8 +69,10 @@ groups:
           summary: "gRPC control-plane error rate > 5% for 5m"
           description: >
             More than 5% of gRPC requests to the control plane are returning
-            non-OK status. Break down by service and method:
-            rate(chv_grpc_server_requests_total{grpc_status!~"0|OK"}[5m]) by (service, method, grpc_status)
+            non-OK status. `client_cancelled` (client disconnect/RST_STREAM) is
+            excluded because it is not a server error. Break down by service
+            and method:
+            rate(chv_grpc_server_requests_total{grpc_status!~"^(0|OK|client_cancelled)$"}[5m]) by (service, method, grpc_status)
           runbook: "docs/runbooks/control-plane-dr.md"
 
   # ---------------------------------------------------------------------------
