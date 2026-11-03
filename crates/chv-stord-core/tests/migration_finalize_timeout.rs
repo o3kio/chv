@@ -96,7 +96,13 @@ fn issue_leaf(ca: &TestCa, cn: &str, server: bool) -> (Vec<u8>, Vec<u8>) {
 
 /// A destination peer that speaks the protocol through `FinalSync` but
 /// never answers `FinalizeComplete` with a `FinalizeAck`.
-struct SilentFinalizePeer;
+struct SilentFinalizePeer {
+    /// When true, keep sending valid boundary `Ack`s forever after
+    /// `FinalizeComplete` (still never a `FinalizeAck`). The sender's bound
+    /// must be one overall deadline, not a per-message timeout that each
+    /// ack resets (#656 review).
+    chatty: bool,
+}
 
 #[tonic::async_trait]
 impl StorageMigrationService for SilentFinalizePeer {
@@ -107,6 +113,7 @@ impl StorageMigrationService for SilentFinalizePeer {
         request: Request<Streaming<MigrationMessage>>,
     ) -> Result<Response<Self::StreamBlocksStream>, Status> {
         let mut inbound = request.into_inner();
+        let chatty = self.chatty;
         let (tx, rx) = mpsc::channel::<MigrationMessage>(64);
         tokio::spawn(async move {
             let mut last_sequence_num: u32 = 0;
@@ -139,10 +146,29 @@ impl StorageMigrationService for SilentFinalizePeer {
                             break;
                         }
                     }
+                    Some(migration_message::Payload::FinalizeComplete(_)) if chatty => {
+                        // The scenario under test (chatty variant): keep the
+                        // stream open and dribble boundary acks, but never
+                        // send FinalizeAck. The sender's bound must be one
+                        // overall deadline, not a per-read timeout.
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let ack = MigrationMessage {
+                                payload: Some(migration_message::Payload::Ack(Ack {
+                                    last_offset,
+                                    last_sequence_num,
+                                    status: AckStatus::AckOk.into(),
+                                })),
+                            };
+                            if tx.send(ack).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     Some(migration_message::Payload::FinalizeComplete(_)) => {
-                        // The scenario under test: keep the stream open and
-                        // never send FinalizeAck. The sender's bounded wait
-                        // must fire.
+                        // The silent scenario under test: keep the stream
+                        // open and never send FinalizeAck. The sender's
+                        // bounded wait must fire.
                     }
                     _ => {}
                 }
@@ -153,7 +179,7 @@ impl StorageMigrationService for SilentFinalizePeer {
     }
 }
 
-async fn spawn_silent_finalize_peer(ca: &TestCa) -> SocketAddr {
+async fn spawn_silent_finalize_peer(ca: &TestCa, chatty: bool) -> SocketAddr {
     let (server_cert, server_key) = issue_leaf(ca, "fake-dest", true);
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(server_cert, server_key))
@@ -161,7 +187,7 @@ async fn spawn_silent_finalize_peer(ca: &TestCa) -> SocketAddr {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let service = StorageMigrationServiceServer::new(SilentFinalizePeer)
+    let service = StorageMigrationServiceServer::new(SilentFinalizePeer { chatty })
         .max_decoding_message_size(MAX_MIGRATION_MESSAGE_SIZE_BYTES);
     tokio::spawn(async move {
         if let Err(e) = Server::builder()
@@ -177,8 +203,9 @@ async fn spawn_silent_finalize_peer(ca: &TestCa) -> SocketAddr {
     addr
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn finalize_ack_timeout_fails_task_and_returns_deadline_exceeded() {
+/// Drive a real migration against a peer that never sends `FinalizeAck`.
+/// Returns the sender's result, the shared task, and the elapsed time.
+async fn run_finalize_timeout(chatty: bool) -> (Result<(), Status>, Arc<MigrationTask>, Duration) {
     install_crypto_provider();
 
     let src_dir = tempfile::tempdir().unwrap();
@@ -208,7 +235,7 @@ async fn finalize_ack_timeout_fails_task_and_returns_deadline_exceeded() {
     let handle = export.attachment_handle;
 
     let ca = test_ca("chv-migration-656-timeout-ca");
-    let addr = spawn_silent_finalize_peer(&ca).await;
+    let addr = spawn_silent_finalize_peer(&ca, chatty).await;
 
     let (task, _pause_rx) =
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
@@ -254,6 +281,15 @@ async fn finalize_ack_timeout_fails_task_and_returns_deadline_exceeded() {
     .expect("migration must not hang waiting for FinalizeAck (bounded-wait regression?)");
     let elapsed = started.elapsed();
 
+    (result, task, elapsed)
+}
+
+/// Assert the shared terminal-state contract of a timed-out finalize wait.
+async fn assert_bounded_timeout(
+    result: Result<(), Status>,
+    task: &Arc<MigrationTask>,
+    elapsed: Duration,
+) {
     let status = result.expect_err("a missing FinalizeAck must fail the migration");
     assert_eq!(
         status.code(),
@@ -290,4 +326,23 @@ async fn finalize_ack_timeout_fails_task_and_returns_deadline_exceeded() {
         !state.needs_vm_pause,
         "a terminal task must not keep reporting a pending VM pause"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finalize_ack_timeout_fails_task_and_returns_deadline_exceeded() {
+    let (result, task, elapsed) = run_finalize_timeout(false).await;
+    assert_bounded_timeout(result, &task, elapsed).await;
+}
+
+/// #656 review: a peer that keeps dribbling valid boundary `Ack`s after
+/// `FinalizeComplete` must not be able to extend the wait indefinitely. The
+/// bound is the overall finalize deadline, not a per-message read timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn periodic_boundary_acks_cannot_extend_the_finalize_deadline() {
+    let (result, task, elapsed) = run_finalize_timeout(true).await;
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "periodic acks extended the finalize deadline: {elapsed:?}"
+    );
+    assert_bounded_timeout(result, &task, elapsed).await;
 }

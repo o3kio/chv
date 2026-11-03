@@ -571,43 +571,47 @@ impl<B: StorageBackend> MigrationSender<B> {
         // Wait for FinalizeAck. Boundary acks flushed by the receiver
         // (round acknowledgments, the FinalSync flush) may still be in
         // flight; they are expected here and processed normally — a
-        // CRC-mismatch Ack still fails the migration (fail-closed). Each
-        // read is bounded so a destination that never answers cannot hang
-        // the task (and leave the VM paused) forever.
+        // CRC-mismatch Ack still fails the migration (fail-closed). The
+        // whole wait is bounded by one fixed deadline rather than a
+        // per-message timeout: otherwise a peer that keeps dribbling
+        // boundary acks could extend the pause forever, and the VM would
+        // stay stopped even though FinalizeAck never arrives.
+        let finalize_deadline = tokio::time::Instant::now() + self.finalize_ack_timeout;
         loop {
-            let ack_msg =
-                match tokio::time::timeout(self.finalize_ack_timeout, inbound.message()).await {
-                    Ok(Ok(Some(msg))) => msg,
-                    Ok(Ok(None)) => {
-                        return Err(tonic::Status::internal("stream closed before FinalizeAck"));
+            let ack_msg = match tokio::time::timeout_at(finalize_deadline, inbound.message()).await
+            {
+                Ok(Ok(Some(msg))) => msg,
+                Ok(Ok(None)) => {
+                    return Err(tonic::Status::internal("stream closed before FinalizeAck"));
+                }
+                // Preserve the transport-level status (cancellation,
+                // unavailable, ...) instead of re-wrapping it as
+                // internal; the previous unbounded `?` did the same.
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    let message = format!(
+                        "timed out waiting for FinalizeAck after {}s",
+                        self.finalize_ack_timeout.as_secs_f64()
+                    );
+                    error!(
+                        volume_id = %self.volume_id,
+                        timeout_secs = self.finalize_ack_timeout.as_secs_f64(),
+                        "migration finalization timed out waiting for FinalizeAck"
+                    );
+                    metrics::counter!(
+                        STORD_MIGRATION_ERRORS_TOTAL,
+                        "reason" => "finalize_ack_timeout"
+                    )
+                    .increment(1);
+                    if let Some(ref task) = self.task {
+                        let mut state = task.state.write().await;
+                        state.phase = MigrationPhase::Failed;
+                        state.error_message = message.clone();
+                        state.needs_vm_pause = false;
                     }
-                    Ok(Err(e)) => {
-                        return Err(tonic::Status::internal(format!("stream error: {e}")));
-                    }
-                    Err(_) => {
-                        let message = format!(
-                            "timed out waiting for FinalizeAck after {}s",
-                            self.finalize_ack_timeout.as_secs_f64()
-                        );
-                        error!(
-                            volume_id = %self.volume_id,
-                            timeout_secs = self.finalize_ack_timeout.as_secs_f64(),
-                            "migration finalization timed out waiting for FinalizeAck"
-                        );
-                        metrics::counter!(
-                            STORD_MIGRATION_ERRORS_TOTAL,
-                            "reason" => "finalize_ack_timeout"
-                        )
-                        .increment(1);
-                        if let Some(ref task) = self.task {
-                            let mut state = task.state.write().await;
-                            state.phase = MigrationPhase::Failed;
-                            state.error_message = message.clone();
-                            state.needs_vm_pause = false;
-                        }
-                        return Err(tonic::Status::deadline_exceeded(message));
-                    }
-                };
+                    return Err(tonic::Status::deadline_exceeded(message));
+                }
+            };
 
             match ack_msg.payload {
                 Some(migration_message::Payload::FinalizeAck(ref ack)) => {
