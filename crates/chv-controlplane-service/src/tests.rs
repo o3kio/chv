@@ -92,11 +92,16 @@ fn test_app_state(pool: StorePool) -> chv_webui_bff::AppState {
 }
 
 fn test_admin_token() -> String {
-    test_token_for_role("admin")
+    test_token_claims("test-admin-id", "admin", "admin")
 }
 
 fn test_token_for_role(role: &str) -> String {
-    test_token_claims(&format!("test-{role}-id"), role, role)
+    if role == "admin" {
+        return test_admin_token();
+    }
+    // Use the seeded synthetic users (`u-viewer`, `u-operator`): #660
+    // rejects legacy tokens whose `sub` has no user row.
+    test_token_claims(&format!("u-{role}"), role, role)
 }
 
 /// Token with an explicit `sub` and admin role, for tests that need a
@@ -4566,10 +4571,49 @@ async fn test_logout_for_deleted_user_still_clears_cookies() {
     }
 }
 
+#[tokio::test]
+async fn test_login_mints_session_audience_and_token_version() {
+    // N4: both mint sites must bind `aud=chv:session` and the user's
+    // `token_version`; without this, session/console separation could
+    // silently regress to the legacy no-audience path.
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let hash = bcrypt::hash("correctpassword", 4).expect("hash");
+    sqlx::query(
+        "INSERT INTO users (user_id, username, password_hash, role, token_version) \
+         VALUES ('u-cp-aud', 'cp-aud', ?, 'operator', 3)",
+    )
+    .bind(&hash)
+    .execute(&test_db.pool)
+    .await
+    .expect("seed user");
+
+    let response = crate::api::auth::login_handler(
+        axum::extract::State(test_app_state(test_db.pool.clone())),
+        axum::Json(serde_json::json!({
+            "username": "cp-aud",
+            "password": "correctpassword"
+        })),
+    )
+    .await
+    .expect("login should succeed");
+
+    let token = response
+        .0
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("API login returns a token");
+    let claims = chv_webui_bff::auth::validate_token(token, "test-secret").expect("decode token");
+    assert_eq!(
+        claims.aud.as_deref(),
+        Some(chv_webui_bff::auth::SESSION_AUDIENCE),
+        "control-plane API logins must mint the session audience"
+    );
+    assert_eq!(claims.token_version, Some(3));
+}
+
 // ---------------------------------------------------------------------------
 // resolve_inspect_required_operation relay (operator egress to the agent)
 // ---------------------------------------------------------------------------
-
 async fn resolve_relay_service() -> (LifecycleServiceImplementation, proto::RequestMeta) {
     let test_db = chv_controlplane_store::test_util::TestDb::new().await;
     let pool = test_db.pool.clone();

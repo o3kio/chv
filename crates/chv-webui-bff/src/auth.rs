@@ -55,10 +55,13 @@ pub struct Claims {
     /// auth extractor compares it with the database on every request.
     ///
     /// `None` means the token predates #660 (or is an API token built from
-    /// a DB row, which is already authoritative). Legacy tokens are
-    /// accepted without a database lookup but cannot outlive their 24-hour
-    /// `exp`; see `docs/OPERATIONS.md` for the rollout. They are skipped
-    /// from serialization so a legacy token round-trips unchanged.
+    /// a DB row, which is already authoritative). Legacy tokens still get a
+    /// cheap user-existence lookup, so a deleted account cannot keep using
+    /// one, but they cannot be revoked by `token_version` and die only at
+    /// their 24-hour `exp`, on user deletion, or when
+    /// `CHV_REQUIRE_TOKEN_VERSION=1` closes the legacy path; see
+    /// `docs/OPERATIONS.md` for the rollout. They are skipped from
+    /// serialization so a legacy token round-trips unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_version: Option<u64>,
 }

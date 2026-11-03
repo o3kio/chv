@@ -814,6 +814,11 @@ mod tests {
             crate::auth::validate_token(&session_cookie_token(&headers), &state.jwt_secret)
                 .expect("decode token");
         assert_eq!(claims.token_version, Some(7));
+        assert_eq!(
+            claims.aud.as_deref(),
+            Some(crate::auth::SESSION_AUDIENCE),
+            "freshly minted session tokens must carry the session audience"
+        );
     }
 
     // ── session cookie (Security S1, staged item 3.B) ─────────────────────

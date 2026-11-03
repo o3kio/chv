@@ -133,6 +133,9 @@ async fn build_state() -> AppState {
     chv_controlplane_store::run_migrations(&pool, None)
         .await
         .expect("run migrations");
+    // #660 validates the user's existence for legacy (no `token_version`)
+    // test JWTs, so synthetic `sub`s must have rows.
+    chv_controlplane_store::test_util::seed_test_users(&pool).await;
 
     AppState {
         pool: pool.clone(),
