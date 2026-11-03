@@ -62,6 +62,7 @@ attach/open/serve and lifecycle hooks.
 | iSCSI backend | Implemented; full `StorageBackend` trait with `iscsiadm`/`targetcli` integration |
 | Ceph RBD backend | Implemented; full `StorageBackend` trait with `rbd` CLI integration |
 | Disk migration bulk copy, flow control, CRC, resumability | Implemented |
+| Prometheus `/metrics` listener (`metrics_bind`, loopback default `127.0.0.1:9101`) | Implemented (#657) |
 | Disk migration dirty sync rounds and convergence reporting | Implemented; `MigrationTaskTable` tracks rounds, dirty blocks, bytes transferred |
 | Paused final dirty flush | Implemented; `MigrationSender` pauses at `PausedFinalSync`, signals via watch channel, waits for agent `resume_disk_migration` |
 | Pause-first mode (issue #394 Option C) | Implemented; `TriggerDiskMigrationRequest.pause_first` moves the same handshake before bulk copy (`PausedPreCopy`, zero bytes transferred); sender fails closed `failed_precondition` without a task; pause channel latches for senders not yet at their gate. Since #656 the user-facing API/UI/chvctl require `true` (live migration fails closed) until #394 is proven — see `disk-migration-protocol-spec.md` |

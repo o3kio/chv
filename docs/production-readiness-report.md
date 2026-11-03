@@ -11,9 +11,10 @@
 > historical snapshot, not as a current verdict.
 >
 > **Fixed since this report (verified on this branch):** in-process
-> `chv_observability::Metrics` counters for `chv-stord` and `chv-nwd` (still
-> not scrapeable — neither daemon serves an HTTP endpoint; see
-> [OBSERVABILITY.md](OBSERVABILITY.md)); migration-reaper resume of paused VMs;
+> `chv_observability::Metrics` counters for `chv-stord` and `chv-nwd` (each now
+> serves a dedicated loopback `/metrics` listener, as do the control plane and
+> agent; see [OBSERVABILITY.md](OBSERVABILITY.md)); gRPC streaming RED status
+> now read from trailers instead of always `"unknown"`; migration-reaper resume of paused VMs;
 > the `StorageMigrationService` implementation; DHCP `network_id`
 > sanitization; and the drain gate on in-flight migrations.
 >

@@ -1544,6 +1544,16 @@ pub struct ControlPlaneTlsConfig {
 pub struct ControlPlaneConfig {
     pub grpc_bind: SocketAddr,
     pub http_bind: SocketAddr,
+    /// Dedicated, loopback-by-default Prometheus listener (issue #657).
+    ///
+    /// The admin-gated `/metrics` route on `http_bind` is retained for
+    /// backward compatibility, but scrapers should use this listener: it is
+    /// unauthenticated and non-public, so scraping never needs a rotating
+    /// admin JWT. Unset selects the daemon's loopback default
+    /// (`127.0.0.1:9103`); an explicit value is honored verbatim and a bad
+    /// value fails startup.
+    #[serde(default)]
+    pub metrics_bind: Option<String>,
     pub log_level: String,
     pub runtime_dir: PathBuf,
     #[serde(default = "default_jwt_secret")]
@@ -1639,6 +1649,7 @@ impl Default for ControlPlaneConfig {
             http_bind: DEFAULT_CONTROLPLANE_HTTP_BIND
                 .parse()
                 .expect("valid default http bind"),
+            metrics_bind: None,
             log_level: DEFAULT_CONTROLPLANE_LOG_LEVEL.to_string(),
             runtime_dir: PathBuf::from(DEFAULT_CONTROLPLANE_RUNTIME_DIR),
             jwt_secret: default_jwt_secret(),

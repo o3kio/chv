@@ -1404,6 +1404,8 @@ install_configs() {
     cat > "$CHV_CONFIG_DIR/controlplane.toml" <<EOF
 grpc_bind = "127.0.0.1:8443"
 http_bind = "127.0.0.1:8080"
+# Dedicated Prometheus listener (unauthenticated, loopback).
+metrics_bind = "127.0.0.1:9103"
 log_level = "info"
 runtime_dir = "/run/chv/controlplane"
 jwt_secret = "${JWT_SECRET}"
@@ -1487,6 +1489,8 @@ EOF
 socket_path = "/run/chv/stord/api.sock"
 runtime_dir = "${CHV_DATA_DIR}/storage/localdisk"
 log_level = "info"
+# Dedicated Prometheus listener (unauthenticated, loopback).
+metrics_bind = "127.0.0.1:9101"
 path_allowlist = ["${CHV_DATA_DIR}/storage/localdisk", "${CHV_DATA_DIR}/storage/lvm", "${CHV_DATA_DIR}/agent"]
 device_allowlist = ["/dev/dm-*", "/dev/mapper/*"]
 EOF
@@ -1497,6 +1501,8 @@ EOF
 socket_path = "/run/chv/nwd/api.sock"
 runtime_dir = "/run/chv/nwd"
 log_level = "info"
+# Dedicated Prometheus listener (unauthenticated, loopback).
+metrics_bind = "127.0.0.1:9102"
 # Bridge topology (bridge name, CIDR, upstream interface) is configured at
 # runtime via gRPC topology specs from the control plane, not in this config
 # file. The dev-resource seeder creates the default network via the API using

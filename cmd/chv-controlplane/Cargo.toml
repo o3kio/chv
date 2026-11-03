@@ -33,7 +33,7 @@ chv-controlplane-store = { path = "../../crates/chv-controlplane-store" }
 chv-controlplane-seed = { path = "../../crates/chv-controlplane-seed" }
 chv-webui-bff = { path = "../../crates/chv-webui-bff" }
 chv-common = { path = "../../crates/chv-common" }
-chv-observability = { path = "../../crates/chv-observability" }
+chv-observability = { path = "../../crates/chv-observability", features = ["http-metrics"] }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

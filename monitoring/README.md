@@ -24,6 +24,44 @@ pinned Prometheus v3.15.1 release, verifies its SHA256 checksum, and runs
 `promtool check rules monitoring/rules/*.yml`. It does not depend on the Rust
 build.
 
+## Scrape endpoints
+
+All four CHV daemons expose Prometheus text exposition on a dedicated HTTP
+listener. The listeners are **unauthenticated and loopback-bound by default**,
+so local scraping does not need a bearer token or admin JWT rotation.
+
+| Daemon | Config key | Default bind |
+|---|---|---|
+| `chv-controlplane` | `metrics_bind` | `127.0.0.1:9103` |
+| `chv-agent` | `metrics_bind` | `127.0.0.1:9100` code fallback; packaged/installer `127.0.0.1:9901` |
+| `chv-stord` | `metrics_bind` | `127.0.0.1:9101` |
+| `chv-nwd` | `metrics_bind` | `127.0.0.1:9102` |
+
+The control plane's older `/metrics` route on `http_bind` remains admin-gated
+for compatibility; use the dedicated `metrics_bind` listener for scraping. For
+remote scraping, bind `metrics_bind` to a specific management address and
+firewall it, or keep loopback and front it with an operator-managed reverse
+proxy. Never bind a metrics listener to a wildcard/public address.
+
+```yaml
+scrape_configs:
+  - job_name: chv-controlplane
+    static_configs:
+      - targets: ['127.0.0.1:9103']
+  - job_name: chv-agent
+    static_configs:
+      - targets: ['127.0.0.1:9901']
+  - job_name: chv-stord
+    static_configs:
+      - targets: ['127.0.0.1:9101']
+  - job_name: chv-nwd
+    static_configs:
+      - targets: ['127.0.0.1:9102']
+```
+
+See [docs/OBSERVABILITY.md](../docs/OBSERVABILITY.md) for the full scrape
+authentication model and the metric reference.
+
 ## Loading into Prometheus
 
 In your `prometheus.yml`:

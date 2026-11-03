@@ -31,8 +31,13 @@ Use `tracing` as the unified logging framework across all Rust code. Follow thes
 - Log file paths where secrets are loaded (`tracing::info!("loaded jwt_secret from {}", path)`) but never the secret value
 
 ### 4. Prometheus metrics endpoint
-- `chv-controlplane` exposes a `/metrics` endpoint for Prometheus scraping
-- Key metrics: VM state counts, node health, operation latency, gRPC error rates
+- Every daemon (`chv-controlplane`, `chv-agent`, `chv-stord`, `chv-nwd`)
+  exposes a Prometheus text `/metrics` endpoint on a dedicated `metrics_bind`
+  HTTP listener. The listener is unauthenticated and loopback by default;
+  remote scraping is an explicit operator binding/reverse-proxy decision
+  (issue #657).
+- Key metrics: VM state counts, node health, operation latency, gRPC error
+  rates, storage/network daemon operation counters, process/build info.
 - Metrics names follow Prometheus conventions: `chv_vms_total`, `chv_nodes_ready`, etc.
 
 ### 5. Log levels

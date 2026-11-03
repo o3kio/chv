@@ -10,33 +10,49 @@ what to alert on, and how to investigate incidents.
 
 | Service | Endpoint | Default bind |
 |---|---|---|
-| `chv-controlplane` | `/metrics` | `127.0.0.1:8080` (HTTP) |
+| `chv-controlplane` | `/metrics` on a dedicated metrics listener | `metrics_bind`; code default `127.0.0.1:9103` |
 | `chv-agent` | `/metrics` | `metrics_bind` in agent config; packaged/installer default `127.0.0.1:9901`; code fallback when unset `127.0.0.1:9100` (loopback) |
-| `chv-stord` | **no HTTP endpoint today** | in-process `chv_observability::Metrics` counters only — not scrapeable |
-| `chv-nwd` | **no HTTP endpoint today** | in-process `chv_observability::Metrics` counters only — not scrapeable |
-| `chv-webui-bff` | served on the `chv-controlplane` HTTP listener (default `127.0.0.1:8080`) | via `/metrics` route |
+| `chv-stord` | `/metrics` on a dedicated metrics listener | `metrics_bind`; code default `127.0.0.1:9101` |
+| `chv-nwd` | `/metrics` on a dedicated metrics listener | `metrics_bind`; code default `127.0.0.1:9102` |
+| `chv-webui-bff` | served on the `chv-controlplane` HTTP listener | via the control plane's HTTP routes, not a separate scrape target |
 
-> Of the node daemons, only `chv-agent` exposes an HTTP `/metrics` endpoint.
-> `chv-stord` and `chv-nwd` record `chv_observability::Metrics` counters
-> in-process, but neither daemon serves them, and the `metrics_bind` key in
-> their config structs is currently not read by any daemon — do not expect a
-> scrape target there.
-> **Never expose `metrics_bind` on a public interface**; the qualified and
-> packaged posture is loopback (qualification config `127.0.0.1:9100`;
-> packaged/installer default `127.0.0.1:9901`). To scrape from another host,
-> bind to a specific management address (for example
-> `metrics_bind = "192.0.2.10:9901"`), not to a wildcard address. The code
-> fallback `9100` is node_exporter's default port: on hosts running
-> node_exporter, set `metrics_bind` explicitly so the agent cannot lose its
-> listener to an address-in-use error (the failure is logged, not fatal).
->
-> The control plane serves `/metrics` on its `http_bind` address **behind the
-> admin auth gate**: an unauthenticated scrape receives `401`. Scrapers need an
-> admin bearer/session credential, and admin JWTs expire — plan credential
-> rotation or scrape it through an operator-managed relay. `quick-install.sh`
-> deliberately binds the control plane HTTP listener on `0.0.0.0:8080` (plain
-> HTTP); firewall it. The packages and `scripts/install.sh` leave it on
-> `127.0.0.1:8080`.
+All four daemons expose Prometheus text exposition on their own listener. The
+endpoint renders the real process registry (every `metrics` counter and
+histogram the daemon records) plus build/process series
+(`chv_build_info`, `process_start_time_seconds`,
+`chv_process_uptime_seconds`). It is not a placeholder or a static page.
+
+### Scrape authentication model
+
+- **Default: loopback-only, unauthenticated scraper access.** Every
+  `metrics_bind` default above is `127.0.0.1`. A Prometheus instance on the
+  same host scrapes without a bearer token or credential file.
+- **No admin JWT rotation.** The control-plane's *legacy* `/metrics` route on
+  `http_bind` remains behind the admin auth gate for backward compatibility
+  (unauthenticated requests still get `401`, and the Web UI route contract is
+  unchanged). Scrapers must use the dedicated metrics listener instead of
+  minting short-lived admin JWTs.
+- **Remote scraping is an explicit operator action.** Set `metrics_bind` to
+  the node's management address (for example
+  `metrics_bind = "192.0.2.10:9101"`), never `0.0.0.0`/`[::]`, and restrict
+  access at the firewall/network-policy layer. Alternatively keep the loopback
+  bind and put an operator-managed reverse proxy in front with TLS, mTLS, or
+  basic auth. The metrics listener has no authentication of its own; the bind
+  address and the surrounding network are the security boundary.
+- **Fail closed on misconfiguration.** `chv-stord`, `chv-nwd`, and
+  `chv-controlplane` bind their metrics listener before serving and abort
+  startup on an invalid `metrics_bind` or an occupied port. `chv-agent` keeps
+  its historical behavior: a bind failure is logged, not fatal.
+- The agent code fallback `9100` is node_exporter's default port: on hosts
+  running node_exporter, set `metrics_bind` explicitly so the agent cannot lose
+  its listener to an address-in-use error. The stord/nwd/control-plane defaults
+  use dedicated ports (`9101`/`9102`/`9103`) to avoid that collision.
+
+`quick-install.sh` deliberately binds the control plane HTTP listener on
+`0.0.0.0:8080` (plain HTTP); firewall it. That does not affect the metrics
+listener, which stays on its own loopback `metrics_bind` unless the operator
+changes it. The packages and `scripts/install.sh` leave the HTTP listener on
+`127.0.0.1:8080`.
 
 ---
 
@@ -167,8 +183,11 @@ check the recording rules (`chv:*:5m`) to see whether you are on track to exhaus
 | `chv_grpc_server_requests_total` | counter | `service`, `method`, `grpc_status` | gRPC request count per method |
 | `chv_grpc_server_duration_seconds` | histogram | `service`, `method`, `grpc_status` | gRPC request duration |
 
-> `grpc_status` is the numeric gRPC status code (`"0"` = OK). For streaming responses where
-> the trailer cannot be read before body completion, the label is `"unknown"`.
+> `grpc_status` is the numeric gRPC status code (`"0"` = OK). Unary responses
+> use the leading `grpc-status` header; streaming responses are observed at the
+> trailer frame, so a completed or errored stream is recorded with its terminal
+> status. `"unknown"` now means only that no status was carried in either
+> headers or trailers (a protocol violation), plus transport-level body errors.
 
 ### Control-plane convergence
 
@@ -273,10 +292,11 @@ Pending runbooks should be filed as follow-up issues before the first production
 ## Prometheus scrape configuration
 
 Prometheus must run on the same host as the scraped daemons (or reach them
-through an operator-managed relay): the packaged/`scripts/install.sh` posture
-for the agent and the control plane is loopback. `quick-install.sh` binds the
+through an operator-managed relay): every packaged/`scripts/install.sh`
+metrics listener is loopback. All four jobs below scrape the unauthenticated
+dedicated listener and need no credential file. `quick-install.sh` binds the
 control plane HTTP listener on `0.0.0.0:8080` (plain HTTP), so firewall that
-port and scrape it from the management network only.
+port; the metrics listener is unaffected and remains loopback unless changed.
 
 ```yaml
 # Minimal prometheus.yml scrape config for CHV on the local host.
@@ -284,14 +304,8 @@ port and scrape it from the management network only.
 
 scrape_configs:
   - job_name: chv-controlplane
-    # Admin-gated: an unauthenticated scrape returns 401. The token is a
-    # short-lived admin JWT, so rotate the credential file before expiry
-    # (or drop this job if you cannot manage a scrape credential).
-    authorization:
-      type: Bearer
-      credentials_file: /etc/prometheus/chv-admin-token
     static_configs:
-      - targets: ['127.0.0.1:8080']
+      - targets: ['127.0.0.1:9103']   # metrics_bind default
 
   - job_name: chv-agent
     # Packaged/installer default. Qualification and unset-fallback configs
@@ -299,17 +313,24 @@ scrape_configs:
     static_configs:
       - targets: ['127.0.0.1:9901']
 
+  - job_name: chv-stord
+    static_configs:
+      - targets: ['127.0.0.1:9101']   # metrics_bind default
+
+  - job_name: chv-nwd
+    static_configs:
+      - targets: ['127.0.0.1:9102']   # metrics_bind default
+
 rule_files:
   - 'monitoring/rules/chv.yml'
   - 'monitoring/rules/recording.yml'
 ```
 
-`chv-stord` and `chv-nwd` expose no HTTP endpoint today, so there are no
-scrape jobs for them. To scrape the agent from another host, set
-`metrics_bind` explicitly to the node's management address (for example
-`192.0.2.10:9901`) and restrict access at the network layer; never bind it to
-a wildcard/public address. See the loopback caveat under “Metrics endpoints”
-above.
+To scrape from another host, set that daemon's `metrics_bind` explicitly to
+its management address (for example `192.0.2.10:9101`) and restrict access at
+the network layer; never bind it to a wildcard/public address. Keep the
+target list in this example loopback when using a reverse proxy or an
+operator-managed relay instead. See “Scrape authentication model” above.
 
 ---
 

@@ -26,6 +26,8 @@
 - expose policy application through a typed local API
 - preserve topology where possible across daemon restart
 - publish health and namespace state
+- publish Prometheus metrics on the dedicated `metrics_bind` listener
+  (loopback default `127.0.0.1:9102`, unauthenticated; issue #657)
 
 ## Traffic policy
 - east-west traffic stays local when safe

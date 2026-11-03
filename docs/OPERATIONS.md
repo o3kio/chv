@@ -928,7 +928,7 @@ before writing (see [Live Database Access](#live-database-access)).
 
 ### Monitoring
 
-The Architecture Designer exposes Prometheus metrics through the control plane's admin `/metrics` endpoint (`http_bind`, default `127.0.0.1:8080`); the endpoint requires an admin credential. (`:9901` is the agent's metrics listener, not the control plane's.) The label vocabularies below match the actual emitter source (`crates/chv-webui-bff/src/metrics_apply.rs` and `metrics_drift.rs`); writing alerts against label values the emitter does not produce yields silent dead-on-arrival rules.
+Every daemon exposes Prometheus metrics on its dedicated `metrics_bind` listener (loopback by default): control plane `127.0.0.1:9103`, stord `127.0.0.1:9101`, nwd `127.0.0.1:9102`, and the packaged agent `127.0.0.1:9901`. The Architecture Designer metrics are served there through the shared process registry. The legacy `/metrics` route on the control plane's `http_bind` (default `127.0.0.1:8080`) remains admin-gated for compatibility, but it is not the scraper path — the dedicated listener needs no admin credential. See [OBSERVABILITY.md](OBSERVABILITY.md) for the scrape auth model. The label vocabularies below match the actual emitter source (`crates/chv-webui-bff/src/metrics_apply.rs` and `metrics_drift.rs`); writing alerts against label values the emitter does not produce yields silent dead-on-arrival rules.
 
 ```
 # Apply attempts (counter)

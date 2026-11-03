@@ -309,7 +309,15 @@ leg that ran in #549 (2026-10-08).
 | 8443 | gRPC (control plane ↔ agent) | `127.0.0.1` |
 | 8080 | HTTP admin API (+ Web UI when `[webui]` is enabled) | `127.0.0.1` |
 | 80 | Edge proxy (nginx; Web UI + API) | `0.0.0.0` |
+| 9103 | Control-plane metrics (`metrics_bind`) | `127.0.0.1` |
 | 9901 | Agent metrics (optional) | `127.0.0.1` |
+| 9101 | Storage daemon metrics (`metrics_bind`) | `127.0.0.1` |
+| 9102 | Network daemon metrics (`metrics_bind`) | `127.0.0.1` |
+
+The metrics listeners are unauthenticated and loopback by default; Prometheus
+scrapes them without an admin JWT. See
+[docs/OBSERVABILITY.md](OBSERVABILITY.md) for the auth model and remote-scrape
+guidance.
 
 ### Verification
 
@@ -513,6 +521,9 @@ sudo chown root:chv /etc/chv/certs/ca.key /etc/chv/certs/ca.crt
 ```toml
 grpc_bind = "127.0.0.1:8443"
 http_bind = "127.0.0.1:8080"
+# Dedicated Prometheus listener (unauthenticated, loopback). The legacy
+# /metrics route on http_bind stays admin-gated; scrapers use this instead.
+metrics_bind = "127.0.0.1:9103"
 log_level = "info"
 runtime_dir = "/run/chv/controlplane"
 jwt_secret = "<generate with: openssl rand -base64 32>"
@@ -593,6 +604,8 @@ healthy_reset_secs = 900        # sustained health resets the budget
 socket_path = "/run/chv/nwd/api.sock"
 runtime_dir = "/run/chv/nwd"
 log_level = "info"
+# Dedicated Prometheus listener; loopback default is 127.0.0.1:9102.
+metrics_bind = "127.0.0.1:9102"
 
 # Bridge topology (bridge name, CIDR, upstream interface) is configured at
 # runtime via gRPC topology specs from the control plane, not in this file.
@@ -603,6 +616,8 @@ log_level = "info"
 socket_path = "/run/chv/stord/api.sock"
 runtime_dir = "/var/lib/chv/storage/localdisk"
 log_level = "info"
+# Dedicated Prometheus listener; loopback default is 127.0.0.1:9101.
+metrics_bind = "127.0.0.1:9101"
 ```
 
 ### 8. Credential Encryption Key

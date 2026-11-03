@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 chv-config = { path = "../../crates/chv-config" }
-chv-observability = { path = "../../crates/chv-observability" }
+chv-observability = { path = "../../crates/chv-observability", features = ["http-metrics"] }
 chv-stord-core = { path = "../../crates/chv-stord-core" }
 chv-stord-backends = { path = "../../crates/chv-stord-backends" }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

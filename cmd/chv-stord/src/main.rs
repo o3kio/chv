@@ -1,5 +1,8 @@
 use chv_config::load_stord_config;
 use chv_observability::init_logger;
+use chv_observability::metrics_server::{
+    resolve_metrics_bind, start_metrics_server, DaemonMetricsInfo,
+};
 use chv_stord_backends::{
     CephRbdBackend, IscsiBackend, LVMBackend, LocalFileBackend, StorageBackend,
 };
@@ -11,6 +14,12 @@ use chv_stord_core::StorageServer;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
+
+/// Default `/metrics` listener when `metrics_bind` is unset. Loopback, never
+/// `0.0.0.0`: an omitted key must not expose storage telemetry on every
+/// interface. Operators scraping remotely set `metrics_bind` explicitly and
+/// restrict access at the network layer (issue #657).
+const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9101";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,6 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CHV_GIT_SHA"),
         env!("CHV_RELEASE_CHANNEL"),
     );
+
+    // Bind the Prometheus listener before opening the session store or any
+    // backend: a bad `metrics_bind` or an occupied port aborts startup loudly
+    // instead of running a daemon with no observability surface (#657).
+    start_metrics_endpoint(&config).await?;
 
     let db_path = config.runtime_dir.join("stord.db");
     let store = SessionStore::new(&db_path)?;
@@ -186,6 +200,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Build the process identity exposed by the `/metrics` endpoint.
+fn daemon_metrics_info() -> DaemonMetricsInfo {
+    DaemonMetricsInfo::new(
+        env!("CARGO_PKG_NAME"),
+        env!("CHV_VERSION"),
+        env!("CHV_GIT_SHA"),
+        env!("CHV_RELEASE_CHANNEL"),
+    )
+}
+
+/// Resolve and bind the `/metrics` listener.
+///
+/// The bind is synchronous with startup (the listener is acquired before this
+/// returns), so `metrics_bind` typos and port conflicts are fatal. The serving
+/// task itself is process-lifetime and logs if it ever exits.
+async fn start_metrics_endpoint(config: &chv_config::StordConfig) -> Result<(), String> {
+    let bind = resolve_metrics_bind(config.metrics_bind.as_deref(), DEFAULT_METRICS_BIND);
+    if config.metrics_bind.is_none() {
+        tracing::warn!(
+            bind = %bind,
+            "metrics_bind is not set; binding /metrics on loopback — set metrics_bind \
+             explicitly to serve a different address"
+        );
+    }
+    start_metrics_server(&bind, daemon_metrics_info())
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to bind metrics listener on {bind}: {e}; set metrics_bind to a valid \
+                 bind address (loopback by default)"
+            )
+        })
+}
+
 /// #379 DP2 fail-closed vocabulary guard (B2): a PRESENT but
 /// unrecognized `backend_type` aborts stord at startup. The pre-#379
 /// fallback arm silently served local-file for a typo'd value — a
@@ -288,7 +336,10 @@ fn load_migration_materials(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_migration_materials, validate_backend_type, verify_volume_group};
+    use super::{
+        load_migration_materials, start_metrics_endpoint, validate_backend_type,
+        verify_volume_group, DEFAULT_METRICS_BIND,
+    };
     use chv_config::StordMigrationConfig;
 
     /// Minimal `tracing` subscriber that records the message text of
@@ -555,6 +606,42 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("storage migration is disabled")),
             "both-halves startup must not log the disabled-migration line"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #657: the metrics listener is configured like the agent's — loopback
+    // default, explicit `metrics_bind` honored, invalid bind fatal.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn metrics_bind_defaults_to_loopback() {
+        assert_eq!(DEFAULT_METRICS_BIND, "127.0.0.1:9101");
+        assert_eq!(
+            chv_observability::metrics_server::resolve_metrics_bind(None, DEFAULT_METRICS_BIND),
+            "127.0.0.1:9101"
+        );
+        assert_eq!(
+            chv_observability::metrics_server::resolve_metrics_bind(
+                Some("192.0.2.10:9101"),
+                DEFAULT_METRICS_BIND
+            ),
+            "192.0.2.10:9101"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_metrics_bind_fails_startup() {
+        let config = chv_config::StordConfig {
+            metrics_bind: Some("not-a-socket-address".to_string()),
+            ..Default::default()
+        };
+        let err = start_metrics_endpoint(&config)
+            .await
+            .expect_err("an invalid metrics_bind must abort startup");
+        assert!(
+            err.contains("failed to bind metrics listener"),
+            "startup error must name the metrics bind failure, got: {err}"
         );
     }
 

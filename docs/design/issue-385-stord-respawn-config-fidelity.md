@@ -118,7 +118,7 @@ Classification against the supervisor-generated respawn config:
 | `backend_type` (:247) | **dropped** | defaults to `"local"` (`main.rs:53`) → LVM/iscsi/ceph deployment respawns as local backend; daemon looks healthy, serves the wrong backend | **dangerous (data availability)** |
 | `iscsi` (:253), `ceph` (:256), `lvm_volume_group` (:260) | **dropped** | inert without `backend_type` (backend constructors read them only under the matching `backend_type`, `main.rs:54-87`) | dangerous only in combination with `backend_type` |
 | `[migration]` (:268; struct `:276-329`: `enabled`, client half `client_cert_path`/`client_key_path`/`ca_cert_path`/`dest_server_name`, receiver half `listen_addr`/`server_cert_path`/`server_key_path`/`client_ca_path`) | **dropped** | `enabled = false` default → migration actions fail unavailable; inbound receiver listener silently disappears (`main.rs:94-132`) | safe *direction* (fail-closed), silent posture change |
-| `metrics_bind` (:244) | dropped | **none — dead key**: parsed but never read by `chv-stord` (no use of `config.metrics_bind` in `cmd/chv-stord/src/main.rs`; `Metrics::new()` at `:137` takes no bind) | inert |
+| `metrics_bind` (:244) | dropped | at the time, a **dead key** (parsed but unread). Since #657 `chv-stord` binds and serves its own `/metrics` listener from this key (loopback default `127.0.0.1:9101`) | inert then; now a real scrape surface |
 
 Summary: of 13 top-level surfaces, the respawn config mirrors 1
 correctly (`socket_path`), mirrors 2 with wrong/hardcoded values

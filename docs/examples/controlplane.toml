@@ -3,6 +3,12 @@
 
 grpc_bind = "127.0.0.1:8443"
 http_bind = "127.0.0.1:8080"
+# Dedicated Prometheus listener (issue #657): unauthenticated and loopback by
+# default, so scraping never requires a rotating admin JWT. The legacy
+# /metrics route on http_bind stays admin-gated for compatibility. To scrape
+# remotely, bind a specific management address (never 0.0.0.0) and firewall
+# it, or front the loopback listener with an operator-managed reverse proxy.
+metrics_bind = "127.0.0.1:9103"
 log_level = "info"
 runtime_dir = "/run/chv/controlplane"
 agent_runtime_dir = "/var/lib/chv/agent"

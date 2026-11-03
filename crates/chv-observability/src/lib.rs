@@ -5,6 +5,11 @@ use tracing::Span;
 pub mod grpc_metrics;
 pub use grpc_metrics::{GrpcMetricsLayer, GrpcMetricsService};
 
+#[cfg(feature = "http-metrics")]
+pub mod metrics_server;
+#[cfg(feature = "http-metrics")]
+pub use metrics_server::{metrics_router, DaemonMetricsInfo};
+
 /// ADR-009 mandated metric names.
 pub const CHV_VMS_TOTAL: &str = "chv_vms_total";
 pub const CHV_NODES_READY: &str = "chv_nodes_ready";
@@ -82,6 +87,14 @@ pub fn prometheus_handle() -> Option<&'static PrometheusHandle> {
 /// the admin `/metrics` route serves without depending on tracing's
 /// own once-per-process global.
 pub fn install_prometheus_recorder() -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize the check-and-install: two callers racing here would both see
+    // an unset handle, and the loser's `set_global_recorder` would fail after
+    // the winner installed. The mutex makes the idempotence real for parallel
+    // tests and for any daemon that initializes logging from multiple tasks.
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if PROMETHEUS_HANDLE.get().is_some() {
         return Ok(());
     }
