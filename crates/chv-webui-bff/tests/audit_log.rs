@@ -409,6 +409,21 @@ async fn get_and_read_shaped_posts_are_not_recorded() {
         .status(),
         StatusCode::OK
     );
+    // Rendering a cloud-init template is a pure read: the POST must not
+    // append an audit row even when the template is missing (404).
+    assert_eq!(
+        send(
+            &state,
+            post_json(
+                "/v1/cloud-init-templates/t-missing/render",
+                Some(&admin),
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
     assert!(all_rows(&state).await.is_empty());
 }
 
@@ -741,6 +756,46 @@ async fn client_supplied_identifiers_are_capped() {
         "correlation_id must be capped at 128 chars"
     );
     assert_eq!(rows[0].operation_id, rows[0].correlation_id);
+
+    // Path-derived fields are capped too: a matched route with a
+    // hostile 1 KiB id segment must not balloon the row (review R2).
+    // `/v1/vm-templates/:id` DELETE is used because its handler touches
+    // only `state.pool` — `export_vm` additionally acquires a pooled
+    // connection, which deadlocks the test pool's single connection.
+    let long_segment = "a".repeat(1_024);
+    let response = send(
+        &state,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/vm-templates/{long_segment}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+            .body(Body::empty())
+            .expect("build request"),
+    )
+    .await;
+    let status = response.status();
+    let response_body = body_bytes(response).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unexpected body: {}",
+        String::from_utf8_lossy(&response_body)
+    );
+    let template_row = all_rows(&state)
+        .await
+        .into_iter()
+        .find(|row| row.action == "vm_template.delete")
+        .expect("vm_template.delete row");
+    assert_eq!(template_row.path.chars().count(), 256, "path capped at 256");
+    assert_eq!(
+        template_row
+            .resource_id
+            .as_deref()
+            .map(|v| v.chars().count()),
+        Some(256),
+        "resource_id capped at 256"
+    );
 }
 
 #[tokio::test]

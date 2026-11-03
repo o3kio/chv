@@ -88,6 +88,17 @@ fn capped_client_id(value: String) -> String {
     value.chars().take(MAX_CLIENT_ID_LEN).collect()
 }
 
+/// Maximum stored length for path-derived fields (`path`, `action`,
+/// `resource_kind`, `resource_id`). These strings can embed
+/// attacker-chosen URL segments (including on the fail-closed unknown
+/// path arm); capping them bounds row size without affecting routing,
+/// filtering on normal values, or the action/resource vocabulary.
+const MAX_AUDIT_FIELD_LEN: usize = 256;
+
+fn capped_field(value: String) -> String {
+    value.chars().take(MAX_AUDIT_FIELD_LEN).collect()
+}
+
 /// Middleware: append exactly one durable audit row for every mutating
 /// request on an audited surface, then return the handler/role-middleware
 /// response.
@@ -150,11 +161,11 @@ pub async fn record_privileged_mutation(
         actor_id: actor.sub,
         actor_username: actor.username,
         actor_role: actor.role,
-        action: classification.action,
+        action: capped_field(classification.action),
         method: method.as_str().to_string(),
-        path,
-        resource_kind: classification.resource_kind,
-        resource_id: classification.resource_id,
+        path: capped_field(path),
+        resource_kind: classification.resource_kind.map(capped_field),
+        resource_id: classification.resource_id.map(capped_field),
         outcome: outcome.to_string(),
         status_code,
         correlation_id,
@@ -329,6 +340,15 @@ fn is_read_shaped_post(method: &Method, path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("/v1/quotas/") {
         let segments: Vec<&str> = rest.split('/').collect();
         if segments.len() == 2 && segments[1] == "usage" {
+            return true;
+        }
+    }
+    // Rendering a stored cloud-init template substitutes variables and
+    // returns text; it writes nothing (and is deliberately not a
+    // mutation of the template).
+    if let Some(rest) = path.strip_prefix("/v1/cloud-init-templates/") {
+        let segments: Vec<&str> = rest.split('/').collect();
+        if segments.len() == 2 && segments[1] == "render" {
             return true;
         }
     }
@@ -702,6 +722,12 @@ mod tests {
         assert!(classify_mutation(&Method::POST, "/v1/quotas/u-1/usage").is_none());
         // Guest-agent inventory list (viewer tier) is a read.
         assert!(classify_mutation(&Method::POST, "/v1/monitoring/agents").is_none());
+        // Cloud-init template rendering is a pure read (no write, no task).
+        assert!(classify_mutation(&Method::POST, "/v1/cloud-init-templates/t-1/render").is_none());
+        // A render-shaped suffix on another path is not read-shaped.
+        assert!(
+            classify_mutation(&Method::POST, "/v1/cloud-init-templates/t-1/render/extra").is_some()
+        );
     }
 
     #[test]
@@ -799,6 +825,21 @@ mod tests {
         let long = "x".repeat(5_000);
         assert_eq!(capped_client_id(long.clone()).len(), MAX_CLIENT_ID_LEN);
         assert_eq!(capped_client_id("short".to_string()), "short");
+    }
+
+    #[test]
+    fn path_derived_fields_are_capped() {
+        let long = "x".repeat(5_000);
+        assert_eq!(
+            capped_field(long.clone()).chars().count(),
+            MAX_AUDIT_FIELD_LEN
+        );
+        assert_eq!(capped_field("vm.create".to_string()), "vm.create");
+        assert_eq!(
+            capped_field("é".repeat(1_000)).chars().count(),
+            MAX_AUDIT_FIELD_LEN,
+            "cap counts characters, not bytes"
+        );
     }
 
     #[test]

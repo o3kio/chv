@@ -275,13 +275,25 @@ impl AuditLogRepository {
     /// SQLite database regardless (#658 review M2). Returns the number
     /// of deleted rows. `max_rows <= 0` is a no-op (defensive; the
     /// config validator enforces a sane floor).
+    ///
+    /// The cutoff is computed **once**: the `max_rows`-th newest row's
+    /// `(occurred_at_ms, audit_id)` tuple. Every batch then deletes
+    /// rows strictly below that tuple, so total work is proportional
+    /// to the overflow rather than re-ranking the whole table per
+    /// batch (#658 review N2). The `audit_id` tie-break makes the
+    /// boundary deterministic when timestamps collide.
     pub async fn prune_to_max_rows(&self, max_rows: i64) -> Result<u64, StoreError> {
         if max_rows <= 0 {
             return Ok(0);
         }
+        let Some((cutoff_ms, cutoff_id)) = self.prune_cutoff(max_rows).await? else {
+            return Ok(0);
+        };
         let mut deleted = 0u64;
         loop {
-            let n = self.prune_limited(max_rows, DELETE_BATCH_ROWS).await?;
+            let n = self
+                .prune_below_limited(cutoff_ms, &cutoff_id, DELETE_BATCH_ROWS)
+                .await?;
             deleted += n;
             if n < DELETE_BATCH_ROWS as u64 {
                 break;
@@ -290,21 +302,38 @@ impl AuditLogRepository {
         Ok(deleted)
     }
 
-    /// One bounded prune step: delete up to `limit` of the oldest rows
-    /// that fall beyond the newest `max_rows`. Private building block
-    /// for [`Self::prune_to_max_rows`]. The inner subquery ranks the
-    /// table newest-first and skips the newest `max_rows`; the outer
-    /// one walks that overflow oldest-first, so an interrupted prune
-    /// has always removed the oldest evidence first.
-    async fn prune_limited(&self, max_rows: i64, limit: i64) -> Result<u64, StoreError> {
+    /// The `(occurred_at_ms, audit_id)` of the `max_rows`-th newest
+    /// row (1-indexed). `None` when the table holds fewer rows than
+    /// the cap.
+    async fn prune_cutoff(&self, max_rows: i64) -> Result<Option<(i64, String)>, StoreError> {
+        let cutoff = sqlx::query_as(
+            "SELECT occurred_at_ms, audit_id FROM audit_log \
+             ORDER BY occurred_at_ms DESC, audit_id DESC LIMIT 1 OFFSET $1",
+        )
+        .bind(max_rows - 1)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(cutoff)
+    }
+
+    /// One bounded prune step: delete up to `limit` rows strictly below
+    /// the `(cutoff_ms, cutoff_id)` ordering boundary, oldest first.
+    /// Private building block for [`Self::prune_to_max_rows`]; the
+    /// tests exercise it directly to pin batching.
+    async fn prune_below_limited(
+        &self,
+        cutoff_ms: i64,
+        cutoff_id: &str,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
         let result = sqlx::query(
             "DELETE FROM audit_log WHERE audit_id IN (\
-             SELECT audit_id FROM (\
-             SELECT audit_id, occurred_at_ms FROM audit_log \
-             ORDER BY occurred_at_ms DESC, audit_id DESC LIMIT -1 OFFSET $1\
-             ) ORDER BY occurred_at_ms ASC, audit_id ASC LIMIT $2)",
+             SELECT audit_id FROM audit_log \
+             WHERE occurred_at_ms < $1 OR (occurred_at_ms = $1 AND audit_id < $2) \
+             ORDER BY occurred_at_ms ASC, audit_id ASC LIMIT $3)",
         )
-        .bind(max_rows)
+        .bind(cutoff_ms)
+        .bind(cutoff_id)
         .bind(limit)
         .execute(&self.pool)
         .await?;
@@ -563,9 +592,14 @@ mod tests {
             .unwrap();
         }
 
-        // One bounded prune step deletes at most its batch, oldest
-        // first.
-        let deleted = repo.prune_limited(3, 2).await.unwrap();
+        // One bounded step deletes at most its batch, oldest first. The
+        // cutoff is the cap boundary (the 3rd-newest row, 8_000).
+        let (cutoff_ms, cutoff_id) = repo.prune_cutoff(3).await.unwrap().expect("cutoff");
+        assert_eq!(cutoff_ms, 8_000);
+        let deleted = repo
+            .prune_below_limited(cutoff_ms, &cutoff_id, 2)
+            .await
+            .unwrap();
         assert_eq!(deleted, 2);
         let (rows, total) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
         assert_eq!(total, 8);
@@ -582,5 +616,41 @@ mod tests {
         // Under the cap: no-op.
         assert_eq!(repo.prune_to_max_rows(3).await.unwrap(), 0);
         assert_eq!(repo.prune_to_max_rows(0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_cutoff_uses_audit_id_tie_break_for_equal_timestamps() {
+        let test_db = TestDb::new().await;
+        let repo = AuditLogRepository::new(test_db.pool.clone());
+        // Five rows share the same millisecond: the cap boundary is
+        // decided by `audit_id DESC`, and the kept set is deterministic.
+        for i in 0..5 {
+            repo.insert(&entry(
+                7_000,
+                "alice",
+                "vm.create",
+                "vm",
+                &format!("vm-{i}"),
+                AUDIT_OUTCOME_SUCCESS,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let (before, _) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
+        let expected_kept: Vec<String> =
+            before.iter().take(3).map(|r| r.audit_id.clone()).collect();
+
+        let deleted = repo.prune_to_max_rows(3).await.unwrap();
+        assert_eq!(deleted, 2);
+
+        let (after, total) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
+        assert_eq!(total, 3);
+        let remaining: Vec<String> = after.iter().map(|r| r.audit_id.clone()).collect();
+        assert_eq!(
+            remaining, expected_kept,
+            "tie-break keeps the first 3 in audit_id DESC order"
+        );
+        assert!(after.iter().all(|r| r.occurred_at_ms == 7_000));
     }
 }

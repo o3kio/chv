@@ -33,8 +33,10 @@ Excluded:
   (TLS-certificate authenticated, high frequency, not a privileged
   human mutation);
 - reads, including filter POSTs such as `POST /v1/vms`, `/v1/tasks`,
-  `/v1/audit-log`, `/v1/audit-log/export`, and the guest-agent
-  inventory list `POST /v1/monitoring/agents`.
+  `/v1/audit-log`, `/v1/audit-log/export`,
+  `POST /v1/cloud-init-templates/:id/render` (pure substitution, no
+  write), and the guest-agent inventory list
+  `POST /v1/monitoring/agents`.
 
 ## Mounting
 
@@ -55,9 +57,13 @@ Layer order (outermost first) and why:
    replacement) carries `x-correlation-id`;
 2. **metrics** — outside the audit layer so the status it counts is the
    final one on the wire, including the 500 `AUDIT_LOG_WRITE_FAILED`
-   replacement. Only API-shaped paths (`/v1/`, `/api/`, `/admin/`,
-   `/internal/`) are recorded so the static tree, health probes, and
-   arbitrary 404 paths cannot balloon histogram cardinality;
+   replacement. The `path` label is the matched route template from
+   axum's `MatchedPath` (bounded by the route table), never the raw
+   URI; API-prefixed requests that match no route (`/v1/`, `/api/`,
+   `/admin/`, `/internal/` probes) collapse to the single constant
+   label `__unmatched__`, so attacker-chosen 404 segments cannot
+   balloon histogram cardinality. Non-API paths (the static tree,
+   health probes, scrapes) are skipped;
 3. **audit** — wraps every route and the fallback.
 
 ## Row contract
@@ -81,7 +87,10 @@ Layer order (outermost first) and why:
 
 Client-controlled identifier strings (`operation_id`,
 `correlation_id`) are capped at 128 characters so a hostile or buggy
-client cannot balloon row size with megabyte header values.
+client cannot balloon row size with megabyte header values. Path-derived
+fields (`path`, `action`, `resource_kind`, `resource_id`) are capped at
+256 characters before insert: unknown-path fallbacks and dynamic URL
+segments are attacker-chosen, and a row must not become a payload.
 
 `source_ip` prefers the transport peer address when the server
 provides connect info — both serve paths (plain HTTP via
