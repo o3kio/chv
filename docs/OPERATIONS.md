@@ -557,10 +557,17 @@ increments `chv_migration_restart_reconciled_total{recovered_phase=...}`.
 `unresolved` rows kept changing during startup (a late progress report raced the
 scan). They are left non-terminal but marked with `interrupted_at` and
 `interrupted_from_phase` when the observation still matches. The normal reaper
-later fails them; if the marked phase is `MemoryMigration` or `Paused`, the
-reaper records `reaper_resume_state = 'blocked'` and does not resume the source.
-A row that changed too fast to mark (or that never carried `interrupted_at`)
-falls back to ordinary reaper semantics, so inspect it manually.
+later fails them; if either the marked phase (`interrupted_from_phase`) or the
+phase scanned at reap time is `MemoryMigration` or `Paused`, the reaper records
+`reaper_resume_state = 'blocked'` and does not resume the source. A row that
+changed too fast to mark (or that never carried `interrupted_at`) falls back to
+ordinary reaper semantics, so inspect it manually.
+
+`interrupted_at` and `interrupted_from_phase` are **audit markers** and are
+never cleared by this recovery path. If a marked, still-non-terminal row is
+later driven to `Completed` by the agent's own progress reports, the marker
+remains. Treat it as "a restart observed this migration", not as "recovery is
+still pending"; only the current `phase` and placement tell you what happened.
 
 **Verify mTLS configuration:**
 ```bash
@@ -767,6 +774,7 @@ counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`)
 | `chv_migration_dirty_blocks` | Gauge | Remaining dirty blocks during convergence |
 | `chv_migration_restart_reconciled_total` | Counter | Rows reconciled at startup, labelled by `recovered_phase`; nonzero means a restart interrupted migrations |
 | `chv_migration_progress_dropped_total` | Counter | Late progress reports dropped after a terminal transition, labelled by `stored_phase` and `reported_phase`; `reported_phase="Completed"` after recovery is especially important |
+| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
 
 **Expected phase durations** (100GB disk, 16GB RAM):
 

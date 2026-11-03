@@ -231,7 +231,7 @@ operator-initiated migration is stop-the-world until #394 is proven.
 
 - New operation type: `MigrateVm` in orchestrator dispatch table
 - Operation follows existing retry/timeout pattern (but migration is NOT retried automatically — failure requires operator review)
-- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The source VM is resumed only after a liveness gate: the row is terminal, no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`). Rows marked by restart recovery with `interrupted_at` and an ambiguous `interrupted_from_phase` (`MemoryMigration`/`Paused`) are failed but never auto-resumed; the reaper records `reaper_resume_state = 'blocked'`.
+- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The source VM is resumed only after a liveness gate: the row is terminal, no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`). Rows marked by restart recovery with `interrupted_at` are failed but never auto-resumed when either `interrupted_from_phase` or the phase scanned at reap time is ambiguous (`MemoryMigration`/`Paused`); the reaper records `reaper_resume_state = 'blocked'`.
 
 ## Configuration
 
@@ -386,8 +386,11 @@ constants above.
   must inspect placement and resume explicitly (the pause-first gate normally
   leaves the source paused). If recovery cannot terminalize a row because
   progress keeps racing it, it marks the row with `interrupted_at` without
-  changing its phase; the reaper later fails it but does not auto-resume a
-  marked `MemoryMigration`/`Paused` row (`reaper_resume_state = 'blocked'`).
+  changing its phase; the reaper later fails it but does not auto-resume when
+  either the marked or the reap-time phase is `MemoryMigration`/`Paused`
+  (`reaper_resume_state = 'blocked'`). The marker is preserved for audit even
+  if the agent later drives the row to `Completed`; it means "a restart
+  observed this row", not "recovery is still pending".
   The parent operation is failed with `error_code = 'MIGRATION_INTERRUPTED'`.
   Interrupted migrations are not retried automatically; a second startup is a
   no-op because only terminal rows remain. Operators inspect the original phase

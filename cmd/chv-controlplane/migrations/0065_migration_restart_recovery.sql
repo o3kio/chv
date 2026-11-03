@@ -10,7 +10,10 @@
 -- was observed (the terminal `phase` overwrites it during reconciliation).
 -- `interrupted_at` is the reconciliation/observation timestamp. It can also be
 -- non-NULL on a still-non-terminal row when recovery saw the row but could not
--- safely terminalize it because progress kept racing the scan.
+-- safely terminalize it because progress kept racing the scan. Both columns are
+-- audit markers and are never cleared: a marked row later driven to `Completed`
+-- by the agent keeps them, so treat them as "restart observed", not "recovery
+-- pending".
 --
 -- Both columns are additive and nullable: rows written by older control
 -- planes, and terminal rows that were never interrupted, keep NULL. The schema

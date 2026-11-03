@@ -191,6 +191,7 @@ check the recording rules (`chv:*:5m`) to see whether you are on track to exhaus
 | `chv_migration_dirty_blocks` | gauge | — | Remaining dirty blocks during precopy convergence |
 | `chv_migration_restart_reconciled_total` | counter | `recovered_phase` | Non-terminal migration rows reconciled at control-plane startup (`recovered_phase` ∈ {`RolledBack`,`Failed`}); a nonzero value means a restart interrupted migrations |
 | `chv_migration_progress_dropped_total` | counter | `stored_phase`, `reported_phase` | Progress reports dropped because the migration was already terminal. Watch for `reported_phase="Completed"` after recovery: it means an agent-side task is still running |
+| `migration_reaper_resume_skipped_total` | counter | `reason` | Source-VM resume attempts skipped by the reaper; `reason` ∈ {`sender_active`,`source_node_not_reporting`,`interrupted_ambiguous`} |
 
 ### Network (eBPF / VXLAN)
 

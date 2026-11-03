@@ -1214,14 +1214,50 @@ max_version = "999.0.0"
     #[test]
     fn restart_recovery_precedes_listener_and_workers() {
         let source = include_str!("bootstrap.rs");
+
+        // Anchor on the real recovery statement, not any earlier textual
+        // mention. The call site is a single registry construction followed
+        // closely by `recover_after_restart()`.
+        // Split literals so `include_str!` does not count this test's own
+        // assertions as a second occurrence.
+        let recovery_anchor = concat!(
+            "let recovery_report = chv_controlplane_service::",
+            "MigrationRegistry::new(pool.clone())"
+        );
+        assert_eq!(
+            source.matches(recovery_anchor).count(),
+            1,
+            "the restart recovery statement must appear exactly once"
+        );
         let recovery = source
-            .find(".recover_after_restart()")
-            .expect("restart recovery call must exist");
+            .find(recovery_anchor)
+            .expect("restart recovery statement must exist");
+        let recover_call = concat!(".recover_after_", "restart()");
+        let recovery_call = recovery
+            + source[recovery..]
+                .find(recover_call)
+                .expect("recovery statement must call recover_after_restart()");
+        assert!(
+            recovery_call - recovery < 200,
+            "recover_after_restart() must be part of the anchored statement"
+        );
+
         for marker in [
-            "let http_listener = tokio::net::TcpListener::bind(config.http_bind)",
-            "let orchestrator = Orchestrator::new(",
-            "let mut migration_reaper = chv_controlplane_service::MigrationReaper::new(",
+            concat!(
+                "let http_listener = tokio::net::TcpListener::bind(",
+                "config.http_bind)"
+            ),
+            concat!("let orchestrator = ", "Orchestrator::new("),
+            concat!(
+                "let mut migration_reaper = chv_controlplane_service::",
+                "MigrationReaper::new("
+            ),
         ] {
+            assert_eq!(
+                source.matches(marker).count(),
+                1,
+                "startup marker {marker:?} must appear exactly once"
+            );
             let position = source
                 .find(marker)
                 .unwrap_or_else(|| panic!("startup marker {marker:?} must exist"));

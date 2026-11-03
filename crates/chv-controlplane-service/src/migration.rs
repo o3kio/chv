@@ -2736,6 +2736,89 @@ mod tests {
         );
     }
 
+    /// A progress writer that keeps moving the row makes every guarded update
+    /// lose. Recovery must exhaust its retry budget, re-read and re-plan each
+    /// time, then leave the row non-terminal, record only the observation
+    /// marker, and report it unresolved.
+    #[tokio::test]
+    async fn restart_recovery_exhausts_retry_budget_and_marks_row_unresolved() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "racing", "ConvergingDisk", -10).await;
+
+        // Simulate a competing progress writer: every attempt to terminalize
+        // the row advances its phase and is ignored, so the guarded UPDATE
+        // affects zero rows and recovery must re-read/re-plan.
+        sqlx::query("CREATE TABLE reconcile_attempts (attempt INTEGER)")
+            .execute(&test_db.pool)
+            .await
+            .expect("create attempt log");
+        sqlx::query(
+            r#"CREATE TRIGGER simulate_progress_race
+               BEFORE UPDATE OF phase ON migrations
+               WHEN OLD.migration_id = 'mig-racing'
+               BEGIN
+                   INSERT INTO reconcile_attempts(attempt) VALUES (NULL);
+                   UPDATE migrations
+                      SET phase = CASE OLD.phase
+                          WHEN 'ConvergingDisk' THEN 'MemoryMigration'
+                          WHEN 'MemoryMigration' THEN 'Paused'
+                          ELSE 'ConvergingDisk'
+                      END
+                    WHERE migration_id = OLD.migration_id;
+                   SELECT RAISE(IGNORE);
+               END"#,
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("create race trigger");
+
+        let repo = chv_controlplane_store::MigrationRepository::new(test_db.pool.clone());
+        let row = repo.get("mig-racing").await.unwrap().expect("seeded row");
+        let outcome = MigrationRegistry::new(test_db.pool.clone())
+            .reconcile_row(row)
+            .await
+            .expect("racing recovery should complete");
+
+        assert!(
+            matches!(outcome, ReconcileRowOutcome::Unresolved),
+            "a row that keeps changing must be reported unresolved"
+        );
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reconcile_attempts")
+            .fetch_one(&test_db.pool)
+            .await
+            .expect("read attempt count");
+        assert_eq!(
+            attempts, RESTART_RECOVERY_MAX_ATTEMPTS as i64,
+            "recovery must use its full retry budget"
+        );
+
+        let row = repo.get("mig-racing").await.unwrap().expect("row remains");
+        assert!(
+            !chv_controlplane_store::is_terminal_phase(&row.phase),
+            "recovery must never write a terminal phase while racing a writer: {}",
+            row.phase
+        );
+        assert_eq!(row.phase, "ConvergingDisk");
+        assert_eq!(
+            row.interrupted_from_phase.as_deref(),
+            Some("ConvergingDisk")
+        );
+        assert!(row.interrupted_at.is_some(), "observation marker missing");
+        assert_eq!(row.completed_at, None);
+        assert_eq!(row.error_message, None);
+        assert_eq!(row.reaper_resume_state, None);
+
+        let operation_status: String =
+            sqlx::query_scalar("SELECT status FROM operations WHERE operation_id = 'op-racing'")
+                .fetch_one(&test_db.pool)
+                .await
+                .expect("read operation");
+        assert_eq!(
+            operation_status, "Running",
+            "the parent operation must not be failed when the row was never terminalized"
+        );
+    }
+
     #[tokio::test]
     async fn progress_from_a_non_participant_node_is_denied_and_not_persisted() {
         let test_db = chv_controlplane_store::test_util::TestDb::new().await;
