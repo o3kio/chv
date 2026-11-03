@@ -65,9 +65,14 @@ test.describe('Real Rust BFF', () => {
 
 		await expect(page).toHaveURL('/');
 
-		// The token is minted by the Rust BFF (HS256 JWT), not a fixture.
-		const token = await page.evaluate(() => localStorage.getItem('chv-api-token'));
-		expect(token?.split('.')).toHaveLength(3);
+		// #660: the JWT is minted by the Rust BFF (HS256) but lives only in
+		// the HttpOnly `chv_session` cookie, never in script-readable storage.
+		const cookies = await page.context().cookies();
+		const session = cookies.find((cookie) => cookie.name === 'chv_session');
+		expect(session).toBeDefined();
+		expect(session?.value.split('.')).toHaveLength(3);
+		expect(session?.httpOnly).toBe(true);
+		expect(await page.evaluate(() => localStorage.getItem('chv-api-token'))).toBeNull();
 
 		// The seeded database is empty, so a correct real-BFF response drives
 		// the honest empty state. A serde drift or a failed /v1/overview call
@@ -85,11 +90,20 @@ test.describe('Real Rust BFF', () => {
 			data: { username: USERNAME, password: PASSWORD }
 		});
 		expect(login.status()).toBe(200);
+		const setCookies = login
+			.headersArray()
+			.filter((header) => header.name.toLowerCase() === 'set-cookie')
+			.map((header) => header.value);
+		const sessionCookie = setCookies.find((cookie) => cookie.startsWith('chv_session='));
+		if (!sessionCookie) throw new Error('login did not set a chv_session cookie');
 		const loginBody = await login.json();
-		expect(typeof loginBody.token).toBe('string');
+		// #660: the credential is cookie-only; the body must not leak it.
+		expect(loginBody.token).toBeUndefined();
 
+		// Authorizing from the HttpOnly session cookie (no Authorization
+		// header) proves the cookie channel works for real API clients.
 		const overview = await request.post(`${REAL_BFF}/v1/overview`, {
-			headers: { Authorization: `Bearer ${loginBody.token}` },
+			headers: { Cookie: sessionCookie.split(';', 1)[0] },
 			data: {}
 		});
 		expect(overview.status()).toBe(200);
