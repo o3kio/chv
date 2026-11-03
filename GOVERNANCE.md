@@ -79,10 +79,18 @@ maintainers and must keep the linked governance records consistent.
 
 ## Release authority
 
-Only maintainers may create or push version tags. The `protect-tags` ruleset
-restricts creation, update, and deletion of `v*` tags. The release workflow
-requires approval through the protected `rc` or `production` GitHub
-environment before it publishes artifacts.
+Only maintainers own the release decision. The `protect-tags` ruleset
+restricts creation, update, and deletion of `v*` tags, and it currently has no
+bypass actors: GitHub therefore lets only a user with bypass permission create
+a matching tag. Cutting a release today requires a repository administrator to
+grant bypass or pause the ruleset, then restore it and record the before/after
+state. Adding the two maintainers as bypass actors is a pending administrator
+decision. The release workflow runs in the `rc` or `production` environment;
+those environments exist but do not yet have a required-reviewer protection
+rule, so they gate by name only until an administrator configures reviewers
+(see [`docs/release/release-process.md`](docs/release/release-process.md)).
+Do not describe the environment as an approval gate before that setting
+exists.
 
 - The release procedure is documented in
   [`docs/release/release-process.md`](docs/release/release-process.md).
@@ -276,6 +284,14 @@ the security rota are the mechanisms for adding coverage.
   review. The ruleset has no bypass actors.
 - Security reports take priority over feature review when the rota primary is
   handling an active report.
+
+**Organization-owner residual.** The `o3kio` organization currently has one
+owner, `@senolcolak`, who is also a maintainer; `@zoorpha` is a repository
+administrator but not an organization owner. The escalation paths that name
+"the organization owner" therefore do not have an independent third party
+today. If the sole owner is unavailable or conflicted, use the GitHub Support
+organization-recovery path and record the incident; appointing a third,
+uninvolved organization owner is the durable fix.
 
 ### Break-glass access
 

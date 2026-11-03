@@ -31,7 +31,9 @@ keyless signing or an OIDC identity.
 
 The release signing secrets and the package-repository key are separate.
 Rotating one does not rotate the other. The release signing job runs in the
-protected `rc` or `production` environment, and the package-repository job runs
+`rc` or `production` environment (currently without a required-reviewer
+protection rule; see [`docs/release/release-process.md`](../release/release-process.md)),
+and the package-repository job runs
 in `rc-repo` or `production-repo`. Store each secret in its protected
 environment according to the release process.
 

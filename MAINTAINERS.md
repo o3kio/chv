@@ -68,10 +68,13 @@ signed commits, resolved conversations, and the required status checks. See
 
 ### Releases
 
-- Only maintainers create or push `v*` tags. The `protect-tags` ruleset blocks
-  tag updates and deletions.
-- A release requires approval through the protected `rc` or `production`
-  environment.
+- Maintainers own the release decision. The `protect-tags` ruleset restricts
+  `v*` tag creation, update, and deletion and currently has no bypass actors,
+  so an administrator must grant bypass or pause the ruleset to cut a tag and
+  restore it afterwards (record the before/after state).
+- Release jobs run in the `rc`/`production` environments. Required-reviewer
+  protection is not configured yet; configuring it is a pending administrator
+  step in [`docs/release/release-process.md`](docs/release/release-process.md).
 - A maintainer verifies the release gates and artifacts described in
   [`docs/release/release-process.md`](docs/release/release-process.md) and
   [`docs/release/verify-release-artifacts.md`](docs/release/verify-release-artifacts.md).

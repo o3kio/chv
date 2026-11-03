@@ -31,7 +31,7 @@ All controls from 1.2 to 1.10 are enforced by the active `protect-main` ruleset 
 |---|---------|--------|-----|
 | 2.1 | Workflows have minimal explicit permissions | ✅ | `permissions: contents: read` in all workflows that do not publish; elevated permissions only in publishing jobs |
 | 2.2 | `GITHUB_TOKEN` has restricted default permissions | **(admin)** | Settings → Actions → Workflow permissions → Read repository contents and packages |
-| 2.3 | Only actions from GitHub-verified creators are allowed | **(admin)** | Settings → Actions → Allow kubedoio, and select non-GitHub-verified actions (review monthly) |
+| 2.3 | Only actions from GitHub-verified creators are allowed | **(admin)** | Settings → Actions → Allow o3kio, and select non-GitHub-verified actions (review monthly) |
 | 2.4 | Self-hosted runner labels are restricted | **(admin)** | `integration-kvm.yml` uses `chv-kvm`; ensure only trusted runners advertise this label |
 | 2.5 | Workflow `workflow_dispatch` inputs are validated | ✅ | `release.yml` validates version format; `package-nightly.yml` has dry-run mode |
 
