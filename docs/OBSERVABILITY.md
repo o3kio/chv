@@ -72,6 +72,8 @@ changes it. The packages and `scripts/install.sh` leave the HTTP listener on
 SLIs are the measurable properties we use to assess service health. Each SLI is expressed
 as a PromQL expression that can be evaluated continuously.
 
+### Availability caveat (#702)
+
 > **Availability caveat ([#702](https://github.com/o3kio/chv/issues/702)).**
 > SLI-1 and SLI-2 are backed by `chv_vm_ops_total` /
 > `chv_vm_op_duration_seconds`. The shipped agent records those samples into
@@ -190,6 +192,10 @@ check the recording rules (`chv:*:5m`) to see whether you are on track to exhaus
 ## Key metrics reference
 
 ### VM lifecycle (`chv-agent-runtime-ch`)
+
+**Not exported by the shipped agent yet — see [SLI availability caveat](#availability-caveat-702)
+and [#702](https://github.com/o3kio/chv/issues/702).** The rows below describe
+the series' shape once the exporter renders the global registry.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
