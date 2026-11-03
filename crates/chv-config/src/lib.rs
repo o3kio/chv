@@ -196,11 +196,13 @@ pub struct SecretsConfig {
     /// configured with the same value as the control plane.
     #[serde(default)]
     pub console_jwt: Option<String>,
-    /// Bearer token the control plane presents to the agent on every RPC.
-    /// This is a daemon credential, deliberately NOT derived from a
-    /// console/user key when set. For a fleet, set a distinct value per
-    /// node; the derived default is only suitable for the single-host path
-    /// where one control plane and one agent share the legacy master.
+    /// Bearer token the control plane presents on every agent RPC today.
+    /// The control plane holds one value and sends it to every agent it
+    /// serves, so all of those agents must be configured with this same
+    /// token. Per-node token selection is future ADR-029 (multi-host)
+    /// work, not an implemented capability. Rotating one agent's token in
+    /// isolation therefore requires re-keying the control plane or a
+    /// maintenance window.
     #[serde(default)]
     pub agent_auth_token: Option<String>,
     /// Key used for credential encryption at rest (backup S3 secrets,
@@ -217,15 +219,17 @@ pub struct SecurityConfig {
     /// out explicitly (`production = false`) AND enable the bypass.
     #[serde(default = "default_production")]
     pub production: bool,
-    /// Explicitly disables token authentication on the agent's Unix
-    /// socket. Logged loudly at startup; refused when `production = true`.
+    /// Explicitly disables token authentication and the peer-UID gate on
+    /// the agent's Unix socket. On the control plane this only relaxes
+    /// config validation (it never changes the token the control plane
+    /// sends). Logged loudly at startup; refused when `production = true`.
     /// Only for local development.
     #[serde(default)]
     pub allow_insecure_agent_auth: bool,
-    /// Unix UIDs allowed to connect to the agent socket. Empty means "the
-    /// agent's own effective UID" (the control plane normally runs as the
-    /// same service user on a single host). Ignored when the insecure
-    /// bypass is active.
+    /// Agent-only: Unix UIDs allowed to connect to the agent socket. Empty
+    /// means "the agent's own effective UID" (the control plane normally
+    /// runs as the same service user on a single host). Ignored by the
+    /// control plane and when the insecure bypass is active.
     #[serde(default)]
     pub agent_auth_allowed_peer_uids: Vec<u32>,
 }
@@ -274,18 +278,33 @@ impl SecretsConfig {
             })
     }
 
-    fn validate_explicit(&self) -> Result<(), ConfigError> {
-        for (name, value) in [
+    fn validate_explicit(&self, include_credential_encryption: bool) -> Result<(), ConfigError> {
+        let mut fields = vec![
             ("secrets.user_jwt", &self.user_jwt),
             ("secrets.console_jwt", &self.console_jwt),
             ("secrets.agent_auth_token", &self.agent_auth_token),
-            ("secrets.credential_encryption", &self.credential_encryption),
-        ] {
+        ];
+        if include_credential_encryption {
+            fields.push(("secrets.credential_encryption", &self.credential_encryption));
+        }
+        for (name, value) in fields {
             if let Some(secret) = explicit_secret(value) {
                 if secret_is_weak(secret) {
                     return Err(ConfigError::Invalid(format!(
                         "{name} must be at least 32 characters and must not be the \
                          development placeholder"
+                    )));
+                }
+                // The agent token is carried as gRPC metadata. A non-ASCII
+                // value would make `MetadataValue::try_from` fail at send
+                // time and silently omit the header, so reject it at load
+                // time with an actionable error instead.
+                if name == "secrets.agent_auth_token"
+                    && !secret.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "{name} must contain only printable ASCII characters so it can be \
+                         sent as gRPC metadata"
                     )));
                 }
             }
@@ -294,21 +313,10 @@ impl SecretsConfig {
     }
 }
 
-fn secrets_equal(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
 fn ensure_distinct_secrets(secrets: &[(&str, &str)]) -> Result<(), ConfigError> {
     for (index, (left_name, left)) in secrets.iter().enumerate() {
         for (right_name, right) in secrets.iter().skip(index + 1) {
-            if secrets_equal(left.as_bytes(), right.as_bytes()) {
+            if chv_common::constant_time_eq(left.as_bytes(), right.as_bytes()) {
                 return Err(ConfigError::Invalid(format!(
                     "{left_name} and {right_name} must be distinct secrets; \
                      configure separate values under [secrets]"
@@ -696,8 +704,11 @@ pub struct AgentConfig {
     pub jwt_secret: String,
     /// Per-purpose secrets (#662). `console_jwt` must match the control
     /// plane's value; `agent_auth_token` must match the control plane's
-    /// `[secrets] agent_auth_token` (or both derive it from the same
-    /// legacy `jwt_secret` on a single-host install).
+    /// `[secrets] agent_auth_token`. The control plane sends one token to
+    /// every agent it serves today, so all agents behind one control plane
+    /// share that token (per-node tokens are future ADR-029 work). Both may
+    /// instead be derived from the same legacy `jwt_secret` on a
+    /// single-host install.
     #[serde(default)]
     pub secrets: SecretsConfig,
     /// Production/development security switches (#662). Production is the
@@ -866,11 +877,12 @@ impl AgentConfig {
         self.secrets.console_jwt(&self.jwt_secret)
     }
 
-    /// Bearer token the control plane must present on every agent RPC.
+    /// Bearer token the control plane presents on every agent RPC.
     /// Explicit `[secrets] agent_auth_token` wins; otherwise this is a
     /// distinct domain-separated derivation of the legacy master. The
-    /// derived form is shared by every process that shares that master,
-    /// so a fleet must configure an explicit per-node value.
+    /// control plane uses one token for all agents it serves, so every one
+    /// of those agents must use the same effective value. Per-node tokens
+    /// are future ADR-029 work.
     pub fn effective_agent_auth_token(&self) -> String {
         self.secrets.agent_auth_token(&self.jwt_secret)
     }
@@ -880,7 +892,9 @@ impl AgentConfig {
     /// programmatically constructed config.
     pub fn validate_secrets(&self) -> Result<(), ConfigError> {
         validate_security_mode(&self.security)?;
-        self.secrets.validate_explicit()?;
+        // The agent never uses `credential_encryption`; skip validating a
+        // control-plane-only key it would not consume.
+        self.secrets.validate_explicit(false)?;
         if self.security.allow_insecure_agent_auth {
             return Ok(());
         }
@@ -2055,8 +2069,10 @@ impl ControlPlaneConfig {
         self.secrets.console_jwt(&self.jwt_secret)
     }
 
-    /// Bearer token presented to every agent. Explicit configuration wins;
-    /// the derived default is only suitable for single-host deployments.
+    /// Bearer token presented on every agent RPC. Explicit configuration
+    /// wins; otherwise it is derived from the legacy master. One value is
+    /// sent to every agent this control plane serves, so all of those
+    /// agents must share it. Per-node tokens are future ADR-029 work.
     pub fn effective_agent_auth_token(&self) -> String {
         self.secrets.agent_auth_token(&self.jwt_secret)
     }
@@ -2073,7 +2089,7 @@ impl ControlPlaneConfig {
     /// [`load_controlplane_config`]; public for programmatic configs.
     pub fn validate_secrets(&self) -> Result<(), ConfigError> {
         validate_security_mode(&self.security)?;
-        self.secrets.validate_explicit()?;
+        self.secrets.validate_explicit(true)?;
         let user = self.effective_user_jwt_secret();
         let console = self.effective_console_jwt_secret();
         let agent = self.effective_agent_auth_token();
@@ -3035,6 +3051,26 @@ nonsense = true
         cfg.secrets.console_jwt = Some(DEV_SECRET.into());
         let err = cfg.validate_secrets().unwrap_err().to_string();
         assert!(err.contains("development placeholder"), "{err}");
+
+        // The agent token is sent as gRPC metadata: non-printable/non-ASCII
+        // values would be silently dropped at send time.
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.secrets.agent_auth_token = Some("agent-token-0123456789abcdef0123456789é".into());
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("printable ASCII"), "{err}");
+    }
+
+    #[test]
+    fn agent_ignores_control_plane_only_credential_encryption() {
+        // The agent never consumes `credential_encryption`; a value that is
+        // invalid for the control plane must not block agent startup.
+        let mut agent = agent_with_master(TEST_MASTER);
+        agent.secrets.credential_encryption = Some("short".into());
+        assert!(agent.validate_secrets().is_ok());
+
+        let mut control_plane = control_plane_with_master(TEST_MASTER);
+        control_plane.secrets.credential_encryption = Some("short".into());
+        assert!(control_plane.validate_secrets().is_err());
     }
 
     #[test]

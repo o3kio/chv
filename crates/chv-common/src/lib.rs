@@ -12,9 +12,10 @@ pub const CONSOLE_AUDIENCE: &str = "chv:console";
 
 /// Application-layer credential the control plane presents on the
 /// control-plane → agent hop. The transport is a local Unix-domain socket
-/// (0600); this metadata key carries a per-daemon bearer token that the
-/// agent validates before any handler runs. See `docs/ARCHITECTURE.md`
-/// and `docs/runbooks/agent-auth-and-secret-rotation.md`.
+/// (0600); this metadata key carries the control plane's agent bearer
+/// token, which the agent validates before any handler runs. See
+/// `docs/ARCHITECTURE.md` and
+/// `docs/runbooks/agent-auth-and-secret-rotation.md`.
 pub const NODE_AUTH_METADATA_KEY: &str = "x-chv-agent-token";
 
 /// Constant-time byte comparison for bearer credentials.

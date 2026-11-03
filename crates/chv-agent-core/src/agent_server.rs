@@ -11,12 +11,24 @@ use futures_util::StreamExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::service::InterceptorLayer;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
+
+/// Interval between agent-auth rejection warnings. Prevents a broken or
+/// hostile local client from flooding the log while still surfacing the
+/// first failure and a suppressed count on the next interval.
+const AUTH_REJECTION_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct AuthWarnState {
+    last_warn: Option<Instant>,
+    suppressed: u64,
+}
 
 /// Application-layer authentication for the control-plane → agent hop
 /// (#662).
@@ -26,8 +38,10 @@ use tracing::{info, warn};
 ///
 /// 1. Unix peer credentials: only the configured UID set (default: the
 ///    agent's own effective UID) may complete a connection.
-/// 2. A per-daemon bearer token carried in gRPC metadata on every RPC.
-///    The token is compared in constant time before any handler runs.
+/// 2. The control plane's agent bearer token, carried in gRPC metadata on
+///    every RPC and compared in constant time before any handler runs.
+///    The control plane has one token and sends it to every agent it
+///    serves today; per-node tokens are future ADR-029 work.
 ///
 /// `allow_insecure` is an explicit local-development bypass. It is refused
 /// when the config declares `security.production = true` (the default).
@@ -36,6 +50,7 @@ pub struct AgentAuth {
     token: Option<Arc<str>>,
     allow_insecure: bool,
     allowed_peer_uids: Arc<Vec<u32>>,
+    warn_state: Arc<std::sync::Mutex<AuthWarnState>>,
 }
 
 impl AgentAuth {
@@ -50,6 +65,7 @@ impl AgentAuth {
             token: (!token.is_empty()).then(|| Arc::<str>::from(token)),
             allow_insecure,
             allowed_peer_uids: Arc::new(allowed_peer_uids),
+            warn_state: Arc::new(std::sync::Mutex::new(AuthWarnState::default())),
         }
     }
 
@@ -62,6 +78,7 @@ impl AgentAuth {
             token: None,
             allow_insecure: false,
             allowed_peer_uids: Arc::new(Vec::new()),
+            warn_state: Arc::new(std::sync::Mutex::new(AuthWarnState::default())),
         }
     }
 
@@ -74,6 +91,33 @@ impl AgentAuth {
         }
         self.allowed_peer_uids.contains(&uid)
     }
+
+    /// Log a rejection at most once per [`AUTH_REJECTION_WARN_INTERVAL`].
+    /// The `reason` is always a static string; token material is never
+    /// logged.
+    fn warn_rejection(&self, reason: &'static str) {
+        let now = Instant::now();
+        let Ok(mut state) = self.warn_state.lock() else {
+            // A poisoned lock must not turn a rejected RPC into a panic.
+            return;
+        };
+        let should_warn = state
+            .last_warn
+            .map(|last| now.duration_since(last) >= AUTH_REJECTION_WARN_INTERVAL)
+            .unwrap_or(true);
+        if !should_warn {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return;
+        }
+        let suppressed = state.suppressed;
+        state.last_warn = Some(now);
+        state.suppressed = 0;
+        drop(state);
+        warn!(
+            reason,
+            suppressed, "agent rejected a control-plane RPC authentication attempt"
+        );
+    }
 }
 
 impl tonic::service::Interceptor for AgentAuth {
@@ -82,11 +126,13 @@ impl tonic::service::Interceptor for AgentAuth {
             return Ok(req);
         }
         let Some(expected) = self.token.as_deref() else {
+            self.warn_rejection("agent authentication is not configured");
             return Err(Status::unauthenticated(
                 "agent authentication is not configured",
             ));
         };
         let Some(presented) = req.metadata().get(chv_common::NODE_AUTH_METADATA_KEY) else {
+            self.warn_rejection("missing agent authentication token");
             return Err(Status::unauthenticated(
                 "missing agent authentication token",
             ));
@@ -94,6 +140,7 @@ impl tonic::service::Interceptor for AgentAuth {
         if chv_common::constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
             Ok(req)
         } else {
+            self.warn_rejection("invalid agent authentication token");
             Err(Status::unauthenticated(
                 "invalid agent authentication token",
             ))
@@ -278,8 +325,18 @@ impl AgentServer {
             source: e,
         })?;
         // Restrict the socket to the agent's own user; the control plane runs
-        // as the same user, so no group access is required.
-        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+        // as the same user, so no group access is required. Log a failure
+        // rather than silently keeping a wider mode; the peer-UID gate still
+        // applies, but operators should know the filesystem boundary is weak.
+        if let Err(err) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            warn!(
+                error = %err,
+                path = %socket_path.display(),
+                "failed to restrict agent socket permissions to 0600"
+            );
+        }
         // Pre-auth peer-credential gate (#662): a peer whose UID is not in
         // the allowlist is dropped before HTTP/2 is spoken, so an
         // unauthorized local process cannot even reach the token check.

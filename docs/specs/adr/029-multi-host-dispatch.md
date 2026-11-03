@@ -20,13 +20,17 @@ Until the P1 gate passes, the shipped posture remains single-host and every
 statement below is a design commitment, not an implemented capability.
 
 **Implemented today (#662):** the single-host control-plane → agent hop is
-gRPC over a `0600` Unix-domain socket. Each RPC carries a per-daemon bearer
-token (`x-chv-agent-token`, constant-time comparison in the agent
-interceptor) and accepted connections are filtered by Unix `SO_PEERCRED` UID
-before HTTP/2 starts. Per-purpose secrets are split under `[secrets]` so the
-agent token, console key, user-session key, and credential-encryption key are
-not the same value. Neither mechanism is a substitute for the remote
-transport described here: an agent on another host is still unreachable.
+gRPC over a `0600` Unix-domain socket. Each RPC carries the control plane's
+agent bearer token (`x-chv-agent-token`, constant-time comparison in the
+agent interceptor) and accepted connections are filtered by Unix `SO_PEERCRED`
+UID before HTTP/2 starts. The control plane has one token and sends it to
+every agent it serves, so all of those agents share it: this is not per-node
+isolation. Per-node token selection (and the remote transport) is part of the
+multi-host work this ADR tracks; it is not implemented. Per-purpose secrets
+are split under `[secrets]` so the agent token, console key, user-session key,
+and credential-encryption key are not the same value. Neither mechanism is a
+substitute for the remote transport described here: an agent on another host
+is still unreachable.
 
 ## Date
 

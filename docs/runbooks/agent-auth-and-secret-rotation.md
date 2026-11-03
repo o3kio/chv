@@ -18,6 +18,13 @@ Unix-domain socket (`0600`). It is **not** mTLS. Two checks protect it:
    before any handler runs and answers `UNAUTHENTICATED` for missing, wrong,
    or unconfigured tokens.
 
+One control plane holds a single `agent_auth_token` and sends that same value
+to every agent it serves. All agents behind one control plane must therefore
+be configured with that same token. There is no per-node token selection
+today; that is future ADR-029 (multi-host) work. A compromised token is
+therefore valid against every agent that control plane serves — this split
+does not provide per-node containment.
+
 Remote (multi-host) mTLS dispatch is design-only in ADR-029; there is no TCP
 agent listener. See `docs/specs/adr/002-control-plane-boundary.md`.
 
@@ -34,12 +41,13 @@ Both `controlplane.toml` and `agent.toml` accept:
 [secrets]
 user_jwt = "..."                 # control plane only
 console_jwt = "..."              # must match on both sides
-agent_auth_token = "..."         # must match on both sides (per node in a fleet)
-credential_encryption = "..."    # control plane only
+agent_auth_token = "..."         # must match on both sides; one shared value
+                                 # for every agent behind the control plane
+credential_encryption = "..."    # control plane only; the agent ignores it
 
 [security]
 production = true                # default
-allow_insecure_agent_auth = false
+allow_insecure_agent_auth = false # control plane: validation only; agent: bypass
 agent_auth_allowed_peer_uids = [] # agent only; empty = own euid
 ```
 
@@ -47,8 +55,8 @@ Every explicit value must be at least 32 characters, must not be the shipped
 development placeholder, and must differ from every other purpose. When a key
 is absent it is derived from the legacy `jwt_secret` with HMAC-SHA256 domain
 separation. That keeps an existing single-host install working, but the
-derived keys all rotate with the master. Use explicit values for independent
-rotation and for a fleet.
+derived keys all rotate with the master. Use explicit values to rotate each
+purpose independently; they do not give each agent a distinct token.
 
 Generate keys with:
 
@@ -87,12 +95,17 @@ window.
 3. **Serial console (`console_jwt`, both sides).** Set the same new value in
    both files, then restart the agent and the control plane. Any open console
    URL older than 60 seconds is already expired; no VM is interrupted.
-4. **Agent RPC (`agent_auth_token`, both sides).** Set the same new value in
-   both files. The agent accepts exactly one token, so there is a short
-   window where dispatch fails while one side is on the old value. Restart
-   the agent first, then the control plane (or perform a rolling restart if
-   your supervision allows it). Dispatch errors during the window are
-   retried; no desired state is lost.
+4. **Agent RPC (`agent_auth_token`, control plane and every agent it
+   serves).** Set the same new value on the control plane and on all of its
+   agents. Because the control plane sends one token to every agent, there
+   is no way to rotate a single agent's token in isolation: doing so either
+   requires re-keying the control plane (and therefore every agent) or a
+   maintenance window where that agent rejects RPCs until the control plane
+   and its own config are updated together. Each agent accepts exactly one
+   token, so there is a short window where dispatch fails while one side is
+   on the old value. Restart the agent first, then the control plane (or
+   perform a rolling restart if your supervision allows it). Dispatch errors
+   during the window are retried; no desired state is lost.
 5. **Credential encryption (`credential_encryption`, control plane only).**
    This key has no online rotation: existing ciphertext is only readable with
    the key that wrote it. Either keep the existing `CHV_ENCRYPTION_KEY`, or
@@ -107,14 +120,21 @@ window.
    `jwt_secret` in place until then; removing it while any derived key is
    still in use re-keys that purpose on the next restart.
 
-A fleet must set an explicit `agent_auth_token` per node. The derived default
-is shared by every process that shares the legacy master, so it is only
-appropriate for a single-host compatibility install.
+All agents served by one control plane must use the same effective
+`agent_auth_token` as that control plane. The derived default is shared by
+every process that consumes the same legacy master, which is appropriate for
+a single-host compatibility install; multi-host fleets should set the same
+explicit value on the control plane and each of its agents until ADR-029
+introduces per-node selection.
 
 ## Verifying
 
-- Agent startup logs the rejection reason for a bad peer or token; a
-  correctly configured agent logs no authentication warnings.
+- A bad peer is logged at `warn` when the connection is dropped. Missing or
+  wrong agent tokens are also logged at `warn`, but those token-rejection
+  warnings are rate-limited to one per 60 seconds per agent (the next warning
+  reports how many were suppressed) so a broken client cannot flood the log.
+  Token material is never logged. A correctly configured agent logs no
+  authentication warnings.
 - A missing/wrong credential surfaces to the control plane as a gRPC
   `UNAUTHENTICATED` status on node dispatch, not as a generic timeout.
 - To prove fail-closed behavior locally, point a client at the agent socket
