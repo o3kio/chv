@@ -3,12 +3,18 @@
 > Qualification status: the multi-node rebuild procedures in this runbook
 > are code-supported but unqualified. The qualified topology is
 > single-host. See `docs/OPERATIONS.md` for details.
+>
+> **Backup scope:** CHV does not back up tenant data. Its backup/restore API
+> is hard-fenced (`501 NOT_IMPLEMENTED`) and no artifact is produced. The
+> "backup artifacts" this runbook restores must be produced by **your own**
+> tooling outside CHV (or predate the fence). See
+> [`DEPLOYMENT-ARCHITECTURE.md`](../DEPLOYMENT-ARCHITECTURE.md) §7.
 
-**Severity:** SEV-1 (complete infrastructure loss)  
-**Automation Level:** Manual  
-**Estimated Time:** 1–4 hours (depending on VM count and backup destination)  
+**Severity:** SEV-1 (complete infrastructure loss)<br>
+**Automation Level:** Manual<br>
+**Estimated Time:** 1–4 hours (depending on VM count and artifact destination)<br>
 **Prerequisites:**
-- Access to off-site backup artifacts (S3 or NFS)
+- Access to off-site disk artifacts produced by external tooling (S3 or NFS)
 - Replacement hardware, or VMs in an external cloud provider, for all CHV roles (control plane and hypervisor nodes)
 - CHV installation media/packages
 - Network configuration (IPs, DNS, VLANs) documented or recoverable
@@ -27,7 +33,7 @@ CHV recovery follows a strict startup order. Do not skip steps.
 | 2 | Network/storage infrastructure | Hypervisor nodes need connectivity to the control plane and storage |
 | 3 | Hypervisor nodes (`chv-agent`) | Host the VMs |
 | 4 | Storage nodes (`chv-stord`) | Volume backends |
-| 5 | VMs (from backup artifacts) | Final workload restoration |
+| 5 | VMs (from external disk artifacts) | Final workload restoration |
 
 ---
 
@@ -37,9 +43,10 @@ Follow [Control Plane DR](control-plane-dr.md) — Scenario A (control-plane hos
 
 Key additional steps for a full site recovery:
 
-### 2a. Verify Backup Artifacts Are Accessible
+### 2a. Verify External Disk Artifacts Are Accessible
 
-Before rebuilding the hypervisor nodes, confirm you can reach the backup destination:
+Before rebuilding the hypervisor nodes, confirm you can reach the location
+where **your own** backup tooling writes disks (CHV produces none):
 
 ```bash
 # S3
@@ -56,7 +63,7 @@ If the old control plane and the DB backup are both lost, reconstruct the topolo
 - List of all VM IDs and their hypervisor assignments
 - Volume IDs and storage backend configuration
 - Network/VLAN assignments
-- Backup schedule configurations
+- External backup tooling configuration (CHV has no backup schedules to restore)
 
 > **Prevention:** Export this data regularly:
 > ```bash
@@ -205,46 +212,46 @@ Bulk restore script (if many VMs):
 #!/bin/bash
 # restore-all-vms.sh — run on the control plane
 
-API_TOKEN="$TOKEN"
 BACKEND="s3"
 BUCKET="my-backup-bucket"
 PREFIX="chv/vm-backups"
 
-# Get all successful backup jobs (job listing is not status-filtered
-# server-side — filter client-side)
-jobs=$(curl -s "http://localhost:8080/v1/backups/jobs" \
-  -H "Authorization: Bearer $API_TOKEN" | jq -r '.items[] | select(.status == "Succeeded") | [.job_id, .vm_id, .target_path] | @tsv')
+# List candidate artifact metadata from the restored control-plane DB.
+# The backup API is fenced (501), so read SQLite directly (read-only).
+jobs=$(sudo sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
+  "SELECT job_id || char(9) || vm_id || char(9) || target_path
+   FROM backup_jobs WHERE status = 'Succeeded' AND destination IS NOT NULL;")
 
 while IFS=$'\t' read -r job_id vm_id target_path; do
   echo "Restoring VM $vm_id from job $job_id"
-  
+
   # Download artifact
   aws s3 cp "s3://$BUCKET/$PREFIX/$job_id.backup" /tmp/$job_id.backup
-  
+
   # Verify checksum
   expected=$(sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
     "SELECT checksum FROM backup_jobs WHERE job_id = '$job_id';")
   actual=$(sha256sum /tmp/$job_id.backup | awk '{print $1}')
-  
+
   if [ "$expected" != "$actual" ]; then
     echo "  ❌ CHECKSUM MISMATCH for $job_id — skipping"
     continue
   fi
-  
+
   # Stop VM
   chvctl vm stop "$vm_id" 2>/dev/null || true
   sleep 5
-  
+
   # Copy disk to hypervisor (requires SSH access)
   node_ip=$(chvctl node get $(chvctl vm get "$vm_id" | jq -r '.node_id') | jq -r '.management_ip')
   scp /tmp/$job_id.backup "root@$node_ip:/var/lib/chv/agent/vms/$vm_id/disk.qcow2"
-  
+
   # Fix ownership
   ssh "root@$node_ip" "chown -R chv:chv /var/lib/chv/agent/vms/$vm_id/"
-  
+
   # Start VM
   chvctl vm start "$vm_id"
-  
+
   echo "  ✅ Restored VM $vm_id"
 done <<< "$jobs"
 ```
@@ -286,32 +293,21 @@ If you have a volume backup artifact, restore it manually to the `chv-stord` dat
 
 ---
 
-## 7. Reconfigure Backup Schedules
+## 7. Backup Configuration
 
-If the DB was restored, schedules should persist. Verify (the `chvctl backup` group was removed — #372; use the API):
+**There is nothing to reconfigure: CHV has no backup engine.** The
+backup/restore API is hard-fenced (`501 NOT_IMPLEMENTED`), no schedules can be
+created, and no new jobs are queued. Any `backup_schedules` rows present in a
+restored database are inert; the worker will not create jobs from them.
 
-```bash
-curl -s http://localhost:8080/v1/backups/schedules -H "Authorization: Bearer $TOKEN" | jq '.items[] | {schedule_id, vm_id, enabled}'
-```
+Re-establish your **external** backup process (the one that produced the
+artifacts you restored from) and verify it is writing to off-host storage
+again. Do not attempt to create CHV backup schedules — the request will be
+rejected with `501`.
 
-If schedules are missing, recreate them:
-
-```bash
-curl -X POST http://localhost:8080/v1/backups/schedules \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "vm_id": "<VM_ID>",
-    "cron_expression": "0 2 * * *",
-    "retention_count": 7,
-    "retention_days": 30,
-    "destination": "s3://my-backup-bucket/chv/",
-    "s3_access_key": "<ACCESS_KEY>",
-    "s3_secret_key": "<SECRET_KEY>"
-  }'
-```
-
-> **Note:** S3 credentials are encrypted at rest in the database using AES-256-GCM.
+> Pre-fence S3 credential rows remain encrypted at rest with
+> `CHV_ENCRYPTION_KEY`; treat that key as part of the database backup set
+> (see [`docs/OPERATIONS.md`](../OPERATIONS.md#backup-and-restore)).
 
 ---
 
@@ -344,35 +340,24 @@ for vm in vm-1 vm-2 vm-3; do
 done
 ```
 
-### 8c. Backup Worker Verification
+### 8c. Verify the Backup Surface Is Fenced
 
-> **Note:** backup execution is currently a guaranteed-fail no-op
-> ("Backup is not DR") — the worker accepts and journals the job, then
-> fails it without producing an artifact. This check verifies the job
-> lifecycle is journaled and observable, not that a backup succeeds.
+CHV does not back up tenant data. Confirm the fence is intact so nobody
+mistakes a 501 for a transient failure during recovery:
 
 ```bash
-# Create a test backup job
-JOB_ID=$(curl -X POST http://localhost:8080/v1/backups/jobs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"vm_id": "<TEST_VM_ID>", "backup_type": "full"}' | jq -r '.job_id')
-
-# Trigger execution, then verify the job reaches a terminal state
-curl -X POST "http://localhost:8080/v1/backups/jobs/$JOB_ID/execute" \
-  -H "Authorization: Bearer $TOKEN"
-
-curl -s "http://localhost:8080/v1/backups/jobs/$JOB_ID" \
-  -H "Authorization: Bearer $TOKEN" | jq '{status, completed_at, error_message}'
-# Expected: status "Failed" with an error message (execution is a no-op) —
-# the point is that the job is journaled and visible, not that it succeeds.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8080/v1/backups/jobs -H "Authorization: Bearer $TOKEN"
+# Expected: 501  (body code: NOT_IMPLEMENTED)
 ```
 
-### 8d. Run a Full Backup Cycle
+### 8d. Verify Your External Backup Process
+
+There is no CHV backup cycle to run. Confirm **your own** backup tooling is
+writing to off-host storage and that a restore drill is scheduled:
 
 ```bash
-# Force all schedules to run (or wait for next cron tick)
-# Verify artifacts appear in S3/NFS
+# Example only — this is your tooling, not CHV.
 aws s3 ls s3://my-backup-bucket/chv/ --recursive | grep $(date +%Y%m%d)
 ```
 
@@ -382,10 +367,10 @@ aws s3 ls s3://my-backup-bucket/chv/ --recursive | grep $(date +%Y%m%d)
 
 1. **Document the root cause** in your incident tracker
 2. **Update network diagrams** if they changed during rebuild
-3. **Verify off-site backups are still running** — the incident may have disrupted schedules
-4. **Run a backup restore drill** within 48 hours to ensure the recovered system can actually restore
+3. **Verify your external backup process is still running** — the incident may have disrupted it; CHV has no backup schedules to check
+4. **Run a restore drill** within 48 hours to ensure the recovered system can actually restore from your external artifacts
 5. **Update this runbook** if any steps didn't work as expected
-6. **Consider implementing automated restore** — the manual steps in this runbook are a significant operational risk
+6. **Treat tenant-data protection as your responsibility** — CHV does not implement backup/restore, so the manual steps here are the whole story
 
 ---
 
@@ -396,12 +381,12 @@ aws s3 ls s3://my-backup-bucket/chv/ --recursive | grep $(date +%Y%m%d)
 | Agent enrollment fails with `invalid token` | Token expired or wrong CA | Generate fresh token; verify CA cert matches |
 | VMs won't start after restore | Disk images incompatible with the new Cloud Hypervisor version | Convert with `qemu-img convert`; check the Cloud Hypervisor release notes |
 | Ceph volumes not visible | Wrong pool or user | Verify `stord.toml` matches old configuration |
-| Backup worker not creating jobs | Schedules not enabled | `sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" "SELECT schedule_id, enabled FROM backup_schedules;"` |
-| S3 upload fails after recovery | Credentials rotated or bucket policy changed | Update schedule with new S3 credentials |
+| CHV backup endpoints return `501` | Expected — backup/restore is hard-fenced | Use external tooling; see [Backup Artifact Restore](backup-artifact-restore.md) |
+| External S3 upload fails after recovery | Credentials rotated or bucket policy changed | Fix your backup tooling's credentials (not a CHV config) |
 | High VM boot time after restore | Disk images need `virtio` drivers | Ensure VM config matches original (same disk bus) |
 
 ## Related Runbooks
 
 - [Control Plane DR](control-plane-dr.md) — For control-plane-only failures
-- [Backup Artifact Restore](backup-artifact-restore.md) — For single-VM recovery from shipped backups
+- [Backup Artifact Restore](backup-artifact-restore.md) — For single-VM recovery from an externally produced disk artifact
 - [VM Snapshot Restore](vm-snapshot-restore.md) — For restoring from local snapshots

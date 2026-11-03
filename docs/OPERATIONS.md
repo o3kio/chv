@@ -181,6 +181,17 @@ chvctl vm resize <VM_ID> --cpu 4 --memory 8G
 
 ## Backup and Restore
 
+> **Scope: the control-plane database only.** CHV does not implement
+> tenant-data (VM disk/volume) backup or restore. That surface is
+> hard-fenced: every backup/restore API route answers `501
+> NOT_IMPLEMENTED`, the WebUI exposes no backup actions, and no artifact is
+> ever produced. Protecting VM disks and volumes is the operator's
+> responsibility outside CHV (see
+> [`DEPLOYMENT-ARCHITECTURE.md`](DEPLOYMENT-ARCHITECTURE.md) §7). The
+> procedures below back up and restore the operational database, which is
+> required for control-plane recovery and is *not* a DR story for guest
+> data.
+
 ### SQLite Database Backup
 
 The database lives at `/var/lib/chv/controlplane.db`. Back up before upgrades or migrations. Always open the live database read-only (see [Live Database Access](#live-database-access)):
@@ -251,7 +262,7 @@ For detailed step-by-step procedures covering VM snapshot restore, volume snapsh
 |---------|----------|
 | [VM Snapshot Restore](runbooks/vm-snapshot-restore.md) | Restore a VM from a local snapshot (automated) |
 | [Volume Snapshot Restore](runbooks/volume-snapshot-restore.md) | Restore a volume from a local snapshot (local/Ceph automated; LVM/iSCSI manual) |
-| [Backup Artifact Restore](runbooks/backup-artifact-restore.md) | Restore a VM from a shipped S3/NFS backup artifact (manual) |
+| [Backup Artifact Restore](runbooks/backup-artifact-restore.md) | Restore a VM from an externally produced S3/NFS disk artifact (manual; CHV creates none) |
 | [Control Plane DR](runbooks/control-plane-dr.md) | Recover the control plane after host failure or DB corruption |
 | [Full Site Recovery](runbooks/full-site-recovery.md) | Rebuild the entire infrastructure from backups |
 
@@ -477,7 +488,7 @@ curl -X POST http://127.0.0.1:8080/v1/nodes/mutate \
 | `failed to connect to peer with mTLS` | Certificate mismatch or network issue | Verify CA cert matches on both nodes; check firewall rules |
 | `CRC mismatch reported by receiver` | Data corruption in transit | Check network for packet corruption; retry migration |
 | `deadline_exceeded waiting for Ack` | Receiver not acknowledging | Check receiver node health; disk I/O saturation on destination |
-| Migration stuck (reaper will clean up) | `chv_migration_phase` gauge stuck | Wait for reaper (2h timeout) or manually fail: update `migrations` table |
+| Migration stalled (reaper will clean up) | `chv_migration_phase` gauge stuck and no progress reports | Wait for the reaper's no-progress timeout (default 7200 s, `CHV_MIGRATION_STALL_TIMEOUT_SECS`) or manually fail the row. The reaper resumes the source VM only when the sender is proven quiescent; otherwise the VM may stay paused for operator review |
 | Backpressure throttling | `slow_down_factor` in logs | Receiver is overwhelmed; reduce concurrent migrations or add I/O capacity |
 
 **Check active migrations:**

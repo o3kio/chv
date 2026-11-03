@@ -217,7 +217,7 @@ landed via #582, with an honest downtime warning).
 
 - New operation type: `MigrateVm` in orchestrator dispatch table
 - Operation follows existing retry/timeout pattern (but migration is NOT retried automatically — failure requires operator review)
-- Operation reaper: scans every 60 s; a migration in a non-terminal phase older than 7200 s (constant `DEFAULT_MIGRATION_TIMEOUT_SECS`, not derived from the calculated total timeout) is marked Failed, its parent operation failed, and the source VM best-effort resumed (`crates/chv-controlplane-service/src/migration_reaper.rs`)
+- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The source VM is resumed only after a liveness gate: the row is terminal, no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`).
 
 ## Configuration
 

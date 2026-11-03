@@ -17,8 +17,10 @@
 > the `StorageMigrationService` implementation; DHCP `network_id`
 > sanitization; and the drain gate on in-flight migrations.
 >
-> **Still open:** the backup execution engine (backup/restore is excluded
-> from the supported matrix — `backup_worker.rs` refuses every job);
+> **Still open:** the backup execution engine (backup/restore is
+> **hard-fenced** — every route answers `501 NOT_IMPLEMENTED`, the WebUI has
+> no backup actions, and tenant-data protection is the operator's
+> responsibility);
 > multi-host (single-host is the declared posture; no TCP agent listener);
 > Volvisor adoption (ADR-028 direction only; no code); and iSCSI/Ceph
 > `destroy()` (explicitly unimplemented).
@@ -107,6 +109,7 @@ The `GrpcMetricsLayer` intercepts response status from `http::Response` headers.
 **Location:** `crates/chv-controlplane-service/src/` (backup routes), `crates/chv-controlplane-store/src/`  
 The backup schema and API surface exist, but the backup execution worker, VM/volume snapshot orchestration, off-host artifact shipping, restore validation, and retention enforcement are unimplemented. An operator calling the backup API today will receive a success response and a DB record with no actual backup artifact created. This is silent data loss under a disaster scenario.  
 **Fix (short-term):** Return `501 Not Implemented` from all backup/restore endpoints until the execution engine exists. Document this clearly in the API.
+**Resolved 2026-11-03 (#654):** the short-term fix was adopted as the posture — every route answers `501 NOT_IMPLEMENTED`, the UI surface is removed, and tenant-data backup is documented as the operator's responsibility. The engine itself remains unimplemented.
 
 ---
 

@@ -94,8 +94,10 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (pinned 2026-09-29)
         with:
           # cargo-deny treats unmaintained advisories as errors by default.
-          # Keep them visible as warnings while issue #617 tracks the
-          # serde_yaml migration; vulnerabilities remain hard failures.
+          # Keep them visible as warnings: the serde_yaml/unsafe-libyaml
+          # removal (#617) is complete, and this flag is now the standing
+          # policy so a future unmaintained advisory is visible while
+          # vulnerabilities remain hard failures.
           command: check --warn unmaintained ${{ matrix.check }}
           # deny.toml lives at the repo root.
           arguments: --all-features

@@ -20,7 +20,7 @@ Open gaps as of 2026-10-30 (verified against this branch):
 
 | Area | Honest status | Evidence |
 |---|---|---|
-| Backup / restore | **Excluded from the supported matrix.** There is no execution engine: `execute_job` always fails with "backup execution engine not yet implemented". The ship/fetch path was removed in #213; the shipper retains only `delete`. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7, §5 UC-9; `crates/chv-controlplane-service/src/backup_worker.rs` (`execute_job`); `crates/chv-controlplane-service/src/backup_shipper.rs` (`BackupShipper::delete` only) |
+| Backup / restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** There is no execution engine: `execute_job` always fails with "backup execution engine not yet implemented". The ship/fetch path was removed in #213; the shipper retains only `delete`. Every backup/restore API route is fenced and the WebUI exposes no backup navigation; tenant-data protection is the operator's responsibility. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7, §5 UC-9; `crates/chv-webui-bff/src/handlers/backups.rs` (`BACKUP_NOT_IMPLEMENTED`); `crates/chv-controlplane-service/src/backup_worker.rs` (`execute_job`); `crates/chv-controlplane-service/src/backup_shipper.rs` (`BackupShipper::delete` only) |
 | Multi-host | **Architecturally impossible as coded.** Dispatch resolves a local filesystem `agent_socket_pattern` path and connects with `UnixStream::connect`; the agent serves gRPC from a `UnixListener` only (no TCP gRPC listener). Single-host is the declared posture for now. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §3.3, §5 UC-6, §8 D1; `crates/chv-controlplane-service/src/migration.rs` (`resolve_agent_socket`); `crates/chv-controlplane-service/src/node_client.rs` (`UnixStream::connect`); `crates/chv-agent-core/src/agent_server.rs` (`UnixListener::bind`) |
 | Volvisor storage backend | **Design direction only.** Accepted by ADR-028 and the 2026-10-13 adoption plan, but there are **zero** `volvisor` references in `crates/`, `cmd/`, `proto/`, or `Cargo.toml`; storage is still `chv-stord`. | [ADR-028](specs/adr/028-volvisor-storage-orchestration.md); [adoption plan](plans/2026-10-13-volvisor-storage-adoption.md); `grep -rni volvisor crates cmd proto Cargo.toml` → no matches |
 | iSCSI / Ceph RBD | **Coded but unqualified; `destroy()` is explicitly unimplemented** and refuses loudly. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7; `crates/chv-stord-backends/src/iscsi.rs`; `crates/chv-stord-backends/src/ceph.rs` |
@@ -37,9 +37,11 @@ particular, §1.2 (backup engine "complete"), §1.3 (iSCSI/Ceph "resolved"), and
 **Proposed work (not implementation):** the multi-host and native-Volvisor
 path is planned in
 [2026-11-02-multihost-and-volvisor-transition.md](plans/2026-11-02-multihost-and-volvisor-transition.md),
-with [ADR-029](specs/adr/029-multi-host-dispatch.md) (Proposed) and
+with [ADR-029](specs/adr/029-multi-host-dispatch.md) (Accepted — implementation
+not started) and
 [`chv-volume-backend-v1`](specs/contracts/chv-volume-backend-v1.md)
-(Proposed). Planning artifacts do not change any status in the table above.
+(Accepted — implementation not started). Ratification does not change any
+status in the table above; no multi-host or Volvisor code exists.
 
 ---
 
@@ -90,19 +92,25 @@ with [ADR-029](specs/adr/029-multi-host-dispatch.md) (Proposed) and
 - **Evidence:** `proto/node/chv-stord-api.proto`, `crates/chv-stord-core/src/migration/task.rs`, `crates/chv-stord-core/src/handlers.rs:844-1067`, `crates/chv-agent-core/src/migration.rs:229-410`, `crates/chv-agent-core/src/daemon_clients.rs:422-520`
 - **Priority:** P1
 
-### 1.2 Backup Jobs: Execution Engine Complete — Restore/DR Runbooks Pending
+### 1.2 Backup Jobs: Execution Engine Removed — Posture Hard-Fenced
 - **Spec:** ARCHITECTURE.md, PHASED_IMPLEMENTATION_PLAN.md Phase 3
-- **Status:** Core execution engine resolved (2026-06-03). Backup shipper trait (Null, NFS, S3 with streaming upload) wired into `BackupWorker`. VM-level snapshots are staged and shipped to remote destinations. DB records gain checksum, size, remote path, and storage backend. `retention_days` enforcement works alongside `retention_count` pruning. Remote artifact deletion uses `job.destination` (original URL) to build the shipper and `job.target_path` (shipped key/path) for the delete. S3 credentials are configurable per-schedule. 9 unit tests cover shipper implementations.
+- **Status (verified 2026-11-03): NOT IMPLEMENTED — hard-fenced.** This entry
+  previously recorded a 2026-06-03 "core execution engine resolved" state. That
+  is no longer true of the tree: the ship/fetch path was removed in #213, the
+  shipper retains only `delete`, and `execute_job` fails every job. The
+  pre-production gate ([#654](https://github.com/o3kio/chv/issues/654)) chose
+  **fence, not implement**: every `/v1/backups/**`, `/v1/backup-jobs`,
+  `/v1/backup-history`, and `/api/v1/backup*` route answers `501
+  NOT_IMPLEMENTED`, the WebUI exposes no backup navigation or actions, and the
+  scheduler creates no new jobs. Tenant-data backup and restore are the
+  operator's responsibility outside CHV.
 
-  **Post-implementation review fixes (2026-06-03):**
-  - Race condition in scheduled job creation eliminated via optimistic locking (`try_claim_schedule_run`)
-  - Count-based retention pruning now cleans up remote artifacts before deleting DB rows (`list_old_jobs_for_count_retention` + `delete_jobs_by_ids`)
-  - S3 credentials encrypted at rest with AES-256-GCM (`CredentialEncryption`), key from `CHV_ENCRYPTION_KEY` or `CHV_JWT_SECRET`
-  - BFF duplicate JSON keys removed; destination tracking preserved across job creation and re-run paths
-
-  Remaining gaps: volume-level `snapshot_volume` shipping (requires agent protocol changes). Restore execution/validation remains a future feature (no restore worker yet). DR runbooks now document all current manual and automated restore paths.
-- **Evidence:** `crates/chv-controlplane-service/src/backup_shipper.rs`, `crates/chv-controlplane-service/src/backup_worker.rs`, `crates/chv-controlplane-store/src/backups.rs`, `crates/chv-controlplane-store/src/credential_crypto.rs`, `cmd/chv-controlplane/migrations/0043_backup_destination_and_credentials.sql`
-- **Priority:** P2
+  What still exists is the *schema* and a worker that drains legacy rows
+  honestly (marking them failed rather than pretending). Retention now refuses
+  to delete a DB row when the remote artifact delete fails, so a legacy
+  artifact cannot be silently orphaned (fixed with #654).
+- **Evidence:** `crates/chv-webui-bff/src/handlers/backups.rs` (`BACKUP_NOT_IMPLEMENTED`), `crates/chv-controlplane-service/src/backup_worker.rs`, `crates/chv-controlplane-service/src/backup_shipper.rs`, `docs/DEPLOYMENT-ARCHITECTURE.md` §7
+- **Priority:** P2 (post-pre-production)
 
 ### 1.3 iSCSI and Ceph RBD Storage Backend Adapters — ✅ RESOLVED 2026-06-03
 - **Spec:** ADR-004, `chv-stord-spec.md`
@@ -207,7 +215,7 @@ These areas were previously flagged as gaps but are now complete:
 | Gap | ADR | Component Spec | Plan Phase | Status |
 |-----|-----|---------------|------------|--------|
 | 1.1 Disk migration dirty sync/final flush | ADR-012 | chv-stord-spec | Phase 3 | ✅ Resolved |
-| 1.2 Backup execution engine | — | — | Phase 3 | ✅ Resolved (shipper wired, retention fixed, crypto at rest, tests added, DR runbooks documented) |
+| 1.2 Backup execution engine | — | — | Phase 3 | ❌ Not implemented — hard-fenced (`501`); prior "resolved" record was stale |
 | 1.3 iSCSI / Ceph adapters | ADR-004 | chv-stord-spec | Phase 2 | ✅ Resolved |
 | 2.1 stord security hardening | — | chv-stord-spec | — | ✅ Resolved |
 | 3.1 Components >300 lines | CLAUDE.md | — | Phase 3 | ✅ Resolved |

@@ -203,31 +203,34 @@ pub fn admin_router_with_guest_agents(
     // `x-csrf-token` header — neither of which cross-site HTML forms
     // can produce (review finding: these routes previously had no CSRF
     // protection at all).
+    // Backup/restore is HARD-FENCED (#654): every legacy route answers 501
+    // (`NOT_IMPLEMENTED`) instead of queuing work no engine can execute. The
+    // CSRF layer stays in front so a form-native POST still dies with 415.
     let legacy_backup_routes = Router::new()
         .route(
             "/api/v1/backup-jobs",
-            get(chv_webui_bff::handlers::backups::list_backup_jobs_api)
-                .post(chv_webui_bff::handlers::backups::create_backup_job_api),
+            get(chv_webui_bff::handlers::backups::backup_fence)
+                .post(chv_webui_bff::handlers::backups::backup_fence),
         )
         .route(
             "/api/v1/backup-jobs/:job_id",
-            delete(chv_webui_bff::handlers::backups::delete_backup_job_api),
+            delete(chv_webui_bff::handlers::backups::backup_fence),
         )
         .route(
             "/api/v1/backup-jobs/:job_id/run",
-            post(chv_webui_bff::handlers::backups::run_backup_job_api),
+            post(chv_webui_bff::handlers::backups::backup_fence),
         )
         .route(
             "/api/v1/backup-jobs/:job_id/toggle",
-            post(chv_webui_bff::handlers::backups::toggle_backup_job_api),
+            post(chv_webui_bff::handlers::backups::backup_fence),
         )
         .route(
             "/api/v1/backup-history",
-            get(chv_webui_bff::handlers::backups::list_backup_history_api),
+            get(chv_webui_bff::handlers::backups::backup_fence),
         )
         .route(
             "/api/v1/vms/:vm_id/backups",
-            get(chv_webui_bff::handlers::backups::list_vm_backups_api),
+            get(chv_webui_bff::handlers::backups::backup_fence),
         )
         .layer(middleware::from_fn(
             chv_webui_bff::csrf_middleware::csrf_protection,

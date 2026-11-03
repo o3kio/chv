@@ -1,41 +1,41 @@
 # Runbook: Backup Artifact Restore
 
-**Severity:** SEV-1 (data loss) / SEV-2 (production VM unavailability)  
-**Automation Level:** **Manual** — CHV does not yet have a restore worker for shipped backup artifacts  
-**Estimated Time:** 10–30 minutes  
+**Severity:** SEV-1 (data loss) / SEV-2 (production VM unavailability)<br>
+**Automation Level:** **Manual** — CHV has no backup or restore engine<br>
+**Estimated Time:** 10–30 minutes<br>
 **Prerequisites:**
-- Backup job completed successfully (status = `Succeeded`)
-- Access to the backup destination (S3 bucket or NFS mount)
+- An off-host disk artifact produced by **your own** tooling (S3/NFS/object store), or a pre-fence CHV job whose artifact still exists
+- Access to the artifact destination (S3 bucket or NFS mount)
 - `qemu-img` installed on the target node
 - Target VM is **stopped** before disk replacement
 - Sufficient disk space on the target node for the artifact + working copy
 
-> **Important:** The `POST /v1/backups/restores` API endpoint creates a tracking record but **does not execute the restore**. This runbook describes the manual procedure until the restore worker is implemented.
+> **CHV cannot create backup artifacts.** The backup/restore API is
+> hard-fenced (`501 NOT_IMPLEMENTED`): no job runs, no artifact is shipped,
+> and no restore executes. This runbook documents a **manual** disk
+> replacement using an artifact that already exists outside CHV. If you have
+> no such artifact, there is nothing to restore — start a real backup process
+> with your own tooling now. See
+> [`DEPLOYMENT-ARCHITECTURE.md`](../DEPLOYMENT-ARCHITECTURE.md) §7.
 
 ---
 
-## 1. Identify the Backup Job
+## 1. Identify the Artifact
 
-### Via API
+If the artifact came from a pre-fence CHV job, its metadata is still in the
+`backup_jobs` table and can be read directly. The API is **not** usable: every
+`/v1/backups/*` route answers `501 NOT_IMPLEMENTED`.
 
-> **Note:** the `chvctl backup` command group was removed (#372) — its
-> subcommands 404'd against routes that never existed, and backup
-> execution itself is a guaranteed-fail no-op ("Backup is not DR"). Use
-> the API (or the UI's backup pages, which call the same routes):
-
-```bash
-# Note: job listing is not vm-filtered server-side — filter client-side:
-curl -s "https://controlplane.example.com/v1/backups/jobs" \
-  -H "Authorization: Bearer $TOKEN" | jq '.items[] | select(.vm_id == "<VM_ID>") | {job_id, vm_id, status, target_path, storage_backend, checksum, size_bytes, completed_at}'
-```
+> The `chvctl backup` command group was removed (#372) — its subcommands
+> 404'd against routes that never existed.
 
 ### Via SQLite (direct DB access)
 
 ```bash
 sudo sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
-  "SELECT job_id, status, destination, storage_backend, checksum, size_bytes, completed_at 
-   FROM backup_jobs 
-   WHERE vm_id = '<VM_ID>' AND status = 'Succeeded' 
+  "SELECT job_id, status, destination, storage_backend, checksum, size_bytes, completed_at
+   FROM backup_jobs
+   WHERE vm_id = '<VM_ID>' AND status = 'Succeeded'
    ORDER BY completed_at DESC LIMIT 5;"
 ```
 
@@ -75,8 +75,8 @@ aws s3 cp "s3://bucket/prefix/<JOB_ID>.backup" /tmp/<JOB_ID>.backup \
 ### 2b. NFS Destination
 
 ```bash
-# The NFS mount should already be mounted on the control plane (used by backup worker)
-# If not, mount it:
+# If the artifact lives on an NFS export your external backup tooling writes
+# to, mount it:
 sudo mount -t nfs backup-nfs.example.com:/exports/backups /mnt/backups
 
 # Copy the artifact
@@ -249,28 +249,22 @@ Start the VM and verify filesystem health via SSH, or inspect the VM boot logs f
 
 ## 8. Record the Restore in CHV
 
-Since the restore was performed manually, update CHV's tracking:
+There is **no API for this**: `POST /v1/backups/restores` is fenced and
+answers `501 NOT_IMPLEMENTED`. If a pre-fence restore row exists, you may
+record the outcome directly in the database. This is a live-database write:
+stop the control plane first and restart it after (see
+[`docs/OPERATIONS.md`](../OPERATIONS.md), section "Live Database Access").
 
 ```bash
-# Create a restore record via API (for audit trail)
-curl -X POST https://controlplane.example.com/v1/backups/restores \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "backup_job_id": "<JOB_ID>",
-    "target_vm_id": "<VM_ID>",
-    "notes": "Manually restored from S3 artifact. Checksum verified."
-  }' | jq '.restore_id'
-
-# Then mark it as succeeded (since the API stub doesn't execute).
-# Live-database write: stop the control plane first and restart it after
-# (see docs/OPERATIONS.md, section "Live Database Access"):
 sudo systemctl stop chv-controlplane
 sudo sqlite3 /var/lib/chv/controlplane.db \
-  "UPDATE backup_restores SET status = 'Succeeded', completed_at = datetime('now') 
+  "UPDATE backup_restores SET status = 'Succeeded', completed_at = datetime('now')
    WHERE backup_job_id = '<JOB_ID>' AND target_vm_id = '<VM_ID>';"
 sudo systemctl start chv-controlplane
 ```
+
+If no row exists, record the manual restore in **your own** incident/tracking
+system rather than fabricating CHV state.
 
 ---
 
@@ -285,23 +279,13 @@ sudo systemctl start chv-controlplane
 | Permission denied on disk | Wrong ownership | `sudo chown -R chv:chv /var/lib/chv/agent/vms/<VM_ID>/` |
 | Guest filesystem errors | Disk image from running VM | Always stop VM before creating snapshots; `fsck` the restored disk |
 
-## When Will This Be Automated?
+## Automation Status
 
-A restore worker is on the roadmap. When implemented, the procedure will be:
-
-```bash
-# Future automated API (NOT YET AVAILABLE)
-curl -X POST https://controlplane.example.com/v1/backups/restores \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"backup_job_id": "<JOB_ID>", "target_vm_id": "<VM_ID>"}'
-
-# Poll for completion
-curl -s https://controlplane.example.com/v1/backups/restores/<RESTORE_ID> \
-  -H "Authorization: Bearer $TOKEN" | jq '{status, progress_percent, error}'
-```
-
-Until then, follow this manual runbook.
+There is no restore worker and no backup engine. The API is hard-fenced
+(`501 NOT_IMPLEMENTED`) and there is no roadmap date. Treat this manual
+runbook as the supported procedure for externally produced artifacts, and
+treat pod-level backup/restore as out of scope for CHV until an end-to-end
+create → ship → restore → verify capability ships with tests.
 
 ## Related Runbooks
 
