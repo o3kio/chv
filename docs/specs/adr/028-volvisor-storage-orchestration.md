@@ -8,6 +8,24 @@ Accepted; runtime integration pending
 
 2026-10-13
 
+> **Implementation note (2026-11-02).** The runtime integration is specified by
+> [`chv-volume-backend-v1`](../contracts/chv-volume-backend-v1.md) and sequenced
+> by
+> [`2026-11-02-multihost-and-volvisor-transition.md`](../../plans/2026-11-02-multihost-and-volvisor-transition.md).
+> Volvisor's reference v2 implementation (pin pending the P3 contract tests)
+> has no route that advances an
+> attachment from `prepared` to `advertised`/`active`. The corrected design is
+> tracked in [o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34)
+> and merged in Volvisor `main` (`a6d1508`, PR #35, 2026-11-02), but it is not
+> released, tagged, or part of the CHV pin (the pin `286f038` predates it).
+> Until the pin advertises `attachment_state_report`,
+> CHV records `prepared` with `observed = false` and does not claim a live
+> attachment (contract §8). Once re-pinned, CHV may reach `advertised` from a
+> truthful `vmm_configured` attestation, but v1 MUST NOT claim `active`: that
+> requires `guest_confirmed` evidence, and the default install has no guest
+> confirmation path. That is an upstream contract gap, not a weakening of this
+> ADR's truthfulness requirement.
+
 ## Context
 
 CHV currently implements storage lifecycle and provider behavior across the
@@ -142,3 +160,6 @@ their PR and link the matching verification evidence, per `CONTRIBUTING.md`.
 - [Issue #515 — Deferred storage capabilities](https://github.com/o3kio/chv/issues/515)
 - [Volvisor project](https://github.com/o3kio/volvisor)
 - [Volvisor adoption implementation plan](../../plans/2026-10-13-volvisor-storage-adoption.md)
+- [CHV volume backend contract v1](../contracts/chv-volume-backend-v1.md)
+- [Multi-host and Volvisor transition plan](../../plans/2026-11-02-multihost-and-volvisor-transition.md)
+- [ADR-029 — Multi-Host Dispatch](029-multi-host-dispatch.md)

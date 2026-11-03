@@ -1,28 +1,38 @@
 # CHV Production Docker Compose Stack
 # =====================================
 # LEGACY / UNMAINTAINED: this compose stack predates the #323 ownership
-# model (stord runs as `chv`, storage `chv:chv-stord 0770`) and the
-# prompt-02 agent authority cutover, and its ownership layout differs
-# deliberately (chv-stord:chv-stord). It is NOT part of the qualified
-# production topology — use the .deb packages or scripts/install.sh
-# (see docs/DEPLOYMENT.md). Kept for existing experimental deployments.
+# model and the prompt-02 agent authority cutover. Its runtime directories
+# follow the image's #323 ownership (stord runs as `chv`; storage is
+# `chv:chv-stord 0770`). It is NOT part of the qualified production topology
+# — use the .deb packages or scripts/install.sh (see docs/DEPLOYMENT.md).
+# Kept for existing experimental deployments.
+#
+# Unmaintained and unverified: nothing in this stack is exercised by CI or by
+# the release gates, and fixing the image build does not make it supported.
 #
 # Prerequisites:
 #   - Docker 24+ with Compose v2
 #   - /dev/kvm available on the host
 #   - Linux bridge (e.g. chvbr0) pre-created on the host
-#   - Cloud Hypervisor binary installed on the host
 #
 # Before first start:
 #   1. Create the Linux bridge on the host (host networking setup)
-#   2. Install Cloud Hypervisor to /usr/bin/cloud-hypervisor
-#   3. Generate a bootstrap token: openssl rand -hex 32 > bootstrap.token
-#   4. Set CHV_JWT_SECRET in your environment (or a .env file)
+#   2. Generate a bootstrap token: openssl rand -hex 32 > bootstrap.token
+#   3. Set CHV_JWT_SECRET in your environment (or a .env file)
 #
-# Start:
+# Start (expected to fail closed):
 #   docker compose -f docker-compose.prod.yml up -d
 #
-# Health checks:
+#   Nothing here provisions TLS/mTLS material or a bootstrap token, and the
+#   control plane fails closed without them (CHV_ALLOW_INSECURE is rejected in
+#   non-dev builds). The control-plane container therefore exits at startup and
+#   `depends_on: service_healthy` never releases. Treat this file as a legacy
+#   reference, not a runnable deployment; supply the material yourself if you
+#   want to experiment. The agent's cert bootstrap also needs
+#   /etc/chv/certs to be writable by the `chv` user, which the image does not
+#   arrange.
+#
+# Health checks (only meaningful once you supply TLS material):
 #   docker compose -f docker-compose.prod.yml ps
 #   curl http://localhost:8080/health
 #
@@ -36,7 +46,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c '
         mkdir -p /run/chv/controlplane /var/lib/chv /tmp;
         JWT_FILE="/var/lib/chv/.jwt_secret";
@@ -89,8 +99,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    user: "chv-stord:chv-stord"
-    command: >
+    user: "chv:chv"
+    command: |
       sh -c '
         mkdir -p /run/chv/stord /tmp;
         cat > /tmp/stord.toml <<EOF
@@ -127,7 +137,7 @@ services:
       context: .
       dockerfile: Dockerfile
     network_mode: host
-    command: >
+    command: |
       sh -c '
         mkdir -p /run/chv/nwd /tmp;
         cat > /tmp/nwd.toml <<EOF
@@ -165,7 +175,7 @@ services:
       - kvm
     devices:
       - /dev/kvm:/dev/kvm
-    command: >
+    command: |
       sh -c '
         mkdir -p /var/lib/chv/agent /run/chv/agent /var/lib/chv/cache /etc/chv/certs /tmp;
         JWT_FILE="/var/lib/chv/.jwt_secret";
@@ -187,7 +197,7 @@ services:
       socket_path = "/run/chv/agent/api.sock"
       runtime_dir = "/var/lib/chv/agent"
       log_level = "info"
-      control_plane_addr = "http://chv-controlplane:8443"
+      control_plane_addr = "https://chv-controlplane:8443"
       stord_socket = "/run/chv/stord/api.sock"
       nwd_socket = "/run/chv/nwd/api.sock"
       chv_binary_path = "/usr/local/bin/cloud-hypervisor"
@@ -216,7 +226,6 @@ services:
       - chv-run:/run/chv
       - chv-certs:/etc/chv/certs
       - ./bootstrap.token:/etc/chv/bootstrap.token:ro
-      - /usr/bin/cloud-hypervisor:/usr/local/bin/cloud-hypervisor:ro
     networks:
       - chv
     restart: unless-stopped
@@ -247,7 +256,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
+    command: |
       sh -c '
         cat > /tmp/nginx.conf <<EOF
       server {
@@ -256,7 +265,7 @@ services:
         root /opt/chv/ui;
         index index.html;
         location / {
-          try_files $$uri $$uri/ /index.html;
+          try_files \$$uri \$$uri/ /index.html;
         }
         location = /index.html {
           add_header Cache-Control "no-cache, no-store, must-revalidate";
@@ -267,27 +276,27 @@ services:
         location /api/ {
           proxy_pass http://chv-controlplane:8080;
           proxy_http_version 1.1;
-          proxy_set_header Host $$host;
-          proxy_set_header X-Real-IP $$remote_addr;
-          proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
-          proxy_set_header X-Forwarded-Proto $$scheme;
+          proxy_set_header Host \$$host;
+          proxy_set_header X-Real-IP \$$remote_addr;
+          proxy_set_header X-Forwarded-For \$$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto \$$scheme;
           proxy_intercept_errors off;
         }
         location /v1/ {
           proxy_pass http://chv-controlplane:8080;
           proxy_http_version 1.1;
-          proxy_set_header Host $$host;
-          proxy_set_header X-Real-IP $$remote_addr;
-          proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
-          proxy_set_header X-Forwarded-Proto $$scheme;
+          proxy_set_header Host \$$host;
+          proxy_set_header X-Real-IP \$$remote_addr;
+          proxy_set_header X-Forwarded-For \$$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto \$$scheme;
           proxy_intercept_errors off;
         }
         location /ws/vms/ {
           proxy_pass http://chv-agent:8444/vms/;
           proxy_http_version 1.1;
-          proxy_set_header Upgrade $$http_upgrade;
+          proxy_set_header Upgrade \$$http_upgrade;
           proxy_set_header Connection "upgrade";
-          proxy_set_header Host $$host;
+          proxy_set_header Host \$$host;
           proxy_read_timeout 3600s;
           proxy_send_timeout 3600s;
         }

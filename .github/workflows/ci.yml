@@ -194,6 +194,14 @@ jobs:
             echo "scripts/smoke-bump-version.sh not found, skipping"
           fi
 
+      - name: Hosting template copies must not drift
+        # Root copies are hand-published; scripts/bump-version.sh rewrites
+        # all four. Fail the PR if only one side changed.
+        run: |
+          for f in cloudflare-worker.js github-pages-index.html; do
+            cmp "$f" "scripts/hosting/$f"
+          done
+
   ui:
     name: UI checks
     runs-on: ubuntu-latest

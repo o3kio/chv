@@ -36,8 +36,10 @@ fn compiled_schema() -> &'static Validator {
 /// A YAML syntax error is also reported as a single SCHEMA_INVALID finding
 /// (rather than panicking) so callers always receive a flat findings list.
 pub fn validate_against_schema(yaml_str: &str) -> Vec<Finding> {
-    // Parse YAML → serde_yaml::Value, then rotate into serde_json::Value.
-    let yaml_value: serde_yaml::Value = match serde_yaml::from_str(yaml_str) {
+    // Parse YAML directly into the JSON value model the schema validator
+    // consumes. serde-saphyr is a safe-Rust YAML parser; serde_json::Value
+    // is the intermediate representation shared with the typed model.
+    let json_value: serde_json::Value = match crate::parse::parse_value(yaml_str) {
         Ok(v) => v,
         Err(err) => {
             return vec![Finding {
@@ -48,21 +50,6 @@ pub fn validate_against_schema(yaml_str: &str) -> Vec<Finding> {
                 resource_ref: None,
                 blocking: true,
                 suggestion: Some("fix the YAML syntax".to_string()),
-            }];
-        }
-    };
-
-    let json_value = match serde_json::to_value(&yaml_value) {
-        Ok(v) => v,
-        Err(err) => {
-            return vec![Finding {
-                severity: Severity::Error,
-                code: Cow::Borrowed(SCHEMA_INVALID),
-                message: format!("yaml is not representable as JSON: {err}"),
-                path: None,
-                resource_ref: None,
-                blocking: true,
-                suggestion: None,
             }];
         }
     };

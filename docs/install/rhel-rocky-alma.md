@@ -10,7 +10,7 @@ This guide covers installing CHV packages on RHEL-compatible systems.
 | Rocky Linux | 9 |
 | AlmaLinux | 9 |
 
-Published CHV packages and release tarballs are `amd64` (`x86_64`) only. The all-in-one installer script (`scripts/install.sh`) also accepts `arm64` hosts, but no `arm64` artifacts are published.
+Published CHV packages and release tarballs are `amd64` (`x86_64`) only. `arm64` is unsupported: `scripts/install.sh` detects it but still downloads and installs the amd64 tarball (whose binaries will not run on arm64) while skipping the VMM download with a warning — it does not fail closed, so use an x86_64 host. `scripts/quick-install.sh` aborts on `arm64` with an explanation.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ Published CHV packages and release tarballs are `amd64` (`x86_64`) only. The all
 
 ## Option 2 — Manual `.rpm` install (current)
 
-Download the `.rpm` packages from the [GitHub Releases](https://github.com/kubedoio/chv/releases) page and install them manually.
+Download the `.rpm` packages from the [GitHub Releases](https://github.com/o3kio/chv/releases) page and install them manually.
 
 ### 1. Download packages
 
@@ -48,7 +48,7 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
 curl -sLO "${BASE_URL}/chv-controlplane-${VERSION}-1.x86_64.rpm"
 curl -sLO "${BASE_URL}/chv-node-${VERSION}-1.x86_64.rpm"
@@ -133,7 +133,7 @@ To upgrade to a newer version, download the new packages and install them over t
 ```bash
 # Download new packages
 VERSION="<new-version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 curl -sLO "${BASE_URL}/chv-controlplane-${VERSION}-1.x86_64.rpm"
 curl -sLO "${BASE_URL}/chv-node-${VERSION}-1.x86_64.rpm"
 curl -sLO "${BASE_URL}/chvctl-${VERSION}-1.x86_64.rpm"

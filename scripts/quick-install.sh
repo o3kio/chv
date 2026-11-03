@@ -2,7 +2,7 @@
 # CHV Quick Install — the one-command lab installer (issue #482)
 #
 # Usage (designed to be curl-pipe-bash'd from raw.githubusercontent.com):
-#   curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s
+#   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
 #   curl -fsSL ... | sudo bash -s -- --version 0.3.0     # pin a release
 #   sudo ./scripts/quick-install.sh --uninstall          # remove software, keep data
 #   sudo ./scripts/quick-install.sh --uninstall --purge  # remove everything
@@ -25,7 +25,7 @@
 #   exercises this path yet (same tier the #447 package serving shape
 #   started at). See docs/DEPLOYMENT.md "Quick Install (single command)".
 #
-# Artifact source: tagged GitHub releases of kubedoio/chv only (the publish
+# Artifact source: tagged GitHub releases of o3kio/chv only (the publish
 # pipeline .github/workflows/release.yml maintains). No nightly default.
 # Asset naming matches what that pipeline actually publishes:
 #   - tarball: chv-<version>-linux-<arch>.tar.gz (+ .sha256 sidecar)
@@ -43,9 +43,14 @@
 # Environment variables (house names shared with scripts/install.sh where the
 # semantics are identical):
 #   INSTALL_CHV_VERSION       - version to install, no leading 'v' (default: latest stable)
-#   GITHUB_REPO               - override the source repository (default: kubedoio/chv)
+#   GITHUB_REPO               - override the source repository (default: o3kio/chv)
 #   INSTALL_CHV_SKIP_DEPS     - "1" to skip dependency installation
 #   INSTALL_CHV_SKIP_CLOUD_HV - "1" to skip the Cloud Hypervisor download
+#   INSTALL_CHV_ALLOW_VMM_MISMATCH - "1" to keep a host cloud-hypervisor /
+#                                ch-remote whose major.minor differs from the
+#                                qualified pin (v53.0) instead of replacing it
+#                                with the pinned, digest-verified static
+#                                binaries. OFF-PIN and UNQUALIFIED.
 #
 # Disclosed judgments (full list in docs/DEPLOYMENT.md and the PR body):
 #   - Packages (.deb/.rpm) are preferred when the distro family matches; the
@@ -73,7 +78,7 @@ set -euo pipefail
 # them; on a real host the defaults match install.sh and the package layout)
 # -----------------------------------------------------------------------------
 INSTALL_CHV_VERSION="${INSTALL_CHV_VERSION:-latest}"
-GITHUB_REPO="${GITHUB_REPO:-kubedoio/chv}"
+GITHUB_REPO="${GITHUB_REPO:-o3kio/chv}"
 INSTALL_CHV_SKIP_DEPS="${INSTALL_CHV_SKIP_DEPS:-0}"
 INSTALL_CHV_SKIP_CLOUD_HV="${INSTALL_CHV_SKIP_CLOUD_HV:-0}"
 
@@ -128,7 +133,7 @@ usage() {
 CHV Quick Install — one-command lab installer (issue #482)
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/kubedoio/chv/main/scripts/quick-install.sh | sudo bash -s
+  curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
   curl -fsSL <url> | sudo bash -s -- --version 0.3.0   # pin a tagged release
   sudo ./scripts/quick-install.sh --uninstall           # remove software, keep data
   sudo ./scripts/quick-install.sh --uninstall --purge   # remove everything
@@ -145,9 +150,12 @@ Flags:
 
 Environment:
   INSTALL_CHV_VERSION        version to install (default: latest stable)
-  GITHUB_REPO                source repository (default: kubedoio/chv)
+  GITHUB_REPO                source repository (default: o3kio/chv)
   INSTALL_CHV_SKIP_DEPS      "1" to skip dependency installation
   INSTALL_CHV_SKIP_CLOUD_HV  "1" to skip the Cloud Hypervisor download
+  INSTALL_CHV_ALLOW_VMM_MISMATCH
+                             "1" to keep an off-pin host cloud-hypervisor /
+                             ch-remote (OFF-PIN and UNQUALIFIED)
 
 Deployment status: [CODE-SUPPORTED, UNQUALIFIED] — the qualified path is
 scripts/install.sh. See docs/DEPLOYMENT.md "Quick Install (single command)".
@@ -227,7 +235,10 @@ github_api_get() {
     # $1: API path (e.g. releases/latest). Prints body; non-200 is fatal.
     local path="$1" body code
     body=$(mktemp)
-    code=$(curl -sS -o "$body" -w '%{http_code}' \
+    # -L: follow the redirect left behind by a repository/org rename (e.g.
+    # kubedoio/chv -> o3kio/chv returns 301 with an HTML/JSON body, which
+    # would otherwise be parsed as a failed API response).
+    code=$(curl -sSL -o "$body" -w '%{http_code}' \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/${GITHUB_REPO}/${path}" 2>/dev/null) || code="000"
     if [ "$code" != "200" ]; then
@@ -635,7 +646,7 @@ install_artifacts_tarball() {
     install -m 0755 "${extract_dir}/bin/chv-nwd" /usr/bin/
     install -m 0755 "${extract_dir}/bin/chvctl" /usr/bin/
 
-    rm -rf "$CHV_UI_DIR"
+    rm -rf "${CHV_UI_DIR:?}"
     mkdir -p "$CHV_UI_DIR"
     cp -r "${extract_dir}/ui/"* "$CHV_UI_DIR/"
     chown -R "$CHV_USER:$CHV_USER" "$CHV_UI_DIR"
@@ -673,33 +684,105 @@ install_cloud_hypervisor() {
         return
     fi
 
-    if cmd_exists cloud-hypervisor; then
-        info "Cloud Hypervisor already installed: $(cloud-hypervisor --version 2>/dev/null || true)"
-        return
-    fi
-
     local chv_version="53.0"
     local chv_sha256="448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc"
     local chv_remote_sha256="13f32ba952e6791fd901f2279be2055fbacc64005f96c42a8e90d58860df84a7"
 
-    info "Downloading Cloud Hypervisor v${chv_version}..."
-    local chv_tmp
-    chv_tmp=$(mktemp)
-    if ! curl -fsSL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${chv_version}/cloud-hypervisor-static" \
-        -o "$chv_tmp"; then
-        rm -f "$chv_tmp"
-        fatal "Failed to download Cloud Hypervisor v${chv_version}."
+    # Version gate, same policy as scripts/install.sh: a host binary is
+    # accepted only when its major.minor matches the qualified pin. Anything
+    # else is replaced with the pinned, digest-verified static build — the
+    # old "any version counts as installed" early return silently kept hosts
+    # on the v43 branch the qualification campaign moved away from.
+    local chv_pin_ok=0
+    # Gate the binary the agent will actually exec (`chv_binary_path` is
+    # /usr/bin/cloud-hypervisor), falling back to PATH only until that link
+    # exists. Checking PATH alone would accept a pinned /usr/local/bin copy
+    # while leaving a stale /usr/bin binary for the agent to run.
+    local chv_bin=""
+    if [ -x /usr/bin/cloud-hypervisor ]; then
+        chv_bin="/usr/bin/cloud-hypervisor"
+    elif cmd_exists cloud-hypervisor; then
+        chv_bin="$(command -v cloud-hypervisor)"
+        # A relative PATH entry makes `command -v` return a relative path;
+        # normalize it so the /usr/bin link never depends on the installer's
+        # working directory.
+        case "$chv_bin" in
+            /*) ;;
+            *) chv_bin="$(cd "$(dirname "$chv_bin")" && pwd)/$(basename "$chv_bin")" ;;
+        esac
     fi
-    if ! echo "${chv_sha256}  ${chv_tmp}" | sha256sum -c - >/dev/null 2>&1; then
-        rm -f "$chv_tmp"
-        fatal "Cloud Hypervisor v${chv_version} digest mismatch (expected ${chv_sha256}); aborting install."
-    fi
-    install -m 0755 "$chv_tmp" /usr/local/bin/cloud-hypervisor
-    rm -f "$chv_tmp"
-    ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
-    info "Cloud Hypervisor installed: $(cloud-hypervisor --version)"
+    if [ -n "$chv_bin" ]; then
+        local found_raw found_mm
+        found_raw="$("$chv_bin" --version 2>/dev/null || true)"
+        # Parse major.minor from e.g. "cloud-hypervisor v43.0.0".
+        found_mm="$(printf '%s' "$found_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
 
-    if ! cmd_exists ch-remote; then
+        if [ "$found_mm" = "$chv_version" ]; then
+            info "Cloud Hypervisor already installed at the qualified pin (${found_raw}); keeping it."
+            if [ "$chv_bin" != "/usr/bin/cloud-hypervisor" ]; then
+                ln -sf "$chv_bin" /usr/bin/cloud-hypervisor
+            fi
+            chv_pin_ok=1
+        elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host Cloud Hypervisor."
+            warn "  found:    ${found_raw:-unparseable}"
+            warn "  required: v${chv_version} (qualified pin)"
+            warn "This install is OFF-PIN and UNQUALIFIED: VMs will run on a VMM the"
+            warn "qualification campaign did not cover. Re-run without this override"
+            warn "(and without INSTALL_CHV_SKIP_CLOUD_HV) to install the pinned binary."
+            if [ "$chv_bin" != "/usr/bin/cloud-hypervisor" ]; then
+                ln -sf "$chv_bin" /usr/bin/cloud-hypervisor
+            fi
+            chv_pin_ok=1
+        else
+            warn "Cloud Hypervisor version mismatch: found ${found_raw:-unparseable},"
+            warn "but the qualified pin is v${chv_version}. Replacing the host binary"
+            warn "with the pinned, digest-verified static build."
+            warn "To keep the host binary instead (off-pin, unqualified), re-run with"
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1."
+        fi
+    fi
+
+    if [ "$chv_pin_ok" = "0" ]; then
+        info "Downloading Cloud Hypervisor v${chv_version}..."
+        local chv_tmp
+        chv_tmp=$(mktemp)
+        if ! curl -fsSL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${chv_version}/cloud-hypervisor-static" \
+            -o "$chv_tmp"; then
+            rm -f "$chv_tmp"
+            fatal "Failed to download Cloud Hypervisor v${chv_version}."
+        fi
+        if ! echo "${chv_sha256}  ${chv_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+            rm -f "$chv_tmp"
+            fatal "Cloud Hypervisor v${chv_version} digest mismatch (expected ${chv_sha256}); aborting install."
+        fi
+        install -m 0755 "$chv_tmp" /usr/local/bin/cloud-hypervisor
+        rm -f "$chv_tmp"
+        ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+        info "Cloud Hypervisor installed: $(cloud-hypervisor --version)"
+    fi
+
+    # ch-remote is version-coupled to cloud-hypervisor; keep the same gate so a
+    # stale host client is not left paired with the pinned VMM.
+    local remote_pin_ok=0
+    if cmd_exists ch-remote; then
+        local remote_raw remote_mm
+        remote_raw="$(ch-remote --version 2>/dev/null || true)"
+        remote_mm="$(printf '%s' "$remote_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+        if [ "$remote_mm" = "$chv_version" ]; then
+            info "ch-remote already installed at the qualified pin (${remote_raw}); keeping it."
+            remote_pin_ok=1
+        elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host ch-remote (off-pin, unqualified)."
+            remote_pin_ok=1
+        else
+            warn "ch-remote version mismatch: found ${remote_raw:-unparseable},"
+            warn "but the qualified pin is v${chv_version}. Replacing it with the"
+            warn "pinned, digest-verified static build."
+        fi
+    fi
+
+    if [ "$remote_pin_ok" = "0" ]; then
         info "Downloading ch-remote v${chv_version}..."
         local remote_tmp
         remote_tmp=$(mktemp)
@@ -714,6 +797,7 @@ install_cloud_hypervisor() {
         fi
         install -m 0755 "$remote_tmp" /usr/local/bin/ch-remote
         rm -f "$remote_tmp"
+        info "ch-remote installed: $(ch-remote --version 2>/dev/null || echo v${chv_version})"
     fi
 }
 

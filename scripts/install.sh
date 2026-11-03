@@ -1,8 +1,8 @@
 #!/bin/bash
 # CHV All-in-One Installer
-# Usage:
-#   curl -sfL https://get.cellhv.com/ | sh -
-#   curl -sfL https://get.cellhv.com/ | INSTALL_CHV_VERSION=0.3.0 sh -
+# Usage (requires bash — the installer uses `set -o pipefail`; dash/sh will not work):
+#   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
+#   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s
 #   ./scripts/install.sh --wipe    # Full teardown before clean install
 #   ./scripts/install.sh --fresh   # Alias for --wipe
 #
@@ -11,6 +11,12 @@
 #   INSTALL_CHV_TARBALL_PATH    - Path to local release tarball (dev mode)
 #   INSTALL_CHV_SKIP_DEPS       - Set to "1" to skip apt dependency installation
 #   INSTALL_CHV_SKIP_CLOUD_HV   - Set to "1" to skip cloud-hypervisor download
+#   INSTALL_CHV_ALLOW_VMM_MISMATCH - Set to "1" to keep host cloud-hypervisor /
+#                                 ch-remote binaries whose major.minor differs
+#                                 from the qualified pin (v53.0) instead of
+#                                 replacing them with the pinned,
+#                                 digest-verified static binaries. The
+#                                 resulting install is OFF-PIN and UNQUALIFIED.
 #   INSTALL_CHV_BRIDGE_IFACE    - Host interface to attach to bridge (default: ens19)
 #   INSTALL_CHV_BRIDGE_NAME     - Bridge name (default: chvbr0)
 #   INSTALL_CHV_BRIDGE_CIDR     - Bridge CIDR (default: 10.200.0.1/24)
@@ -57,7 +63,7 @@ CHV_MIGRATIONS_DIR="/usr/local/share/chv/migrations"
 CHV_MONITORING_MIGRATIONS_DIR="/usr/local/share/chv/monitoring-migrations"
 CHV_DB_PATH="${CHV_DATA_DIR}/controlplane.db"
 
-GITHUB_REPO="${GITHUB_REPO:-kubedoio/chv}"
+GITHUB_REPO="${GITHUB_REPO:-o3kio/chv}"
 
 # Populated later
 EXTRACT_DIR=""
@@ -177,8 +183,10 @@ case "$ARCH" in
 esac
 info "Detected architecture: $ARCH (image suffix: $CHV_ARCH)"
 
-# Detect if we are running from inside a release tarball directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Detect if we are running from inside a release tarball directory.
+# BASH_SOURCE[0] is unset when the script is piped into `bash -s` (the
+# documented curl|bash path), so default it instead of tripping `set -u`.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
 if [ -f "${SCRIPT_DIR}/bin/chv-controlplane" ] && [ -z "$INSTALL_CHV_TARBALL_PATH" ]; then
     info "Detected local release directory mode (binaries next to install.sh)"
     INSTALL_CHV_TARBALL_PATH="${SCRIPT_DIR}"
@@ -269,6 +277,12 @@ print_github_install_alternatives() {
 }
 
 resolve_version() {
+    # Offline/air-gapped fallback pin: used ONLY when the GitHub API cannot be
+    # reached or queried (never silently — every use is logged as a warning
+    # naming the version, so an operator can tell a stale pin from a resolved
+    # one). Keep in sync with the last qualified release.
+    local fallback_version="0.3.0"
+
     # A local tarball/directory needs no GitHub API lookup — and the 404
     # fail-fast below must not abort the documented local-tarball install
     # path while no stable release is published yet (#440, #454 review).
@@ -276,7 +290,8 @@ resolve_version() {
     # default the failed-'latest' fallback uses, which only names the
     # extracted top-level directory (EXTRACT_DIR) in download_release().
     if [ -n "$INSTALL_CHV_TARBALL_PATH" ] && [ "$INSTALL_CHV_VERSION" = "latest" ]; then
-        INSTALL_CHV_VERSION="0.3.0"
+        INSTALL_CHV_VERSION="$fallback_version"
+        info "Local tarball mode with no explicit version — using ${INSTALL_CHV_VERSION} for the extracted directory name."
     fi
     if [ "$INSTALL_CHV_VERSION" = "latest" ]; then
         if cmd_exists curl; then
@@ -284,7 +299,9 @@ resolve_version() {
             local latest=""
             local api_body http_code
             api_body=$(mktemp)
-            http_code=$(curl -sS -o "$api_body" -w '%{http_code}' "$latest_api" 2>/dev/null) || http_code="000"
+            # -L: follow a repo/org rename redirect (301) instead of treating
+            # the redirect body as the API response.
+            http_code=$(curl -sSL -o "$api_body" -w '%{http_code}' "$latest_api" 2>/dev/null) || http_code="000"
             if [ "$http_code" = "200" ]; then
                 latest=$(grep '"tag_name":' "$api_body" | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/') || true
             fi
@@ -302,11 +319,17 @@ resolve_version() {
                 print_github_install_alternatives
                 fatal "Cannot resolve 'latest' CHV version — no stable release published yet."
             else
-                warn "Could not determine latest version from GitHub API (HTTP ${http_code}), falling back to 0.3.0"
-                INSTALL_CHV_VERSION="0.3.0"
+                warn "Could not determine the latest version from the GitHub API"
+                warn "(HTTP ${http_code}). Falling back to ${fallback_version} —"
+                warn "an offline/air-gapped fallback pin, NOT the resolved latest release."
+                warn "Pin explicitly with INSTALL_CHV_VERSION=<version> to silence this."
+                INSTALL_CHV_VERSION="$fallback_version"
             fi
         else
-            INSTALL_CHV_VERSION="0.3.0"
+            warn "curl is not available, so the latest release cannot be resolved."
+            warn "Falling back to ${fallback_version} — an offline/air-gapped fallback"
+            warn "pin, NOT the resolved latest release."
+            INSTALL_CHV_VERSION="$fallback_version"
         fi
     fi
     info "Installing CHV version: $INSTALL_CHV_VERSION"
@@ -320,7 +343,7 @@ print_tarball_download_diagnostics() {
     local tarball_url="$1"
     local release_api="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/v${INSTALL_CHV_VERSION}"
     local http_code
-    http_code=$(curl -sS -o /dev/null -w '%{http_code}' "$release_api" 2>/dev/null) || http_code="000"
+    http_code=$(curl -sSL -o /dev/null -w '%{http_code}' "$release_api" 2>/dev/null) || http_code="000"
 
     if [ "$http_code" = "404" ]; then
         warn "No GitHub Release is published for tag v${INSTALL_CHV_VERSION} in ${GITHUB_REPO}."
@@ -356,16 +379,34 @@ download_release() {
         return
     fi
 
-    local tarball_url="https://github.com/${GITHUB_REPO}/releases/download/v${INSTALL_CHV_VERSION}/chv-${INSTALL_CHV_VERSION}-linux-amd64.tar.gz"
+    local tarball_name="chv-${INSTALL_CHV_VERSION}-linux-amd64.tar.gz"
+    local tarball_url="https://github.com/${GITHUB_REPO}/releases/download/v${INSTALL_CHV_VERSION}/${tarball_name}"
     local tmpdir
     tmpdir=$(mktemp -d)
-    local tarball="$tmpdir/chv-release.tar.gz"
+    local tarball="$tmpdir/${tarball_name}"
+    local checksum="${tarball}.sha256"
     CLEANUP_TMPDIR="$tmpdir"
 
     info "Downloading release tarball..."
     if ! curl -fsSL "$tarball_url" -o "$tarball"; then
         print_tarball_download_diagnostics "$tarball_url"
         fatal "Failed to download release from $tarball_url"
+    fi
+
+    # The tarball carries root-installed binaries, units, UI assets, and
+    # migrations, so TLS alone is not enough. The release pipeline publishes a
+    # `.sha256` sidecar for every tarball; a missing or mismatched sidecar is
+    # fail-closed (the same discipline quick-install.sh applies).
+    info "Verifying release tarball checksum..."
+    local checksum_code
+    checksum_code=$(curl -sSL -o "$checksum" -w '%{http_code}' "${tarball_url}.sha256" 2>/dev/null) || checksum_code="000"
+    if [ "$checksum_code" = "404" ]; then
+        fatal "Release v${INSTALL_CHV_VERSION} has no published ${tarball_name}.sha256; refusing to install an unverified tarball."
+    elif [ "$checksum_code" != "200" ]; then
+        fatal "Failed to download ${tarball_name}.sha256 (HTTP ${checksum_code}); refusing to install an unverified tarball."
+    fi
+    if ! ( cd "$tmpdir" && sha256sum -c --strict "${tarball_name}.sha256" ); then
+        fatal "Checksum mismatch for ${tarball_name} against the release sidecar; aborting install."
     fi
 
     info "Extracting release tarball..."
@@ -385,7 +426,9 @@ install_binaries_and_assets() {
     install -m 755 "${EXTRACT_DIR}/bin/chv-nwd"          /usr/bin/
 
     info "Installing Web UI assets..."
-    rm -rf "$CHV_UI_DIR"/*
+    # SC2115: the :? guard makes an empty/mis-set CHV_UI_DIR abort the script
+    # instead of expanding to `rm -rf /*`.
+    rm -rf "${CHV_UI_DIR:?}"/*
     cp -r "${EXTRACT_DIR}/ui/"* "$CHV_UI_DIR/"
     # Owned by the control plane user since #447: the binary serves the
     # tree ([webui] in controlplane.toml), not nginx. Files/dirs stay
@@ -399,10 +442,16 @@ install_binaries_and_assets() {
 
     # Monitoring store migrations (ADR-027, #602): applied to the
     # separate disposable monitoring.db; failure to open that file only
-    # degrades monitoring.
+    # degrades monitoring. Releases before v0.3.1 do not carry this
+    # directory (the installer runs from main against the latest tarball),
+    # so its absence must not abort an otherwise good install.
     mkdir -p "$CHV_MONITORING_MIGRATIONS_DIR" "$CHV_DATA_DIR/monitoring"
-    cp -r "${EXTRACT_DIR}/monitoring-migrations/"* "$CHV_MONITORING_MIGRATIONS_DIR/"
-    chown -R "$CHV_USER:$CHV_USER" "$CHV_MONITORING_MIGRATIONS_DIR"
+    if [ -d "${EXTRACT_DIR}/monitoring-migrations" ]; then
+        cp -r "${EXTRACT_DIR}/monitoring-migrations/"* "$CHV_MONITORING_MIGRATIONS_DIR/"
+        chown -R "$CHV_USER:$CHV_USER" "$CHV_MONITORING_MIGRATIONS_DIR"
+    else
+        warn "Release tarball carries no monitoring-migrations/; monitoring store stays degraded."
+    fi
     chown -R "$CHV_USER:$CHV_USER" "$CHV_DATA_DIR/monitoring"
 }
 
@@ -414,37 +463,115 @@ install_cloud_hypervisor() {
         info "Skipping Cloud Hypervisor installation (INSTALL_CHV_SKIP_CLOUD_HV=1)"
         return
     fi
-
-    if cmd_exists cloud-hypervisor; then
-        info "Cloud Hypervisor already installed: $(cloud-hypervisor --version 2>/dev/null || true)"
-        if [ ! -f /usr/bin/cloud-hypervisor ] && [ -f /usr/local/bin/cloud-hypervisor ]; then
-            ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
-        fi
+    if [ "$CHV_ARCH" != "amd64" ]; then
+        # The pinned static artifacts are the x86_64 ones. arm64 has no
+        # published release tarball yet either; mirror quick-install and
+        # fail softly rather than installing an unrunnable VMM.
+        warn "Cloud Hypervisor install is only wired for amd64; skipping (VMs will not run until a VMM is installed)."
         return
     fi
 
     local chv_version="53.0"
+
+    # Version gate: a host cloud-hypervisor is accepted only when its
+    # major.minor matches the qualified pin. Any other version is replaced
+    # with the pinned, digest-verified static binary below — the previous
+    # "any version counts as installed" early return silently kept hosts on
+    # the v43 branch the qualification campaign moved away from.
+    local chv_pin_ok=0
+    # Gate the binary the agent will actually exec (`chv_binary_path` is
+    # /usr/bin/cloud-hypervisor), falling back to PATH only until that link
+    # exists. Checking PATH alone would accept a pinned /usr/local/bin copy
+    # while leaving a stale /usr/bin binary for the agent to run.
+    local chv_bin=""
+    if [ -x /usr/bin/cloud-hypervisor ]; then
+        chv_bin="/usr/bin/cloud-hypervisor"
+    elif cmd_exists cloud-hypervisor; then
+        chv_bin="$(command -v cloud-hypervisor)"
+        # A relative PATH entry makes `command -v` return a relative path;
+        # normalize it so the /usr/bin link never depends on the installer's
+        # working directory.
+        case "$chv_bin" in
+            /*) ;;
+            *) chv_bin="$(cd "$(dirname "$chv_bin")" && pwd)/$(basename "$chv_bin")" ;;
+        esac
+    fi
+    if [ -n "$chv_bin" ]; then
+        local found_raw found_mm
+        found_raw="$("$chv_bin" --version 2>/dev/null || true)"
+        # Parse major.minor from e.g. "cloud-hypervisor v43.0.0". Comparing
+        # major.minor (not the full string) lets v53.0.0 match the "53.0" pin.
+        found_mm="$(printf '%s' "$found_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+
+        if [ "$found_mm" = "$chv_version" ]; then
+            info "Cloud Hypervisor already installed at the qualified pin (${found_raw}); keeping it."
+            if [ "$chv_bin" != "/usr/bin/cloud-hypervisor" ]; then
+                ln -sf "$chv_bin" /usr/bin/cloud-hypervisor
+            fi
+            chv_pin_ok=1
+        elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host Cloud Hypervisor."
+            warn "  found:    ${found_raw:-unparseable}"
+            warn "  required: v${chv_version} (qualified pin)"
+            warn "This install is OFF-PIN and UNQUALIFIED: VMs will run on a VMM the"
+            warn "qualification campaign did not cover. Re-run without this override"
+            warn "(and without INSTALL_CHV_SKIP_CLOUD_HV) to install the pinned binary."
+            if [ "$chv_bin" != "/usr/bin/cloud-hypervisor" ]; then
+                ln -sf "$chv_bin" /usr/bin/cloud-hypervisor
+            fi
+            chv_pin_ok=1
+        else
+            warn "Cloud Hypervisor version mismatch: found ${found_raw:-unparseable},"
+            warn "but the qualified pin is v${chv_version}. Replacing the host binary"
+            warn "with the pinned, digest-verified static build."
+            warn "To keep the host binary instead (off-pin, unqualified), re-run with"
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1."
+        fi
+    fi
+
     # Qualified-pin digests — D6 option (b), #448 campaign
     # (docs/evidence/vmm-requalification/v53.0/). The download aborts on
     # mismatch; the pin and its digests move together, always.
     local chv_sha256="448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc"
     local chv_remote_sha256="13f32ba952e6791fd901f2279be2055fbacc64005f96c42a8e90d58860df84a7"
 
-    info "Downloading Cloud Hypervisor v${chv_version}..."
-    local chv_tmp
-    chv_tmp="$(mktemp)"
-    curl -fsSL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${chv_version}/cloud-hypervisor-static" \
-        -o "${chv_tmp}"
-    if ! echo "${chv_sha256}  ${chv_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+    if [ "$chv_pin_ok" = "0" ]; then
+        info "Downloading Cloud Hypervisor v${chv_version}..."
+        local chv_tmp
+        chv_tmp="$(mktemp)"
+        curl -fsSL "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v${chv_version}/cloud-hypervisor-static" \
+            -o "${chv_tmp}"
+        if ! echo "${chv_sha256}  ${chv_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+            rm -f "${chv_tmp}"
+            fatal "Cloud Hypervisor v${chv_version} digest mismatch (expected ${chv_sha256}); aborting install"
+        fi
+        install -m 0755 "${chv_tmp}" /usr/local/bin/cloud-hypervisor
         rm -f "${chv_tmp}"
-        fatal "Cloud Hypervisor v${chv_version} digest mismatch (expected ${chv_sha256}); aborting install"
+        ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
+        info "Cloud Hypervisor installed: $(cloud-hypervisor --version)"
     fi
-    install -m 0755 "${chv_tmp}" /usr/local/bin/cloud-hypervisor
-    rm -f "${chv_tmp}"
-    ln -sf /usr/local/bin/cloud-hypervisor /usr/bin/cloud-hypervisor
-    info "Cloud Hypervisor installed: $(cloud-hypervisor --version)"
 
-    if ! cmd_exists ch-remote; then
+    # ch-remote is version-coupled to cloud-hypervisor; apply the same gate so
+    # a stale host client is not left paired with the pinned VMM.
+    local remote_pin_ok=0
+    if cmd_exists ch-remote; then
+        local remote_raw remote_mm
+        remote_raw="$(ch-remote --version 2>/dev/null || true)"
+        remote_mm="$(printf '%s' "$remote_raw" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+        if [ "$remote_mm" = "$chv_version" ]; then
+            info "ch-remote already installed at the qualified pin (${remote_raw}); keeping it."
+            remote_pin_ok=1
+        elif [ "${INSTALL_CHV_ALLOW_VMM_MISMATCH:-0}" = "1" ]; then
+            warn "INSTALL_CHV_ALLOW_VMM_MISMATCH=1: keeping the host ch-remote (off-pin, unqualified)."
+            remote_pin_ok=1
+        else
+            warn "ch-remote version mismatch: found ${remote_raw:-unparseable},"
+            warn "but the qualified pin is v${chv_version}. Replacing it with the"
+            warn "pinned, digest-verified static build."
+        fi
+    fi
+
+    if [ "$remote_pin_ok" = "0" ]; then
         info "Downloading ch-remote v${chv_version}..."
         local chv_remote_tmp
         chv_remote_tmp="$(mktemp)"
@@ -457,8 +584,6 @@ install_cloud_hypervisor() {
         install -m 0755 "${chv_remote_tmp}" /usr/local/bin/ch-remote
         rm -f "${chv_remote_tmp}"
         info "ch-remote installed: $(ch-remote --version 2>/dev/null || echo v${chv_version})"
-    else
-        info "ch-remote already installed: $(ch-remote --version 2>/dev/null || true)"
     fi
 }
 
@@ -472,6 +597,12 @@ BASE_IMAGE_PATH="${CHV_DATA_DIR}/images/ubuntu-noble-${CHV_ARCH}.img"
 FIRMWARE_ARCH="${ARCH}"
 FIRMWARE_URL="https://github.com/kubedoio/rust-hypervisor-firmware/releases/download/v0.5.0/hypervisor-fw-${FIRMWARE_ARCH}"
 FIRMWARE_PATH="${CHV_DATA_DIR}/hypervisor-fw"
+# Digests from the v0.5.0 release API; version, URL and digests move together.
+case "$FIRMWARE_ARCH" in
+    x86_64)  FIRMWARE_SHA256="50e2c9c55476c1c43f63a9c5aee722655ba6a114029ddad8b2f5f5fa32a5fdb5" ;;
+    aarch64) FIRMWARE_SHA256="3fb96c65438377096bb42ba15e32d3c4eaf9fc49c6c0b5e91764205af8604221" ;;
+    *)       FIRMWARE_SHA256="" ;;
+esac
 
 download_base_image() {
     info "Checking for base OS image..."
@@ -561,16 +692,17 @@ download_base_image() {
     fi
 }
 
-## added for workaround
+## Explicit local firmware override. A firmware build dropped at
+## /root/CLOUDHV.fd wins over the pinned download in download_firmware()
+## (which skips when ${FIRMWARE_PATH} already exists).
 copy_firmware() {
-    info "Copy BUID firmware file..."
-    #cp /root/Build/CloudHvX64/DEBUG_GCC/FV/CLOUDHV.fd
     if [ -f /root/CLOUDHV.fd ]; then
-        cp /root/CLOUDHV.fd /var/lib/chv/hypervisor-fw
-        chown "${CHV_USER}:${CHV_USER}" /var/lib/chv/hypervisor-fw
-        chmod 644 /var/lib/chv/hypervisor-fw
+        info "Using local firmware override /root/CLOUDHV.fd -> ${FIRMWARE_PATH}"
+        cp /root/CLOUDHV.fd "${FIRMWARE_PATH}"
+        chown "${CHV_USER}:${CHV_USER}" "${FIRMWARE_PATH}"
+        chmod 644 "${FIRMWARE_PATH}"
     else
-        warn "Firmware file /root/CLOUDHV.fd not found; skipping firmware copy."
+        info "No local firmware override at /root/CLOUDHV.fd; using the pinned download."
     fi
 }
 
@@ -589,15 +721,33 @@ download_firmware() {
     info "Downloading cloud-hypervisor firmware for ${FIRMWARE_ARCH}..."
     info "URL: ${FIRMWARE_URL}"
 
-    if curl -fsSL --retry 3 --retry-delay 5 "$FIRMWARE_URL" -o "$FIRMWARE_PATH"; then
+    if [ -z "$FIRMWARE_SHA256" ]; then
+        warn "No pinned firmware digest for architecture ${FIRMWARE_ARCH};"
+        warn "skipping the download. VMs that request firmware will fail to start."
+        return
+    fi
+
+    local fw_tmp
+    fw_tmp=$(mktemp)
+    if curl -fsSL --retry 3 --retry-delay 5 "$FIRMWARE_URL" -o "$fw_tmp"; then
+        if ! echo "${FIRMWARE_SHA256}  ${fw_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+            rm -f "$fw_tmp"
+            fatal "Firmware v0.5.0 digest mismatch (expected ${FIRMWARE_SHA256}); aborting install"
+        fi
+        install -m 644 "$fw_tmp" "$FIRMWARE_PATH"
+        rm -f "$fw_tmp"
         chown "${CHV_USER}:${CHV_USER}" "$FIRMWARE_PATH"
-        chmod 755 "$FIRMWARE_PATH"
         local fw_size
         fw_size=$(du -h "$FIRMWARE_PATH" | cut -f1)
-        info "Firmware downloaded (${fw_size}) -> ${FIRMWARE_PATH}"
+        info "Firmware downloaded and verified (${fw_size}) -> ${FIRMWARE_PATH}"
     else
+        rm -f "$fw_tmp"
         warn "Failed to download firmware from ${FIRMWARE_URL}"
-        warn "VM creation may fail without firmware."
+        warn "No firmware will be present at ${FIRMWARE_PATH}: VMs that request"
+        warn "firmware will fail to start with 'firmware not found: ${FIRMWARE_PATH}'."
+        warn "Retry manually (download to a temp file, verify, then install):"
+        warn "  curl -fSL --retry 3 '${FIRMWARE_URL}' -o '${FIRMWARE_PATH}.tmp'"
+        warn "  echo '${FIRMWARE_SHA256}  ${FIRMWARE_PATH}.tmp' | sha256sum -c - && mv '${FIRMWARE_PATH}.tmp' '${FIRMWARE_PATH}'"
     fi
 }
 
@@ -1221,6 +1371,15 @@ server {
     listen 80;
     server_name _;
 
+    # Internal control-plane management routes (for example
+    # /internal/bootstrap-token) are unauthenticated and protected only by a
+    # handler-side loopback check. Proxying them would make nginx the peer, so
+    # the loopback check would pass for any remote caller. Never expose them
+    # through the edge.
+    location ^~ /internal/ {
+        return 404;
+    }
+
     # Everything (UI + BFF/API) from the control plane binary.
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -1642,8 +1801,8 @@ download_release
 install_binaries_and_assets
 install_cloud_hypervisor
 download_base_image
-#download_firmware
-copy_firmware
+copy_firmware        # explicit local override wins (/root/CLOUDHV.fd)
+download_firmware    # otherwise fetch the pinned firmware into ${FIRMWARE_PATH}
 generate_certs
 setup_network
 install_configs

@@ -33,7 +33,7 @@ fi
 
 if [ -z "${REPO_SLUG}" ]; then
     error "Could not determine repository slug from git remote."
-    REPO_SLUG="${REPO_SLUG:-kubedoio/chv}"
+    REPO_SLUG="${REPO_SLUG:-o3kio/chv}"
 fi
 
 echo "========================================"
@@ -58,8 +58,8 @@ fi
 echo "--- 1. CODEOWNERS ---"
 if [ -f "${REPO_ROOT}/.github/CODEOWNERS" ]; then
     ok ".github/CODEOWNERS exists"
-    TEAM_COUNT=$(grep -cE '@kubedoio/' "${REPO_ROOT}/.github/CODEOWNERS" || true)
-    ok "CODEOWNERS references ${TEAM_COUNT} team entries"
+    OWNER_COUNT=$(grep -vE '^[[:space:]]*#' "${REPO_ROOT}/.github/CODEOWNERS" | grep -oE '@[A-Za-z0-9_.-]+' | sort -u | wc -l)
+    ok "CODEOWNERS references ${OWNER_COUNT} distinct owner entries"
 else
     error ".github/CODEOWNERS is missing"
 fi

@@ -1,5 +1,10 @@
 # Volvisor Storage Adoption Plan
 
+> **Superseded (2026-11-02).** The active sequencing is
+> [`2026-11-02-multihost-and-volvisor-transition.md`](2026-11-02-multihost-and-volvisor-transition.md).
+> This document is retained as the original ADR-028 implementation review; do
+> not use its phase ordering or work packages.
+
 This plan implements [ADR-028](../specs/adr/028-volvisor-storage-orchestration.md),
 which selects Volvisor as CHV's storage lifecycle and provider authority. It
 does not enable a Volvisor-backed storage class for tenants until its gates

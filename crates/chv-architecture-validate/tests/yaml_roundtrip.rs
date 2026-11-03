@@ -3,8 +3,8 @@
 //! Asserts that every fixture survives a full
 //! `parse_yaml → to_yaml → parse_yaml` cycle without losing structural
 //! information. We compare the **two parsed models** (model_a vs model_b),
-//! not raw bytes: `serde_yaml`'s emitter does not guarantee byte-identical
-//! output (key ordering, scalar quoting), and the durable contract is "no
+//! not raw bytes: the YAML emitter does not guarantee byte-identical output
+//! (key ordering, scalar quoting), and the durable contract is "no
 //! data loss across the round-trip", which structural equality captures.
 //!
 //! Fixtures live under `tests/fixtures/` and are progressively richer.

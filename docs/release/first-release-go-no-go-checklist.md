@@ -198,7 +198,7 @@ Run each section in order. Do not skip sections. Each section must pass 100% bef
 - [ ] J.11 A fresh Rocky Linux container can install the `.rpm` packages
 - [ ] J.12 Installed binaries report version `0.1.0`
 - [ ] J.13 Install docs page loads correctly on GitHub
-- [ ] J.14 `curl -sfL https://github.com/.../install.sh | sh` works (or equivalent)
+- [ ] J.14 `curl -fsSL https://github.com/.../install.sh | sudo bash -s` works (or equivalent)
 
 **Section J Status:** PASS / FAIL: __________
 

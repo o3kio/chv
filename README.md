@@ -65,7 +65,7 @@ The project has a solid Phase 1 foundation (Rust control plane, SQLite store, ce
 - **Backend / Control Plane**: Rust (Tokio, tonic, axum, sqlx/SQLite)
 - **Frontend**: SvelteKit 3 + Svelte 5 + TailwindCSS + Vite
 - **Contracts**: gRPC/protobuf
-- **Metrics**: Prometheus endpoint
+- **Metrics**: Prometheus `/metrics` from the control plane and `chv-agent` only (`chv-stord`/`chv-nwd` expose no HTTP endpoint) — see [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md)
 
 ## Repository Structure
 
@@ -108,7 +108,20 @@ The project has a solid Phase 1 foundation (Rust control plane, SQLite store, ce
 
 ## Install
 
-CHV is distributed as `.deb` and `.rpm` packages. Choose the guide for your distribution:
+**Supported today:** one host, Cloud Hypervisor v53.0, Ubuntu amd64. No multi-host, HA, or backup/restore — see [`docs/DEPLOYMENT-ARCHITECTURE.md` §7](./docs/DEPLOYMENT-ARCHITECTURE.md#7-supported-envelope).
+
+The qualified deployment path is the all-in-one installer on a fresh Ubuntu amd64 host:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
+
+# Pin a release instead of resolving the latest stable:
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s
+```
+
+The installer requires **bash** (it uses `set -o pipefail`); do not replace `bash -s` with `sh -`.
+
+CHV is also distributed as `.deb` and `.rpm` packages. Choose the guide for your distribution:
 
 | Distribution | Guide |
 |--------------|-------|
@@ -117,11 +130,11 @@ CHV is distributed as `.deb` and `.rpm` packages. Choose the guide for your dist
 | Other / Tarball | [`docs/install/from-github-release.md`](./docs/install/from-github-release.md) |
 | In-guest monitoring agent (optional) | [`docs/install/guest-monitor-agent.md`](./docs/install/guest-monitor-agent.md) |
 
-Quick install (Debian/Ubuntu):
+Quick package install (Debian/Ubuntu):
 
 ```bash
 VERSION="<version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"
@@ -129,6 +142,12 @@ sudo dpkg -i chv-controlplane_${VERSION}_amd64.deb chv-node_${VERSION}_amd64.deb
 sudo systemctl daemon-reload
 sudo systemctl enable --now chv-controlplane chv-agent chv-stord chv-nwd
 ```
+
+Packages provide the layout only: provision TLS and a real `jwt_secret` before
+starting the services (see the distribution guide, steps 5–6), and do not start
+them with the example configs. Package-only installs do not seed an admin login
+— use `scripts/install.sh` or `scripts/quick-install.sh` for a working
+deployment.
 
 See [`docs/install/channels.md`](./docs/install/channels.md) for stable, RC, nightly, and PR artifact channels.
 
@@ -183,7 +202,7 @@ cargo build --workspace
 |----------|---------|
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | System architecture, data flow, and boundaries |
 | [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) | Deploy CHV on a combined control-plane + hypervisor host |
-| [`docs/specs/adr/`](./docs/specs/adr) | Architecture Decision Records (ADR-001–ADR-022) |
+| [`docs/specs/adr/`](./docs/specs/adr) | Architecture Decision Records (41 ADRs; numbering ADR-001–ADR-029, with `001`–`006` reused across domains) |
 | [`docs/specs/component/`](./docs/specs/component) | Component specs (agent, stord, nwd) |
 | [`PHASED_IMPLEMENTATION_PLAN.md`](./PHASED_IMPLEMENTATION_PLAN.md) | Phased implementation roadmap |
 | [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) | Day-2 operations, monitoring, and troubleshooting |
@@ -206,7 +225,7 @@ cargo build --workspace
 
 GitHub Actions runs on every push and PR:
 - `cargo check`, `cargo clippy -- -D warnings`, `cargo test --workspace`
-- UI `npm ci`, `npm run build`, `npm run check`, and Playwright E2E tests
+- UI `npm ci`, `npm run build`, `npm run check`, and Playwright tests against the mock BFF (`ui/tests/e2e/mock-bff.mjs`) — not a live stack
 - `chvctl` smoke test and VERSION validation
 
 See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).

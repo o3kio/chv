@@ -6,8 +6,8 @@ section: default
 priority: optional
 maintainer: Kubedo <engineering@kubedo.io>
 description: CHV command-line client
-homepage: https://github.com/kubedoio/chv
-license: MIT
+homepage: https://github.com/o3kio/chv
+license: Apache-2.0
 # Runtime libs: chvctl links against OpenSSL 3 via reqwest's `native-tls`
 # feature. The runtime soname is `libssl.so.3`, but the package name
 # differs between distros — debian/ubuntu ship it as `libssl3`, RHEL

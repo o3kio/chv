@@ -8,7 +8,7 @@ This guide covers installing CHV by downloading artifacts directly from GitHub R
 > `.sha256` sidecar), so the version-pinned URLs and the release tarball
 > described below are available today: `releases/latest` resolves v0.3.0 and
 > `releases/download/v0.3.0/...` serves its assets. The rolling
-> [`nightly` pre-release](https://github.com/kubedoio/chv/releases/tag/nightly)
+> [`nightly` pre-release](https://github.com/o3kio/chv/releases/tag/nightly)
 > remains development-only. The all-in-one installer's default `latest` path
 > resolves v0.3.0 and installs it; with an explicit `INSTALL_CHV_VERSION`
 > pinned to a tag that has no Release, it fails at the tarball download with
@@ -19,7 +19,7 @@ This guide covers installing CHV by downloading artifacts directly from GitHub R
 
 ## Choose your release
 
-Go to the [CHV Releases](https://github.com/kubedoio/chv/releases) page and select a release:
+Go to the [CHV Releases](https://github.com/o3kio/chv/releases) page and select a release:
 
 | Release type | Tag example | Who should use it |
 |--------------|-------------|-------------------|
@@ -46,7 +46,7 @@ Set `VERSION` to the release tag, without the leading `v`:
 
 ```bash
 VERSION="<version>"
-RELEASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+RELEASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
 # Download .deb packages
 curl -sLO "${RELEASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
@@ -99,7 +99,7 @@ If your distribution does not support `.deb` or `.rpm`, use the release tarball.
 ```bash
 VERSION="<version>"
 TARBALL="chv-${VERSION}-linux-amd64.tar.gz"
-curl -sLO "https://github.com/kubedoio/chv/releases/download/v${VERSION}/${TARBALL}"
+curl -sLO "https://github.com/o3kio/chv/releases/download/v${VERSION}/${TARBALL}"
 
 # Extract
 tar -xzf "${TARBALL}"
@@ -109,7 +109,7 @@ cd "chv-${VERSION}-linux-amd64"
 sudo ./install.sh
 ```
 
-The install script downloads Cloud Hypervisor (the VMM) when it is not already installed. Set `INSTALL_CHV_SKIP_CLOUD_HV=1` to skip that step.
+The install script keeps a preinstalled Cloud Hypervisor VMM and `ch-remote` client only when their major.minor matches the qualified v53.0 pin; any other version is replaced with the pinned, digest-verified static builds. Set `INSTALL_CHV_SKIP_CLOUD_HV=1` to skip that step (the VMM and client are then neither installed nor replaced).
 
 The tarball includes:
 - Pre-built binaries (`bin/`)

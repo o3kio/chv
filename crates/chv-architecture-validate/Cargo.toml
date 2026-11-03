@@ -9,7 +9,7 @@ publish = false
 chv-controlplane-types = { path = "../chv-controlplane-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
+serde-saphyr = { version = "2.0", default-features = false, features = ["serialize", "deserialize"] }
 thiserror = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 jsonschema = { version = "0.49", default-features = false }

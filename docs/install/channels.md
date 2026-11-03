@@ -6,7 +6,7 @@ CHV distributes packages through multiple channels. Choose the channel that matc
 
 | Channel | Stability | Use case | Source |
 |---------|-----------|----------|--------|
-| **Stable** | Production-ready | Production deployments, long-term evaluation | GitHub Release (tagged) |
+| **Stable** | Stable (technical preview) | Long-term evaluation within the supported envelope | GitHub Release (tagged) |
 | **RC** | Pre-release | Validation before stable, integration testing | GitHub Pre-release (tagged) |
 | **Nightly** | Unstable | Development, feature preview, CI integration | GitHub Nightly pre-release |
 | **PR** | Experimental | Testing specific changes before merge | GitHub Actions artifacts |
@@ -17,8 +17,8 @@ Stable releases are tagged with SemVer versions, for example `v1.2.3`.
 
 - **Quality:** Full CI pipeline passes, container smoke tests pass, lifecycle tests pass, changelog entry required.
 - **Artifacts:** `.deb`, `.rpm`, tarball, checksums, SBOM, build provenance attestation.
-- **Support:** Best-effort community support. Security fixes are backported to the latest stable minor version.
-- **Upgrade path:** Forward upgrades to newer stable versions are safe. Persistent data and configs are preserved.
+- **Support:** Best-effort community support; no backport or support SLA is committed.
+- **Upgrade path:** Forward upgrades are the only supported direction. The qualified path preserves persistent data and configs; rollback is not qualified.
 
 ### Install stable
 
@@ -26,7 +26,7 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
-BASE_URL="https://github.com/kubedoio/chv/releases/download/v${VERSION}"
+BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
 curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"
@@ -79,7 +79,7 @@ The version includes the date and git short SHA, making every nightly build uniq
 
 ### Install nightly
 
-Download from the rolling [CHV Nightly](https://github.com/kubedoio/chv/releases/tag/nightly) GitHub pre-release.
+Download from the rolling [CHV Nightly](https://github.com/o3kio/chv/releases/tag/nightly) GitHub pre-release.
 
 > **Warning:** Do not use nightly packages in production. Use them only on disposable test hosts or VMs.
 

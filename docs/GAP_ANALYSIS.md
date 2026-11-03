@@ -7,7 +7,46 @@
 
 ---
 
+## Correction (2026-10-30) — superseded for capability claims
+
+**This document is a historical analysis dated 2026-06-02 (v0.1.0).** Its
+"zero gaps across all categories" executive summary is **not current and must
+not be used for capability claims.** Effective 2026-10-30, capability claims
+are owned by [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7
+("Supported envelope"). The rest of this file is preserved unchanged as
+historical analysis as of its original date.
+
+Open gaps as of 2026-10-30 (verified against this branch):
+
+| Area | Honest status | Evidence |
+|---|---|---|
+| Backup / restore | **Excluded from the supported matrix.** There is no execution engine: `execute_job` always fails with "backup execution engine not yet implemented". The ship/fetch path was removed in #213; the shipper retains only `delete`. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7, §5 UC-9; `crates/chv-controlplane-service/src/backup_worker.rs` (`execute_job`); `crates/chv-controlplane-service/src/backup_shipper.rs` (`BackupShipper::delete` only) |
+| Multi-host | **Architecturally impossible as coded.** Dispatch resolves a local filesystem `agent_socket_pattern` path and connects with `UnixStream::connect`; the agent serves gRPC from a `UnixListener` only (no TCP gRPC listener). Single-host is the declared posture for now. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §3.3, §5 UC-6, §8 D1; `crates/chv-controlplane-service/src/migration.rs` (`resolve_agent_socket`); `crates/chv-controlplane-service/src/node_client.rs` (`UnixStream::connect`); `crates/chv-agent-core/src/agent_server.rs` (`UnixListener::bind`) |
+| Volvisor storage backend | **Design direction only.** Accepted by ADR-028 and the 2026-10-13 adoption plan, but there are **zero** `volvisor` references in `crates/`, `cmd/`, `proto/`, or `Cargo.toml`; storage is still `chv-stord`. | [ADR-028](specs/adr/028-volvisor-storage-orchestration.md); [adoption plan](plans/2026-10-13-volvisor-storage-adoption.md); `grep -rni volvisor crates cmd proto Cargo.toml` → no matches |
+| iSCSI / Ceph RBD | **Coded but unqualified; `destroy()` is explicitly unimplemented** and refuses loudly. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7; `crates/chv-stord-backends/src/iscsi.rs`; `crates/chv-stord-backends/src/ceph.rs` |
+| BFF / architecture stubs | **Stubs remain.** `list_architecture_versions` returns `NotImplemented("phase 0")`. | `crates/chv-webui-bff/src/handlers/architectures.rs` |
+| Docker Compose | **Not a supported install path.** The image builds, but the compose stacks do not run end-to-end (no TLS/mTLS provisioning, no bootstrap token; the control plane fails closed). Use packages or `scripts/install.sh`. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §10; `docker-compose.yml`, `docker-compose.prod.yml` banners |
+| Hardware minimums | **No qualified minimum.** "4 cores / 8 GB / 50 GB" is an unevidenced recommendation. | [DEPLOYMENT-ARCHITECTURE.md](DEPLOYMENT-ARCHITECTURE.md) §7; [DEPLOYMENT.md](DEPLOYMENT.md) |
+
+**Consequences for the sections below:** the "resolved" entries in §1–§5 and
+Appendix A reflect the 2026-06-02/04 codebase. Where they conflict with the
+table above or with `DEPLOYMENT-ARCHITECTURE.md` §7, the latter wins. In
+particular, §1.2 (backup engine "complete"), §1.3 (iSCSI/Ceph "resolved"), and
+§4.2 (Docker Compose "resolved") are no longer accurate.
+
+**Proposed work (not implementation):** the multi-host and native-Volvisor
+path is planned in
+[2026-11-02-multihost-and-volvisor-transition.md](plans/2026-11-02-multihost-and-volvisor-transition.md),
+with [ADR-029](specs/adr/029-multi-host-dispatch.md) (Proposed) and
+[`chv-volume-backend-v1`](specs/contracts/chv-volume-backend-v1.md)
+(Proposed). Planning artifacts do not change any status in the table above.
+
+---
+
 ## Executive Summary
+
+> **Historical (2026-06-02):** the zero-gap table below is superseded — see
+> [Correction](#correction-2026-10-30--superseded-for-capability-claims) above.
 
 | Category | Total Gaps | P0 | P1 | P2 | P3 |
 |----------|-----------|----|----|----|----|

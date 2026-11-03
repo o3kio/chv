@@ -5804,8 +5804,8 @@ mod tests {
     #[test]
     fn cloud_init_meta_data_is_string_typed_for_all_digit_ids() {
         let meta_data = cloud_init_meta_data("74074613");
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&meta_data).expect("meta-data must be valid YAML");
+        let parsed: serde_json::Value =
+            serde_saphyr::from_str(&meta_data).expect("meta-data must be valid YAML");
         assert!(
             parsed["local-hostname"].is_string(),
             "local-hostname must be a YAML string, got: {:?}",
@@ -5825,8 +5825,8 @@ mod tests {
     #[test]
     fn cloud_init_meta_data_preserves_the_hostname_value() {
         let meta_data = cloud_init_meta_data("17b2c9d5");
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&meta_data).expect("meta-data must be valid YAML");
+        let parsed: serde_json::Value =
+            serde_saphyr::from_str(&meta_data).expect("meta-data must be valid YAML");
         assert_eq!(parsed["local-hostname"].as_str(), Some("17b2c9d5"));
         assert_eq!(parsed["instance-id"].as_str(), Some("17b2c9d5"));
     }

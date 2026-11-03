@@ -20,6 +20,8 @@ core_store_path = "/var/lib/chv/agent/core.db"
 core_api_socket_path = "/run/chv/core/core-v1.sock"
 core_archive_path = "/var/lib/chv/agent/node-cache-v1.archive"
 node_id = ""                  # assigned automatically during enrollment
+# Loopback only (never bind metrics to a public interface). Packaged/install.sh
+# default: 127.0.0.1:9901. When unset, the code fallback is 127.0.0.1:9100.
 metrics_bind = "127.0.0.1:9901"
 storage_base_dir = "/var/lib/chv/storage"  # agent probes subdirs for storage classes
 

@@ -398,11 +398,11 @@ pub struct UserAuth {
 /// Project definitions are intentionally typed as a free-form object map.
 /// `yaml-contract.md` does not yet pin a project schema, and the JSON
 /// Schema accepts `additionalProperties: true` here. Keeping it as a
-/// `serde_yaml::Value`-shaped map preserves round-trip fidelity until the
+/// `serde_json::Value`-shaped map preserves round-trip fidelity until the
 /// contract narrows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Project {
     pub name: String,
     #[serde(flatten)]
-    pub extras: BTreeMap<String, serde_yaml::Value>,
+    pub extras: BTreeMap<String, serde_json::Value>,
 }

@@ -177,8 +177,16 @@ VERSION file
     ├──> docs/DEPLOYMENT.md
     ├──> scripts/install.sh
     ├──> scripts/hosting/cloudflare-worker.js
-    └──> scripts/hosting/github-pages-index.html
+    ├──> scripts/hosting/github-pages-index.html
+    ├──> cloudflare-worker.js        (hand-published copy; must stay byte-identical)
+    └──> github-pages-index.html     (hand-published copy; must stay byte-identical)
 ```
+
+`cloudflare-worker.js` and `github-pages-index.html` are duplicated at the
+repository root for manual publishing to the hosting surfaces. They are
+copies of the `scripts/hosting/` files, are rewritten together by
+`scripts/bump-version.sh`, and must not drift; `scripts/check-release-local.sh`
+fails if they differ.
 
 ### Git Tags
 - Stable releases: `v<VERSION>` (e.g., `v0.1.0`).

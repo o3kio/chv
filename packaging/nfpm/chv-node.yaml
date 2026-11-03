@@ -6,8 +6,8 @@ section: default
 priority: optional
 maintainer: Kubedo <engineering@kubedo.io>
 description: CHV node services (agent, storage, network)
-homepage: https://github.com/kubedoio/chv
-license: MIT
+homepage: https://github.com/o3kio/chv
+license: Apache-2.0
 depends:
   - chv-controlplane
 # wireguard-tools: hard dependency on deb (in Debian/Ubuntu main), soft
