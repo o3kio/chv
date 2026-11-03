@@ -38,6 +38,50 @@ pub async fn backup_fence() -> Result<Json<Value>, BffError> {
     Err(BffError::NotImplemented(BACKUP_NOT_IMPLEMENTED.to_string()))
 }
 
+/// Enforce ownership of every VM/volume a backup surface binds (#655).
+///
+/// Backup jobs and schedules carry no owner column of their own: the VM and
+/// volume ids they encode are the ownership authority. This delegates to the
+/// same `require_vm_owner` / `require_volume_owner` gates the VM and volume
+/// mutation routes use, so:
+///
+/// - a non-owner operator is rejected with the same 403 `FORBIDDEN` contract;
+/// - admins bypass the check exactly as they do on those routes;
+/// - a missing or orphaned resource fails closed (admin-only), matching the
+///   existing "resource has no owner" behavior;
+/// - the check runs before any write, so a denied request persists nothing.
+///
+/// A job or schedule whose VM/volume has since been deleted is orphaned: the
+/// owner lookup finds no row, so operators cannot update or delete it and an
+/// admin must perform the cleanup. That is intentional — deleting a bound VM
+/// never silently discards backup history. Read/list/get visibility is out of
+/// scope for #655; this gate covers backup/restore writes only.
+///
+/// The backup hard-fence (#654) still runs at the router layer; this is
+/// defense-in-depth for the handler layer and for a future engine.
+async fn require_backup_resource_owner(
+    state: &AppState,
+    claims: &crate::auth::Claims,
+    vm_id: Option<&str>,
+    volume_id: Option<&str>,
+) -> Result<(), BffError> {
+    if claims.role == "admin" {
+        return Ok(());
+    }
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to acquire connection: {}", e)))?;
+    if let Some(vm_id) = vm_id {
+        super::vms::require_vm_owner(&mut conn, vm_id, &claims.sub, false).await?;
+    }
+    if let Some(volume_id) = volume_id {
+        super::volumes::require_volume_owner(&mut conn, volume_id, &claims.sub, false).await?;
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Legacy /v1/backup-jobs and /v1/backup-history (POST with page payload)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +236,7 @@ pub async fn create_backup_job(
         .get("volume_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    require_backup_resource_owner(&state, &claims, Some(&vm_id), volume_id.as_deref()).await?;
     let backup_type = payload
         .get("backup_type")
         .and_then(|v| v.as_str())
@@ -322,6 +367,15 @@ pub async fn delete_backup_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
+    if let Some(row) = state
+        .backup_repo
+        .get_job(&job_id)
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to get backup job: {}", e)))?
+    {
+        require_backup_resource_owner(&state, &claims, Some(&row.vm_id), row.volume_id.as_deref())
+            .await?;
+    }
     state
         .backup_repo
         .delete_job(&job_id)
@@ -346,11 +400,15 @@ pub async fn update_backup_job(
         .map_err(|e| BffError::Internal(format!("failed to get backup job: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("backup job {} not found", job_id)))?;
 
+    require_backup_resource_owner(&state, &claims, Some(&row.vm_id), row.volume_id.as_deref())
+        .await?;
+
     let volume_id = payload
         .get("volume_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or(row.volume_id);
+    require_backup_resource_owner(&state, &claims, None, volume_id.as_deref()).await?;
     let status = payload
         .get("status")
         .and_then(|v| v.as_str())
@@ -430,6 +488,9 @@ pub async fn execute_backup_job(
         .map_err(|e| BffError::Internal(format!("failed to get backup job: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("backup job {} not found", job_id)))?;
 
+    require_backup_resource_owner(&state, &claims, Some(&row.vm_id), row.volume_id.as_deref())
+        .await?;
+
     let input = BackupJobCreateInput {
         vm_id: row.vm_id,
         volume_id: row.volume_id,
@@ -483,6 +544,7 @@ pub async fn create_backup_schedule(
         .get("volume_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    require_backup_resource_owner(&state, &claims, Some(&vm_id), volume_id.as_deref()).await?;
     let name = payload
         .get("name")
         .and_then(|v| v.as_str())
@@ -628,6 +690,14 @@ pub async fn update_backup_schedule(
         .map_err(|e| BffError::Internal(format!("failed to get backup schedule: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("backup schedule {} not found", schedule_id)))?;
 
+    require_backup_resource_owner(
+        &state,
+        &claims,
+        Some(&existing.vm_id),
+        existing.volume_id.as_deref(),
+    )
+    .await?;
+
     let vm_id = payload
         .get("vm_id")
         .and_then(|v| v.as_str())
@@ -638,6 +708,7 @@ pub async fn update_backup_schedule(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or(existing.volume_id);
+    require_backup_resource_owner(&state, &claims, Some(&vm_id), volume_id.as_deref()).await?;
     let name = payload
         .get("name")
         .and_then(|v| v.as_str())
@@ -706,6 +777,15 @@ pub async fn delete_backup_schedule(
     Path(schedule_id): Path<String>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
+    if let Some(row) = state
+        .backup_repo
+        .get_schedule(&schedule_id)
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to get backup schedule: {}", e)))?
+    {
+        require_backup_resource_owner(&state, &claims, Some(&row.vm_id), row.volume_id.as_deref())
+            .await?;
+    }
     state
         .backup_repo
         .delete_schedule(&schedule_id)
@@ -740,6 +820,31 @@ pub async fn create_backup_restore(
         .get("target_volume_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+
+    // Ownership is derived from the source job's VM/volume and from the
+    // explicit restore targets. Both must belong to the caller (or the caller
+    // must be admin): a foreign source artifact is as sensitive as a foreign
+    // target.
+    let source_job = state
+        .backup_repo
+        .get_job(&backup_job_id)
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to get backup job: {}", e)))?
+        .ok_or_else(|| BffError::NotFound(format!("backup job {} not found", backup_job_id)))?;
+    require_backup_resource_owner(
+        &state,
+        &claims,
+        Some(&source_job.vm_id),
+        source_job.volume_id.as_deref(),
+    )
+    .await?;
+    require_backup_resource_owner(
+        &state,
+        &claims,
+        target_vm_id.as_deref(),
+        target_volume_id.as_deref(),
+    )
+    .await?;
 
     let input = BackupRestoreCreateInput {
         backup_job_id,
@@ -879,6 +984,7 @@ pub async fn create_backup_job_api(
         .and_then(|v| v.as_str())
         .ok_or_else(|| BffError::BadRequest("missing vm_id".into()))?
         .to_string();
+    require_backup_resource_owner(&state, &claims, Some(&vm_id), None).await?;
 
     let name = payload
         .get("name")
@@ -938,6 +1044,15 @@ pub async fn delete_backup_job_api(
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
+    if let Some(row) = state
+        .backup_repo
+        .get_schedule(&job_id)
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to get backup job: {}", e)))?
+    {
+        require_backup_resource_owner(&state, &claims, Some(&row.vm_id), row.volume_id.as_deref())
+            .await?;
+    }
     state
         .backup_repo
         .delete_schedule(&job_id)
@@ -997,6 +1112,14 @@ pub async fn run_backup_job_api(
         .map_err(|e| BffError::Internal(format!("failed to get schedule: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("schedule {} not found", job_id)))?;
 
+    require_backup_resource_owner(
+        &state,
+        &claims,
+        Some(&schedule.vm_id),
+        schedule.volume_id.as_deref(),
+    )
+    .await?;
+
     let input = BackupJobCreateInput {
         vm_id: schedule.vm_id.clone(),
         volume_id: schedule.volume_id.clone(),
@@ -1041,6 +1164,14 @@ pub async fn toggle_backup_job_api(
         .await
         .map_err(|e| BffError::Internal(format!("failed to get schedule: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("schedule {} not found", job_id)))?;
+
+    require_backup_resource_owner(
+        &state,
+        &claims,
+        Some(&schedule.vm_id),
+        schedule.volume_id.as_deref(),
+    )
+    .await?;
 
     let new_enabled = !schedule.enabled;
     let input = BackupScheduleUpdateInput {
