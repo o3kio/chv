@@ -225,7 +225,12 @@ impl MigrationReaper {
                     ) AS stalled_secs
             FROM migrations m
             WHERE m.reaper_resume_state = 'pending'
-            ORDER BY m.updated_at ASC
+            -- Rotate fairly through the backlog: a deferred row's
+            -- `updated_at` is frozen at its reap time, so ordering only by
+            -- age would starve every newly reaped migration behind the 64
+            -- oldest unresolvable rows forever. Attempts increase once per
+            -- drained row, which moves selected rows behind untouched ones.
+            ORDER BY m.reaper_resume_attempts ASC, m.updated_at ASC
             LIMIT 64
             "#,
         )
@@ -843,6 +848,50 @@ mod tests {
             "after enough retry time the resume gate must become satisfiable ({} >= {})",
             after[0].stalled_secs,
             reaper.resume_quiescence_secs()
+        );
+    }
+
+    /// The retry pass must not starve a newly reaped migration behind 64 older
+    /// rows whose resumes are permanently unresolvable (dead source node or a
+    /// persistently failing RPC). Ordering only by `updated_at` would return
+    /// the same oldest 64 rows on every tick.
+    #[tokio::test]
+    async fn pending_resume_backlog_rotates_through_new_rows() {
+        let test_db = TestDb::new().await;
+
+        for i in 0..64 {
+            let id = format!("zombie-{i}");
+            seed_migration(&test_db.pool, &id, "Failed", -10_800, -600).await;
+            sqlx::query(
+                "UPDATE migrations SET reaper_resume_state = 'pending', \
+                 reaper_stalled_secs = 100, reaper_resume_attempts = 5 \
+                 WHERE migration_id = ?",
+            )
+            .bind(&id)
+            .execute(&test_db.pool)
+            .await
+            .expect("mark zombie pending");
+        }
+
+        // Most recent row: an `updated_at`-only ordering would put it last.
+        seed_migration(&test_db.pool, "newcomer", "Failed", -10_800, 0).await;
+        sqlx::query(
+            "UPDATE migrations SET reaper_resume_state = 'pending', reaper_stalled_secs = 100 \
+             WHERE migration_id = 'newcomer'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("mark newcomer pending");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let rows = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes");
+        assert_eq!(rows.len(), 64);
+        assert!(
+            rows.iter().any(|row| row.migration_id == "newcomer"),
+            "a newly reaped migration must not be starved behind 64 older unresolvable rows"
         );
     }
 

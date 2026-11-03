@@ -11,7 +11,9 @@
 --   NULL       — not a reaper-failed migration
 --   'pending'  — resume not yet completed; retried every reaper tick
 --   'resumed'  — resume RPC succeeded
---   'cancelled'— the migration became non-terminal again (progress raced)
+--   'cancelled'— the phase re-check found a non-resumable phase (usually a
+--                progress race; also covers a row that completed before the
+--                resume pass looked again)
 --   'missing'  — the migration row disappeared
 --
 -- `reaper_stalled_secs` preserves the no-progress age measured before
