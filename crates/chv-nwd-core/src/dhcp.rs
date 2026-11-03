@@ -44,6 +44,23 @@ async fn reload_dnsmasq(network_id: &str) {
         .await;
 }
 
+/// Interface name recorded in a dnsmasq scope.
+///
+/// An existing config is the source of truth during upgrades: it records the
+/// interface the scope was created against. A first-time scope derives the
+/// same `br-*` name as the executor
+/// ([`chv_common::bridge_name_for_network`]), which truncates and hashes ids
+/// that do not fit the 15-character IFNAMSIZ limit. `format!("br-{network_id}")`
+/// is NOT equivalent once ids exceed 12 characters.
+fn interface_name_for_network(existing: &str, network_id: &str) -> String {
+    existing
+        .lines()
+        .find(|l| l.starts_with("interface="))
+        .and_then(|l| l.strip_prefix("interface="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| chv_common::bridge_name_for_network(network_id))
+}
+
 pub async fn ensure_dhcp_scope(
     network_id: &str,
     cidr: &str,
@@ -105,13 +122,9 @@ pub async fn ensure_dhcp_scope(
         return Ok(());
     }
 
-    // Determine bridge name from existing config or use convention
-    let bridge_name = existing
-        .lines()
-        .find(|l| l.starts_with("interface="))
-        .and_then(|l| l.strip_prefix("interface="))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("br-{}", network_id));
+    // Reuse the name already recorded in the config; otherwise derive the
+    // same IFNAMSIZ-safe bridge name the executor creates.
+    let bridge_name = interface_name_for_network(&existing, network_id);
 
     // Derive gateway from CIDR (first usable IP)
     let gateway = derive_gateway(cidr).unwrap_or_default();
@@ -402,6 +415,24 @@ mod tests {
         assert!(
             result.is_err(),
             "shell-injection network_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn interface_name_matches_the_executor_bridge_for_128_bit_ids() {
+        let network_id = "0123456789abcdef0123456789abcdef";
+        let name = interface_name_for_network("", network_id);
+        assert_eq!(name, chv_common::bridge_name_for_network(network_id));
+        assert_eq!(name.len(), 15, "must fit IFNAMSIZ: {name}");
+        assert_ne!(name, format!("br-{network_id}"));
+    }
+
+    #[test]
+    fn interface_name_reuses_the_recorded_config_value() {
+        let existing = "interface=br-legacy0\nbind-interfaces\n";
+        assert_eq!(
+            interface_name_for_network(existing, "0123456789abcdef0123456789abcdef"),
+            "br-legacy0"
         );
     }
 }

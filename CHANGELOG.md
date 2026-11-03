@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **resource IDs (128-bit, #664)**: persistent resource and operation IDs are
+  now 128-bit (32 lowercase hex characters via `chv_common::gen_resource_id()`)
+  instead of 32-bit, and the eBPF `vm_key` / `struct rule_key.id` width was
+  widened to match. Existing 8-character IDs remain valid; node certificate
+  serials stay 8 characters because their format is externally pinned.
+  Dnsmasq scopes and ingress-eBPF attachment now use the shared
+  `bridge_name_for_network` derivation, so a 32-character network ID is
+  truncated and hashed to the 15-character IFNAMSIZ limit instead of producing
+  an invalid `br-<full-id>` interface name.
 - **Wave 2 pre-production P0 close-out (ratified 2026-11-03)** — six lanes, each with tests or scripted evidence:
   - **control plane authz (#651)**: every node-scoped lifecycle RPC, the four reconcile `apply_*_desired_state` handlers, and `ReportMigrationProgress` now bind the wire `node_id` to the mTLS peer identity. `MigrationProgress` gained `node_id` (field 9) and every agent producer stamps its own id. A compromised cert for node A can no longer mutate node B. Four two-identity regression tests; the only exemptions are documented (`enroll_node`, and control-plane-internal non-agent dispatch paths).
   - **migration reaper (#652)**: reaps on **progress liveness** (`updated_at`) instead of `started_at`, so a multi-hour but reporting migration survives; the failure UPDATE is guarded against a racing progress report. Source-VM resume now requires a terminal row, `max(stall timeout, 90 s)` of silence, and a fresh source-node heartbeat — otherwise the VM stays paused for an operator. `CHV_MIGRATION_STALL_TIMEOUT_SECS` overrides the 7200 s default.

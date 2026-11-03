@@ -294,7 +294,7 @@ leg that ran in #549 (2026-10-08).
 | `/etc/chv/controlplane.toml` | Control plane config |
 | `/etc/chv/agent.toml` | Agent config |
 | `/etc/chv/stord.toml` | Storage daemon config |
-| `/etc/chv/nwd.toml` | Network daemon config (socket, runtime dir; bridges are API-created `br-<net_id>`) |
+| `/etc/chv/nwd.toml` | Network daemon config (socket, runtime dir; bridges are API-created from the network id via `chv_common::bridge_name_for_network`) |
 | `/etc/chv/certs/` | TLS CA and certificates |
 | `/var/lib/chv/controlplane.db` | SQLite database |
 | `/var/lib/chv/cache/` | Agent durable cache |

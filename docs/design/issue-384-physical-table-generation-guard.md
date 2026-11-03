@@ -110,7 +110,7 @@ migration writes to either table (verified: no `INSERT`/`UPDATE` on
 |---|---|---|---|---|
 | N1 | `UPSERT_NETWORK_SQL` via `upsert_network` / `upsert_network_with_exposures` | SQL `desired_state.rs:194-214`; methods `:941-984`, `:986-1057` | unconditional DO UPDATE, one tx with the guarded NDS upsert | yes (tx coupling) |
 | N1a | ← agent network fragment | `reconcile.rs:646-671` | **the only production caller** of the physical networks upsert | yes |
-| N2 | BFF network create | `chv-webui-bff/src/handlers/networks.rs:301-312` (id minted `:293` via `gen_short_id()`) | plain `INSERT`, fail-closed | n/a |
+| N2 | BFF network create | `chv-webui-bff/src/handlers/networks.rs:301-312` (id minted `:293` via `gen_resource_id()` since #664; `gen_short_id()` before that) | plain `INSERT`, fail-closed | n/a |
 | N3 | BFF network delete | `networks.rs:483-487`, inside a `BEGIN IMMEDIATE` tx (`:384-388`, the #356 serialization) gated on zero live attachments | `DELETE FROM networks` (NDS cascades, `0001_initial.sql:176`) | no (tx + gate) |
 | N4 | BFF network rename | `networks.rs:578` | `UPDATE networks SET display_name` in a plain tx | no |
 | N5 | BFF VM-create implicit network | `vms.rs:718-729` (after check-then-resolve `:642-670`) | plain `INSERT` — check-then-insert TOCTOU but fail-closed on PK | n/a |

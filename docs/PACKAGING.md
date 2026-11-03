@@ -153,9 +153,10 @@ sudo rpm -i chvctl-<version>-1.x86_64.rpm
 
 1. **Create a network**  
    Create networks through the CHV API or Web UI. `chv-nwd` creates each
-   network's bridge (`br-<net_id>`) when the control plane applies the
-   topology. The packages do not require a pre-existing bridge. The legacy
-   `chvbr0` dev bridge created by the all-in-one installer is optional.
+   network's bridge (`br-<net_id>` when the name fits the 15-character
+   interface limit, otherwise `br-<prefix><hash>`) when the control plane
+   applies the topology. The packages do not require a pre-existing bridge. The
+   legacy `chvbr0` dev bridge created by the all-in-one installer is optional.
 
 2. **Generate TLS certificates**  
    The control plane and agent use mTLS. Generate or place certificates in
