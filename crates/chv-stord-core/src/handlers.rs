@@ -1328,6 +1328,9 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
                 tls_config,
                 Some(task_clone),
                 req_pause_first,
+                // Default bound (30 s) for the FinalizeAck wait; operators
+                // can tune it in a later config PR.
+                None,
             )
             .await;
 

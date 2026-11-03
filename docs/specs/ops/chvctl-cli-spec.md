@@ -27,14 +27,14 @@ spellings the binary never accepted.
 - `chvctl vm stop <vm_id>` — Stop a VM
 - `chvctl vm reboot <vm_id>` — Reboot a VM
 - `chvctl vm delete <vm_id>` — Delete a VM
-- `chvctl vm migrate <vm_id> --to <node_id>` — Live-migrate a VM
+- `chvctl vm migrate <vm_id> --to <node_id> --pause-first` — Stop-the-world migrate a VM (the VM pauses for the full transfer). `--pause-first` is required until #394 is proven; without it the command fails closed locally
 - `chvctl vm resize <vm_id> [--cpu <n>] [--memory <size>]` — Resize VM resources
 - `chvctl vm import <name> --file <path>` — Import a VM from a qcow2 disk image (`POST /v1/vms/import`, the route's first in-tree client). The file is uploaded as a multipart form (a `name` field and the image as the `file` part); the server validates the qcow2 magic and rejects a non-qcow2 file with a 400 naming it. The request carries a non-empty `x-csrf-token` header — the BFF's CSRF layer requires it on multipart (JSON mutations satisfy the same layer by content type alone; the header value is a fixed marker, not a verified secret, because the platform has no CSRF token model). The response carries the server-minted VM `id`, the `name`, a `Pending` desired state, and the node-side `disk_path` the image landed at — no `task_id` (unlike the volume create/delete responses); the journaled `CreateVm` operation is observable through `task list`. The imported VM, its `-disk` volume, and the operation are stamped with the importing operator as owner, and the VM appears in `vm list` immediately
 
 ### Nodes
 - `chvctl node list` — List compute nodes
 - `chvctl node get <node_id>` — Show node details
-- `chvctl node drain <node_id>` — Drain node (evacuate VMs via live migration)
+- `chvctl node drain <node_id>` — Drain node (evacuate VMs; migrations are stop-the-world until #394 is proven)
 - `chvctl node maintenance <node_id> --enable` — Enter (`--enable`) or exit (omitted) maintenance mode
 
 ### Volumes
@@ -70,7 +70,8 @@ the platform today and the flag was silently ignored when it existed
 - `chvctl user delete <user_id>` — Delete a user (takes the user id from `user list`, not the username)
 
 ### Migrations
-- `chvctl migrate start <vm_id> <target_node>` — Start a live migration. Delegates to the vm-mutate migrate path (`POST /v1/vms/mutate`) — the same route `chvctl vm migrate` drives; the two commands are equivalent entry points. Operator role; the response carries the `task_id` to feed `chvctl task watch`
+- `chvctl migrate start <vm_id> <target_node> --pause-first` — Start a stop-the-world migration (the VM pauses for the full transfer). Delegates to the vm-mutate migrate path (`POST /v1/vms/mutate`) — the same route `chvctl vm migrate` drives; the two commands are equivalent entry points. **`--pause-first` is required**: live/concurrent-write migration is disabled until #394 is proven, so omitting the flag fails closed locally with a usage error and sends no request. Operator role; the response carries the `task_id` to feed `chvctl task watch`
+- `chvctl vm migrate <vm_id> --to <target_node> --pause-first` — Equivalent stop-the-world entry point with the same fail-closed `--pause-first` requirement
 - `chvctl migrate status <migration_id>` — Show a migration's phase and progress counters (`GET /v1/migrations/{id}`, viewer tier; unknown ids are a 404)
 - `chvctl migrate cancel <migration_id>` — Request a cooperative cancel of an in-flight migration (`POST /admin/migrations/{id}/cancel` on the control-plane admin surface). **Admin role required** — an operator-role token gets a 403, and the server must be a CP admin endpoint, not a plain BFF bind. The cancel is best-effort: the migration loop observes the flag at a safe point and rolls back; the response's `outcome` distinguishes `requested` from the `already_requested`/`already_terminal` no-ops
 - `chvctl migrate list` — List migrations (`GET /v1/migrations`, viewer tier)

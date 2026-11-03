@@ -1,7 +1,7 @@
 # Disk Migration Protocol Spec (stord-to-stord)
 
 ## Purpose
-Defines the block-level data transfer protocol between two `chv-stord` instances during VM live migration. This is the stord-level wire companion of `live-migration-spec.md`, which covers the control plane (CP) side of orchestration: where the two overlap, that spec covers orchestration and this one covers the stream itself.
+Defines the block-level data transfer protocol between two `chv-stord` instances during VM migration. This is the stord-level wire companion of `live-migration-spec.md`, which covers the control plane (CP) side of orchestration: where the two overlap, that spec covers orchestration and this one covers the stream itself. The user-facing API currently enforces stop-the-world (pause-first) migration until issue #394 is proven; the wire protocol itself still carries the `pause_first` mode bit.
 
 ## Participants
 - **Source stord**: reads volume blocks, tracks dirty blocks, streams data (`crates/chv-stord-core/src/migration/sender.rs`)
@@ -52,11 +52,11 @@ optimization layered in front of the digest, not a correctness gate of
 its own — the residual window between the pre-pause gate and the pause
 completing remains covered by the post-pause whole-volume digest.
 
-**Pause-first mode (issue #394, Option C — opt-in stop-the-world).**
+**Pause-first mode (issue #394, Option C — temporary mandatory gate, #656).**
 `TriggerDiskMigrationRequest.pause_first` (threaded end-to-end: the
 agent's `MigrateVmRequest`→`MigrationConfig.pause_first`, the BFF
 vm-mutate migrate action's `pause_first` JSON field, the WebUI
-migrate modal's pause-first checkbox, and
+migrate modal's mandatory checked pause-first control, and
 `chvctl migrate start --pause-first` / `chvctl vm migrate
 --pause-first`) moves the VM-pause handshake to **before any source
 byte is read**: the task enters the `PAUSED_PRE_COPY` status phase
@@ -68,20 +68,32 @@ converge trivially on the quiesced source; the finalize digest
 verifies instead of catching loss. A migration in this mode is
 correct by construction for any write pattern, at the cost of
 downtime equal to the full disk+memory transfer — the operator-facing
-alternative to #394's "retry with the source quiesced" answer. The
-sender fails closed (`failed_precondition`, before connecting) if the
-mode is requested without a task attached: an operator who asked for
-the pause must never get a silent degradation to quiescent-assumed
+alternative to #394's "retry with the source quiesced" answer.
+
+**Fail-closed until #394 is proven (#656).** The user-facing API no
+longer defaults to the live path: the BFF vm-mutate handler and the
+control-plane mutation service reject `pause_first=false` (and a
+missing field) with `400 Bad Request` — "live/concurrent-write
+migration is not supported until #394 is proven; set pause_first=true
+(stop-the-world)" — before any lifecycle dispatch, and both chvctl
+commands fail closed client-side before sending a request. The WebUI
+modal defaults to pause-first, renders the control checked and
+disabled, and always sends `true`. This is a temporary gate, not a
+new capability claim: live migration returns when #394 is proven.
+The stord wire protocol still accepts `pause_first=false` (the
+default) for internal/older callers; the gate lives at the
+user-facing surfaces.
+
+The sender fails closed (`failed_precondition`, before connecting) if
+the mode is requested without a task attached: an operator who asked
+for the pause must never get a silent degradation to quiescent-assumed
 semantics. **T=0 skew guard (#582)**: stord echoes the requested mode
 in `TriggerDiskMigrationResponse.pause_first`, and the agent fails
 the migration at trigger time when a pause-first request comes back
 without the echo — a stord that predates the field drops the unknown
 request field (proto3) and would silently run the default path. The
 guard is one-directional: default-mode requests never require an
-echo, so a skewed stord still serves them. The WebUI's migrate modal
-exposes the opt-in as a pause-first checkbox with an honest downtime
-warning (landed via #582); the mode is now reachable from every
-surface: UI, API, and chvctl.
+echo, so a skewed stord still serves them.
 
 ## Transport
 - gRPC bidirectional streaming: `StorageMigrationService.StreamBlocks` over a single `MigrationMessage` stream (`proto/node/chv-stord-migration.proto`)
@@ -213,6 +225,7 @@ Source                          Destination
 - The receiver flushes any still-unacknowledged chunks (defense in depth; `FinalSync` normally already did), then re-computes the same digest over the destination and answers `FinalizeAck{verified, error_message}` (`crates/chv-stord-core/src/migration/receiver.rs`)
 - **Fail-closed**: `verified = false` — digest mismatch, unknown/unparseable digest format, or an unreadable destination — makes the sender fail the migration with `Status::data_loss` and the task end Failed. `Completed` genuinely means "destination verified" (issue #392)
 - Boundary acks still in flight when `FinalizeAck` is awaited are processed normally; a CRC-mismatch Ack arriving there still fails the migration
+- **Bounded wait (#656)**: each read of the `FinalizeAck` wait is wrapped in a configurable timeout (default 30 s, production bounds 5–300 s; `MigrationSender::with_finalize_ack_timeout` for tests). On expiry the sender emits the migration error metric (`reason="finalize_ack_timeout"`), marks the task Failed with the timeout message, and returns `Status::deadline_exceeded("timed out waiting for FinalizeAck after Ns")`. A destination that never answers finalization can no longer hang the task — or leave the VM paused — forever.
 
 ## Dirty Block Tracking
 
@@ -278,6 +291,8 @@ of the M4.6 qualification).
 | Receiving volume creation fails (incl. existing partial file) | Handshake fails | Error before `MigrationReady` |
 | Chunk past end of receiving volume | — | `invalid_argument` |
 | Timeout (no Ack in 30 s) | `deadline_exceeded`, task Failed | — |
+| Timeout waiting for `FinalizeAck` (default 30 s, #656) | `deadline_exceeded`, task Failed | — |
+| Live (`pause_first=false`) request at the user-facing API (BFF/chvctl/UI, #656) | `400 Bad Request` before dispatch (CLI fails locally) | — |
 | Finalize digest mismatch / unknown format / unreadable destination | `data_loss`, task Failed | `FinalizeAck{verified: false}` with a content-free error message |
 | Oversized InitMigration (> 16 TiB) or unsafe volume_id | Handshake fails | `invalid_argument` |
 
@@ -474,8 +489,9 @@ not under `[migration]`): the destination endpoint host of every
 | Phase 3/4: Write canary | sender.rs `verify_source_canary()`, backends `write_canary_probe()` | DONE — file-stat fingerprint sampled before bulk copy, re-checked at every round boundary and the pre-pause gate; `source_modified_during_migration` fail-fast (issue #394, Option A) |
 | Phase 3: Round acks / boundary flushes | receiver.rs, sender.rs | DONE — ack every 64 chunks, round ack on `RoundComplete`, window flush at `FinalSync`/pre-`FinalizeAck` (issue #391) |
 | Phase 4: Pause handshake (`needs_vm_pause` → `ResumeDiskMigration{vm_paused:true}` → `FinalSync{vm_paused:true}`) | sender.rs, task.rs, handlers.rs | DONE — no post-pause dirty sweep (issue #394, see Claimed mode) |
-| Phase 0/4: Pause-first mode (`pause_first` → `PAUSED_PRE_COPY` before bulk copy; fail-closed without a task) | sender.rs, handlers.rs, task.rs; agent migration.rs, daemon_clients.rs, agent_server.rs; CP bff_mutations.rs; BFF handlers/vms.rs; chvctl | DONE — issue #394, Option C (see Claimed mode) |
+| Phase 0/4: Pause-first mode (`pause_first` → `PAUSED_PRE_COPY` before bulk copy; fail-closed without a task) | sender.rs, handlers.rs, task.rs; agent migration.rs, daemon_clients.rs, agent_server.rs; CP bff_mutations.rs; BFF handlers/vms.rs; chvctl; WebUI | DONE — issue #394, Option C; mandatory at the user-facing API until #394 is proven (issue #656, see Claimed mode) |
 | Phase 5: Finalize digest | volume_digest.rs, sender.rs | DONE — versioned SHA-256 over the full source, sent in `FinalizeComplete.volume_checksum` (issue #392) |
+| Phase 5: Bounded `FinalizeAck` wait | sender.rs `finalize_ack_timeout` | DONE — 30 s default, 5–300 s production bounds; timeout marks task Failed and returns `deadline_exceeded` (issue #656) |
 | Phase 5: Destination verification | receiver.rs `verify_destination()` | DONE — re-computes the digest over the destination; `verified=false` ⇒ sender fails with `Status::data_loss`, task Failed |
 | Flow control (SendWindow, Ack) | flow_control.rs | DONE — window 128, ack interval 64, 30 s timeout |
 | gRPC message size limit (8 MiB, both serving paths) | migration/mod.rs, server.rs | DONE |

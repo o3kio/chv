@@ -28,7 +28,9 @@
 	let loading = $state(false);
 	let error = $state<string | null>(null);
 	let selectedNodeId = $state('');
-	let pauseFirst = $state(false);
+	// Issue #656: live/concurrent-write migration is disabled until #394
+	// is proven, so pause-first is mandatory, not an opt-in toggle.
+	let pauseFirst = $state(true);
 
 	const eligibleNodes = $derived(
 		nodes.filter((n) => n.node_id !== currentNodeId && n.state === 'TenantReady')
@@ -37,7 +39,7 @@
 	$effect(() => {
 		if (open) {
 			selectedNodeId = '';
-			pauseFirst = false;
+			pauseFirst = true;
 			error = null;
 			fetchNodes();
 		}
@@ -68,13 +70,9 @@
 {#snippet children()}
 	<div class="form-fields">
 		<p class="description">
-			{#if pauseFirst}
-				Migrate VM <strong>{vmId}</strong> in <strong>pause-first (stop-the-world)</strong> mode: the VM is
-				paused before any data is copied and stays paused until the migration completes.
-			{:else}
-				Select a target node to live-migrate VM <strong>{vmId}</strong>.
-				The VM will remain running during the migration.
-			{/if}
+			Migrate VM <strong>{vmId}</strong> to a target node. The VM is paused before any data is
+			copied and stays paused for the full disk and memory transfer. Live migration is disabled
+			until #394 is proven.
 		</p>
 
 		{#if loading}
@@ -103,22 +101,19 @@
 					<input
 						id="migrate-pause-first"
 						type="checkbox"
-						bind:checked={pauseFirst}
-						disabled={submitting}
-						aria-describedby={pauseFirst ? 'migrate-pause-first-warning' : undefined}
+						checked={pauseFirst}
+						disabled
+						aria-describedby="migrate-pause-first-warning"
 					/>
-					Pause-first (stop-the-world)
+					Pause-first (stop-the-world, required)
 				</label>
-				{#if pauseFirst}
-					<div class="downtime-warning" id="migrate-pause-first-warning" role="alert">
-						<AlertCircle size={14} />
-						<span>
-							Downtime equals the full disk and memory transfer — the VM is unreachable for the
-							entire migration. Use this only for workloads whose write pattern cannot
-							tolerate live migration.
-						</span>
-					</div>
-				{/if}
+				<div class="downtime-warning" id="migrate-pause-first-warning" role="alert">
+					<AlertCircle size={14} />
+					<span>
+						Stop-the-world migration: the VM is paused for the full disk and memory transfer
+						and is unreachable for the entire migration.
+					</span>
+				</div>
 			</div>
 		{/if}
 	</div>

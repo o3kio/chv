@@ -217,6 +217,19 @@ impl MutationService for ControlPlaneMutationService {
         pause_first: bool,
         requested_by: String,
     ) -> Result<MutateVmResponse, BffError> {
+        // Issue #656: live/concurrent-write migration is not supported
+        // until #394 is proven. Fail closed at the user-facing API before
+        // any lookup or lifecycle dispatch; do NOT silently coerce false
+        // to true (that would claim a stop-the-world pause the operator
+        // did not request).
+        if !pause_first {
+            return Err(BffError::BadRequest(
+                "live/concurrent-write migration is not supported until #394 is proven; \
+                 set pause_first=true (stop-the-world)"
+                    .to_string(),
+            ));
+        }
+
         let source_node_id =
             sqlx::query_scalar::<_, Option<String>>("SELECT node_id FROM vms WHERE vm_id = ?")
                 .bind(&vm_id)
@@ -822,6 +835,7 @@ mod tests {
     /// pinned at the same trait boundary production uses.
     struct RecordingLifecycle {
         attach_calls: std::sync::Arc<std::sync::Mutex<Vec<proto::AttachVolumeRequest>>>,
+        migrate_calls: std::sync::Arc<std::sync::Mutex<Vec<proto::MigrateVmRequest>>>,
     }
 
     fn ok_ack(operation_id: String) -> proto::AckResponse {
@@ -1032,9 +1046,15 @@ mod tests {
         }
         async fn migrate_vm(
             &self,
-            _request: proto::MigrateVmRequest,
+            request: proto::MigrateVmRequest,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
-            unreachable!("no migrate_vm in the A9 tests")
+            let operation_id = request
+                .meta
+                .as_ref()
+                .map(|m| m.operation_id.clone())
+                .unwrap_or_default();
+            self.migrate_calls.lock().unwrap().push(request);
+            Ok(ok_ack(operation_id))
         }
         async fn update_overlay(
             &self,
@@ -1054,6 +1074,96 @@ mod tests {
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no resolve_inspect_required_operation in the A9 tests")
         }
+    }
+
+    /// Issue #656: the BFF mutation service rejects the live path at its
+    /// own boundary — before the VM lookup and before dispatching
+    /// `MigrateVm` — and never coerces `pause_first=false` to true.
+    #[tokio::test]
+    async fn migrate_vm_rejects_live_path_before_lookup_or_dispatch() {
+        let pool = chv_controlplane_store::test_util::create_test_pool().await;
+        let migrate_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ControlPlaneMutationService::new(
+            pool,
+            std::sync::Arc::new(RecordingLifecycle {
+                attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                migrate_calls: migrate_calls.clone(),
+            }),
+        );
+
+        // No VM row exists: a lookup-first implementation would return
+        // NotFound here. The gate must return BadRequest instead.
+        let err = service
+            .migrate_vm(
+                "vm-does-not-exist".to_string(),
+                "n-2".to_string(),
+                false,
+                "test-user".to_string(),
+            )
+            .await
+            .expect_err("live migration must fail closed");
+        match err {
+            BffError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("#394") && msg.contains("pause_first=true"),
+                    "the rejection must explain the gate and remedy: {msg}"
+                );
+            }
+            other => panic!("expected bad-request, got {other:?}"),
+        }
+        assert!(
+            migrate_calls.lock().unwrap().is_empty(),
+            "a rejected live request must not dispatch a lifecycle RPC"
+        );
+    }
+
+    /// Issue #656: the stop-the-world path still threads
+    /// `pause_first=true` through to the lifecycle request.
+    #[tokio::test]
+    async fn migrate_vm_forwards_pause_first_true() {
+        let pool = chv_controlplane_store::test_util::create_test_pool().await;
+        sqlx::query(
+            "INSERT INTO nodes (node_id, hostname, display_name) VALUES ('node-656', 'host', 'host')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO vms (vm_id, display_name, node_id) VALUES ('vm-656', 'vm-656', 'node-656')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migrate_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ControlPlaneMutationService::new(
+            pool,
+            std::sync::Arc::new(RecordingLifecycle {
+                attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                migrate_calls: migrate_calls.clone(),
+            }),
+        );
+
+        service
+            .migrate_vm(
+                "vm-656".to_string(),
+                "node-656-b".to_string(),
+                true,
+                "test-user".to_string(),
+            )
+            .await
+            .expect("pause-first migration must be accepted");
+
+        let calls = migrate_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one MigrateVm dispatch");
+        let request = &calls[0];
+        assert_eq!(request.vm_id, "vm-656");
+        assert_eq!(request.source_node_id, "node-656");
+        assert_eq!(request.destination_node_id, "node-656-b");
+        assert!(
+            request.config.as_ref().is_some_and(|c| c.pause_first),
+            "the stop-the-world flag must be forwarded"
+        );
     }
 
     /// #379 PR 2 (A9): the BFF attach mutation populates
@@ -1124,6 +1234,7 @@ mod tests {
             pool,
             std::sync::Arc::new(RecordingLifecycle {
                 attach_calls: attach_calls.clone(),
+                migrate_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
 

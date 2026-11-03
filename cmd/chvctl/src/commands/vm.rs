@@ -70,9 +70,9 @@ pub enum VmCommands {
         /// Target node ID
         #[arg(long)]
         to: String,
-        /// Pause the VM before disk transfer (stop-the-world, issue #394
-        /// Option C): correct by construction, downtime equals the full
-        /// transfer. Omit for the default quiescent-assumed mode.
+        /// Required: pause the VM for the full transfer (stop-the-world).
+        /// Live migration is disabled until #394 is proven; omitting this
+        /// flag fails closed without sending a request.
         #[arg(long)]
         pause_first: bool,
     },
@@ -220,6 +220,7 @@ pub async fn execute(
             to,
             pause_first,
         } => {
+            crate::commands::require_pause_first(pause_first)?;
             let body = json!({
                 "vm_id": vm_id,
                 "action": "migrate",

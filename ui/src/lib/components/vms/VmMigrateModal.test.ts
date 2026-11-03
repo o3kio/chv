@@ -55,57 +55,42 @@ describe('VmMigrateModal', () => {
 		});
 	}
 
-	it('defaults to live migration: no pause-first, VM described as running', async () => {
-		renderModal();
-		await waitForNodes();
-		const checkbox = screen.getByLabelText(/pause-first \(stop-the-world\)/i);
-		expect((checkbox as HTMLInputElement).checked).toBe(false);
-		expect(screen.getByText(/will remain running during the migration/i)).toBeTruthy();
-		expect(screen.queryByText(/Downtime equals the full disk/i)).toBeNull();
-	});
+	function pauseFirstCheckbox() {
+		return screen.getByLabelText(/pause-first \(stop-the-world/i) as HTMLInputElement;
+	}
 
-	it('shows the honest downtime warning when pause-first is checked', async () => {
+	it('defaults to pause-first: the control is checked, disabled, and the live path is called out', async () => {
 		renderModal();
 		await waitForNodes();
-		fireEvent.click(screen.getByLabelText(/pause-first \(stop-the-world\)/i));
-		await waitFor(() => {
-			expect(screen.getByText(/Downtime equals the full disk and memory transfer/i)).toBeTruthy();
-		});
-		expect(screen.getByText(/paused before any data is copied/i)).toBeTruthy();
+		const checkbox = pauseFirstCheckbox();
+		expect(checkbox.checked).toBe(true);
+		expect(checkbox.disabled).toBe(true);
+		expect(screen.getByText(/Live migration is disabled until #394 is proven/i)).toBeTruthy();
+		expect(screen.getByText(/stays paused for the full disk and memory transfer/i)).toBeTruthy();
+		expect(screen.getByText(/unreachable for the entire migration/i)).toBeTruthy();
 		expect(screen.queryByText(/will remain running during the migration/i)).toBeNull();
 	});
 
-	it('migrates live by default: onmigrate receives pauseFirst=false', async () => {
+	it('always sends pauseFirst=true: no live path is reachable', async () => {
 		const { onmigrate } = renderModal();
 		await waitForNodes();
 		fireEvent.change(screen.getByLabelText(/target node/i), { target: { value: 'node-b' } });
-		fireEvent.click(screen.getByRole('button', { name: /^Migrate$/i }));
-		expect(onmigrate).toHaveBeenCalledWith('node-b', false);
-	});
-
-	it('threads the pause-first opt-in: onmigrate receives pauseFirst=true', async () => {
-		const { onmigrate } = renderModal();
-		await waitForNodes();
-		fireEvent.change(screen.getByLabelText(/target node/i), { target: { value: 'node-b' } });
-		fireEvent.click(screen.getByLabelText(/pause-first \(stop-the-world\)/i));
 		fireEvent.click(screen.getByRole('button', { name: /^Migrate$/i }));
 		expect(onmigrate).toHaveBeenCalledWith('node-b', true);
+		expect(onmigrate).not.toHaveBeenCalledWith('node-b', false);
 	});
 
-	it('resets the pause-first toggle when the modal reopens', async () => {
+	it('keeps pause-first mandatory when the modal reopens', async () => {
 		const { rerender } = renderModal();
 		await waitForNodes();
-		fireEvent.click(screen.getByLabelText(/pause-first \(stop-the-world\)/i));
-		expect((screen.getByLabelText(/pause-first \(stop-the-world\)/i) as HTMLInputElement).checked)
-			.toBe(true);
+		expect(pauseFirstCheckbox().checked).toBe(true);
 		// Close (open=false unmounts the form body), then reopen: the
-		// opt-in must not survive as stale state — the same reset the
-		// target-node select gets.
+		// mandatory mode must survive as checked, not reset to live.
 		await rerender({ open: false });
 		await rerender({ open: true });
 		await waitForNodes();
-		expect((screen.getByLabelText(/pause-first \(stop-the-world\)/i) as HTMLInputElement).checked)
-			.toBe(false);
-		expect(screen.getByText(/will remain running during the migration/i)).toBeTruthy();
+		expect(pauseFirstCheckbox().checked).toBe(true);
+		expect(pauseFirstCheckbox().disabled).toBe(true);
+		expect(screen.getByText(/Live migration is disabled until #394 is proven/i)).toBeTruthy();
 	});
 });
