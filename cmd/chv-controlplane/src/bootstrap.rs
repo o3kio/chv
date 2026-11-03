@@ -32,6 +32,11 @@ use std::sync::Arc;
 /// exit (graceful, SIGTERM, or crash).
 static INSTANCE_LOCK: std::sync::OnceLock<instance_lock::InstanceLock> = std::sync::OnceLock::new();
 
+/// Default dedicated Prometheus listener when `metrics_bind` is unset.
+/// Loopback, never `0.0.0.0`: the scrape surface has no authentication of its
+/// own, so an omitted key must not expose it on every interface (issue #657).
+const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9103";
+
 /// Validate the TLS configuration for the control plane.
 ///
 /// Returns `Ok(())` when:
@@ -69,6 +74,44 @@ pub fn validate_tls(
     }
 
     Ok(())
+}
+
+/// Resolve and bind the dedicated `/metrics` listener (issue #657).
+///
+/// The bind happens before this returns, so an invalid `metrics_bind` or an
+/// occupied port is a startup error. The admin-gated `/metrics` on `http_bind`
+/// stays for compatibility, but scrapers use this listener and therefore never
+/// need a rotating admin JWT.
+async fn start_metrics_endpoint(
+    config: &ControlPlaneConfig,
+    process_started: std::time::Instant,
+) -> Result<(), ControlPlaneServiceError> {
+    let bind = chv_observability::metrics_server::resolve_metrics_bind(
+        config.metrics_bind.as_deref(),
+        DEFAULT_METRICS_BIND,
+    );
+    if config.metrics_bind.is_none() {
+        tracing::warn!(
+            bind = %bind,
+            "metrics_bind is not set; binding /metrics on loopback — set metrics_bind \
+             explicitly to serve a different address"
+        );
+    }
+    let info = chv_observability::DaemonMetricsInfo::new(
+        env!("CARGO_PKG_NAME"),
+        env!("CHV_VERSION"),
+        env!("CHV_GIT_SHA"),
+        env!("CHV_RELEASE_CHANNEL"),
+    )
+    .with_started_at(process_started);
+    chv_observability::metrics_server::start_metrics_server(&bind, info)
+        .await
+        .map_err(|e| {
+            ControlPlaneServiceError::Internal(format!(
+                "failed to bind metrics listener on {bind}: {e}; set metrics_bind to a valid \
+                 bind address (loopback by default)"
+            ))
+        })
 }
 
 /// Connect the isolated monitoring store (ADR-027, #602 PR-2).
@@ -247,6 +290,7 @@ pub async fn check_compat_matrix(
 
 pub async fn build_service(
     config: &ControlPlaneConfig,
+    process_started: std::time::Instant,
 ) -> Result<ControlPlaneService, ControlPlaneServiceError> {
     tokio::fs::create_dir_all(&config.runtime_dir).await?;
 
@@ -279,6 +323,15 @@ pub async fn build_service(
             instance_lock::ALREADY_RUNNING_MESSAGE.to_string(),
         ));
     }
+
+    // Dedicated Prometheus listener (#657). Bind after the single-instance
+    // guard so a second control plane reports the instance-lock error instead
+    // of a misleading metrics-port conflict, and before the database is opened
+    // so an invalid `metrics_bind` or an occupied port still aborts startup
+    // instead of running without a scrape surface. This listener is separate
+    // from the admin-gated `/metrics` route on `http_bind`; it is loopback by
+    // default and needs no JWT.
+    start_metrics_endpoint(config, process_started).await?;
 
     let store_config = ControlPlaneStoreConfig {
         database_url: config.database.url.clone(),
@@ -1065,6 +1118,40 @@ mod tests {
             Err(ControlPlaneServiceError::Internal(m)) => m,
             other => panic!("expected Err(Internal), got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // #657: dedicated metrics listener — loopback default, explicit bind
+    // honored, invalid bind fatal.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn metrics_bind_defaults_to_loopback() {
+        assert_eq!(DEFAULT_METRICS_BIND, "127.0.0.1:9103");
+        assert_eq!(
+            chv_observability::metrics_server::resolve_metrics_bind(None, DEFAULT_METRICS_BIND),
+            "127.0.0.1:9103"
+        );
+        assert_eq!(
+            chv_observability::metrics_server::resolve_metrics_bind(
+                Some("192.0.2.10:9103"),
+                DEFAULT_METRICS_BIND
+            ),
+            "192.0.2.10:9103"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_metrics_bind_fails_startup() {
+        let config = ControlPlaneConfig {
+            metrics_bind: Some("not-a-socket-address".to_string()),
+            ..Default::default()
+        };
+        let err = err_msg(start_metrics_endpoint(&config, std::time::Instant::now()).await);
+        assert!(
+            err.contains("failed to bind metrics listener"),
+            "startup error must name the metrics bind failure, got: {err}"
+        );
     }
 
     #[test]

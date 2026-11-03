@@ -4,6 +4,10 @@
 socket_path = "/run/chv/stord/api.sock"
 runtime_dir = "/var/lib/chv/storage/localdisk"
 log_level = "info"
+# Dedicated Prometheus listener (issue #657). Unauthenticated and loopback by
+# default; set a specific management address (never 0.0.0.0) only when
+# scraping remotely, and firewall it.
+metrics_bind = "127.0.0.1:9101"
 path_allowlist = ["/var/lib/chv/storage/localdisk", "/var/lib/chv/storage/lvm"]
 device_allowlist = ["/dev/dm-*", "/dev/mapper/*"]
 

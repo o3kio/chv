@@ -486,6 +486,48 @@ async fn grpc_health_endpoint_reports_serving() {
     );
 }
 
+/// **nwd records gRPC RED metrics (#657 review M3)**: the server builder must
+/// compose `GrpcMetricsLayer` like stord/agent/control plane. A health RPC is
+/// the cheapest call that proves the layer is installed and records the
+/// terminal status from the response headers.
+#[tokio::test]
+async fn grpc_metrics_layer_records_health_check() {
+    chv_observability::install_prometheus_recorder().expect("install prometheus recorder");
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("nwd.sock");
+
+    let server = NetworkServer::new(MockExecutor, Metrics::new());
+    let socket_clone = socket.clone();
+    tokio::spawn(async move {
+        server.serve(&socket_clone).await.ok();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let channel = make_channel(socket).await;
+    let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
+    health
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("health Check must answer");
+
+    let text = chv_observability::prometheus_handle()
+        .expect("prometheus recorder installed")
+        .render();
+    assert!(
+        text.lines().any(|line| {
+            line.starts_with("chv_grpc_server_requests_total{")
+                && line.contains("service=\"grpc.health.v1.Health\"")
+                && line.contains("method=\"Check\"")
+                && line.contains("grpc_status=\"0\"")
+        }),
+        "nwd must install GrpcMetricsLayer; exposition was:\n{text}"
+    );
+}
+
 #[tokio::test]
 async fn ensure_and_delete_topology_idempotent() {
     let dir = tempfile::tempdir().unwrap();

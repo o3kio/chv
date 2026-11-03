@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 chv-config = { path = "../../crates/chv-config" }
-chv-observability = { path = "../../crates/chv-observability" }
+chv-observability = { path = "../../crates/chv-observability", features = ["http-metrics"] }
 chv-nwd-core = { path = "../../crates/chv-nwd-core" }
 tokio = { workspace = true }
 tracing = { workspace = true }

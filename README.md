@@ -67,7 +67,7 @@ The project has a solid Phase 1 foundation (Rust control plane, SQLite store, ce
 - **Backend / Control Plane**: Rust (Tokio, tonic, axum, sqlx/SQLite)
 - **Frontend**: SvelteKit 3 + Svelte 5 + TailwindCSS + Vite
 - **Contracts**: gRPC/protobuf
-- **Metrics**: Prometheus `/metrics` from the control plane and `chv-agent` only (`chv-stord`/`chv-nwd` expose no HTTP endpoint) — see [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md)
+- **Metrics**: Prometheus `/metrics` from every daemon (`chv-controlplane`, `chv-agent`, `chv-stord`, `chv-nwd`) on a dedicated, loopback-by-default `metrics_bind` listener — see [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md)
 
 ## Repository Structure
 

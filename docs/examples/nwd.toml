@@ -4,6 +4,10 @@
 socket_path = "/run/chv/nwd/api.sock"
 runtime_dir = "/run/chv/nwd"
 log_level = "info"
+# Dedicated Prometheus listener (issue #657). Unauthenticated and loopback by
+# default; set a specific management address (never 0.0.0.0) only when
+# scraping remotely, and firewall it.
+metrics_bind = "127.0.0.1:9102"
 
 # Bridge topology (bridge name, CIDR, upstream interface) is configured at runtime
 # via gRPC topology specs from the control plane, not in this config file.

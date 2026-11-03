@@ -22,10 +22,12 @@ groups:
           )
 
       # gRPC
+      # `client_cancelled` is a client-side disconnect / RST_STREAM, not a
+      # server error; exclude it from the error numerator.
       - record: chv:grpc_error_rate:5m
         expr: |
           sum by (service, method) (
-            rate(chv_grpc_server_requests_total{grpc_status!~"^(0|OK)$"}[5m])
+            rate(chv_grpc_server_requests_total{grpc_status!~"^(0|OK|client_cancelled)$"}[5m])
           )
           /
           clamp_min(

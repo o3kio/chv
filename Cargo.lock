@@ -1186,14 +1186,17 @@ dependencies = [
 name = "chv-observability"
 version = "0.3.0"
 dependencies = [
+ "axum 0.7.9",
  "bytes",
  "futures-util",
  "http",
+ "http-body",
  "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
  "pin-project-lite",
  "tokio",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",

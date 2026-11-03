@@ -24,6 +24,8 @@ node:
 controlplane:
   grpc_bind: "127.0.0.1:8443"
   http_bind: "127.0.0.1:8080"
+  # Dedicated Prometheus listener: unauthenticated, loopback by default.
+  metrics_bind: "127.0.0.1:9103"
   log_level: info
   runtime_dir: /run/chv/controlplane
   agent_runtime_dir: /var/lib/chv/agent
@@ -78,6 +80,8 @@ stord:
   socket_path: /run/chv/stord/api.sock
   runtime_dir: /var/lib/chv/storage/localdisk
   log_level: info
+  # Dedicated Prometheus listener: unauthenticated, loopback by default.
+  metrics_bind: "127.0.0.1:9101"
   path_allowlist:
     - /var/lib/chv/storage/localdisk
     - /var/lib/chv/storage/lvm
@@ -92,4 +96,6 @@ network:
   socket_path: /run/chv/nwd/api.sock
   runtime_dir: /run/chv/nwd
   log_level: info
+  # Dedicated Prometheus listener: unauthenticated, loopback by default.
+  metrics_bind: "127.0.0.1:9102"
   # Bridge topology is configured at runtime via gRPC from the control plane.

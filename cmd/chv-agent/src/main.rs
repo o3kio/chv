@@ -1019,6 +1019,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
         };
+        // Match the shared listener's posture: a wildcard address exposes the
+        // unauthenticated scrape surface on every interface, which needs an
+        // explicit firewall/reverse-proxy decision (#657 review N2).
+        if metrics_bind_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip().is_unspecified())
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                bind = %metrics_bind_addr,
+                "metrics_bind is an unspecified/wildcard address: the unauthenticated /metrics \
+                 listener is exposed on ALL interfaces. Restrict it with a firewall or network \
+                 policy, or front it with an authenticated reverse proxy; prefer a specific \
+                 management address or loopback (issue #657)"
+            );
+        }
         info!(bind = %metrics_bind_addr, "metrics server listening");
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "metrics server exited with error");

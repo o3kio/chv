@@ -8,27 +8,33 @@
 //!
 //! ### Status classification
 //!
-//! tonic returns gRPC errors as HTTP 200 with a `grpc-status` header (sometimes
-//! delivered as a trailer for streaming responses). This layer inspects the
-//! response headers for `grpc-status` and falls back to mapping the HTTP status
-//! code (non-200 → `"unknown"`). For unary handlers — which dominate CHV's
-//! gRPC surface — tonic emits `grpc-status` in the leading headers because the
-//! body is buffered, so the inspection is reliable.
+//! tonic returns gRPC errors as HTTP 200 with a `grpc-status` header. Unary
+//! responses carry that header in the leading HEADERS frame; streaming
+//! responses terminate with `grpc-status` in HTTP/2 trailers. This layer:
 //!
-//! ### Known limitation: streaming responses always emit `grpc_status = "unknown"`
+//! - reads `grpc-status` from the response headers when present (unary and
+//!   trailers-only responses) and records immediately;
+//! - otherwise wraps the response body, observes the trailer frame as it
+//!   passes through, and records the terminal status when the stream ends.
+//!   This does not consume or alter the body: the wrapper forwards every frame
+//!   untouched and only peeks at `Frame::trailers`.
 //!
-//! gRPC streaming RPCs (serial console, migration block transfer) deliver the
-//! `grpc-status` code in HTTP/2 trailers, not headers. This layer inspects
-//! headers only; reading trailers requires consuming the response body, which
-//! breaks the middleware contract. As a result, every successful streaming
-//! response is classified as `grpc_status = "unknown"` in the RED metrics.
+//! For a streaming RPC the duration therefore covers the stream's lifetime
+//! (headers through trailing status), which is the semantically correct RED
+//! latency. If a body ends without trailers, the HTTP status fallback is used
+//! (`unknown` for HTTP 200, `http_<code>` otherwise); a transport body error is
+//! recorded as `unknown`.
 //!
-//! Operators monitoring serial-console or migration RED metrics should filter
-//! on `grpc_status != "unknown"` to see real errors and treat `"unknown"` as
-//! "streaming response received" rather than "failure".
-//!
-//! A future version can fix this by wrapping the response body in a
-//! trailer-observing adapter (see tower-http's `TraceLayer` for the pattern).
+//! If the consumer drops the response body before it ends — a client
+//! disconnect, `RST_STREAM`, or a canceled request — [`Drop`] records a
+//! terminal [`CLIENT_CANCELLED_STATUS`] (`"client_cancelled"`) sample. It is
+//! deliberately distinct from `"unknown"`: the handler ran, but the client went
+//! away before the terminal status arrived, so this is a client-side event, not
+//! a protocol violation. Once a response has been produced, the pending sample
+//! is taken on every path (headers, trailer, end-of-stream, error, drop), so
+//! that request is recorded exactly once. A request whose service future is
+//! dropped before it resolves never produces a response and is not recorded
+//! (pre-existing behavior).
 //!
 //! ### Service / method extraction
 //!
@@ -42,11 +48,18 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use http::{HeaderMap, Request, Response};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use pin_project_lite::pin_project;
 use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{CHV_GRPC_SERVER_DURATION_SECONDS, CHV_GRPC_SERVER_REQUESTS_TOTAL};
+
+/// Terminal status used when the client cancels or drops the response before
+/// its trailers arrive. Kept distinct from `"unknown"` so dashboards can tell a
+/// client-side cancellation apart from a protocol violation / transport error
+/// (issue #657 review M1).
+pub const CLIENT_CANCELLED_STATUS: &str = "client_cancelled";
 
 /// Tower layer that wraps a tonic service stack with RED-style gRPC metrics.
 ///
@@ -79,8 +92,9 @@ pub struct GrpcMetricsService<S> {
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for GrpcMetricsService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    ResBody: HttpBody,
 {
-    type Response = S::Response;
+    type Response = Response<MetricsBody<ResBody>>;
     type Error = S::Error;
     type Future = GrpcMetricsFuture<S::Future>;
 
@@ -101,8 +115,9 @@ where
 }
 
 pin_project! {
-    /// Future returned by [`GrpcMetricsService`]. Records metrics exactly once
-    /// — when the inner future resolves — and forwards the response untouched.
+    /// Future returned by [`GrpcMetricsService`]. Records metrics exactly once:
+    /// when the headers carry a status, at response time; otherwise when the
+    /// wrapped body reaches its trailers/end.
     pub struct GrpcMetricsFuture<F> {
         #[pin]
         inner: F,
@@ -115,8 +130,9 @@ pin_project! {
 impl<F, ResBody, E> Future for GrpcMetricsFuture<F>
 where
     F: Future<Output = Result<Response<ResBody>, E>>,
+    ResBody: HttpBody,
 {
-    type Output = Result<Response<ResBody>, E>;
+    type Output = Result<Response<MetricsBody<ResBody>>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -132,16 +148,173 @@ where
             .method_label
             .take()
             .unwrap_or_else(|| "unknown".to_string());
-        let elapsed = this.started.elapsed().as_secs_f64();
+        let started = *this.started;
 
-        let status_label = match &result {
-            Ok(resp) => classify_response(resp.headers(), resp.status().as_u16()),
-            Err(_) => "unknown".to_string(),
-        };
+        match result {
+            Ok(response) => {
+                let (parts, body) = response.into_parts();
+                let http_status = parts.status.as_u16();
+                let header_status = status_from_headers(&parts.headers, http_status);
+                let pending = if let Some(status) = header_status {
+                    record(&service, &method, &status, started.elapsed().as_secs_f64());
+                    None
+                } else if body.is_end_stream() {
+                    // No headers status and no body to observe (empty unary
+                    // response): fall back immediately. A 200 with no status
+                    // anywhere is still the "unknown" bucket.
+                    record(
+                        &service,
+                        &method,
+                        &fallback_status(http_status),
+                        started.elapsed().as_secs_f64(),
+                    );
+                    None
+                } else {
+                    Some(PendingMetrics {
+                        service,
+                        method,
+                        started,
+                        fallback_status: fallback_status(http_status),
+                    })
+                };
 
-        record(&service, &method, &status_label, elapsed);
+                let body = MetricsBody {
+                    inner: body,
+                    pending: PendingMetricsGuard::new(pending),
+                };
+                Poll::Ready(Ok(Response::from_parts(parts, body)))
+            }
+            Err(e) => {
+                // No response headers/body to observe: transport-level error.
+                record(
+                    &service,
+                    &method,
+                    "unknown",
+                    started.elapsed().as_secs_f64(),
+                );
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+}
 
-        Poll::Ready(result)
+struct PendingMetrics {
+    service: String,
+    method: String,
+    started: Instant,
+    fallback_status: String,
+}
+
+/// Owns a not-yet-recorded sample. If the guard is dropped before the body
+/// records a terminal status (client disconnect / `RST_STREAM` / canceled
+/// request), it records [`CLIENT_CANCELLED_STATUS`] instead of silently losing
+/// the request. Every recording path calls [`Self::take`], so the guard is a
+/// no-op after the sample has been consumed — double recording is impossible.
+struct PendingMetricsGuard(Option<PendingMetrics>);
+
+impl PendingMetricsGuard {
+    fn new(pending: Option<PendingMetrics>) -> Self {
+        Self(pending)
+    }
+
+    fn take(&mut self) -> Option<PendingMetrics> {
+        self.0.take()
+    }
+
+    fn is_pending(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for PendingMetricsGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.0.take() {
+            record(
+                &pending.service,
+                &pending.method,
+                CLIENT_CANCELLED_STATUS,
+                pending.started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+}
+
+pin_project! {
+    /// Response body adapter that records the terminal gRPC status from the
+    /// trailer frame. Every frame is forwarded unchanged; the body is not
+    /// consumed or buffered.
+    pub struct MetricsBody<B> {
+        #[pin]
+        inner: B,
+        // Drop guard: records `client_cancelled` if the body is dropped before
+        // any terminal status is observed.
+        pending: PendingMetricsGuard,
+    }
+}
+
+impl<B> HttpBody for MetricsBody<B>
+where
+    B: HttpBody,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let frame = std::task::ready!(this.inner.poll_frame(cx));
+
+        match frame {
+            Some(Ok(frame)) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    if let Some(pending) = this.pending.take() {
+                        let status = status_from_trailers(trailers)
+                            .unwrap_or_else(|| pending.fallback_status.clone());
+                        record(
+                            &pending.service,
+                            &pending.method,
+                            &status,
+                            pending.started.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Some(Err(e)) => {
+                if let Some(pending) = this.pending.take() {
+                    record(
+                        &pending.service,
+                        &pending.method,
+                        "unknown",
+                        pending.started.elapsed().as_secs_f64(),
+                    );
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            None => {
+                if let Some(pending) = this.pending.take() {
+                    record(
+                        &pending.service,
+                        &pending.method,
+                        &pending.fallback_status,
+                        pending.started.elapsed().as_secs_f64(),
+                    );
+                }
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // While a recording is pending, force one final poll so a body that
+        // ends without a trailer frame still records its fallback status.
+        self.inner.is_end_stream() && !self.pending.is_pending()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -159,27 +332,41 @@ fn parse_service_method(path: &str) -> (String, String) {
     }
 }
 
-/// Map the response headers (and HTTP status code as fallback) to a
-/// `grpc_status` label value. The value is the numeric gRPC status code as a
-/// string (e.g. `"0"` for OK, `"5"` for NotFound) when discoverable, otherwise
-/// `"unknown"`.
-fn classify_response(headers: &HeaderMap, http_status: u16) -> String {
-    if let Some(v) = headers.get("grpc-status") {
-        if let Ok(s) = v.to_str() {
-            return s.to_string();
+/// Read `grpc-status` from a header map, if present. An unparseable value is
+/// surfaced as `unknown` rather than ignored (it is a protocol violation, not
+/// a missing status).
+fn header_grpc_status(headers: &HeaderMap) -> Option<String> {
+    headers.get("grpc-status").map(|v| {
+        v.to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|_| "unknown".to_string())
+    })
+}
+
+/// Status available from the response headers alone. A present `grpc-status`
+/// wins; a non-200 HTTP status is a protocol-level failure surfaced under the
+/// same label namespace. `None` means "defer to body trailers".
+fn status_from_headers(headers: &HeaderMap, http_status: u16) -> Option<String> {
+    header_grpc_status(headers).or_else(|| {
+        if http_status == 200 {
+            None
+        } else {
+            Some(format!("http_{http_status}"))
         }
-    }
+    })
+}
+
+/// Status to use when neither headers nor trailers carried one.
+fn fallback_status(http_status: u16) -> String {
     if http_status == 200 {
-        // tonic typically sets grpc-status on unary success; absence with
-        // HTTP 200 suggests a streaming response whose status lives in the
-        // trailers. We cannot read trailers without consuming the body, so
-        // bucket as unknown.
-        return "unknown".to_string();
+        "unknown".to_string()
+    } else {
+        format!("http_{http_status}")
     }
-    // Non-200 HTTP responses are protocol-level failures (auth, malformed
-    // request, etc.). Surface the HTTP status under the same label namespace
-    // so operators can spot them.
-    format!("http_{}", http_status)
+}
+
+fn status_from_trailers(trailers: &HeaderMap) -> Option<String> {
+    header_grpc_status(trailers)
 }
 
 fn record(service: &str, method: &str, grpc_status: &str, duration_secs: f64) {
@@ -205,7 +392,7 @@ mod tests {
 
     use bytes::Bytes;
     use http::{HeaderValue, Request, Response, StatusCode};
-    use http_body_util::Empty;
+    use http_body_util::{BodyExt, Empty};
     use tower_layer::Layer;
     use tower_service::Service;
 
@@ -228,17 +415,22 @@ mod tests {
     }
 
     #[test]
-    fn classify_response_reads_grpc_status_header() {
+    fn status_from_headers_reads_grpc_status_header() {
         let mut headers = HeaderMap::new();
         headers.insert("grpc-status", HeaderValue::from_static("5"));
-        assert_eq!(classify_response(&headers, 200), "5");
+        assert_eq!(status_from_headers(&headers, 200).as_deref(), Some("5"));
     }
 
     #[test]
-    fn classify_response_falls_back_to_http_status() {
+    fn status_from_headers_defers_http_200_without_header() {
         let headers = HeaderMap::new();
-        assert_eq!(classify_response(&headers, 200), "unknown");
-        assert_eq!(classify_response(&headers, 503), "http_503");
+        assert_eq!(status_from_headers(&headers, 200), None);
+        assert_eq!(
+            status_from_headers(&headers, 503).as_deref(),
+            Some("http_503")
+        );
+        assert_eq!(fallback_status(200), "unknown");
+        assert_eq!(fallback_status(503), "http_503");
     }
 
     /// Echo service that returns a `grpc-status: 0` header — the canonical
@@ -271,6 +463,115 @@ mod tests {
         }
     }
 
+    /// Streaming-shaped service: HTTP 200, no leading `grpc-status`, terminal
+    /// status delivered in a trailer frame exactly as tonic does for streaming
+    /// RPCs.
+    #[derive(Clone)]
+    struct TrailersService {
+        grpc_status: Option<&'static str>,
+    }
+
+    struct TrailersBody {
+        trailers: HeaderMap,
+        state: u8,
+    }
+
+    impl HttpBody for TrailersBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            match this.state {
+                0 => {
+                    this.state = 1;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"frame")))))
+                }
+                1 => {
+                    this.state = 2;
+                    Poll::Ready(Some(Ok(Frame::trailers(this.trailers.clone()))))
+                }
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    impl Service<Request<Empty<Bytes>>> for TrailersService {
+        type Response = Response<TrailersBody>;
+        type Error = Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Empty<Bytes>>) -> Self::Future {
+            let grpc_status = self.grpc_status;
+            Box::pin(async move {
+                let mut trailers = HeaderMap::new();
+                if let Some(status) = grpc_status {
+                    trailers.insert("grpc-status", HeaderValue::from_static(status));
+                }
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(TrailersBody { trailers, state: 0 })
+                    .unwrap();
+                Ok(resp)
+            })
+        }
+    }
+
+    /// Service whose future fails before producing a response, exercising the
+    /// `Err` arm of `GrpcMetricsFuture`.
+    #[derive(Clone)]
+    struct FailingService;
+
+    impl Service<Request<Empty<Bytes>>> for FailingService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = &'static str;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Empty<Bytes>>) -> Self::Future {
+            std::future::ready(Err("transport failure"))
+        }
+    }
+
+    fn has_series(service: &str, method: &str, grpc_status: &str) -> bool {
+        series_value(service, method, grpc_status).is_some()
+    }
+
+    fn series_value(service: &str, method: &str, grpc_status: &str) -> Option<f64> {
+        let text = crate::prometheus_handle()
+            .expect("prometheus recorder installed")
+            .render();
+        text.lines().find_map(|line| {
+            let matches = line.starts_with("chv_grpc_server_requests_total{")
+                && line.contains(&format!("service=\"{service}\""))
+                && line.contains(&format!("method=\"{method}\""))
+                && line.contains(&format!("grpc_status=\"{grpc_status}\""));
+            matches.then(|| {
+                line.rsplit_once(' ')
+                    .and_then(|(_, value)| value.parse::<f64>().ok())
+                    .expect("counter sample ends with a numeric value")
+            })
+        })
+    }
+
     #[tokio::test]
     async fn layer_passes_response_through_unchanged() {
         let mut svc = GrpcMetricsLayer::new().layer(OkService);
@@ -294,16 +595,145 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classify_response_returns_unknown_for_streaming_success() {
-        // Streaming RPCs return grpc-status in trailers, not headers.
-        // HTTP 200 with no grpc-status header (the streaming shape) classifies as "unknown".
-        // This is expected — see module doc for operator guidance.
-        let headers = HeaderMap::new();
+    #[tokio::test]
+    async fn completed_stream_records_trailer_status_not_unknown() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(TrailersService {
+            grpc_status: Some("0"),
+        });
+        let req = Request::builder()
+            .uri("/test.StreamingSuccessService/Watch")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        // Drive the stream to completion so the trailer frame is observed.
+        let collected = resp.into_body().collect().await.unwrap();
+        assert!(
+            collected.trailers().is_some(),
+            "test body must deliver a trailer frame"
+        );
+
+        assert!(
+            has_series("test.StreamingSuccessService", "Watch", "0"),
+            "completed streaming RPC must be recorded with grpc_status=0, not unknown"
+        );
+        assert!(
+            !has_series("test.StreamingSuccessService", "Watch", "unknown"),
+            "streaming RPC must not be permanently bucketed as unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_stream_records_trailer_status_not_unknown() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(TrailersService {
+            grpc_status: Some("5"),
+        });
+        let req = Request::builder()
+            .uri("/test.StreamingErrorService/Watch")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        let _ = resp.into_body().collect().await.unwrap();
+
+        assert!(
+            has_series("test.StreamingErrorService", "Watch", "5"),
+            "errored streaming RPC must be recorded with its terminal status"
+        );
+        assert!(
+            !has_series("test.StreamingErrorService", "Watch", "unknown"),
+            "errored streaming RPC must not be bucketed as unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_without_status_falls_back_to_unknown() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(TrailersService { grpc_status: None });
+        let req = Request::builder()
+            .uri("/test.StreamingNoStatusService/Watch")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        let _ = resp.into_body().collect().await.unwrap();
+
+        // Truly absent status is a protocol violation; it must still be
+        // recorded, as the documented fallback.
+        assert!(has_series(
+            "test.StreamingNoStatusService",
+            "Watch",
+            "unknown"
+        ));
+    }
+
+    /// #657 review L3: the future's `Err` arm (transport failure before any
+    /// response) must still record exactly one terminal sample.
+    #[tokio::test]
+    async fn transport_error_records_unknown_exactly_once() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(FailingService);
+        let req = Request::builder()
+            .uri("/test.TransportErrorService/Call")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let err = match svc.call(req).await {
+            Ok(_) => panic!("inner service must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err, "transport failure");
         assert_eq!(
-            classify_response(&headers, 200),
-            "unknown",
-            "HTTP 200 with no grpc-status header must classify as 'unknown'"
+            series_value("test.TransportErrorService", "Call", "unknown"),
+            Some(1.0),
+            "a transport error must record exactly one unknown sample"
+        );
+    }
+
+    /// #657 review M1/L3: dropping the body without polling it (client
+    /// disconnect / `RST_STREAM`) must still record a terminal sample, and
+    /// exactly one — the drop guard cannot double-record.
+    #[tokio::test]
+    async fn dropped_body_records_client_cancelled_exactly_once() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(TrailersService {
+            grpc_status: Some("0"),
+        });
+        let req = Request::builder()
+            .uri("/test.DroppedBodyService/Watch")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        // Simulate the client going away before the stream delivers trailers.
+        drop(resp);
+
+        assert_eq!(
+            series_value("test.DroppedBodyService", "Watch", CLIENT_CANCELLED_STATUS),
+            Some(1.0),
+            "a dropped body must record exactly one client_cancelled sample"
+        );
+        assert_eq!(
+            series_value("test.DroppedBodyService", "Watch", "0"),
+            None,
+            "the trailer status must not also be recorded after a drop"
         );
     }
 }

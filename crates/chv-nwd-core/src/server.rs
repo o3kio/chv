@@ -101,6 +101,7 @@ impl<E: NetworkExecutor> NetworkServer<E> {
         });
 
         let result = Server::builder()
+            .layer(chv_observability::GrpcMetricsLayer::new())
             .add_service(health_service)
             .add_service(NetworkServiceServer::new(self.inner))
             .serve_with_incoming(uds_stream)

@@ -5,6 +5,16 @@ license = "Apache-2.0"
 edition = "2021"
 publish = false
 
+[features]
+# Opt-in scraper listener (`metrics_server` module). Enabled by the daemons
+# that expose `/metrics`; keeping it off by default means libraries that only
+# need the metrics macros do not pull in an HTTP server stack.
+#
+# Note: `metrics_server` (and its tests) only build with this feature. Run
+# `cargo test -p chv-observability --features http-metrics` to exercise them;
+# a plain `cargo test -p chv-observability` compiles the module out.
+http-metrics = ["dep:axum", "dep:tokio"]
+
 [dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -13,10 +23,14 @@ metrics-exporter-prometheus = { workspace = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 http = "1"
+http-body = "1"
 pin-project-lite = "0.2"
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
+tower = { workspace = true }
