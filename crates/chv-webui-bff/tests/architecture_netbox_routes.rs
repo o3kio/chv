@@ -1097,6 +1097,58 @@ async fn dry_run_corrupted_ciphertext_is_400_netbox_token_missing() {
     assert!(!raw.contains("deadbeef"), "ciphertext echoed: {raw}");
 }
 
+/// #655: when no credential-encryption key is configured, a config upsert
+/// that *does* carry a token must fail closed and must not be reported as
+/// `NETBOX_TOKEN_MISSING` — the caller supplied a token; the server cannot
+/// encrypt it. The row must not be written, and the response must not echo
+/// the plaintext token.
+#[tokio::test]
+async fn config_upsert_without_encryption_key_fails_closed_and_is_not_mislabeled() {
+    let mut state = build_state().await;
+    let arch = seed_topology(&state, "nokey-encrypt", "u-alice", None).await;
+    state.netbox_config = Arc::new(NetboxProjectionConfigRepository::with_crypto(
+        state.pool.clone(),
+        chv_controlplane_store::CredentialEncryption::without_key(),
+    ));
+
+    let operator = token_for(&state, "u-alice", "operator");
+    let (status, raw) = post_raw(
+        &state,
+        "/v1/architectures/netbox/config/upsert",
+        &operator,
+        &upsert_body(&arch),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a missing encryption key is a server misconfiguration: {raw}"
+    );
+    assert!(
+        raw.contains("\"INTERNAL_ERROR\""),
+        "expected the generic internal-error code: {raw}"
+    );
+    assert!(
+        !raw.contains("NETBOX_TOKEN_MISSING"),
+        "a supplied token must not be reported as missing: {raw}"
+    );
+    assert!(
+        !raw.contains("netbox-token-do-not-leak"),
+        "the request token must never be echoed: {raw}"
+    );
+
+    assert!(
+        state
+            .netbox_config
+            .get(&ArchitectureId::new(arch.clone()).expect("valid architecture id"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed encryption must not persist a config row"
+    );
+}
+
 /// A NetBox that rejects the configured token (401 on the first list
 /// endpoint) answers 502 with the literal `NETBOX_AUTH_FAILED` code.
 /// The mock is reached through the crate's dev-only `test-http` client

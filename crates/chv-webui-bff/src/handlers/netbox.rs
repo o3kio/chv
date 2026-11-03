@@ -503,8 +503,15 @@ pub async fn netbox_config_upsert(
     };
 
     // Captured before the upsert consumes the request: the audit event
-    // records only the boolean, never the token.
+    // records only the boolean, never the token. `token_usable` mirrors the
+    // store's own normalization (empty/whitespace == absent) so the error
+    // mapping below can tell "the caller supplied no token" apart from
+    // "the store could not encrypt the supplied token" (#655).
     let token_supplied = req.token.is_some();
+    let token_usable = req
+        .token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
     let config = state
         .netbox_config
         .upsert(NetboxProjectionConfigUpsertInput {
@@ -525,9 +532,22 @@ pub async fn netbox_config_upsert(
             // has no usable token" code covers it; the store's reason
             // is static and safe, but the dedicated variant renders
             // the BFF's own clean message instead.
-            StoreError::InvalidConfiguration { .. } => BffError::NetboxTokenMissing {
-                architecture_id: id.to_string(),
-            },
+            //
+            // #655: `InvalidConfiguration` is also the fail-closed
+            // credential-encryption error. When the caller DID supply a
+            // usable token, reporting `NETBOX_TOKEN_MISSING` would hide
+            // the real cause (e.g. `CHV_ENCRYPTION_KEY` unset) and blame
+            // the caller; surface it as a server-side internal error and
+            // let the logged reason name the encryption failure.
+            StoreError::InvalidConfiguration { .. } if !token_usable => {
+                BffError::NetboxTokenMissing {
+                    architecture_id: id.to_string(),
+                }
+            }
+            StoreError::InvalidConfiguration { reason } => BffError::Internal(format!(
+                "failed to persist netbox config for architecture {}: {}",
+                id, reason
+            )),
             other => other.into(),
         })?;
 
