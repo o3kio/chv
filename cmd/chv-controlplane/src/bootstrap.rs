@@ -84,6 +84,7 @@ pub fn validate_tls(
 /// need a rotating admin JWT.
 async fn start_metrics_endpoint(
     config: &ControlPlaneConfig,
+    process_started: std::time::Instant,
 ) -> Result<(), ControlPlaneServiceError> {
     let bind = chv_observability::metrics_server::resolve_metrics_bind(
         config.metrics_bind.as_deref(),
@@ -101,7 +102,8 @@ async fn start_metrics_endpoint(
         env!("CHV_VERSION"),
         env!("CHV_GIT_SHA"),
         env!("CHV_RELEASE_CHANNEL"),
-    );
+    )
+    .with_started_at(process_started);
     chv_observability::metrics_server::start_metrics_server(&bind, info)
         .await
         .map_err(|e| {
@@ -288,6 +290,7 @@ pub async fn check_compat_matrix(
 
 pub async fn build_service(
     config: &ControlPlaneConfig,
+    process_started: std::time::Instant,
 ) -> Result<ControlPlaneService, ControlPlaneServiceError> {
     tokio::fs::create_dir_all(&config.runtime_dir).await?;
 
@@ -300,13 +303,6 @@ pub async fn build_service(
     // interceptor constructor repeats this check as defense-in-depth.
     validate_security_mode(allow_insecure)?;
     validate_tls(&config.tls, allow_insecure)?;
-
-    // Dedicated Prometheus listener (#657). Bind before the database is opened
-    // so an invalid `metrics_bind` or an occupied port aborts startup instead
-    // of running a control plane with no scrape surface. This listener is
-    // separate from the admin-gated `/metrics` route on `http_bind`; it is
-    // loopback by default and needs no JWT.
-    start_metrics_endpoint(config).await?;
 
     // Single-instance guard (#653): take the exclusive lock before the SQLite
     // database is opened or migrated. Two control planes sharing one database
@@ -327,6 +323,15 @@ pub async fn build_service(
             instance_lock::ALREADY_RUNNING_MESSAGE.to_string(),
         ));
     }
+
+    // Dedicated Prometheus listener (#657). Bind after the single-instance
+    // guard so a second control plane reports the instance-lock error instead
+    // of a misleading metrics-port conflict, and before the database is opened
+    // so an invalid `metrics_bind` or an occupied port still aborts startup
+    // instead of running without a scrape surface. This listener is separate
+    // from the admin-gated `/metrics` route on `http_bind`; it is loopback by
+    // default and needs no JWT.
+    start_metrics_endpoint(config, process_started).await?;
 
     let store_config = ControlPlaneStoreConfig {
         database_url: config.database.url.clone(),
@@ -1142,7 +1147,7 @@ mod tests {
             metrics_bind: Some("not-a-socket-address".to_string()),
             ..Default::default()
         };
-        let err = err_msg(start_metrics_endpoint(&config).await);
+        let err = err_msg(start_metrics_endpoint(&config, std::time::Instant::now()).await);
         assert!(
             err.contains("failed to bind metrics listener"),
             "startup error must name the metrics bind failure, got: {err}"

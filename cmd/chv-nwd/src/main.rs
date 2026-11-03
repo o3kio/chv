@@ -16,6 +16,10 @@ const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9102";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Capture the true process start before any work so the metrics listener
+    // reports a truthful uptime / `process_start_time_seconds` (issue #657).
+    let process_started = std::time::Instant::now();
+
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!(
             "{} {} (commit {}, build {}, channel {})",
@@ -44,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind the Prometheus listener before touching the network executor: a
     // bad `metrics_bind` or an occupied port aborts startup loudly instead of
     // running a daemon with no observability surface (#657).
-    start_metrics_endpoint(&config).await?;
+    start_metrics_endpoint(&config, process_started).await?;
 
     let mut executor = chv_nwd_core::executor::LinuxExecutor::new(config.runtime_dir.clone());
     if config.fabric.enabled {
@@ -85,19 +89,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the process identity exposed by the `/metrics` endpoint.
-fn daemon_metrics_info() -> DaemonMetricsInfo {
+fn daemon_metrics_info(process_started: std::time::Instant) -> DaemonMetricsInfo {
     DaemonMetricsInfo::new(
         env!("CARGO_PKG_NAME"),
         env!("CHV_VERSION"),
         env!("CHV_GIT_SHA"),
         env!("CHV_RELEASE_CHANNEL"),
     )
+    .with_started_at(process_started)
 }
 
 /// Resolve and bind the `/metrics` listener. The bind happens before this
 /// returns, so an invalid `metrics_bind` or an occupied port is a startup
 /// error (fail-closed).
-async fn start_metrics_endpoint(config: &chv_config::NwdConfig) -> Result<(), String> {
+async fn start_metrics_endpoint(
+    config: &chv_config::NwdConfig,
+    process_started: std::time::Instant,
+) -> Result<(), String> {
     let bind = resolve_metrics_bind(config.metrics_bind.as_deref(), DEFAULT_METRICS_BIND);
     if config.metrics_bind.is_none() {
         tracing::warn!(
@@ -106,7 +114,7 @@ async fn start_metrics_endpoint(config: &chv_config::NwdConfig) -> Result<(), St
              explicitly to serve a different address"
         );
     }
-    start_metrics_server(&bind, daemon_metrics_info())
+    start_metrics_server(&bind, daemon_metrics_info(process_started))
         .await
         .map_err(|e| {
             format!(
@@ -142,7 +150,7 @@ mod tests {
             metrics_bind: Some("not-a-socket-address".to_string()),
             ..Default::default()
         };
-        let err = start_metrics_endpoint(&config)
+        let err = start_metrics_endpoint(&config, std::time::Instant::now())
             .await
             .expect_err("an invalid metrics_bind must abort startup");
         assert!(

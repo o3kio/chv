@@ -25,6 +25,7 @@ use axum::{
     routing::get,
     Router,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -93,8 +94,22 @@ pub async fn bind_metrics_listener(bind: &str) -> std::io::Result<tokio::net::Tc
 /// The bind happens before this function returns, so a bad address or an
 /// occupied port is a startup error. Once bound, the serving task runs for the
 /// lifetime of the process and logs a terminal error if it ever stops.
+///
+/// A wildcard bind (`0.0.0.0`/`[::]`) is allowed for compatibility with the
+/// agent's historical behavior, but it is loud: the listener has no
+/// authentication of its own, so exposing it on every interface requires a
+/// firewall/network policy or an authenticated reverse proxy in front.
 pub async fn start_metrics_server(bind: &str, info: DaemonMetricsInfo) -> std::io::Result<()> {
     let listener = bind_metrics_listener(bind).await?;
+    if metrics_bind_is_unspecified(bind) {
+        tracing::warn!(
+            bind = %bind,
+            "metrics_bind is an unspecified/wildcard address: the unauthenticated /metrics \
+             listener is exposed on ALL interfaces. Restrict it with a firewall or network \
+             policy, or front it with an authenticated reverse proxy; prefer a specific \
+             management address or loopback (issue #657)"
+        );
+    }
     tracing::info!(
         bind = %bind,
         daemon = info.daemon,
@@ -106,6 +121,14 @@ pub async fn start_metrics_server(bind: &str, info: DaemonMetricsInfo) -> std::i
         }
     });
     Ok(())
+}
+
+/// True when `bind` parses to a wildcard address (`0.0.0.0` or `[::]`).
+/// Unparseable values return `false`; they fail at bind time instead.
+fn metrics_bind_is_unspecified(bind: &str) -> bool {
+    bind.parse::<SocketAddr>()
+        .map(|addr| addr.ip().is_unspecified())
+        .unwrap_or(false)
 }
 
 /// Build the `/metrics` router. Kept public so tests (and launchers that own
@@ -140,11 +163,11 @@ fn render_metrics(info: &DaemonMetricsInfo, registry: String) -> String {
     let commit = escape_label_value(info.commit);
     let channel = escape_label_value(info.channel);
     let uptime = info.started.elapsed().as_secs_f64();
-    let started_unix = SystemTime::now()
+    let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-        - uptime;
+        .unwrap_or(0.0);
+    let started_unix = process_start_unix(now_unix, uptime);
 
     let mut body = String::with_capacity(registry.len() + 512);
     body.push_str(
@@ -173,6 +196,13 @@ fn render_metrics(info: &DaemonMetricsInfo, registry: String) -> String {
         body.push('\n');
     }
     body
+}
+
+/// Compute the process start timestamp, clamped at the Unix epoch so a
+/// backwards wall-clock jump (NTP correction, VM snapshot restore) cannot
+/// expose a negative `process_start_time_seconds`.
+fn process_start_unix(now_unix: f64, uptime_secs: f64) -> f64 {
+    (now_unix - uptime_secs).max(0.0)
 }
 
 /// Escape a Prometheus label value (backslash, double quote, newline).
@@ -315,5 +345,23 @@ mod tests {
     #[test]
     fn label_values_are_escaped() {
         assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn detects_wildcard_bind_addresses() {
+        assert!(metrics_bind_is_unspecified("0.0.0.0:9101"));
+        assert!(metrics_bind_is_unspecified("[::]:9101"));
+        assert!(!metrics_bind_is_unspecified("127.0.0.1:9101"));
+        assert!(!metrics_bind_is_unspecified("192.0.2.10:9101"));
+        // Unparseable values fail at bind time; they are not "wildcard".
+        assert!(!metrics_bind_is_unspecified("not-a-socket-address"));
+        assert!(!metrics_bind_is_unspecified(""));
+    }
+
+    #[test]
+    fn process_start_time_clamps_backwards_clock_jumps() {
+        assert_eq!(process_start_unix(1_700_000_000.0, 12.5), 1_699_999_987.5);
+        // A backwards wall-clock jump must not produce a negative start time.
+        assert_eq!(process_start_unix(5.0, 10.0), 0.0);
     }
 }

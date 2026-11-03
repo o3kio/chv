@@ -16,11 +16,18 @@ what to alert on, and how to investigate incidents.
 | `chv-nwd` | `/metrics` on a dedicated metrics listener | `metrics_bind`; code default `127.0.0.1:9102` |
 | `chv-webui-bff` | served on the `chv-controlplane` HTTP listener | via the control plane's HTTP routes, not a separate scrape target |
 
-All four daemons expose Prometheus text exposition on their own listener. The
-endpoint renders the real process registry (every `metrics` counter and
-histogram the daemon records) plus build/process series
-(`chv_build_info`, `process_start_time_seconds`,
-`chv_process_uptime_seconds`). It is not a placeholder or a static page.
+`chv-controlplane`, `chv-stord`, and `chv-nwd` render the real process
+registry on their dedicated listener: every `metrics` counter and histogram the
+daemon records, plus build/process series (`chv_build_info`,
+`process_start_time_seconds`, `chv_process_uptime_seconds`). It is not a
+placeholder or a static page.
+
+`chv-agent` has a **separate, older endpoint**: it hand-rolls its exposition
+(`chv_agent_*`, journal/monitoring counters) rather than rendering the shared
+process registry, and it does not emit the `chv_build_info` /
+`process_start_time_seconds` / `chv_process_uptime_seconds` preamble. Its
+metric vocabulary and labels are unchanged by #657; unifying the agent with the
+shared renderer is deferred to a follow-up.
 
 ### Scrape authentication model
 
@@ -38,7 +45,11 @@ histogram the daemon records) plus build/process series
   access at the firewall/network-policy layer. Alternatively keep the loopback
   bind and put an operator-managed reverse proxy in front with TLS, mTLS, or
   basic auth. The metrics listener has no authentication of its own; the bind
-  address and the surrounding network are the security boundary.
+  address and the surrounding network are the security boundary. A wildcard
+  bind is still accepted for compatibility, but each daemon logs a loud
+  warning that the unauthenticated listener is exposed on **all** interfaces;
+  treat that warning as a misconfiguration unless a firewall/reverse proxy is
+  deliberately in front of it.
 - **Fail closed on misconfiguration.** `chv-stord`, `chv-nwd`, and
   `chv-controlplane` bind their metrics listener before serving and abort
   startup on an invalid `metrics_bind` or an occupied port. `chv-agent` keeps
@@ -188,6 +199,9 @@ check the recording rules (`chv:*:5m`) to see whether you are on track to exhaus
 > trailer frame, so a completed or errored stream is recorded with its terminal
 > status. `"unknown"` now means only that no status was carried in either
 > headers or trailers (a protocol violation), plus transport-level body errors.
+> `"client_cancelled"` is a distinct terminal value recorded when the client
+> drops the response body before it completes (`RST_STREAM`, disconnect, or a
+> canceled request) — the handler ran, but no terminal status was observed.
 
 ### Control-plane convergence
 

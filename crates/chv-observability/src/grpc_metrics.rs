@@ -25,6 +25,15 @@
 //! (`unknown` for HTTP 200, `http_<code>` otherwise); a transport body error is
 //! recorded as `unknown`.
 //!
+//! If the consumer drops the response body before it ends — a client
+//! disconnect, `RST_STREAM`, or a canceled request — [`Drop`] records a
+//! terminal [`CLIENT_CANCELLED_STATUS`] (`"client_cancelled"`) sample. It is
+//! deliberately distinct from `"unknown"`: the handler ran, but the client went
+//! away before the terminal status arrived, so this is a client-side event, not
+//! a protocol violation. The pending sample is taken on every path (headers,
+//! trailer, end-of-stream, error, drop), so each request is recorded exactly
+//! once.
+//!
 //! ### Service / method extraction
 //!
 //! tonic routes requests under `/<package>.<service>/<method>`. The path is
@@ -43,6 +52,12 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{CHV_GRPC_SERVER_DURATION_SECONDS, CHV_GRPC_SERVER_REQUESTS_TOTAL};
+
+/// Terminal status used when the client cancels or drops the response before
+/// its trailers arrive. Kept distinct from `"unknown"` so dashboards can tell a
+/// client-side cancellation apart from a protocol violation / transport error
+/// (issue #657 review M1).
+pub const CLIENT_CANCELLED_STATUS: &str = "client_cancelled";
 
 /// Tower layer that wraps a tonic service stack with RED-style gRPC metrics.
 ///
@@ -163,7 +178,7 @@ where
 
                 let body = MetricsBody {
                     inner: body,
-                    pending,
+                    pending: PendingMetricsGuard::new(pending),
                 };
                 Poll::Ready(Ok(Response::from_parts(parts, body)))
             }
@@ -188,6 +203,40 @@ struct PendingMetrics {
     fallback_status: String,
 }
 
+/// Owns a not-yet-recorded sample. If the guard is dropped before the body
+/// records a terminal status (client disconnect / `RST_STREAM` / canceled
+/// request), it records [`CLIENT_CANCELLED_STATUS`] instead of silently losing
+/// the request. Every recording path calls [`Self::take`], so the guard is a
+/// no-op after the sample has been consumed — double recording is impossible.
+struct PendingMetricsGuard(Option<PendingMetrics>);
+
+impl PendingMetricsGuard {
+    fn new(pending: Option<PendingMetrics>) -> Self {
+        Self(pending)
+    }
+
+    fn take(&mut self) -> Option<PendingMetrics> {
+        self.0.take()
+    }
+
+    fn is_pending(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for PendingMetricsGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.0.take() {
+            record(
+                &pending.service,
+                &pending.method,
+                CLIENT_CANCELLED_STATUS,
+                pending.started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+}
+
 pin_project! {
     /// Response body adapter that records the terminal gRPC status from the
     /// trailer frame. Every frame is forwarded unchanged; the body is not
@@ -195,7 +244,9 @@ pin_project! {
     pub struct MetricsBody<B> {
         #[pin]
         inner: B,
-        pending: Option<PendingMetrics>,
+        // Drop guard: records `client_cancelled` if the body is dropped before
+        // any terminal status is observed.
+        pending: PendingMetricsGuard,
     }
 }
 
@@ -257,7 +308,7 @@ where
     fn is_end_stream(&self) -> bool {
         // While a recording is pending, force one final poll so a body that
         // ends without a trailer frame still records its fallback status.
-        self.inner.is_end_stream() && self.pending.is_none()
+        self.inner.is_end_stream() && !self.pending.is_pending()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -476,15 +527,46 @@ mod tests {
         }
     }
 
+    /// Service whose future fails before producing a response, exercising the
+    /// `Err` arm of `GrpcMetricsFuture`.
+    #[derive(Clone)]
+    struct FailingService;
+
+    impl Service<Request<Empty<Bytes>>> for FailingService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = &'static str;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Empty<Bytes>>) -> Self::Future {
+            std::future::ready(Err("transport failure"))
+        }
+    }
+
     fn has_series(service: &str, method: &str, grpc_status: &str) -> bool {
+        series_value(service, method, grpc_status).is_some()
+    }
+
+    fn series_value(service: &str, method: &str, grpc_status: &str) -> Option<f64> {
         let text = crate::prometheus_handle()
             .expect("prometheus recorder installed")
             .render();
-        text.lines().any(|line| {
-            line.starts_with("chv_grpc_server_requests_total{")
+        text.lines().find_map(|line| {
+            let matches = line.starts_with("chv_grpc_server_requests_total{")
                 && line.contains(&format!("service=\"{service}\""))
                 && line.contains(&format!("method=\"{method}\""))
-                && line.contains(&format!("grpc_status=\"{grpc_status}\""))
+                && line.contains(&format!("grpc_status=\"{grpc_status}\""));
+            matches.then(|| {
+                line.rsplit_once(' ')
+                    .and_then(|(_, value)| value.parse::<f64>().ok())
+                    .expect("counter sample ends with a numeric value")
+            })
         })
     }
 
@@ -592,5 +674,64 @@ mod tests {
             "Watch",
             "unknown"
         ));
+    }
+
+    /// #657 review L3: the future's `Err` arm (transport failure before any
+    /// response) must still record exactly one terminal sample.
+    #[tokio::test]
+    async fn transport_error_records_unknown_exactly_once() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(FailingService);
+        let req = Request::builder()
+            .uri("/test.TransportErrorService/Call")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let err = match svc.call(req).await {
+            Ok(_) => panic!("inner service must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err, "transport failure");
+        assert_eq!(
+            series_value("test.TransportErrorService", "Call", "unknown"),
+            Some(1.0),
+            "a transport error must record exactly one unknown sample"
+        );
+    }
+
+    /// #657 review M1/L3: dropping the body without polling it (client
+    /// disconnect / `RST_STREAM`) must still record a terminal sample, and
+    /// exactly one — the drop guard cannot double-record.
+    #[tokio::test]
+    async fn dropped_body_records_client_cancelled_exactly_once() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        let mut svc = GrpcMetricsLayer::new().layer(TrailersService {
+            grpc_status: Some("0"),
+        });
+        let req = Request::builder()
+            .uri("/test.DroppedBodyService/Watch")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        // Simulate the client going away before the stream delivers trailers.
+        drop(resp);
+
+        assert_eq!(
+            series_value("test.DroppedBodyService", "Watch", CLIENT_CANCELLED_STATUS),
+            Some(1.0),
+            "a dropped body must record exactly one client_cancelled sample"
+        );
+        assert_eq!(
+            series_value("test.DroppedBodyService", "Watch", "0"),
+            None,
+            "the trailer status must not also be recorded after a drop"
+        );
     }
 }

@@ -9,6 +9,10 @@ publish = false
 # Opt-in scraper listener (`metrics_server` module). Enabled by the daemons
 # that expose `/metrics`; keeping it off by default means libraries that only
 # need the metrics macros do not pull in an HTTP server stack.
+#
+# Note: `metrics_server` (and its tests) only build with this feature. Run
+# `cargo test -p chv-observability --features http-metrics` to exercise them;
+# a plain `cargo test -p chv-observability` compiles the module out.
 http-metrics = ["dep:axum", "dep:tokio"]
 
 [dependencies]

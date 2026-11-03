@@ -11,6 +11,10 @@ fn config_path_from_args() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Capture the true process start before any work so the metrics listener
+    // reports a truthful uptime / `process_start_time_seconds` (issue #657).
+    let process_started = std::time::Instant::now();
+
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!(
             "{} {} (commit {}, build {}, channel {})",
@@ -39,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CHV_RELEASE_CHANNEL"),
     );
 
-    let service = bootstrap::build_service(&config).await?;
+    let service = bootstrap::build_service(&config, process_started).await?;
     let shutdown_tx = service.shutdown_tx();
 
     tokio::spawn(async move {
