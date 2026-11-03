@@ -1,0 +1,81 @@
+name: Feature request
+description: Propose a capability, improvement, or documentation change.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to propose a change. Security vulnerabilities belong in
+        the private reporting channel, not in a public issue. See
+        [`SECURITY.md`](https://github.com/o3kio/chv/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem are you trying to solve? Describe the user or operator impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the change you want. Include commands, API shapes, or UI behavior when relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe other approaches and why they are less suitable.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Control plane
+        - Agent or VM lifecycle
+        - Storage
+        - Networking
+        - Web UI or backend-for-frontend (BFF)
+        - Packaging, install, or deployment
+        - Documentation or governance
+        - Other or unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Does this change an architecture, API, or security boundary?
+      description: Architecture, public API, protobuf, authentication, authorization, storage, and network isolation changes require an ADR.
+      options:
+        - "No"
+        - "Yes"
+        - "Unsure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Link prior discussions, designs, or related issues. Remove secrets and personal data.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched the existing issues and did not find a duplicate.
+          required: true
+        - label: This request is not a security vulnerability report.
+          required: true

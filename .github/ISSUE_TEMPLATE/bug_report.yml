@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a reproducible defect in CHV.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for reproducible defects. Do not report security
+        vulnerabilities here. Report them privately through the link in the
+        issue chooser or [`SECURITY.md`](https://github.com/o3kio/chv/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: CHV version
+      description: Paste the output of `chvctl version`.
+      placeholder: "chvctl <version> (commit <sha>, build <date>, channel <channel>)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment shape
+      description: Choose the shape that is closest to the affected install.
+      options:
+        - Single-node development install
+        - Multi-node deployment
+        - Package install (.deb or .rpm)
+        - Containerized deployment
+        - Other or unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: component
+    attributes:
+      label: Affected component or area
+      description: Name the component if you know it, such as chv-controlplane, chv-agent, chv-stord, chv-nwd, the backend-for-frontend (BFF), the UI, packaging, or installation.
+      placeholder: "For example: chv-agent, UI, or packaging"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest sequence that reproduces the problem.
+      placeholder: |
+        1. Install ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, errors, or other evidence
+      description: Paste relevant logs or a link to an artifact. Remove secrets, tokens, customer data, and personal data before submitting.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add anything else that may help, such as a regression range or related issues.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched the existing issues and did not find a duplicate.
+          required: true
+        - label: I can reproduce this problem on a supported version.
+          required: true
+        - label: This report does not contain a security vulnerability and does not contain secrets or personal data.
+          required: true

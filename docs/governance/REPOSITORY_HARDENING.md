@@ -119,20 +119,23 @@ repos:
 |---|---------|--------|-----|
 | 6.1 | CODEOWNERS file exists and is valid | ✅ | `.github/CODEOWNERS` |
 | 6.2 | CODEOWNERS review requirement is enabled | ✅ | `protect-main` ruleset requires code-owner review |
-| 6.3 | CODEOWNERS owners have write access | **(admin)** | Current entries list individual users (`@zoorpha`, `@senolcolak`); the `kubedoio` teams below are the planned migration |
-| 6.4 | Admin-only paths (`.github/`, `SECURITY.md`) require review by a code owner | ✅ | `.github/CODEOWNERS` (individual owners; no team references) |
+| 6.3 | CODEOWNERS owners have write access | **(admin)** | Current entries list individual users (`@zoorpha`, `@senolcolak`); the `o3kio` teams API returned no teams (checked 2026-11-03), so team handles are not in use. Migration plan: [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md) |
+| 6.4 | Admin-only paths (`.github/`, `SECURITY.md`, governance records) require review by a code owner | ✅ | `.github/CODEOWNERS` (individual owners; no team references) |
 
 ### Team inventory
 
-CODEOWNERS enforcement is active with individual-user owners. Create these teams in the `kubedoio` organization when migrating from individual users:
+CODEOWNERS enforcement is active with individual-user owners. These teams are
+intended for the `o3kio` organization but **do not exist yet**; do not put these
+handles in CODEOWNERS until [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md)
+confirms they are visible and have write access.
 
 | Team | Purpose | Approximate size |
 |------|---------|-----------------|
-| `chv-admins` | Repository governance, CI, security policy | 2–3 |
-| `chv-maintainers` | Rust backend, control plane, protobuf | 3–5 |
-| `chv-frontend` | SvelteKit UI, backend-for-frontend (BFF) integration | 2–3 |
-| `chv-ops` | Deployment, packaging, install scripts | 2–3 |
-| `chv-architecture` | ADRs, specs, design docs | 2–3 |
+| `@o3kio/chv-admins` | Repository governance, CI, security policy | 2–3 |
+| `@o3kio/chv-maintainers` | Rust backend, control plane, protobuf | 3–5 |
+| `@o3kio/chv-frontend` | SvelteKit UI, backend-for-frontend (BFF) integration | 2–3 |
+| `@o3kio/chv-ops` | Deployment, packaging, install scripts | 2–3 |
+| `@o3kio/chv-architecture` | ADRs, specs, design docs | 2–3 |
 
 ---
 
@@ -148,7 +151,9 @@ CODEOWNERS enforcement is active with individual-user owners. Create these teams
 
 ## Quick Start for Admins
 
-1. Create the GitHub teams listed above.
+1. Create the GitHub teams listed above (see
+   [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md) for the required visibility
+   and access checks).
 2. Branch protection is already enforced (`protect-main`, active since 2026-10-03). Re-apply the ruleset definition with `./scripts/github-setup/apply-branch-protection.sh`.
 3. Apply tag protection: run `./scripts/github-setup/apply-tag-protection.sh`.
 4. Enable secret scanning and push protection in repository settings.

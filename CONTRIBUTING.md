@@ -2,6 +2,18 @@
 
 Thank you for contributing to CHV. This document covers development setup, code style, and the contribution workflow.
 
+## Governance and recognition
+
+- [`GOVERNANCE.md`](GOVERNANCE.md) — roles, decision-making, release authority,
+  and the [contributor ladder](GOVERNANCE.md#contributor-ladder).
+- [`MAINTAINERS.md`](MAINTAINERS.md) — current maintainers, review
+  expectations, emeritus status, and access offboarding.
+- [`docs/governance/SECURITY_TRIAGE_ROTA.md`](docs/governance/SECURITY_TRIAGE_ROTA.md)
+  — the weekly primary and backup maintainers for private security reports. The
+  reporting process and timelines are in [`SECURITY.md`](SECURITY.md).
+- [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) — the
+  checklist applied to every pull request.
+
 ## Development Environment
 
 ### Required Tools
@@ -138,7 +150,8 @@ Add quota enforcement to VM create path
 2. Ensure CI passes: `cargo clippy`, `cargo test`, UI build
 3. Update `CHANGELOG.md` under `[Unreleased]` if the change is user-facing
 4. Update relevant specs or ADRs if the change affects architectural boundaries
-5. Open a PR with a clear description of the problem, solution, and testing performed
+5. Open a PR with a clear description of the problem, solution, and testing performed. The [pull request template](.github/PULL_REQUEST_TEMPLATE.md) prompts for the test evidence, risk and rollback, documentation, security impact, and signed-commit checks
+6. Link the related issue with `Part of #<issue>` or `Closes #<issue>`
 
 ### High-risk changes
 
