@@ -101,9 +101,11 @@ jobs:
       - name: Install cargo-nextest
         # Nextest runs each test in its own process, isolates hangs, and
         # reports a per-test summary; it does not run doctests (see below).
+        # Pin the tool version: the action otherwise installs the latest
+        # release, which makes CI nondeterministic.
         uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.151
 
       - name: cargo nextest
         # `cargo test` stopped at the first failing test binary. Keep
@@ -307,9 +309,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install cargo-llvm-cov
+        # Pinned for the same reproducibility reason as cargo-nextest above.
         uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Install llvm-tools-preview
         # cargo-llvm-cov needs the llvm-profdata/llvm-cov binaries shipped
