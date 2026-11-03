@@ -92,6 +92,12 @@ jobs:
         # `metric-label-drift-alert-vs-emitter` retro and PR #108 CR2).
         run: ./scripts/check-metric-labels.sh
 
+      - name: Installer release-signature negative path
+        # Offline test of scripts/install.sh's GPG verification policy (#646):
+        # a tampered or missing signature must abort. Kept in CI so the
+        # installer's trust checks cannot silently rot.
+        run: ./tests/scripts/install-signature-negative.sh
+
       - name: cargo test
         run: cargo test --workspace
 
