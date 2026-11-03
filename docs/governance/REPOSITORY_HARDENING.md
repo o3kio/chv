@@ -111,6 +111,50 @@ repos:
 | 5.5 | `cargo deny` is configured (`deny.toml`) | ✅ | At repo root |
 | 5.6 | Action versions are pinned to commit SHAs | ✅ | Third-party `uses:` lines pin immutable commit SHAs with the moving tag in a trailing comment (pin policy in `.github/dependabot.yml`) |
 
+### Advisory triage cadence
+
+`security.yml` runs `cargo-audit` and `cargo-deny` on every pull request, on
+every push to `main`, and on a **daily 06:00 UTC schedule**. `cargo-audit`
+reads the lockfile (`.cargo/audit.toml`); `cargo-deny` runs the
+`advisories`, `bans`, `licenses`, and `sources` checks independently
+(`deny.toml`) with `--warn unmaintained`. Both must pass. The scheduled run is
+what catches a newly disclosed advisory on already-merged code.
+
+| Cadence | Action | Evidence/recording |
+|---|---|---|
+| **Daily (automated)** | Scheduled `security.yml` run against `main` at 06:00 UTC | Actions run history; workflow `schedule.cron` |
+| **Weekly** | Review the scheduled runs; a red scheduled run means a newly disclosed advisory or a gate regression on merged code. File/fix an issue and confirm the next run is green. | Linked issue/PR; the failing Actions run |
+| **Monthly** | Reconcile both ignore sets against the tools: `cargo deny check advisories` and `cargo audit` locally. Remove ignores that no longer match; confirm every remaining entry still documents (a), (b), (c). | `deny.toml` / `.cargo/audit.toml` comments; the reconciling PR |
+| **Per new advisory** | Decide applicability and mitigation within the severity window in [`SECURITY.md`](../../SECURITY.md): Critical 7 days, High 30 days, Medium 60 days, Low best effort. | Issue with the advisory ID, affected crate/version, and decision |
+| **On ignore removal** | Delete the entry and add a dated `Removed YYYY-MM-DD (...)` comment naming the reason and issue/PR. Re-run the gate. Do not leave a stale "just in case" entry. | `deny.toml` / `.cargo/audit.toml`; `unused-ignored-advisory = "deny"` makes staleness fail |
+
+Rules that make this cadence enforceable:
+
+- **Vulnerabilities fail; unmaintained warns.** `deny.toml` denies
+  vulnerabilities and yanked versions, and warns on unmaintained crates by
+  standing policy so a migration does not block unrelated PRs. An unmaintained
+  advisory still needs a monthly decision: migrate, or record why the crate is
+  acceptable and when the exception ends.
+- **Stale ignores are policy debt.** `unused-ignored-advisory = "deny"` turns
+  an ignore that no longer matches the graph into a gate failure. This is why
+  the monthly reconciliation is not optional.
+- **The two ignore sets are intentionally different.** `cargo-audit` walks the
+  raw lockfile with no reachability filtering; `cargo-deny` walks the
+  feature-aware graph. A crate can be unreachable in the build graph (no
+  `deny.toml` entry) yet present in `Cargo.lock` (an `audit.toml` entry is
+  needed). Reconcile each file against its own tool; do not blind-mirror them.
+- **Every ignore documents three things:** (a) why the advisory is
+  non-applicable to CHV's runtime/threat model, (b) an upstream tracking link
+  (or "no upstream fix" with rationale), and (c) the removal condition. The
+  convention is stated at the top of `deny.toml`; reviewers enforce it because
+  the file format cannot.
+- **Record removals, not just additions.** A dated removal comment is the
+  audit trail that the exception was retired deliberately rather than dropped
+  when it stopped matching.
+
+Escalate a suspected exploitable vulnerability through the private channel in
+[`SECURITY.md`](../../SECURITY.md), not a public issue.
+
 ---
 
 ## 6. CODEOWNERS and Review Governance

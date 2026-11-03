@@ -3,6 +3,14 @@
 ## Purpose
 Track supported version combinations for a tested node bundle.
 
+Related contracts:
+
+- [Authority-mode feature matrix](mode-feature-matrix.md) — what `legacy`,
+  `core-managed`, and `core-native` each compose, and the legacy removal
+  target.
+- [BFF HTTP API versioning](bff-http-api-versioning.md) — the `/v1` contract,
+  additive vs breaking changes, and the deprecation policy.
+
 ## Required dimensions
 - control plane version
 - `chv-agent` version

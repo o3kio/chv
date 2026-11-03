@@ -23,7 +23,7 @@ groups:
             The 99th percentile VM start time has exceeded 45s for 10 minutes,
             breaching the 30s SLO with no remaining error-budget headroom.
             Check agent logs for slow CH API responses or resource exhaustion.
-          runbook: "docs/OBSERVABILITY.md#vms-tart-latency"
+          runbook: "docs/runbooks/vm-start-slow.md"
 
       - alert: VmOpFailureRateHigh
         expr: |
@@ -43,7 +43,7 @@ groups:
             More than 5% of VM lifecycle operations (create/start/stop/delete/
             pause/resume) are returning errors cluster-wide. Check per-op
             breakdown with: rate(chv_vm_ops_total{result="err"}[5m]) by (op)
-          runbook: "docs/OBSERVABILITY.md#vm-op-failure-rate"
+          runbook: "docs/runbooks/vm-op-failures.md"
 
   # ---------------------------------------------------------------------------
   # gRPC control-plane SLOs
@@ -178,7 +178,7 @@ groups:
             More than 1% of HTTP requests to chv-webui-bff are returning 5xx
             status codes. The request_id in error response bodies can be used
             to correlate with control-plane logs via x-correlation-id.
-          runbook: "docs/OBSERVABILITY.md#bff-api-error-rate"
+          runbook: "docs/runbooks/bff-errors.md"
 
   # ---------------------------------------------------------------------------
   # Node liveness SLOs

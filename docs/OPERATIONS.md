@@ -368,6 +368,10 @@ For detailed step-by-step procedures covering VM snapshot restore, volume snapsh
 | Volume prepared by stord | `journalctl -u chv-stord -n 50` |
 | Network bridge up | `ip addr show chvbr0` |
 
+For a sustained p99 start-latency alert (`VmStartLatencyHighP99`) use
+[VM Start Latency](runbooks/vm-start-slow.md); for lifecycle errors
+(`VmOpFailureRateHigh`) use [VM Operation Failures](runbooks/vm-op-failures.md).
+
 ### Web UI Blank or API Errors
 | Symptom | Fix |
 |---------|-----|
@@ -375,6 +379,10 @@ For detailed step-by-step procedures covering VM snapshot restore, volume snapsh
 | JSON parse error | Ensure the nginx `proxy_pass` has NO trailing slash after the port |
 | 502 Bad Gateway | Verify control plane is running: `systemctl status chv-controlplane` |
 | Console disconnected | Check the edge's WebSocket `/ws/` proxy config (the binary does not proxy `/ws/`); verify agent PTY process is running |
+
+For a sustained BFF 5xx alert (`BffApiErrorRate`) or a user-visible error
+code, use [BFF API Errors](runbooks/bff-errors.md). The `request_id` in the
+error body matches the `x-correlation-id` response header.
 
 ### chv-stord or chv-nwd Keep Restarting
 | Check | Command |
