@@ -29,6 +29,8 @@ CHV is not presented as a general VMware, Proxmox, or OpenStack replacement.
 
 It is not a fully mature production virtualization platform yet. It is a technical-preview infrastructure product for teams that want to evaluate lightweight virtualization patterns before adopting or extending them.
 
+It does not implement tenant-data backup or restore. That surface is hard-fenced (`501 NOT_IMPLEMENTED`) and tenant-data protection remains the operator's responsibility; see [`docs/DEPLOYMENT-ARCHITECTURE.md`](./docs/DEPLOYMENT-ARCHITECTURE.md) §7.
+
 
 CHV is a Linux-first, cloud-image-first virtualization platform for sovereign private cloud and edge cloud environments. It provides API-driven VM lifecycle management built on [Cloud Hypervisor](https://www.cloudhypervisor.org/).
 

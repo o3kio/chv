@@ -17,8 +17,10 @@ promtool check rules monitoring/rules/chv.yml
 promtool check rules monitoring/rules/recording.yml
 ```
 
-Both rules files must pass `promtool check rules` before merging. CI validates
-them automatically.
+Both rules files must pass `promtool check rules` before merging. CI does
+**not** currently run `promtool`: the automated gate is tracked in the
+observability issue ([#657](https://github.com/o3kio/chv/issues/657)). Until it
+lands, the command above is a local review step, not an enforced check.
 
 ## Loading into Prometheus
 

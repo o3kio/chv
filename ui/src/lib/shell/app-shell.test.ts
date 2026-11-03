@@ -15,7 +15,7 @@ describe('app shell definitions', () => {
 			'/tasks',
 			'/events',
 			'/alerts',
-			'/backup-jobs',
+			'/maintenance',
 			'/settings'
 		]);
 	});
@@ -30,8 +30,7 @@ describe('app shell definitions', () => {
 		expect(getPageDefinition('/storage').title).toBe('Storage Pools');
 		expect(getPageDefinition('/operations').title).toBe('Tasks');
 		expect(getPageDefinition('/templates').title).toBe('Images');
-		expect(getPageDefinition('/backup-jobs').title).toBe('Backups');
-		expect(getPageDefinition('/maintenance').title).toBe('Backups');
+		expect(getPageDefinition('/maintenance').title).toBe('Maintenance');
 		expect(getPageDefinition('/quotas').title).toBe('Settings');
 		expect(getPageDefinition('/observability').title).toBe('Overview');
 	});

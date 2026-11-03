@@ -397,3 +397,57 @@ async fn notifications_test_rejects_operator_and_viewer_with_403() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #654: the backup/restore surface is hard-fenced, not "temporarily empty".
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn backup_surface_answers_501_not_implemented() {
+    let state = build_state().await;
+    let operator = token_for(&state, "operator");
+
+    // Operator write block.
+    let app = chv_webui_bff::bff_router(state.clone()).with_state(state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/backups/jobs")
+        .header("authorization", format!("Bearer {operator}"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "NOT_IMPLEMENTED");
+    assert!(
+        json["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("operator's responsibility")),
+        "fence message must name the operator responsibility: {json}"
+    );
+
+    // Viewer read block — and the legacy POST alias.
+    for (method, path) in [
+        ("GET", "/v1/backups/jobs"),
+        ("GET", "/v1/backups/restores"),
+        ("POST", "/v1/backup-jobs"),
+    ] {
+        let app = chv_webui_bff::bff_router(state.clone()).with_state(state.clone());
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {operator}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "{method} {path} must be fenced"
+        );
+    }
+}

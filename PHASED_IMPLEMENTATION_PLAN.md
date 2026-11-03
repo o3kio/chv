@@ -1,5 +1,12 @@
 # CHV Phased Implementation Plan
 
+> **Status: historical roadmap, not a capability claim.** This document records
+> sprint-era intent. Delivered/partial statements can lag the code; the
+> authoritative supported envelope is
+> [`docs/DEPLOYMENT-ARCHITECTURE.md`](docs/DEPLOYMENT-ARCHITECTURE.md) §7 with
+> the capability table in §9. Stale entries that were verified against the code
+> are corrected inline below.
+
 Based on the comprehensive repository review and existing roadmap, the following is a detailed, phased implementation plan to bring the CHV platform to production readiness.
 
 ## Current Status Summary
@@ -7,7 +14,6 @@ Based on the comprehensive repository review and existing roadmap, the following
 As of Sprint 15 (PRs 49-52), the platform has transitioned from early-MVP toward stability, but several production-readiness areas remain partial. The high-level VM lifecycle, node enrollment, desired-state reconciliation, and base storage/network daemons are usable; live migration, overlay policy enforcement, storage backends, and Backup/DR still have important gaps.
 
 **Delivered in recent sprints:**
-- Rolling upgrade orchestration (`UpgradeOrchestrator` + `SystemdNodeUpgrader`)
 - Compatibility matrix boot gate (version validation before upgrade)
 - mTLS enforcement on storage migration (plaintext rejected)
 - Backpressure handling in migration sender
@@ -16,7 +22,7 @@ As of Sprint 15 (PRs 49-52), the platform has transitioned from early-MVP toward
 - `chv-nwd` kernel VXLAN/FDB lifecycle work (policy eBPF remains enforcement scope only, not a VXLAN datapath)
 - FDB cleanup on VM detach
 - VXLAN teardown on topology delete
-- MigrationReaper (auto-fails stuck migrations after 2h)
+- MigrationReaper (auto-fails stalled migrations after a no-progress timeout; not a total-runtime cap)
 - Circuit breaker on node communication
 - Deep health checks (database, agent socket, agent connectivity)
 - Hypervisor trait decoupling (`chv-hypervisor-api` crate, `HypervisorAdapter` interface, `chv-agent-core` isolated from Cloud Hypervisor runtime)
@@ -76,7 +82,13 @@ As of Sprint 15 (PRs 49-52), the platform has transitioned from early-MVP toward
 *   **Remaining**: Some components still exceed 300 lines (`vms/[id]/+page.svelte` at 467 lines, `CreateVMModal.svelte` at 580 lines). Full Tailwind-first purge of legacy CSS selectors not yet complete.
 
 ### 3.2 Backups & Role-Based Access [PARTIAL]
-*   **Backup/DR (`B2`)**: Implement the backup execution worker, VM/volume snapshot orchestration, off-host artifact shipping, restore validation, retention enforcement, and documented DR automation. SQLite pre-migration backup exists, but it is not a full Backup/DR system.
+*   **Backup/DR (`B2`)**: **Decision (2026-11-03): fenced, not implemented for
+    the pre-production gate.** The backup/restore API and WebUI surface are
+    hard-disabled (`501 NOT_IMPLEMENTED`); tenant-data protection is the
+    operator's responsibility. Implementing the execution worker, off-host
+    artifact shipping, restore validation, retention, and documented DR
+    automation remains post-gate work. SQLite pre-migration backup exists, but
+    it is not a full Backup/DR system.
 *   ~~RBAC Middleware (`B6`)~~: Role-based access on BFF routes implemented.
 
 ### 3.3 CI/CD & Deployments (`I3`, `I4`, `I5`, `I6`) [COMPLETE]
@@ -86,7 +98,9 @@ As of Sprint 15 (PRs 49-52), the platform has transitioned from early-MVP toward
 *   ~~Versioning~~: Release versioning automated via `VERSION` file + Makefile.
 
 ### 3.4 Production Gaps (Sprints 11-15) [PARTIAL]
-*   ~~Rolling upgrade orchestration~~ (UpgradeOrchestrator, SystemdNodeUpgrader)
+*   **Rolling upgrade orchestration**: **not delivered.** `UpgradeOrchestrator`
+    and `SystemdNodeUpgrader` do not exist in the tree; the earlier "delivered"
+    entry was stale.
 *   ~~Compatibility matrix enforcement~~ (boot gate rejects incompatible versions)
 *   ~~mTLS on storage migration~~ (plaintext connections rejected)
 *   ~~Backpressure handling~~ (sender throttles based on receiver feedback)

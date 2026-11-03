@@ -391,10 +391,14 @@ to define and document an air-gap profile is decision **D4**.
   [runbooks/full-site-recovery.md](runbooks/full-site-recovery.md)). The
   control plane keeps pre-migration DB backups under
   `/var/lib/chv/backups/` (last 10).
-- **Backup/restore is excluded from the RC supported matrix** (declaration
-  §3: "a backup without restore validation is not DR"). The BFF backup
-  manager is a broken no-op; snapshot/restore via the CHV API at the agent
-  layer is a separate, existing surface, not a DR claim.
+- **Backup/restore is hard-fenced, not merely unfinished** (declaration
+  §3: "a backup without restore validation is not DR"). CHV ships no
+  tenant-data backup execution engine, so the whole surface — every
+  `/v1/backups/**`, `/v1/backup-jobs`, `/v1/backup-history`, and legacy
+  `/api/v1/backup*` route — answers `501 NOT_IMPLEMENTED`, and the WebUI
+  exposes no backup navigation or actions. Tenant-data backup and restore
+  are the operator's responsibility outside CHV. Snapshot/restore at the
+  agent layer is a separate, existing surface, not a DR claim.
 
 ### UC-10 — Edge / resource-constrained profiles
 
@@ -431,7 +435,7 @@ is not supported.
 | Storage profiles | Local file (VM-integrated) + LVM (stord layer only; not reachable from the VM lifecycle, #379). Ceph RBD / iSCSI not claimed. | Declaration §3; m4.5 |
 | Migration | Quiescent-volume (single-writer) disk migration over mTLS between two stord instances, single host. Multi-host migration unproven. | Declaration §3; m4.6; m4.9 §4.1 |
 | Lifecycle authority | Exactly one durable CellHV Core authority per node; legacy/control-plane paths are compatibility adapters only. | Declaration §3; prompt-02 |
-| Backup/restore | **Excluded from the RC supported matrix.** | Declaration §3 |
+| Backup/restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** | Declaration §3; no execution engine or restore validation exists |
 | Scale | **No concurrency, density, throughput, or requests-per-second claim.** M4.8 numbers are baselines on the qualification host only. | m4.8; m4.9 §3 |
 | Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" and now labels it an **unevidenced recommendation**; it remains pending Prompt-05/06 qualification. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; ADR-011 |
 
@@ -587,7 +591,7 @@ deploy them; do not file evidence against them.
 | `authority_mode = "legacy"` | Compatibility adapter only | Explicit opt-in; the agent logs a warning. Qualified posture is core-managed everywhere. |
 | `packaging/config/chv.yaml` (`/etc/chv/chv.yaml` in `chv-node`) | Reference-only | Ships `authority_mode: core-managed` (aligned with the shipped `.toml` configs via #424). No daemon consumes it for authority selection. |
 | `docs/examples/bootstrap.sh` | Manual helper | Points operators to `scripts/install.sh`; not a supported install path. |
-| BFF backup manager | Broken no-op | Excluded from the RC matrix (declaration §3); "backup is not DR". |
+| BFF backup manager | Hard-fenced (`501 NOT_IMPLEMENTED`) | No execution engine. The API and WebUI surface are disabled rather than left as a broken no-op; tenant-data backup is the operator's responsibility (declaration §3). |
 | `chvctl upgrade` subcommands | Removed | Targeted unimplemented BFF routes (§6); removed via #427. |
 
 ## 11. Source-of-truth map

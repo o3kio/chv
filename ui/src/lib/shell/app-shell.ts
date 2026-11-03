@@ -171,14 +171,13 @@ const pageDefinitions: PageDefinition[] = [
 		]
 	},
 	{
-		href: '/backup-jobs',
-		navLabel: 'Backups',
-		title: 'Backups',
+		href: '/maintenance',
+		navLabel: 'Maintenance',
+		title: 'Maintenance',
 		eyebrow: 'Change coordination',
 		description:
 			'Coordinate maintenance windows, draining, and upgrade visibility without hiding the related tasks and alerts.',
 		icon: Wrench,
-		aliases: ['/maintenance'],
 		badges: [
 			{ label: 'Change-aware', tone: 'warning' },
 			{ label: 'Operational', tone: 'healthy' }

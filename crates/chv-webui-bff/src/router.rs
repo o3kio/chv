@@ -308,39 +308,41 @@ pub fn bff_router(state: AppState) -> Router<AppState> {
             post(crate::handlers::quotas::check_quota),
         )
         .route("/v1/tokens", post(crate::handlers::tokens::list_tokens))
-        // Legacy backup endpoints
+        // Backup/restore is HARD-FENCED (#654). CHV ships no tenant-data
+        // backup execution engine, so every route answers 501 with the stable
+        // `NOT_IMPLEMENTED` code instead of promising an engine that cannot
+        // run. Auth/CSRF middleware still gate the route before the handler.
         .route(
             "/v1/backup-jobs",
-            post(crate::handlers::backups::list_backup_jobs),
+            post(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backup-history",
-            post(crate::handlers::backups::list_backup_history),
+            post(crate::handlers::backups::backup_fence),
         )
-        // New backup endpoints (viewer)
         .route(
             "/v1/backups/jobs",
-            get(crate::handlers::backups::list_backup_jobs_rest),
+            get(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/jobs/:job_id",
-            get(crate::handlers::backups::get_backup_job),
+            get(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/schedules",
-            get(crate::handlers::backups::list_backup_schedules),
+            get(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/schedules/:schedule_id",
-            get(crate::handlers::backups::get_backup_schedule),
+            get(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/restores",
-            get(crate::handlers::backups::list_backup_restores),
+            get(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/restores/:restore_id",
-            get(crate::handlers::backups::get_backup_restore),
+            get(crate::handlers::backups::backup_fence),
         )
         // Architecture Designer (Phase 0) — viewer-accessible reads + stubs.
         .route(
@@ -502,32 +504,32 @@ pub fn bff_router(state: AppState) -> Router<AppState> {
             "/v1/tokens/revoke",
             post(crate::handlers::tokens::revoke_token),
         )
-        // New backup endpoints (operator)
+        // Backup/restore is HARD-FENCED (#654) — see the viewer block above.
         .route(
             "/v1/backups/jobs",
-            post(crate::handlers::backups::create_backup_job),
+            post(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/jobs/:job_id",
-            patch(crate::handlers::backups::update_backup_job)
-                .delete(crate::handlers::backups::delete_backup_job),
+            patch(crate::handlers::backups::backup_fence)
+                .delete(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/jobs/:job_id/execute",
-            post(crate::handlers::backups::execute_backup_job),
+            post(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/schedules",
-            post(crate::handlers::backups::create_backup_schedule),
+            post(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/schedules/:schedule_id",
-            patch(crate::handlers::backups::update_backup_schedule)
-                .delete(crate::handlers::backups::delete_backup_schedule),
+            patch(crate::handlers::backups::backup_fence)
+                .delete(crate::handlers::backups::backup_fence),
         )
         .route(
             "/v1/backups/restores",
-            post(crate::handlers::backups::create_backup_restore),
+            post(crate::handlers::backups::backup_fence),
         )
         // Architecture Designer (Phase 0) — operator CRUD writes + planning
         // stubs. Apply/destroy live in the admin layer below.

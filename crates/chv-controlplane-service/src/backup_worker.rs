@@ -12,6 +12,12 @@ use tracing::{error, info, warn};
 
 const MAX_RETRIES: i64 = 3;
 
+/// Hard-fence (#654): no new backup/restore work may be created while the
+/// posture is fenced. Existing rows are still drained by the executor so no
+/// job is left in a misleading `Pending`/`Running` state; the scheduler stops
+/// queueing new jobs even if a pre-fence schedule row is still enabled.
+const BACKUP_EXECUTION_FENCED: bool = true;
+
 /// Background worker that schedules backup jobs from cron expressions
 /// and executes pending backup jobs against node agents.
 pub struct BackupWorker {
@@ -131,6 +137,18 @@ impl BackupWorker {
 
         if let Some(due_time) = next_due {
             if due_time <= now {
+                // #654 hard-fence: never create new backup work. Checked
+                // before the optimistic claim so a pre-fence schedule is not
+                // even marked as run; it stays inert for a future
+                // implementation to adopt.
+                if BACKUP_EXECUTION_FENCED {
+                    warn!(
+                        schedule_id = %schedule.schedule_id,
+                        "backup/restore is hard-fenced; skipping scheduled job creation"
+                    );
+                    return Ok(());
+                }
+
                 // Optimistic locking: claim the schedule run atomically before creating the job.
                 // This prevents duplicate job creation when multiple backup workers run concurrently.
                 let now_str = now.to_rfc3339();
@@ -198,40 +216,22 @@ impl BackupWorker {
                         .await
                     {
                         Ok(old_jobs) if !old_jobs.is_empty() => {
+                            let mut job_ids: Vec<&str> = Vec::new();
                             for old_job in &old_jobs {
-                                if let (Some(dest), Some(remote_path)) = (
-                                    old_job.destination.as_deref(),
-                                    old_job.target_path.as_deref(),
-                                ) {
-                                    if Self::is_remote_destination(dest) {
-                                        let ak = schedule.s3_access_key.clone();
-                                        let sk = schedule.s3_secret_key.clone();
-                                        match shipper_from_destination(dest, ak, sk) {
-                                            Ok(shipper) => {
-                                                if let Err(del_err) =
-                                                    shipper.delete(remote_path).await
-                                                {
-                                                    warn!(
-                                                        job_id = %old_job.job_id,
-                                                        error = %del_err,
-                                                        "failed to delete remote backup artifact during count retention cleanup"
-                                                    );
-                                                }
-                                            }
-                                            Err(con_err) => {
-                                                warn!(
-                                                    job_id = %old_job.job_id,
-                                                    error = %con_err,
-                                                    "failed to build shipper for remote backup artifact cleanup"
-                                                );
-                                            }
-                                        }
-                                    }
+                                if !Self::artifact_removal_allows_row_delete(
+                                    old_job,
+                                    schedule.s3_access_key.clone(),
+                                    schedule.s3_secret_key.clone(),
+                                )
+                                .await
+                                {
+                                    // Delete failed: keep the row so the
+                                    // artifact is recorded and the next pass
+                                    // retries (#655).
+                                    continue;
                                 }
+                                job_ids.push(old_job.job_id.as_str());
                             }
-
-                            let job_ids: Vec<&str> =
-                                old_jobs.iter().map(|j| j.job_id.as_str()).collect();
                             match self.backup_repo.delete_jobs_by_ids(&job_ids).await {
                                 Ok(deleted) if deleted > 0 => {
                                     info!(
@@ -272,38 +272,19 @@ impl BackupWorker {
                     {
                         Ok(old_jobs) if !old_jobs.is_empty() => {
                             for old_job in &old_jobs {
-                                // Attempt to delete remote artifact if shipping was used.
-                                // Use `destination` (the original destination URL) to build the
-                                // shipper, and `target_path` (the shipped artifact path/key) as
-                                // the argument to delete().
-                                if let (Some(dest), Some(remote_path)) = (
-                                    old_job.destination.as_deref(),
-                                    old_job.target_path.as_deref(),
-                                ) {
-                                    if Self::is_remote_destination(dest) {
-                                        let ak = schedule.s3_access_key.clone();
-                                        let sk = schedule.s3_secret_key.clone();
-                                        match shipper_from_destination(dest, ak, sk) {
-                                            Ok(shipper) => {
-                                                if let Err(del_err) =
-                                                    shipper.delete(remote_path).await
-                                                {
-                                                    warn!(
-                                                        job_id = %old_job.job_id,
-                                                        error = %del_err,
-                                                        "failed to delete remote backup artifact during retention cleanup"
-                                                    );
-                                                }
-                                            }
-                                            Err(con_err) => {
-                                                warn!(
-                                                    job_id = %old_job.job_id,
-                                                    error = %con_err,
-                                                    "failed to build shipper for remote backup artifact cleanup"
-                                                );
-                                            }
-                                        }
-                                    }
+                                // Attempt to delete the remote artifact if
+                                // shipping was used. A failed delete keeps the
+                                // row (and its record of the artifact) so the
+                                // next retention pass retries instead of
+                                // silently orphaning the object (#655).
+                                if !Self::artifact_removal_allows_row_delete(
+                                    old_job,
+                                    schedule.s3_access_key.clone(),
+                                    schedule.s3_secret_key.clone(),
+                                )
+                                .await
+                                {
+                                    continue;
                                 }
 
                                 if let Err(e) =
@@ -453,21 +434,180 @@ impl BackupWorker {
         &self,
         job: &chv_controlplane_store::BackupJobRow,
     ) -> Result<(), ChvError> {
-        // Backup execution engine not yet implemented.
-        // See: docs/production-readiness-report.md P0 #11
+        // Backup/restore is HARD-FENCED (#654): the API surface refuses new
+        // work, and this executor only drains rows created before the fence so
+        // none is left in a misleading Pending/Running state.
         warn!(
             job_id = %job.job_id,
             vm_id = %job.vm_id,
-            "backup execution engine not implemented — job will be marked failed"
+            "backup/restore is hard-fenced (no execution engine) — job will be marked failed"
         );
         Err(ChvError::Internal {
-            reason: "backup execution engine not yet implemented".to_string(),
+            reason: "backup/restore is not implemented in this release (hard-fenced, #654)"
+                .to_string(),
         })
+    }
+
+    /// Attempt to delete a retention candidate's remote artifact.
+    ///
+    /// Returns `true` only when the caller may delete the database row: either
+    /// the destination has no remote artifact, or the shipper confirmed the
+    /// delete (including "already absent"). A failed delete returns `false`,
+    /// increments `backup_retention_artifact_delete_failures_total`, and leaves
+    /// the row in place so the artifact is not silently orphaned; the next
+    /// retention pass retries (#655).
+    async fn artifact_removal_allows_row_delete(
+        job: &chv_controlplane_store::BackupJobRow,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+    ) -> bool {
+        let (Some(dest), Some(remote_path)) =
+            (job.destination.as_deref(), job.target_path.as_deref())
+        else {
+            return true;
+        };
+        if !Self::is_remote_destination(dest) {
+            return true;
+        }
+
+        match shipper_from_destination(dest, access_key, secret_key) {
+            Ok(shipper) => {
+                Self::delete_artifact_with(shipper.as_ref(), &job.job_id, remote_path).await
+            }
+            Err(e) => {
+                metrics::counter!("backup_retention_artifact_delete_failures_total").increment(1);
+                warn!(
+                    job_id = %job.job_id,
+                    error = %e,
+                    "failed to build shipper for remote backup artifact cleanup; keeping DB row for retry"
+                );
+                false
+            }
+        }
+    }
+
+    /// Delete one remote artifact and report whether the row may be removed.
+    ///
+    /// Split from [`Self::artifact_removal_allows_row_delete`] so tests can
+    /// inject a failing [`crate::backup_shipper::BackupShipper`] without a
+    /// network endpoint.
+    async fn delete_artifact_with(
+        shipper: &dyn crate::backup_shipper::BackupShipper,
+        job_id: &str,
+        remote_path: &str,
+    ) -> bool {
+        match shipper.delete(remote_path).await {
+            Ok(()) => true,
+            Err(e) => {
+                metrics::counter!("backup_retention_artifact_delete_failures_total").increment(1);
+                warn!(
+                    job_id = %job_id,
+                    path = %remote_path,
+                    error = %e,
+                    "failed to delete remote backup artifact during retention cleanup; keeping DB row for retry"
+                );
+                false
+            }
+        }
     }
 
     fn is_remote_destination(destination: &str) -> bool {
         destination.starts_with("s3://")
             || destination.starts_with("nfs://")
             || destination.eq_ignore_ascii_case("null")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup_shipper::BackupShipper;
+
+    struct AlwaysOkShipper;
+    #[async_trait::async_trait]
+    impl BackupShipper for AlwaysOkShipper {
+        async fn delete(&self, _remote_path: &str) -> Result<(), ChvError> {
+            Ok(())
+        }
+    }
+
+    struct AlwaysFailShipper;
+    #[async_trait::async_trait]
+    impl BackupShipper for AlwaysFailShipper {
+        async fn delete(&self, _remote_path: &str) -> Result<(), ChvError> {
+            Err(ChvError::Internal {
+                reason: "synthetic delete failure".to_string(),
+            })
+        }
+    }
+
+    fn job(
+        destination: Option<&str>,
+        target_path: Option<&str>,
+    ) -> chv_controlplane_store::BackupJobRow {
+        chv_controlplane_store::BackupJobRow {
+            job_id: "job-test".to_string(),
+            vm_id: "vm-test".to_string(),
+            volume_id: None,
+            schedule_id: None,
+            status: "Succeeded".to_string(),
+            backup_type: "full".to_string(),
+            target_path: target_path.map(str::to_string),
+            storage_backend: None,
+            created_at: "2026-11-03T00:00:00Z".to_string(),
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            size_bytes: None,
+            retry_count: 0,
+            next_retry_at: None,
+            checksum: None,
+            checksum_algorithm: None,
+            destination: destination.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_artifact_delete_allows_row_removal() {
+        assert!(
+            BackupWorker::delete_artifact_with(&AlwaysOkShipper, "job-1", "key").await,
+            "a confirmed delete must allow the row delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_delete_keeps_row() {
+        assert!(
+            !BackupWorker::delete_artifact_with(&AlwaysFailShipper, "job-2", "key").await,
+            "a failed delete must retain the row so the artifact is not orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_remote_destination_does_not_require_artifact_delete() {
+        let row = job(None, Some("/var/lib/chv/backups/artifact"));
+        assert!(
+            BackupWorker::artifact_removal_allows_row_delete(&row, None, None).await,
+            "a local row has no remote artifact to delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_shipper_keeps_row() {
+        // A syntactically valid but unreachable endpoint exercises the real
+        // delete-failure path: the row must stay so the artifact is retried.
+        let row = job(
+            Some("s3://bucket/prefix?endpoint=http://127.0.0.1:1"),
+            Some("prefix/artifact"),
+        );
+        assert!(
+            !BackupWorker::artifact_removal_allows_row_delete(
+                &row,
+                Some("ak".to_string()),
+                Some("sk".to_string())
+            )
+            .await,
+            "an unreachable shipper must retain the row for retry"
+        );
     }
 }

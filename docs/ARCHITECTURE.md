@@ -272,7 +272,7 @@ Status values: `healthy` (all pass), `degraded` (DB pass but agent issues), `unh
 
 | Area | Gap | Priority |
 |------|-----|----------|
-| Backend | Backup/DR execution engine, off-host shipping, restore validation, and runbook automation incomplete | P2 |
+| Backend | Backup/DR: **not implemented — API/UI hard-fenced (`501 NOT_IMPLEMENTED`)**; tenant-data protection is the operator's responsibility | P2 |
 | Backend | Concurrent-write disk migration unproven (issue #394); control-plane-orchestrated migration path unqualified | P1 |
 | Backend | iSCSI and Ceph RBD storage backend adapters planned, not production-complete | P2 |
 | UI | Some components still exceed 300 lines (`vms/[id]/+page.svelte` at 325, `SidebarNav.svelte` at 346) | P2 |

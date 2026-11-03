@@ -104,8 +104,9 @@ existed:
 - `chvctl backup list|run` — every subcommand 404'd; even repointed, the
   live `BackupWorker`'s execute is a guaranteed-fail no-op ("Backup is
   not DR" per the production-readiness declaration). The BFF's
-  `/v1/backups/*` routes, the UI's backup catalog pages, and the
-  `BackupWorker` scaffold are unchanged.
+  `/v1/backups/*` routes are now **hard-fenced** (`501 NOT_IMPLEMENTED`,
+  #654), the UI's backup catalog pages and navigation are removed, and the
+  `BackupWorker` scaffold only drains legacy rows.
 
 Invoking either group now fails at argument parsing with
 "unrecognized subcommand" — louder and truthful (the old behavior was a

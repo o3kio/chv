@@ -12,6 +12,32 @@ use chv_controlplane_store::{
     BackupScheduleCreateInput, BackupScheduleUpdateInput,
 };
 
+/// Stable reason returned by every backup/restore route while the posture is
+/// fenced (#654).
+///
+/// CHV has no tenant-data backup execution engine: `execute_job` fails, the
+/// off-host ship path was removed, and there is no restore validation. The
+/// pre-production gate therefore chose **fence**, not implement: an API that
+/// promises an engine it cannot run is worse than an explicit 501.
+///
+/// `docs/DEPLOYMENT-ARCHITECTURE.md` §7 and `docs/GAP_ANALYSIS.md` carry the
+/// operator-facing statement of responsibility. Do not remove this fence
+/// without an end-to-end create → ship → restore → verify test.
+pub const BACKUP_NOT_IMPLEMENTED: &str =
+    "backup and restore are not implemented in this release; tenant-data backup is the \
+     operator's responsibility outside CHV (see docs/DEPLOYMENT-ARCHITECTURE.md §7)";
+
+/// Router-level fence for every `/v1/backups/**`, `/v1/backup-jobs`,
+/// `/v1/backup-history`, and legacy `/api/v1/backup*` route.
+///
+/// Returning 501 (not 404) is deliberate: the surface exists and callers get a
+/// deterministic `NOT_IMPLEMENTED` code instead of guessing whether the route
+/// moved. Authentication and CSRF middleware still run first, so fencing never
+/// creates an unauthenticated path.
+pub async fn backup_fence() -> Result<Json<Value>, BffError> {
+    Err(BffError::NotImplemented(BACKUP_NOT_IMPLEMENTED.to_string()))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Legacy /v1/backup-jobs and /v1/backup-history (POST with page payload)
 // ─────────────────────────────────────────────────────────────────────────────

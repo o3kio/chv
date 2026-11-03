@@ -13,7 +13,6 @@
 		{ id: 'go-networks', title: 'Go to Networks', category: 'Nodes', href: '/networks', icon: Network },
 		{ id: 'go-volumes', title: 'Go to Volumes', category: 'Nodes', href: '/volumes', icon: HardDrive },
 		{ id: 'go-settings', title: 'Go to Settings', category: 'Settings', href: '/settings', icon: Settings },
-		{ id: 'go-backup-jobs', title: 'Go to Backup Jobs', category: 'Settings', href: '/backup-jobs', icon: Activity },
 		{ id: 'go-alerts', title: 'Go to Alerts', category: 'Settings', href: '/alerts', icon: Activity },
 		{ id: 'create-vm', title: 'Create VM', category: 'Actions', href: '/vms', icon: Plus },
 		{ id: 'create-network', title: 'Create Network', category: 'Actions', href: '/networks', icon: Plus }
