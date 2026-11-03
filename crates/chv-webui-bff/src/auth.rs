@@ -242,6 +242,171 @@ fn session_cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
 
 pub struct BearerToken(pub Claims);
 
+/// How the request proved its identity. Recorded in audit metadata as a
+/// classification only; no credential material ever crosses this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthSource {
+    BearerJwt,
+    ApiToken,
+    SessionCookie,
+    /// No credential validated; the audit row carries the explicit
+    /// anonymous actor rather than a forged identity.
+    Anonymous,
+}
+
+impl AuthSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthSource::BearerJwt => "bearer_jwt",
+            AuthSource::ApiToken => "api_token",
+            AuthSource::SessionCookie => "session_cookie",
+            AuthSource::Anonymous => "anonymous",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthFailure {
+    pub message: &'static str,
+}
+
+/// Decode the same credential the `BearerToken` extractor accepts,
+/// without consuming request parts. The audit middleware uses this so a
+/// denied mutation is attributed to the real authenticated actor while
+/// an unauthenticated denial carries the explicit anonymous marker.
+///
+/// This is the single credential-decoding implementation: the extractor
+/// below delegates here, so JWT, session-cookie, and API-token semantics
+/// cannot drift between authorization and audit.
+pub(crate) async fn authenticate_headers(
+    headers: &axum::http::HeaderMap,
+    state: &crate::router::AppState,
+) -> Result<(Claims, AuthSource), AuthFailure> {
+    let auth_header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+
+    // Session-cookie fallback (Security S1, staged item 3.B). When no
+    // Authorization header is present, the HttpOnly `chv_session` cookie
+    // (set by /v1/auth/login) is accepted as the JWT and goes through
+    // the exact same verification path (constant-time HMAC, exp check).
+    //
+    // Deliberate behaviors:
+    // - If BOTH are present, the Authorization header wins (the cookie
+    //   is not even parsed).
+    // - An invalid cookie JWT is a hard 401 — we never silently fall
+    //   back to an anonymous request.
+    // - Cookie auth is NOT restricted to non-mutating methods: the
+    //   csrf_middleware requires an un-forgeable request shape for
+    //   every non-GET — `application/json` content-type or (multipart
+    //   routes, #496) a non-empty `x-csrf-token` header, neither of
+    //   which a cross-site HTML form can produce without a CORS
+    //   preflight — and SameSite=Strict blocks the cookie from being
+    //   sent on cross-site requests at all. That reasoning is the
+    //   documented CSRF posture for this staged flow.
+    let auth = match auth_header {
+        Some(header) => header,
+        None => {
+            return match session_cookie_token(headers) {
+                Some(token) => match validate_token(&token, &state.jwt_secret) {
+                    Ok(claims) => Ok((claims, AuthSource::SessionCookie)),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "session cookie JWT validation failed");
+                        Err(AuthFailure {
+                            message: "invalid or expired session cookie",
+                        })
+                    }
+                },
+                None => Err(AuthFailure {
+                    message: "missing authorization header",
+                }),
+            };
+        }
+    };
+
+    if !auth.to_ascii_lowercase().starts_with("bearer ") {
+        return Err(AuthFailure {
+            message: "invalid authorization scheme",
+        });
+    }
+    let token = &auth[7..];
+
+    // Try JWT first
+    match validate_token(token, &state.jwt_secret) {
+        Ok(claims) => return Ok((claims, AuthSource::BearerJwt)),
+        Err(e) => {
+            tracing::debug!(error = %e, "JWT validation failed, checking API token");
+        }
+    }
+
+    // Try API token (chv_ prefix)
+    if token.starts_with("chv_") {
+        let token_hash = chv_common::sha256_hex(token);
+
+        #[derive(sqlx::FromRow)]
+        struct ApiTokenUser {
+            user_id: String,
+            username: String,
+            role: String,
+            /// Enforced per Security T1: `"full"` keeps the user's role,
+            /// `"readonly"` demotes to viewer, unknown values are
+            /// fail-safe-treated as `"full"` (see
+            /// [`effective_role_for_scope`]).
+            scope: String,
+        }
+
+        let result = sqlx::query_as::<_, ApiTokenUser>(
+            "SELECT u.user_id, u.username, u.role, t.scope \
+             FROM api_tokens t \
+             JOIN users u ON t.user_id = u.user_id \
+             WHERE t.token_hash = ? \
+             AND (t.expires_at IS NULL OR t.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&state.pool)
+        .await;
+
+        match result {
+            Ok(Some(row)) => {
+                // Update last_used_at in the background (best effort)
+                let pool = state.pool.clone();
+                let hash = token_hash.clone();
+                tokio::spawn(async move {
+                    let _ = sqlx::query(
+                        "UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE token_hash = ?",
+                    )
+                    .bind(&hash)
+                    .execute(&pool)
+                    .await;
+                });
+
+                let claims = Claims {
+                    sub: row.user_id,
+                    username: row.username,
+                    // Scope enforcement: the token's role on the wire is
+                    // the user's role as narrowed by api_tokens.scope.
+                    role: effective_role_for_scope(&row.scope, &row.role),
+                    // Far future expiry for API tokens — their expiry is managed by expires_at in DB
+                    exp: u64::MAX / 2,
+                    // API tokens bypass the must-change-password gate: they are
+                    // service credentials minted explicitly by an authenticated
+                    // user, not the seeded bootstrap admin row.
+                    must_change_password: false,
+                };
+                return Ok((claims, AuthSource::ApiToken));
+            }
+            Ok(None) => {
+                tracing::warn!("API token not found or expired");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "API token DB lookup failed");
+            }
+        }
+    }
+
+    Err(AuthFailure {
+        message: "invalid or expired token",
+    })
+}
+
 #[async_trait]
 impl FromRequestParts<crate::router::AppState> for BearerToken {
     type Rejection = (StatusCode, Json<serde_json::Value>);
@@ -256,125 +421,10 @@ impl FromRequestParts<crate::router::AppState> for BearerToken {
                 Json(serde_json::json!({ "message": msg, "code": "UNAUTHORIZED" })),
             )
         };
-
-        let auth_header = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-
-        // Session-cookie fallback (Security S1, staged item 3.B). When no
-        // Authorization header is present, the HttpOnly `chv_session` cookie
-        // (set by /v1/auth/login) is accepted as the JWT and goes through
-        // the exact same verification path (constant-time HMAC, exp check).
-        //
-        // Deliberate behaviors:
-        // - If BOTH are present, the Authorization header wins (the cookie
-        //   is not even parsed).
-        // - An invalid cookie JWT is a hard 401 — we never silently fall
-        //   back to an anonymous request.
-        // - Cookie auth is NOT restricted to non-mutating methods: the
-        //   csrf_middleware requires an un-forgeable request shape for
-        //   every non-GET — `application/json` content-type or (multipart
-        //   routes, #496) a non-empty `x-csrf-token` header, neither of
-        //   which a cross-site HTML form can produce without a CORS
-        //   preflight — and SameSite=Strict blocks the cookie from being
-        //   sent on cross-site requests at all. That reasoning is the
-        //   documented CSRF posture for this staged flow.
-        let auth = match auth_header {
-            Some(header) => header,
-            None => {
-                return match session_cookie_token(&parts.headers) {
-                    Some(token) => match validate_token(&token, &state.jwt_secret) {
-                        Ok(claims) => Ok(BearerToken(claims)),
-                        Err(e) => {
-                            tracing::debug!(error = %e, "session cookie JWT validation failed");
-                            Err(reject("invalid or expired session cookie"))
-                        }
-                    },
-                    None => Err(reject("missing authorization header")),
-                };
-            }
-        };
-
-        if !auth.to_ascii_lowercase().starts_with("bearer ") {
-            return Err(reject("invalid authorization scheme"));
-        }
-        let token = &auth[7..];
-
-        // Try JWT first
-        match validate_token(token, &state.jwt_secret) {
-            Ok(claims) => return Ok(BearerToken(claims)),
-            Err(e) => {
-                tracing::debug!(error = %e, "JWT validation failed, checking API token");
-            }
-        }
-
-        // Try API token (chv_ prefix)
-        if token.starts_with("chv_") {
-            let token_hash = chv_common::sha256_hex(token);
-
-            #[derive(sqlx::FromRow)]
-            struct ApiTokenUser {
-                user_id: String,
-                username: String,
-                role: String,
-                /// Enforced per Security T1: `"full"` keeps the user's role,
-                /// `"readonly"` demotes to viewer, unknown values are
-                /// fail-safe-treated as `"full"` (see
-                /// [`effective_role_for_scope`]).
-                scope: String,
-            }
-
-            let result = sqlx::query_as::<_, ApiTokenUser>(
-                "SELECT u.user_id, u.username, u.role, t.scope \
-                 FROM api_tokens t \
-                 JOIN users u ON t.user_id = u.user_id \
-                 WHERE t.token_hash = ? \
-                 AND (t.expires_at IS NULL OR t.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-            )
-            .bind(&token_hash)
-            .fetch_optional(&state.pool)
-            .await;
-
-            match result {
-                Ok(Some(row)) => {
-                    // Update last_used_at in the background (best effort)
-                    let pool = state.pool.clone();
-                    let hash = token_hash.clone();
-                    tokio::spawn(async move {
-                        let _ = sqlx::query(
-                            "UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE token_hash = ?",
-                        )
-                        .bind(&hash)
-                        .execute(&pool)
-                        .await;
-                    });
-
-                    let claims = Claims {
-                        sub: row.user_id,
-                        username: row.username,
-                        // Scope enforcement: the token's role on the wire is
-                        // the user's role as narrowed by api_tokens.scope.
-                        role: effective_role_for_scope(&row.scope, &row.role),
-                        // Far future expiry for API tokens — their expiry is managed by expires_at in DB
-                        exp: u64::MAX / 2,
-                        // API tokens bypass the must-change-password gate: they are
-                        // service credentials minted explicitly by an authenticated
-                        // user, not the seeded bootstrap admin row.
-                        must_change_password: false,
-                    };
-                    return Ok(BearerToken(claims));
-                }
-                Ok(None) => {
-                    tracing::warn!("API token not found or expired");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "API token DB lookup failed");
-                }
-            }
-        }
-
-        Err(reject("invalid or expired token"))
+        let (claims, _source) = authenticate_headers(&parts.headers, state)
+            .await
+            .map_err(|failure| reject(failure.message))?;
+        Ok(BearerToken(claims))
     }
 }
 

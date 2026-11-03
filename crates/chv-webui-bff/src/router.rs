@@ -705,6 +705,17 @@ pub fn bff_router(state: AppState) -> Router<AppState> {
             patch(crate::handlers::quotas::update_quota)
                 .delete(crate::handlers::quotas::delete_quota),
         )
+        // Durable privileged-mutation audit trail (#658). Admin only,
+        // read-shaped POSTs (the audit middleware does not append rows
+        // for these paths).
+        .route(
+            "/v1/audit-log",
+            post(crate::handlers::audit::query_audit_log),
+        )
+        .route(
+            "/v1/audit-log/export",
+            post(crate::handlers::audit::export_audit_log),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::admin_middleware,
@@ -720,6 +731,13 @@ pub fn bff_router(state: AppState) -> Router<AppState> {
         ))
         .layer(axum::middleware::from_fn(
             crate::csrf_middleware::csrf_protection,
+        ))
+        // Wraps the role middlewares (and CSRF) so denied and failed
+        // privileged mutations are recorded too. Correlation runs
+        // outside this layer and is therefore available in extensions.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::audit::record_privileged_mutation,
         ))
         .layer(axum::middleware::from_fn(
             crate::correlation_middleware::extract_correlation_id,

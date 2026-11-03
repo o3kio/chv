@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod architectures;
+pub mod audit;
 pub mod auth;
 pub mod backups;
 pub mod clusters;

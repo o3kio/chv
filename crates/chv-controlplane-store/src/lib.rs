@@ -1,6 +1,7 @@
 mod alert_rules;
 mod alerts;
 mod architectures;
+mod audit_log;
 mod backups;
 mod bootstrap_tokens;
 mod credential_crypto;
@@ -43,6 +44,11 @@ pub use architectures::{
     NetboxProjectionRunRepository, PlanCreateInput, PlanRepository, PlanStatusUpdateInput,
     TopologyCreateInput, TopologyListFilter, TopologyRepository, TopologyUpdateInput,
     VersionCreateInput, VersionRepository, ACTIVE_RUN_CONFLICT_MARKER, MAX_ATTEMPTS,
+};
+pub use audit_log::{
+    AuditLogFilter, AuditLogInsert, AuditLogRepository, AuditLogRow, AUDIT_ANONYMOUS_ACTOR_ID,
+    AUDIT_ANONYMOUS_ROLE, AUDIT_ANONYMOUS_USERNAME, AUDIT_OUTCOME_DENIED, AUDIT_OUTCOME_FAILED,
+    AUDIT_OUTCOME_SUCCESS,
 };
 pub use backups::{
     BackupJobCreateInput, BackupJobRow, BackupJobStatusUpdateInput, BackupJobUpdateInput,
