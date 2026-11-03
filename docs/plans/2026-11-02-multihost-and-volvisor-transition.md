@@ -1,6 +1,6 @@
 # Multi-Host and Native Volvisor Transition Plan
 
-Status: Proposed — requires ratification of the decisions in §4 before P1 starts
+Status: Accepted — Gate P0 decisions ratified 2026-11-03; implementation not started (no P1 code)
 Date: 2026-11-02
 Decision sources: [ADR-028](../specs/adr/028-volvisor-storage-orchestration.md) (accepted, runtime pending), [ADR-021](../specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md) (accepted, in execution), [ADR-002](../specs/adr/002-control-plane-boundary.md) (control-plane/node boundary), [ADR-004](../specs/adr/004-storage-datapath.md) (host-side storage datapath)
 Supersedes: the single-host envelope in [`../DEPLOYMENT-ARCHITECTURE.md`](../DEPLOYMENT-ARCHITECTURE.md) §3.1/§5/§8 (D1), once the P1 dispatch and P2 console gates pass (the decisions themselves are ratified at Gate P0)
@@ -125,12 +125,17 @@ Not everything is missing. These reduce cost and should be reused:
 
 ---
 
-## 4. Decisions to ratify
+## 4. Ratified decisions
 
-The plan is executable only after these are accepted. Each becomes an ADR on
-ratification.
+These decisions were ratified by the project maintainers on 2026-11-03 at
+Gate P0 (§7). D-MH1–D-MH8 are the basis of
+[ADR-029](../specs/adr/029-multi-host-dispatch.md); D-VS1–D-VS7 are the basis
+of [`chv-volume-backend-v1`](../specs/contracts/chv-volume-backend-v1.md).
+None of them is implemented.
 
 ### 4.1 Multi-host
+
+**Status: D-MH1–D-MH8 ratified 2026-11-03, as written. Implementation pending (P1).**
 
 | ID | Decision | Recommended option | Rejected alternatives and why |
 |---|---|---|---|
@@ -144,6 +149,8 @@ ratification.
 | **D-MH8** | Agent gRPC port | `9443/TCP` (unused in the §3.1 listener table; the only `9443` references today are config test fixtures). | Reusing `8444` (console) or `8443` (CP) — conflates trust domains. |
 
 ### 4.2 Volvisor
+
+**Status: D-VS1–D-VS7 ratified 2026-11-03, as written. Implementation pending (P3/P4).**
 
 | ID | Decision | Recommended option | Rejected alternatives and why |
 |---|---|---|---|
@@ -522,25 +529,35 @@ of merged PRs. A phase does not start until the previous gate passes.
 | P0.5 | File the upstream attachment-phase amendment request; record the accepted/dispositioned outcome | Volvisor issue [#34](https://github.com/o3kio/volvisor/issues/34) — **filed and merged 2026-11-02** (PR [#35](https://github.com/o3kio/volvisor/pull/35), `a6d1508`); pin re-review pending |
 | P0.6 | Decide `project_id` carriage and `seed_from` posture for Volvisor-owned volumes | this plan + proto draft |
 
-**Status 2026-11-02:** P0.1 ([ADR-029](../specs/adr/029-multi-host-dispatch.md)),
-P0.2 ([`chv-volume-backend-v1`](../specs/contracts/chv-volume-backend-v1.md)),
-the proposed markings in P0.3, and the P0.4 pin record (§10.1.1) are written.
-The pin is a review reference until P3's contract tests run against it in CI.
-P0.5 is **filed and merged**: the corrected upstream design is
-[o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34) (a
-`POST /v2/volumes/{id}/attachment-state` consumer report with monotonic
-`state_revision` and an unchanging detach-fencing generation, an `attachments[]`
-inspect projection, and the `attachment_state_report` capability), merged in
-Volvisor `main` as PR [#35](https://github.com/o3kio/volvisor/pull/35)
-(`a6d1508`) with conformance/API tests. It is **not released or pinned**. No
-consumer adoption is assumed; §8 keeps the `prepared`-only posture until the
-pin is consciously re-reviewed against a build carrying the capability. P0.6 (project/seed decisions)
-also remains open, and its recommendation is already encoded in contract v1
-§10/§11.3 pending ratification. No P1 work has started.
+**Status 2026-11-03 (Gate P0):** all Gate P0 decisions are ratified. The
+maintainers accepted [ADR-029](../specs/adr/029-multi-host-dispatch.md) and
+[`chv-volume-backend-v1`](../specs/contracts/chv-volume-backend-v1.md) as the
+design baseline, and ratified D-MH1–D-MH8 and D-VS1–D-VS7 as written in §4.
+The status is **accepted — implementation not started**; no P1 (or later) code
+has been written, and no multi-host or Volvisor capability is claimed.
 
-**Gate P0:** all decisions in §4 (D-MH1–D-MH8, D-VS1–D-VS7) ratified, plus
-the P0.6 decisions (`project_id` source and `seed_from` posture for
-Volvisor-owned volumes); no code merged that assumes an unratified option.
+- **P0.1–P0.3:** ADR-029, the contract, and the DEPLOYMENT-ARCHITECTURE
+  markers exist. The ADR and contract now carry an accepted status and a
+  ratification record; the deployment markers read "ACCEPTED — ADR-029;
+  NOT IMPLEMENTED".
+- **P0.4:** the pin record in §10.1.1 is written and remains a review
+  reference until P3's contract tests run against it in CI.
+- **P0.5:** the corrected upstream attachment-phase design
+  ([o3kio/volvisor#34](https://github.com/o3kio/volvisor/issues/34)) is
+  **filed and merged upstream** (PR [#35](https://github.com/o3kio/volvisor/pull/35),
+  `a6d1508`), but it is **not released or pinned**. No consumer adoption is
+  assumed; §8 and contract §8 keep the `prepared`-only posture until the pin
+  is consciously re-reviewed against a build carrying the capability.
+- **P0.6:** recorded — `project_id` is the VM tenant id, and `seed_from` is
+  refused for Volvisor-owned volumes (see §14).
+
+No P1 work has started.
+
+**Gate P0 — met 2026-11-03:** all decisions in §4 (D-MH1–D-MH8,
+D-VS1–D-VS7) ratified as written, and the P0.6 decisions recorded
+(`project_id` = VM tenant id; `seed_from` refused for Volvisor-owned
+volumes). P0.5 is filed/merged upstream but not released or pinned; that
+remains a P3 re-pin dependency, not a P0 blocker. No P1 code is started.
 
 ### P1 — Remote dispatch (5–7 weeks)
 
@@ -878,7 +895,7 @@ Ordering rules:
 
 ## 14. Open questions (tagged with the gate that resolves them)
 
-Resolved by this draft:
+### Resolved before Gate P0
 
 - **Split node identity** — D-MH2/D-MH3: split `node-client` / `node-server`,
   plus a dedicated control-plane client CA (ADR-029 §3).
@@ -886,26 +903,30 @@ Resolved by this draft:
   table; the only existing `9443` references are config test fixtures
   (`crates/chv-config/src/lib.rs:2172`).
 
-Still open:
+### Resolved at Gate P0 (2026-11-03)
 
-1. **Management network assumption (Gate P0).** Is there a dedicated
-   management network/VLAN, or must the agent listener coexist with tenant
-   traffic? This changes the exposure rule and the firewall model.
-2. **`project_id` source (Gate P0 for the decision; P4 for carriage).** VM
-   tenant id, or a new first-class project concept? Recommendation: VM tenant
-   id in P4, first-class project later. Contract v1 §11.3 encodes the
-   recommendation; ratification is still required.
-3. **`seed_from` for Volvisor-owned volumes (Gate P0 for the decision; P4 for
-   enforcement).** Refuse in P4 (recommended), or build an explicit pre-seed
-   job? Contract v1 §10 encodes the refusal; ratification is still required.
-4. **Volvisor packaging (Gate P3).** Build from the pinned SHA into
-   `chv-node`, or a separate `chv-volvisord` package with its own upgrade
-   cadence?
-5. **LVM pool claiming (before Gate P4).** Which operator workflow claims
-   devices (`/v2/admin/devices/claim`) and who holds the claim token? This is
-   destructive and needs a written procedure before P4.
-6. **Console transport (Gate P2).** BFF → agent console over the management
-   network with mTLS (recommended), or tunnel through the gRPC stream later?
+1. **Management network assumption.** Resolved: use a **dedicated management
+   network/VLAN** for CP↔agent dispatch and the multi-host listeners; they do
+   not share tenant traffic. This is the basis of the §8 exposure rule and
+   the firewall model.
+2. **`project_id` source.** Resolved: `project_id` is the **VM tenant id**
+   (carried additively on `StorageAttachmentRef` in P4). A first-class project
+   concept can be revisited later without changing this decision.
+3. **`seed_from` for Volvisor-owned volumes.** Resolved: **refused** for
+   Volvisor-owned volumes in v1. An explicit pre-seed job is out of scope.
+   Contract v1 §10 and §11.3 encode this refusal.
+
+### Still open (later gates)
+
+4. **Volvisor packaging.** Build from the pinned SHA into `chv-node`, or a
+   separate `chv-volvisord` package with its own upgrade cadence?
+   **Open — P3-gated.**
+5. **LVM pool claiming.** Which operator workflow claims devices
+   (`/v2/admin/devices/claim`) and who holds the claim token? This is
+   destructive and needs a written procedure. **Open — P4-gated.**
+6. **Console transport.** BFF → agent console over the management network with
+   mTLS (recommended), or tunnel through the gRPC stream later?
+   **Open — P2-gated.**
 
 ---
 

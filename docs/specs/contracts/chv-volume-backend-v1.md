@@ -1,7 +1,8 @@
 # CHV volume backend contract v1
 
-**Status:** Proposed — not implemented; requires ADR-028 runtime integration
-and ratification of the Volvisor decisions (D-VS1–D-VS7)
+**Status:** Accepted — implementation not started (ratified 2026-11-03);
+requires ADR-028 runtime integration. Design baseline only; no Volvisor code
+exists in CHV.
 **Authority:** [ADR-028](../adr/028-volvisor-storage-orchestration.md) (storage
 authority and ownership split), [ADR-002](../adr/002-control-plane-boundary.md)
 (control-plane → agent boundary), [ADR-029](../adr/029-multi-host-dispatch.md)
@@ -9,6 +10,20 @@ authority and ownership split), [ADR-002](../adr/002-control-plane-boundary.md)
 **Purpose:** define the normative, backend-neutral volume contract that
 `chv-agent` exposes internally, the ownership rules that select a backend, and
 the exact Volvisor v2 binding used by the native-local implementation
+
+## Ratification
+
+- **Date:** 2026-11-03
+- **Ratified by:** project maintainers
+- **Scope:** the 15 Gate P0 decisions — D-MH1–D-MH8 (ADR-029) and
+  D-VS1–D-VS7 (this contract) — plus P0.6 (`project_id` = VM tenant id;
+  `seed_from` refused for Volvisor-owned volumes).
+- **Status:** accepted as the design baseline. **Implementation is pending**:
+  no `VolumeBackend` seam, Volvisor client, migration, or CHV code reference
+  exists. Capability claims remain gated by the P3/P4 evidence gates.
+
+The normative content below is ratified as written; the "pin pending P3"
+references describe work not yet done, not a gap in the decision.
 
 ## 1. Scope
 
