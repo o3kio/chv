@@ -1497,9 +1497,19 @@ pub async fn create_migration_record(
 }
 
 /// Update migration progress in the database (called from telemetry).
+///
+/// `node_id` is the authenticated sender (the control plane pins it to the
+/// mTLS peer certificate before calling this). The update is scoped to a
+/// migration the sender actually participates in, so a compromised node
+/// cannot overwrite another node's migration row even though it holds a valid
+/// cluster certificate. A late report for a migration that already reached a
+/// terminal phase is dropped (returns `Ok`): the reaper may have failed the
+/// row and resumed the source VM, and a queued `ConvergingDisk` report must
+/// never resurrect it.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_migration_progress(
     pool: &StorePool,
+    node_id: &str,
     vm_id: &str,
     operation_id: &str,
     phase: i32,
@@ -1526,11 +1536,13 @@ pub async fn update_migration_progress(
                dirty_blocks_remaining = ?,
                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                {}
-           WHERE vm_id = ? AND operation_id = ?"#,
+           WHERE vm_id = ? AND operation_id = ?
+             AND (source_node_id = ? OR destination_node_id = ?)
+             AND phase NOT IN ('Completed', 'Failed', 'RolledBack')"#,
         completed_at_clause
     );
 
-    sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(phase_str)
         .bind(bytes_transferred as i64)
         .bind(total_bytes as i64)
@@ -1538,13 +1550,67 @@ pub async fn update_migration_progress(
         .bind(dirty_blocks_remaining as i64)
         .bind(vm_id)
         .bind(operation_id)
+        .bind(node_id)
+        .bind(node_id)
         .execute(pool)
         .await
         .map_err(|e| ChvError::Internal {
             reason: format!("failed to update migration progress: {e}"),
         })?;
 
-    Ok(())
+    if result.rows_affected() > 0 {
+        return Ok(());
+    }
+
+    // The guarded update matched nothing. Classify the no-op so the caller
+    // can distinguish "late terminal report, safely dropped" (Ok) from
+    // "this node does not own this migration" (denied) and "no such row".
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        r#"SELECT source_node_id, destination_node_id, phase
+           FROM migrations
+           WHERE vm_id = ? AND operation_id = ?
+           ORDER BY started_at DESC
+           LIMIT 1"#,
+    )
+    .bind(vm_id)
+    .bind(operation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ChvError::Internal {
+        reason: format!("failed to classify migration progress update: {e}"),
+    })?;
+
+    let Some((source_node_id, destination_node_id, current_phase)) = row else {
+        // Progress can race the control plane's own record creation; treat a
+        // missing row as an idempotent no-op rather than a poison-pill error
+        // that the agent would retry forever.
+        return Ok(());
+    };
+
+    if source_node_id != node_id && destination_node_id != node_id {
+        return Err(ChvError::AccessDenied {
+            resource: format!("migration {operation_id}"),
+            reason: format!("node {node_id} is neither the source nor destination"),
+        });
+    }
+
+    if matches!(
+        current_phase.as_str(),
+        "Completed" | "Failed" | "RolledBack"
+    ) {
+        // Terminal: the report arrived too late (reaper won). Dropping it is
+        // correct; returning an error would make the agent retry forever.
+        return Ok(());
+    }
+
+    // The row exists, the sender participates, and the phase is still
+    // non-terminal — the update should have matched. Treat this as an
+    // internal inconsistency rather than silently acknowledging it.
+    Err(ChvError::Internal {
+        reason: format!(
+            "migration progress update matched no rows for operation {operation_id} in phase {current_phase}"
+        ),
+    })
 }
 
 /// Fetch the current generation for a VM from the desired state store.
@@ -2056,5 +2122,123 @@ mod tests {
             proto_phase_to_str(proto::MigrationPhase::RolledBack as i32),
             "RolledBack"
         );
+    }
+
+    async fn seed_migration_for_progress(pool: &StorePool, phase: &str) {
+        sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES ('vm-progress', 'vm-progress')")
+            .execute(pool)
+            .await
+            .expect("insert vm");
+        sqlx::query(
+            r#"INSERT INTO operations
+                   (operation_id, idempotency_key, resource_kind, resource_id,
+                    operation_type, status, requested_at)
+               VALUES ('op-progress', 'idem-progress', 'vm', 'vm-progress',
+                       'Migrate', 'Running', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"#,
+        )
+        .execute(pool)
+        .await
+        .expect("insert operation");
+        sqlx::query(
+            r#"INSERT INTO migrations
+                   (migration_id, operation_id, vm_id, source_node_id,
+                    destination_node_id, phase)
+               VALUES ('mig-progress', 'op-progress', 'vm-progress',
+                       'node-a', 'node-b', ?)"#,
+        )
+        .bind(phase)
+        .execute(pool)
+        .await
+        .expect("insert migration");
+    }
+
+    #[tokio::test]
+    async fn progress_from_a_non_participant_node_is_denied_and_not_persisted() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_for_progress(&test_db.pool, "ConvergingDisk").await;
+
+        let result = update_migration_progress(
+            &test_db.pool,
+            "node-c",
+            "vm-progress",
+            "op-progress",
+            proto::MigrationPhase::MemoryMigration as i32,
+            1,
+            2,
+            3,
+            4,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ChvError::AccessDenied { .. })));
+        let (phase, round): (String, i32) = sqlx::query_as(
+            "SELECT phase, convergence_round FROM migrations WHERE migration_id = 'mig-progress'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "ConvergingDisk");
+        assert_eq!(round, 0, "a denied update must not mutate the row");
+    }
+
+    #[tokio::test]
+    async fn progress_from_either_participant_is_accepted() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_for_progress(&test_db.pool, "ConvergingDisk").await;
+
+        for node in ["node-a", "node-b"] {
+            update_migration_progress(
+                &test_db.pool,
+                node,
+                "vm-progress",
+                "op-progress",
+                proto::MigrationPhase::ConvergingDisk as i32,
+                10,
+                20,
+                1,
+                5,
+            )
+            .await
+            .expect("source and destination may both report progress");
+        }
+
+        let round: i32 = sqlx::query_scalar(
+            "SELECT convergence_round FROM migrations WHERE migration_id = 'mig-progress'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(round, 1);
+    }
+
+    #[tokio::test]
+    async fn late_progress_cannot_resurrect_a_terminal_migration() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_for_progress(&test_db.pool, "Failed").await;
+
+        // A queued non-terminal report arrives after the reaper failed the
+        // row: it must be acknowledged (so the agent drops it) but ignored.
+        update_migration_progress(
+            &test_db.pool,
+            "node-a",
+            "vm-progress",
+            "op-progress",
+            proto::MigrationPhase::ConvergingDisk as i32,
+            1,
+            2,
+            9,
+            9,
+        )
+        .await
+        .expect("a late report is dropped, not retried forever");
+
+        let (phase, round): (String, i32) = sqlx::query_as(
+            "SELECT phase, convergence_round FROM migrations WHERE migration_id = 'mig-progress'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Failed");
+        assert_eq!(round, 0);
     }
 }

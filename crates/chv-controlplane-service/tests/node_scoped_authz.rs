@@ -183,3 +183,81 @@ async fn report_migration_progress_accepts_matching_peer() {
 
     assert_eq!(resp.into_inner().result.expect("result meta").status, "ok");
 }
+
+/// A `MigrationProgress` queued by an agent version that predates field 9 is
+/// replayed with `node_id == ""`. The certificate is the authoritative
+/// identity in secure mode, so this must be repaired rather than rejected
+/// forever (a permanent rejection would block the agent's ordered queue).
+#[tokio::test]
+async fn report_migration_progress_accepts_legacy_empty_node_id() {
+    use proto::telemetry_service_server::TelemetryService as _;
+
+    let server = telemetry_server().await;
+    let req = request_with_peer(migration_progress(""), "node-a");
+    let resp = server
+        .report_migration_progress(req)
+        .await
+        .expect("an empty legacy node_id must be pinned to the peer certificate");
+
+    assert_eq!(resp.into_inner().result.expect("result meta").status, "ok");
+}
+
+fn resolve_request(target_node_id: &str) -> proto::ResolveInspectRequiredOperationRequest {
+    proto::ResolveInspectRequiredOperationRequest {
+        meta: Some(proto::RequestMeta {
+            operation_id: "op-resolve".into(),
+            requested_by: "node-a".into(),
+            target_node_id: target_node_id.into(),
+            desired_state_version: "1".into(),
+            request_unix_ms: 1_000,
+        }),
+        vm_id: "vm-1".into(),
+        operation_id: "core-op-1".into(),
+        disposition: "failed".into(),
+        note: "inspected: effect never started".into(),
+    }
+}
+
+/// The node-facing relay target is caller-chosen (`meta.target_node_id`), so
+/// it must be pinned to the authenticated peer too. Otherwise any node could
+/// relay a journal resolution into another node's core.
+#[tokio::test]
+async fn resolve_inspect_required_operation_rejects_cross_node_target() {
+    use proto::lifecycle_service_server::LifecycleService as _;
+
+    let server = lifecycle_server().await;
+    let req = request_with_peer(resolve_request("node-b"), "node-a");
+    let status = server
+        .resolve_inspect_required_operation(req)
+        .await
+        .expect_err("must reject a relay aimed at another node");
+
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status.message().contains("node-a") && status.message().contains("node-b"),
+        "status message must name both peer and target; got: {}",
+        status.message()
+    );
+}
+
+/// A node resolving its own operation still reaches the service layer (which
+/// fails closed with `unimplemented` when no relay egress is configured).
+#[tokio::test]
+async fn resolve_inspect_required_operation_accepts_matching_target() {
+    use proto::lifecycle_service_server::LifecycleService as _;
+
+    let server = lifecycle_server().await;
+    let req = request_with_peer(resolve_request("node-a"), "node-a");
+    let status = server
+        .resolve_inspect_required_operation(req)
+        .await
+        .expect_err("relay egress is not configured in this test");
+
+    assert_eq!(
+        status.code(),
+        Code::Unimplemented,
+        "matching target must pass authz and fail closed at the unimplemented relay; got: {} ({})",
+        status.code(),
+        status.message()
+    );
+}

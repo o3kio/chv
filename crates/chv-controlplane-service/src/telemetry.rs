@@ -8,6 +8,7 @@ use chv_controlplane_store::{
 use chv_controlplane_types::domain::{
     EventSeverity, EventType, Generation, NodeId, NodeState, OperationId, ResourceId,
 };
+use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
 use std::str::FromStr;
 use tracing::warn;
@@ -483,8 +484,9 @@ impl TelemetryService for TelemetryServiceImplementation {
         // Update the migrations table with progress from the agent
         let pool = self.observed_state_repo.pool();
 
-        if let Err(e) = crate::migration::update_migration_progress(
+        match crate::migration::update_migration_progress(
             pool,
+            &request.node_id,
             &request.vm_id,
             &request.operation_id,
             request.phase,
@@ -495,12 +497,34 @@ impl TelemetryService for TelemetryServiceImplementation {
         )
         .await
         {
-            warn!(
-                vm_id = %request.vm_id,
-                operation_id = %request.operation_id,
-                error = %e,
-                "failed to update migration progress"
-            );
+            Ok(()) => {}
+            Err(ChvError::AccessDenied { resource, reason }) => {
+                warn!(
+                    vm_id = %request.vm_id,
+                    operation_id = %request.operation_id,
+                    node_id = %request.node_id,
+                    %reason,
+                    "rejected migration progress from a node that does not own the migration"
+                );
+                return Err(ControlPlaneServiceError::PermissionDenied(format!(
+                    "access denied: {resource} — {reason}"
+                )));
+            }
+            Err(e) => {
+                // Do not acknowledge a progress update that was not persisted:
+                // an ACK would tell the agent the row is fresh, the reaper
+                // would see a false stall, and the report would be lost. The
+                // agent retries on error.
+                warn!(
+                    vm_id = %request.vm_id,
+                    operation_id = %request.operation_id,
+                    error = %e,
+                    "failed to update migration progress"
+                );
+                return Err(ControlPlaneServiceError::Internal(format!(
+                    "failed to persist migration progress: {e}"
+                )));
+            }
         }
 
         Ok(proto::AckResponse {

@@ -265,8 +265,11 @@ pub async fn build_service(
     // would race migrations, seeding, and every lifecycle worker. The guard is
     // stored process-wide so it survives `build_service` returning; the kernel
     // releases it when this process exits, including on SIGTERM/crash.
-    let instance_lock = instance_lock::InstanceLock::acquire(&config.runtime_dir)
-        .map_err(|e| ControlPlaneServiceError::Internal(e.to_string()))?;
+    let instance_lock = instance_lock::InstanceLock::acquire_for_database(
+        &config.runtime_dir,
+        &config.database.url,
+    )
+    .map_err(|e| ControlPlaneServiceError::Internal(e.to_string()))?;
     tracing::info!(
         path = %instance_lock.path().display(),
         "acquired control-plane single-instance lock"

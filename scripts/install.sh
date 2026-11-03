@@ -459,18 +459,34 @@ setup_release_gpg() {
             || fatal "Failed to import CHV_RELEASE_GPG_PUBKEY (expected an ASCII-armored public key)."
     fi
 
-    if ! release_gpg --list-keys --with-colons 2>/dev/null | grep -q '^pub:'; then
-        fatal "The configured release GPG keyring contains no public key; cannot verify the release signature."
+    # Reject a keyring whose only public key is expired/revoked/disabled: gpg
+    # still lists it as `pub`, and (worse) `gpg --verify` exits 0 for a
+    # signature made before expiry, so exit status alone cannot detect this.
+    if ! release_gpg --list-keys --with-colons 2>/dev/null \
+        | awk -F: '$1 == "pub" && $2 !~ /^[erdi]$/ { found = 1 } END { exit(found ? 0 : 1) }'; then
+        fatal "The configured release GPG keyring contains no usable (non-expired, non-revoked) public key; cannot verify the release signature."
     fi
     info "Release GPG public key imported; signatures are REQUIRED for this install."
 }
 
 # Non-fatal primitive used by the negative test and the download path.
+#
+# `gpg --verify` exits 0 for a signature made by a key that has since expired
+# or been revoked, so parse the machine-readable status instead. A signature is
+# accepted only when gpg reports VALIDSIG and none of the expiry/revocation
+# markers. This is the difference between "the bytes match a signature" and
+# "the release is authentic under a currently-valid key".
 verify_detached_signature() {
     local signature="$1"
     local signed_file="$2"
+    local status
     [ -s "$signature" ] && [ -s "$signed_file" ] || return 1
-    release_gpg --verify "$signature" "$signed_file" >/dev/null 2>&1
+    status="$(release_gpg --status-fd 1 --verify "$signature" "$signed_file" 2>/dev/null)" || return 1
+    grep -q '^\[GNUPG:\] VALIDSIG ' <<< "$status" || return 1
+    if grep -Eq '^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|EXPSIG|SIGEXPIRED|KEYEXPIRED)' <<< "$status"; then
+        return 1
+    fi
+    return 0
 }
 
 tarball_sums_lists_asset() {
@@ -1725,18 +1741,28 @@ start_services() {
         if ! cmd_exists sqlite3; then
             fatal "sqlite3 is required to seed bootstrap tokens. Install sqlite3 or rerun without INSTALL_CHV_SKIP_DEPS=1."
         fi
+        # The sqlite3 CLI has no positional `?` binding: placeholders are left
+        # unbound and the statement aborts. Both values are generated locally
+        # and constrained (sha256 hex, fixed timestamp format), so inline them
+        # as SQL literals after validating the shapes.
+        if [ "${#token_hash}" -ne 64 ] || [ -n "${token_hash//[0-9a-f]/}" ]; then
+            fatal "Internal error: bootstrap token hash is not a 64-character hex digest."
+        fi
+        case "$expires" in
+            ""|????-??-??T??:??:??Z) ;;
+            *) fatal "Internal error: unexpected bootstrap token expiry '${expires}'." ;;
+        esac
         chv_sqlite "${CHV_DB_PATH}" \
             "INSERT OR REPLACE INTO bootstrap_tokens
              (token_hash, description, one_time_use, used_at, expires_at, created_at, updated_at)
-             VALUES (?, 'All-in-one installer', 1, NULL,
-                     NULLIF(?, ''),
+             VALUES ('${token_hash}', 'All-in-one installer', 1, NULL,
+                     NULLIF('${expires}', ''),
                      strftime('%Y-%m-%dT%H:%M:%SZ','now'),
-                     strftime('%Y-%m-%dT%H:%M:%SZ','now'));" \
-            "${token_hash}" "${expires}"
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
 
         local seeded_tokens
         seeded_tokens=$(chv_sqlite "${CHV_DB_PATH}" \
-            "SELECT COUNT(*) FROM bootstrap_tokens WHERE token_hash=?;" "${token_hash}" 2>/dev/null || echo "0")
+            "SELECT COUNT(*) FROM bootstrap_tokens WHERE token_hash='${token_hash}';" 2>/dev/null || echo "0")
         if [ "${seeded_tokens}" -lt 1 ] 2>/dev/null; then
             fatal "Failed to seed bootstrap token in ${CHV_DB_PATH}."
         fi
@@ -1964,8 +1990,13 @@ reset_must_change_password() {
             warn "CRITICAL: Failed to reset must_change_password flag. Admin may not be forced to rotate password on first login."
         fi
         # Subshell: a fatal ownership verdict must not change the cleanup
-        # exit status after a successful install.
-        ( ensure_chv_db_ownership ) 2>/dev/null || true
+        # exit status after a successful install. Capture the verdict instead
+        # of discarding it: a root-owned WAL artifact makes the control plane
+        # fail to open the database, so the operator must see the reason.
+        local ownership_error
+        if ! ownership_error="$( ( ensure_chv_db_ownership ) 2>&1 )"; then
+            warn "CRITICAL: failed to restore database ownership: ${ownership_error:-unknown error}"
+        fi
     fi
 }
 

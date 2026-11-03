@@ -1,7 +1,7 @@
 use crate::enrollment::EnrollmentService;
 use crate::inventory::InventoryService;
 use crate::lifecycle::LifecycleService;
-use crate::peer_identity::verify_peer_matches;
+use crate::peer_identity::{verify_peer_matches, InsecurePeer, PeerNodeId};
 use crate::reconcile::ReconcileService;
 use crate::telemetry::TelemetryService;
 use chv_controlplane_types::domain::NodeId;
@@ -38,6 +38,40 @@ fn enforce_peer_node_id<T>(
     let node_id = NodeId::new(requested_node_id.to_string())
         .map_err(|e| Status::invalid_argument(format!("invalid node_id: {}", e)))?;
     verify_peer_matches(request.extensions(), &node_id, method).map_err(Status::from)
+}
+
+/// Resolve the authoritative sender node id for a report and pin any
+/// wire-asserted value to it.
+///
+/// Returns the mTLS peer identity in secure mode. An empty asserted `node_id`
+/// is accepted in that case: it is the back-compat shape of a
+/// `MigrationProgress` queued by an agent version that predates the field
+/// (proto3 leaves it `""` after deserialising the old cache JSON), and
+/// rejecting it would poison the agent's at-least-once queue forever. In
+/// insecure/dev mode there is no certificate to fall back to, so the asserted
+/// value is required.
+#[allow(clippy::result_large_err)]
+fn authoritative_peer_node_id<T>(
+    request: &Request<T>,
+    asserted_node_id: &str,
+    method: &'static str,
+) -> Result<String, Status> {
+    if let Some(peer) = request.extensions().get::<PeerNodeId>() {
+        if !asserted_node_id.is_empty() {
+            enforce_peer_node_id(request, asserted_node_id, method)?;
+        }
+        return Ok(peer.as_node_id().to_string());
+    }
+
+    if request.extensions().get::<InsecurePeer>().is_some() {
+        let node_id = NodeId::new(asserted_node_id.to_string())
+            .map_err(|e| Status::invalid_argument(format!("invalid node_id: {}", e)))?;
+        return Ok(node_id.to_string());
+    }
+
+    Err(Status::permission_denied(
+        "peer mTLS identity required for this RPC",
+    ))
 }
 
 pub struct EnrollmentServer {
@@ -308,14 +342,19 @@ impl proto::telemetry_service_server::TelemetryService for TelemetryServer {
 
     async fn report_migration_progress(
         &self,
-        request: Request<proto::MigrationProgress>,
+        mut request: Request<proto::MigrationProgress>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
+        let authoritative = authoritative_peer_node_id(
             &request,
             &request.get_ref().node_id,
             "report_migration_progress",
         )?;
+        // Overwrite the wire value with the certificate-derived identity: the
+        // store scopes the UPDATE by this field, so it must never be
+        // caller-controlled. This also repairs legacy queued reports whose
+        // `node_id` is empty.
+        request.get_mut().node_id = authoritative;
         let _span = tracing::info_span!("report_migration_progress", %op_id);
         let resp = self
             .service
@@ -972,15 +1011,28 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         Ok(Response::new(resp))
     }
 
-    /// Authz note: not node-scoped on the wire. This is an operator egress
-    /// relay into a node; the request carries no `node_id` field and the
-    /// target is derived from `meta.target_node_id` (the operator/CP is the
-    /// authenticated caller, not the target node). It is therefore exempt
-    /// from `enforce_peer_node_id`.
+    /// Authz note: the request carries no `node_id` field; the target is
+    /// `meta.target_node_id`. This RPC is exposed on the node-facing mTLS
+    /// listener, so the only authenticated caller identity available to the
+    /// control plane is the peer node certificate. Pin the target to that
+    /// peer: a compromised node may resolve its own interrupted operations,
+    /// but must not be able to relay a resolution into another node's core
+    /// journal.
     async fn resolve_inspect_required_operation(
         &self,
         request: Request<proto::ResolveInspectRequiredOperationRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
+        let target_node_id = request
+            .get_ref()
+            .meta
+            .as_ref()
+            .map(|meta| meta.target_node_id.clone())
+            .unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &target_node_id,
+            "resolve_inspect_required_operation",
+        )?;
         let op_id = extract_op_id(&request).unwrap_or_default();
         let _span = tracing::info_span!("resolve_inspect_required_operation", op_id = %op_id.escape_debug());
         let resp = self

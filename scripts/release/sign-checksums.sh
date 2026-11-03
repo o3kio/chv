@@ -30,6 +30,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# Remove every temporary secret/binary even when a step fails under `set -e`
+# or exits through `signing_unavailable`.
+cleanup_temps() {
+    # shellcheck disable=SC2317  # invoked indirectly by the EXIT trap below.
+    rm -f "${COSIGN_TMP:-}" "${COSIGN_KEY_FILE:-}"
+    # shellcheck disable=SC2317
+    [[ -z "${GPG_HOME:-}" ]] || rm -rf "$GPG_HOME"
+}
+trap cleanup_temps EXIT
+
 CHECKSUMS="${1:-${REPO_ROOT}/dist/packages/SHA256SUMS}"
 REQUIRE_SIGNING="${CHV_REQUIRE_SIGNING:-0}"
 
@@ -103,20 +113,41 @@ if [[ -n "${CHV_RELEASE_GPG_KEY:-}" ]]; then
 
     echo "GPG signature created and verified: ${CHECKSUMS}.sig"
     rm -rf "$GPG_HOME"
-    exit 0
+    GPG_SIGNED=1
 fi
 
 # ---------------------------------------------------------------------------
 # Cosign signing (Sigstore)
 # ---------------------------------------------------------------------------
+# Runs even when GPG signing succeeded: the two signatures serve different
+# verifiers, and the old `exit 0` in the GPG branch silently skipped a
+# configured cosign key.
 if [[ -n "${CHV_RELEASE_COSIGN_KEY:-}" ]]; then
     if ! command -v cosign >/dev/null 2>&1; then
-        echo "Cosign key detected but cosign CLI not found — installing..."
-        if ! curl -sL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /tmp/cosign; then
-            signing_unavailable "Failed to download cosign CLI"
+        echo "Cosign key detected but cosign CLI not found — installing pinned release..."
+        # Never download `latest` into the protected signing job: an
+        # unversioned, unverified binary would receive the private key. The
+        # version and digest are pinned in-tree; override only with a matching
+        # pair when intentionally rotating.
+        COSIGN_VERSION="${CHV_COSIGN_VERSION:-v2.4.1}"
+        COSIGN_SHA256="${CHV_COSIGN_SHA256:-8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b}"
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            signing_unavailable "cosign auto-install supports x86_64 only; provision cosign on this runner"
         fi
-        chmod +x /tmp/cosign
-        COSIGN_BIN="/tmp/cosign"
+        COSIGN_TMP="$(mktemp)"
+        if ! curl -fsSL --retry 3 --max-time 120 \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+            -o "$COSIGN_TMP"; then
+            rm -f "$COSIGN_TMP"
+            signing_unavailable "Failed to download cosign CLI ${COSIGN_VERSION}"
+        fi
+        COSIGN_ACTUAL="$(sha256sum "$COSIGN_TMP" | awk '{print $1}')"
+        if [[ "$COSIGN_ACTUAL" != "$COSIGN_SHA256" ]]; then
+            rm -f "$COSIGN_TMP"
+            signing_unavailable "cosign CLI checksum mismatch (expected ${COSIGN_SHA256}, got ${COSIGN_ACTUAL})"
+        fi
+        chmod +x "$COSIGN_TMP"
+        COSIGN_BIN="$COSIGN_TMP"
     else
         COSIGN_BIN="cosign"
     fi
@@ -129,6 +160,7 @@ if [[ -n "${CHV_RELEASE_COSIGN_KEY:-}" ]]; then
     if [[ -n "${CHV_RELEASE_COSIGN_PASSWORD:-}" ]]; then
         if ! COSIGN_PASSWORD="$CHV_RELEASE_COSIGN_PASSWORD" "$COSIGN_BIN" sign-blob \
             --key "$COSIGN_KEY_FILE" \
+            --tlog-upload=false \
             --output-signature "${CHECKSUMS}.cosign.sig" \
             "$CHECKSUMS" 2>/dev/null; then
             rm -f "$COSIGN_KEY_FILE"
@@ -137,6 +169,7 @@ if [[ -n "${CHV_RELEASE_COSIGN_KEY:-}" ]]; then
     else
         if ! "$COSIGN_BIN" sign-blob \
             --key "$COSIGN_KEY_FILE" \
+            --tlog-upload=false \
             --output-signature "${CHECKSUMS}.cosign.sig" \
             "$CHECKSUMS" 2>/dev/null; then
             rm -f "$COSIGN_KEY_FILE"
@@ -146,6 +179,12 @@ if [[ -n "${CHV_RELEASE_COSIGN_KEY:-}" ]]; then
 
     echo "Cosign signature created: ${CHECKSUMS}.cosign.sig"
     rm -f "$COSIGN_KEY_FILE"
+    [[ -z "${COSIGN_TMP:-}" ]] || rm -f "$COSIGN_TMP"
+    COSIGN_SIGNED=1
+fi
+
+if [[ "${GPG_SIGNED:-0}" == "1" || "${COSIGN_SIGNED:-0}" == "1" ]]; then
+    echo "Signing complete: ${CHECKSUMS}$([[ "${GPG_SIGNED:-0}" == "1" ]] && echo ' (GPG)')$([[ "${COSIGN_SIGNED:-0}" == "1" ]] && echo ' (cosign)')"
     exit 0
 fi
 

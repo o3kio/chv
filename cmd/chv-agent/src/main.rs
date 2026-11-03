@@ -591,7 +591,15 @@ async fn send_or_defer_control_plane_message(
         return;
     };
 
-    if let Err(e) = client.dispatch_pending_message(&message).await {
+    // Same legacy-queue repair as the shared drain: a message persisted by
+    // a build that predates `MigrationProgress.node_id` has an empty field,
+    // and the control plane will reject it. Fill it from the local identity
+    // before dispatch.
+    let local_node_id = cache.lock().await.node_id.clone();
+    if let Err(e) = client
+        .dispatch_pending_message(&message, &local_node_id)
+        .await
+    {
         warn!(error = %e, "failed to send control-plane message, deferring");
         *telemetry = None;
         connectivity.record_failure(now);

@@ -258,6 +258,7 @@ async fn test_happy_path_migration_state_progression() {
     // Phase: PreCopyDisk
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-001",
         "op-mig-001",
         proto::MigrationPhase::PrecopyDisk as i32,
@@ -279,6 +280,7 @@ async fn test_happy_path_migration_state_progression() {
     // Phase: ConvergingDisk with decreasing dirty blocks
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-001",
         "op-mig-001",
         proto::MigrationPhase::ConvergingDisk as i32,
@@ -292,6 +294,7 @@ async fn test_happy_path_migration_state_progression() {
 
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-001",
         "op-mig-001",
         proto::MigrationPhase::ConvergingDisk as i32,
@@ -316,6 +319,7 @@ async fn test_happy_path_migration_state_progression() {
     // Phase: MemoryMigration
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-001",
         "op-mig-001",
         proto::MigrationPhase::MemoryMigration as i32,
@@ -330,6 +334,7 @@ async fn test_happy_path_migration_state_progression() {
     // Phase: Completed
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-001",
         "op-mig-001",
         proto::MigrationPhase::Completed as i32,
@@ -416,6 +421,7 @@ async fn test_disk_convergence_dirty_block_decrease() {
     for (round, dirty) in &dirty_sequence {
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv",
             "op-conv-001",
             proto::MigrationPhase::ConvergingDisk as i32,
@@ -484,6 +490,7 @@ async fn test_failure_in_precopy_disk_rollback() {
     // (e.g., dest stord killed mid-stream)
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-fail-pre",
         "op-fail-pre",
         proto::MigrationPhase::PrecopyDisk as i32,
@@ -498,6 +505,7 @@ async fn test_failure_in_precopy_disk_rollback() {
     // Dest stord failure -> agent reports RolledBack
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-fail-pre",
         "op-fail-pre",
         proto::MigrationPhase::RolledBack as i32,
@@ -568,6 +576,7 @@ async fn test_failure_in_memory_migration_marked_failed() {
     // Progress through precopy and convergence
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-fail-mem",
         "op-fail-mem",
         proto::MigrationPhase::PrecopyDisk as i32,
@@ -581,6 +590,7 @@ async fn test_failure_in_memory_migration_marked_failed() {
 
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-fail-mem",
         "op-fail-mem",
         proto::MigrationPhase::ConvergingDisk as i32,
@@ -595,6 +605,7 @@ async fn test_failure_in_memory_migration_marked_failed() {
     // Enter memory migration
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-fail-mem",
         "op-fail-mem",
         proto::MigrationPhase::MemoryMigration as i32,
@@ -609,6 +620,7 @@ async fn test_failure_in_memory_migration_marked_failed() {
     // Dest agent killed mid-transfer -> agent reports Failed
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-fail-mem",
         "op-fail-mem",
         proto::MigrationPhase::Failed as i32,
@@ -938,6 +950,7 @@ async fn test_performance_baseline_block_streaming_throughput() {
 
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-perf-blk",
         "op-perf-blk",
         proto::MigrationPhase::PrecopyDisk as i32,
@@ -1015,6 +1028,7 @@ async fn test_performance_baseline_total_migration_time() {
     let phase_start = std::time::Instant::now();
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-perf-tot",
         "op-perf-tot",
         proto::MigrationPhase::PrecopyDisk as i32,
@@ -1031,6 +1045,7 @@ async fn test_performance_baseline_total_migration_time() {
     let phase_start = std::time::Instant::now();
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-perf-tot",
         "op-perf-tot",
         proto::MigrationPhase::ConvergingDisk as i32,
@@ -1047,6 +1062,7 @@ async fn test_performance_baseline_total_migration_time() {
     let phase_start = std::time::Instant::now();
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-perf-tot",
         "op-perf-tot",
         proto::MigrationPhase::MemoryMigration as i32,
@@ -1063,6 +1079,7 @@ async fn test_performance_baseline_total_migration_time() {
     let phase_start = std::time::Instant::now();
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-perf-tot",
         "op-perf-tot",
         proto::MigrationPhase::Completed as i32,
@@ -1173,6 +1190,7 @@ async fn test_concurrent_migrations_tracked_independently() {
     // Progress migration 1 to Completed
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-conc-1",
         "op-conc-1",
         proto::MigrationPhase::Completed as i32,
@@ -1187,6 +1205,7 @@ async fn test_concurrent_migrations_tracked_independently() {
     // Progress migration 2 to Failed
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-conc-2",
         "op-conc-2",
         proto::MigrationPhase::Failed as i32,
@@ -1454,6 +1473,7 @@ async fn test_wait_for_convergence_honors_cancel_flag() {
     // Set initial progress so the loop sees a non-converged state.
     update_migration_progress(
         &cluster.pool,
+        "node-a",
         "vm-cancel-conv",
         "op-cancel-conv",
         proto::MigrationPhase::ConvergingDisk as i32,
@@ -2147,6 +2167,7 @@ mod fabric_dispatch {
         // (round 0, dirty 0). This is the truthful mid-bulk shape.
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv-bulk",
             "op-conv-bulk",
             proto::MigrationPhase::PrecopyDisk as i32,
@@ -2176,6 +2197,7 @@ mod fabric_dispatch {
         // migration reports.
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv-bulk",
             "op-conv-bulk",
             proto::MigrationPhase::ConvergingDisk as i32,
@@ -2247,6 +2269,7 @@ mod fabric_dispatch {
         // bulk copy, so the row shows only A's re-sends.
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv-skew",
             "op-conv-skew",
             proto::MigrationPhase::ConvergingDisk as i32,
@@ -2388,6 +2411,7 @@ mod fabric_dispatch {
         // forced cutover territory.
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv-cap",
             "op-conv-cap",
             proto::MigrationPhase::ConvergingDisk as i32,
@@ -2452,6 +2476,7 @@ mod fabric_dispatch {
         // the agent stopped reporting mid-dirty-sync.
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv-stale2",
             "op-conv-stale2",
             proto::MigrationPhase::ConvergingDisk as i32,
@@ -2524,6 +2549,7 @@ mod fabric_dispatch {
         // round 0, dirty 0, no bytes.
         update_migration_progress(
             &cluster.pool,
+            "node-a",
             "vm-conv-diskless",
             "op-conv-diskless",
             proto::MigrationPhase::MemoryMigration as i32,

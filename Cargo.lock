@@ -891,6 +891,8 @@ dependencies = [
  "chv-monitoring-store",
  "chv-observability",
  "chv-webui-bff",
+ "nix",
+ "percent-encoding",
  "rustls",
  "sqlx",
  "tempfile",

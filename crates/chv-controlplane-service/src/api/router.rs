@@ -204,8 +204,9 @@ pub fn admin_router_with_guest_agents(
     // can produce (review finding: these routes previously had no CSRF
     // protection at all).
     // Backup/restore is HARD-FENCED (#654): every legacy route answers 501
-    // (`NOT_IMPLEMENTED`) instead of queuing work no engine can execute. The
-    // CSRF layer stays in front so a form-native POST still dies with 415.
+    // (`NOT_IMPLEMENTED`) instead of queuing work no engine can execute.
+    // Authentication runs first (401), then CSRF (415 for a form-native POST),
+    // then the fence (501).
     let legacy_backup_routes = Router::new()
         .route(
             "/api/v1/backup-jobs",
@@ -234,6 +235,15 @@ pub fn admin_router_with_guest_agents(
         )
         .layer(middleware::from_fn(
             chv_webui_bff::csrf_middleware::csrf_protection,
+        ))
+        // Authentication must run before the fence: the fence replaced
+        // handlers that each extracted `BearerToken`, and returning 501 to an
+        // anonymous caller would both leak the surface and regress the
+        // pre-fence 401 contract. `viewer` is the pre-fence floor (any
+        // authenticated session).
+        .layer(middleware::from_fn_with_state(
+            bff_state.clone(),
+            chv_webui_bff::auth::viewer_middleware,
         ));
 
     let admin_routes = Router::new()
