@@ -111,6 +111,9 @@ crc32fast = "1"
 moka = { version = "0.12", features = ["future"] }
 aes-gcm = "0.11"
 object_store = { version = "0.14", default-features = false, features = ["aws", "http"] }
+# URL parsing/validation for operator-supplied endpoints (object_store
+# panics on malformed S3 endpoints instead of returning an error, #677).
+url = "2.5"
 # Shared Kubedo stretched-L2 fabric provider (ADR-021), pinned to tag v0.1.5.
 fabric-plan = { git = "https://github.com/o3kio/fabric", tag = "v0.1.5" }
 fabric-linux = { git = "https://github.com/o3kio/fabric", tag = "v0.1.5" }

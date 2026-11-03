@@ -92,6 +92,12 @@ impl S3Shipper {
             .with_disable_bulk_delete(true);
 
         if let Some(endpoint) = &endpoint {
+            // Validate at the construction boundary, not only at the
+            // `shipper_from_destination` call site: object_store 0.14.2
+            // panics inside its URI parser when a malformed endpoint is
+            // first used, so every path that constructs an S3 client must
+            // reject it here (#677).
+            validate_s3_endpoint(endpoint)?;
             // Preserve the previous `Region::Custom` behavior: plain-http
             // endpoints (e.g. a local MinIO) are allowed.
             if endpoint.starts_with("http://") {
@@ -140,6 +146,52 @@ impl BackupShipper for S3Shipper {
     }
 }
 
+/// ASCII characters that the `http` URI parser (used internally by
+/// `object_store`) rejects. `url::Url::parse` accepts most of them by
+/// percent-encoding, so they must be rejected explicitly: the raw endpoint
+/// string is what reaches `object_store`, not the normalized URL.
+const URI_ILLEGAL_CHARS: &[char] = &['"', '<', '>', '\\', '^', '`', '{', '|', '}'];
+
+/// Validate an operator-supplied S3 endpoint before it reaches `object_store`.
+///
+/// `object_store` 0.14.2 feeds the endpoint into its HTTP request builder,
+/// where a malformed value (e.g. one containing a space) can panic inside the
+/// `http`/`url` parsers (`InvalidUriChar`) instead of returning an error
+/// (#677). A typo in a backup destination must surface as a normal
+/// configuration error so retention keeps the row for an operator to fix.
+fn validate_s3_endpoint(endpoint: &str) -> Result<(), ChvError> {
+    let reject = |detail: String| ChvError::InvalidArgument {
+        field: "destination".to_string(),
+        reason: format!("invalid S3 endpoint '{endpoint}': {detail}"),
+    };
+
+    if let Some(c) = endpoint.chars().find(|c| {
+        c.is_control() || c.is_whitespace() || !c.is_ascii() || URI_ILLEGAL_CHARS.contains(c)
+    }) {
+        return Err(reject(format!(
+            "contains character {c:?}, which is not allowed in a URL"
+        )));
+    }
+
+    let parsed =
+        url::Url::parse(endpoint).map_err(|e| reject(format!("not an absolute URL: {e}")))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(reject(format!(
+                "unsupported scheme '{scheme}': expected http or https"
+            )))
+        }
+    }
+
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(reject("missing host".to_string()));
+    }
+
+    Ok(())
+}
+
 /// Convenience constructor that builds a shipper from a destination string.
 ///
 /// Supported formats:
@@ -181,6 +233,15 @@ pub fn shipper_from_destination(
                     _ => {}
                 }
             }
+        }
+
+        if let Some(endpoint) = endpoint.as_deref() {
+            // `S3Shipper::new` validates the endpoint before object_store
+            // sees it (malformed endpoints, including an empty value, panic
+            // in 0.14.2 instead of returning an error — #677). Kept here as
+            // an explicit fail-fast so the error is attributed to the
+            // destination before bucket/credential parsing.
+            validate_s3_endpoint(endpoint)?;
         }
 
         return Ok(Box::new(S3Shipper::new(
@@ -257,5 +318,75 @@ mod tests {
     fn test_shipper_from_destination_rejects_invalid() {
         let result = shipper_from_destination("ftp://host/path", None, None);
         assert!(matches!(result, Err(ChvError::InvalidArgument { .. })));
+    }
+
+    #[test]
+    fn test_shipper_from_destination_rejects_malformed_s3_endpoint() {
+        // Regression for #677: these previously reached object_store, which
+        // panicked (InvalidUriChar) instead of returning an error.
+        for endpoint in [
+            "",
+            "not a url",
+            "http://",
+            "ftp://host",
+            "http://127.0.0.1:9000/backups dir",
+        ] {
+            let destination = format!("s3://bucket/prefix?endpoint={endpoint}");
+            match shipper_from_destination(
+                &destination,
+                Some("ak".to_string()),
+                Some("sk".to_string()),
+            ) {
+                Err(ChvError::InvalidArgument { field, reason }) => {
+                    assert_eq!(field, "destination");
+                    assert!(
+                        reason.contains(&format!("'{endpoint}'")),
+                        "reason must name the offending endpoint {endpoint:?}: {reason}"
+                    );
+                }
+                other => panic!(
+                    "expected InvalidArgument for endpoint {endpoint:?}, got {:?}",
+                    other.map(|_| "Ok(shipper)")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_s3_shipper_new_validates_endpoint_at_construction_boundary() {
+        // Defense in depth for #677: validation inside the constructor, not
+        // only in `shipper_from_destination`, so a future in-crate caller
+        // cannot hand object_store a panicking endpoint.
+        let result = S3Shipper::new(
+            "bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("not a url".to_string()),
+            None,
+            None,
+        );
+        match result {
+            Err(ChvError::InvalidArgument { field, .. }) => assert_eq!(field, "destination"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("malformed endpoint must be rejected"),
+        }
+    }
+
+    #[test]
+    fn test_shipper_from_destination_accepts_http_and_https_endpoints() {
+        // Construction is local (no network call); only the parsed config is
+        // handed to object_store.
+        for endpoint in ["http://127.0.0.1:9000", "https://s3.example.com"] {
+            let destination = format!("s3://bucket/prefix?endpoint={endpoint}");
+            let result = shipper_from_destination(
+                &destination,
+                Some("ak".to_string()),
+                Some("sk".to_string()),
+            );
+            assert!(
+                result.is_ok(),
+                "valid endpoint {endpoint:?} was rejected: {:?}",
+                result.err()
+            );
+        }
     }
 }

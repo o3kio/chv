@@ -56,6 +56,9 @@ futures = "0.3"
 semver = "1"
 toml = { workspace = true }
 object_store = { workspace = true }
+# Validates operator-supplied S3 endpoints before object_store sees them
+# (malformed values panic inside object_store, #677).
+url = { workspace = true }
 x509-parser = { version = "0.18", features = ["verify"] }
 uuid = { workspace = true }
 # Notification dispatcher worker: hardened outbound HTTPS (HTTPS-only,
