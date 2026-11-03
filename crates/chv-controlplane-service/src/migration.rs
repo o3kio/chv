@@ -2223,9 +2223,10 @@ async fn notify_overlay_after_migration(
         return;
     }
 
-    // Bridge name follows the standard naming convention on the node
-    // (first 8 chars of network_id prefixed with "br-"). The agent resolves
-    // the actual interface; we pass our best guess for the ARP request.
+    // Bridge name follows chv_common::bridge_name_for_network: "chvbr0" for
+    // the default network, "br-<id>" while it fits IFNAMSIZ, otherwise
+    // "br-<first 8><fnv16>". The agent resolves the actual interface; we
+    // pass the same derivation for the ARP request.
     for nic in &nics {
         let bridge_name = migration_bridge_name(&nic.network_id);
 
