@@ -99,6 +99,49 @@ impl EnrollmentServer {
         self.revocation = Some(revocation);
         self
     }
+
+    /// Re-check the peer serial against the denylist for enrollment-service
+    /// RPCs that are *not* the token-authenticated `EnrollNode` recovery path.
+    ///
+    /// The enrollment service uses an identity-only interceptor, so handlers
+    /// that mutate state (`RotateNodeCertificate`, `ReportBootstrapResult`)
+    /// must call this themselves. The log line uses the certificate-derived
+    /// [`PeerNodeId`], never the wire-asserted `node_id`, so a revoked peer
+    /// cannot plant a victim's id in the logs.
+    #[allow(clippy::result_large_err)] // tonic::Status is the handler error type.
+    fn reject_revoked_peer<T>(
+        &self,
+        request: &Request<T>,
+        method: &'static str,
+    ) -> Result<(), Status> {
+        if request.extensions().get::<InsecurePeer>().is_some() {
+            return Ok(());
+        }
+        let Some(revocation) = &self.revocation else {
+            return Ok(());
+        };
+        let serial = request
+            .extensions()
+            .get::<PeerCertificateSerial>()
+            .and_then(|serial| serial.0.as_deref());
+        if !revocation.is_revoked(serial) {
+            return Ok(());
+        }
+
+        metrics::counter!("chv_revoked_peer_rejected_total").increment(1);
+        let peer_node_id = request
+            .extensions()
+            .get::<PeerNodeId>()
+            .map(|peer| peer.as_node_id().to_string())
+            .unwrap_or_else(|| "<missing>".to_string());
+        tracing::warn!(
+            peer_node_id = %peer_node_id,
+            certificate_serial = ?serial,
+            method,
+            "rejecting request: peer certificate serial is revoked"
+        );
+        Err(Status::unauthenticated("peer certificate is revoked"))
+    }
 }
 
 #[tonic::async_trait]
@@ -128,6 +171,18 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
         request: Request<proto::RotateNodeCertificateRequest>,
     ) -> Result<Response<proto::RotateNodeCertificateResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "rotate_node_certificate",
+        )?;
+        // The enrollment service uses an identity-only interceptor so a
+        // revoked certificate can still present a one-time bootstrap token to
+        // `EnrollNode`. Rotation is *not* a recovery path: re-check the
+        // denylist here before any handler logic, mirroring the steady-state
+        // interceptor's UNAUTHENTICATED response.
+        self.reject_revoked_peer(&request, "rotate_node_certificate")?;
+
         // Read the peer certificate serial and security-mode marker before
         // `into_inner()` consumes the request. In secure mode the serial is
         // proof that the caller possesses the currently trusted certificate;
@@ -137,31 +192,6 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             .get::<PeerCertificateSerial>()
             .and_then(|serial| serial.0.clone());
         let allow_insecure = request.extensions().get::<InsecurePeer>().is_some();
-
-        // The enrollment service uses an identity-only interceptor so a
-        // revoked certificate can still present a one-time bootstrap token to
-        // `EnrollNode`. Rotation is *not* a recovery path: re-check the
-        // denylist here before any handler logic, mirroring the steady-state
-        // interceptor's UNAUTHENTICATED response.
-        if !allow_insecure {
-            if let Some(revocation) = &self.revocation {
-                if revocation.is_revoked(presented_serial.as_deref()) {
-                    metrics::counter!("chv_revoked_peer_rejected_total").increment(1);
-                    tracing::warn!(
-                        node_id = %request.get_ref().node_id,
-                        certificate_serial = ?presented_serial,
-                        "rejecting certificate rotation: peer certificate serial is revoked"
-                    );
-                    return Err(Status::unauthenticated("peer certificate is revoked"));
-                }
-            }
-        }
-
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
-            "rotate_node_certificate",
-        )?;
         let _span = tracing::info_span!("rotate_node_certificate", %op_id);
         let resp = self
             .service
@@ -182,6 +212,10 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             &request.get_ref().node_id,
             "report_bootstrap_result",
         )?;
+        // Same enrollment-service exemption as rotation: bootstrap-result
+        // upserts are self-scoped, but a revoked certificate must not mutate
+        // node state. `EnrollNode` alone is the token-authenticated exception.
+        self.reject_revoked_peer(&request, "report_bootstrap_result")?;
         let _span = tracing::info_span!("report_bootstrap_result", %op_id);
         let resp = self
             .service

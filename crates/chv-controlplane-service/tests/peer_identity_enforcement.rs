@@ -480,6 +480,38 @@ async fn report_bootstrap_result_rejects_peer_node_id_mismatch() {
     assert_eq!(status.code(), Code::PermissionDenied);
 }
 
+/// N1 (#661 review): `ReportBootstrapResult` rides the identity-only
+/// enrollment interceptor but must still deny a revoked certificate — it
+/// upserts node state and is not the token-authenticated enrollment path.
+#[tokio::test]
+async fn report_bootstrap_result_rejects_revoked_serial() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, _repo) = build_enrollment_server_with_revocation(&["revoked-serial"]).await;
+
+    let payload = proto::ReportBootstrapResultRequest {
+        meta: Some(proto::RequestMeta {
+            operation_id: "op-revoked-report".into(),
+            requested_by: "node-a".into(),
+            target_node_id: "node-a".into(),
+            desired_state_version: "1".into(),
+            request_unix_ms: 0,
+        }),
+        node_id: "node-a".into(),
+        bootstrap_status: "success".into(),
+        message: "".into(),
+    };
+
+    let req = request_with_peer_serial(payload, "node-a", Some("revoked-serial"));
+    let status = server
+        .report_bootstrap_result(req)
+        .await
+        .expect_err("revoked serial must not upsert bootstrap results");
+
+    assert_eq!(status.code(), Code::Unauthenticated);
+    assert_eq!(status.message(), "peer certificate is revoked");
+}
+
 /// Defense-in-depth: when no peer identity extension is present (i.e. the
 /// interceptor did NOT run), the handler must still reject — never silently
 /// accept the wire-asserted node_id.

@@ -21,9 +21,11 @@ This runbook covers:
 CHV v1 has no CRL or OCSP responder. Node certificates are short-lived
 (issued with a ~90-day lifetime; agents rotate every 12 hours) and the
 control plane keeps a durable **denylist keyed by certificate serial**
-(`node_certificate_revocations`). Every production mTLS request is checked
-against an in-memory snapshot of that table by the gRPC peer-identity
-interceptor before the handler runs.
+(`node_certificate_revocations`). Every steady-state production mTLS request
+is checked against an in-memory snapshot of that table by the gRPC
+peer-identity interceptor before the handler runs. The token-authenticated
+`EnrollNode` recovery path is the sole exception (see *Recovery exemption*
+below).
 
 Revocation is therefore two independent guarantees:
 
@@ -72,12 +74,13 @@ chvctl node revoke-certificate <NODE_ID> \
 
 > **The `--certificate-serial` value is the canonical DB serial, not the
 > `openssl` display.** CHV stores an 8-character lowercase hex string in
-> `nodes.certificate_serial` (e.g. `0a3f7b2c`). `openssl x509 -serial` prints
-> the DER integer as **HEX** (typically 16+ characters, e.g.
-> `0a:3f:7b:2c:...`), which is a *different* value encoding. Passing that value
-> is rejected with a 400 rather than creating a denylist row that matches no
-> certificate. Read `nodes.certificate_serial` (or omit
-> `--certificate-serial` to use the node's active serial).
+> `nodes.certificate_serial` (e.g. `0a3f7b2c`). The DER integer contains the
+> **ASCII bytes** of that string, so `openssl x509 -noout -serial` renders
+> `serial=3061336637623263` (HEX of `0a3f7b2c`) — a *different, longer* value
+> encoding. Passing the openssl value is rejected with a 400 rather than
+> creating a denylist row that matches no certificate. Read
+> `nodes.certificate_serial` (or omit `--certificate-serial` to use the node's
+> active serial).
 
 Equivalent API call:
 
@@ -204,11 +207,11 @@ plane disagree:
    the `openssl` HEX rendering:
    - Canonical value: the 8-character lowercase hex string in
      `nodes.certificate_serial` (e.g. `0a3f7b2c`).
-   - `openssl x509 -noout -serial -in /etc/chv/certs/agent-client.crt` prints
-     the DER integer as HEX (e.g. `serial=0A3F7B2C2F9E1B4D`). Do not paste that
-     into `--certificate-serial`; it is a different encoding and will be
-     rejected. Convert it only if you can map it unambiguously to the DB value,
-     or read the DB value directly.
+   - For that same certificate, `openssl x509 -noout -serial -in
+     /etc/chv/certs/agent-client.crt` prints `serial=3061336637623263` — the
+     HEX encoding of the ASCII bytes `0a3f7b2c`, not the canonical value.
+     Do not paste the openssl value into `--certificate-serial`; it is a
+     different encoding and will be rejected. Read the DB value directly.
 2. If the node holds the current serial but the stored one is stale, the
    previous rotation committed late — wait one agent cycle and retry.
 3. If the node cannot present the recorded serial, it must re-enroll
@@ -314,6 +317,20 @@ production does not accept unauthenticated TLS clients.
   will say `node-a` even if the request came from an attacker's host. Treat
   actions by that node id as untrusted during an incident.
 - Protect a deployment running `CHV_ALLOW_INSECURE=1` (dev only).
+
+**Residual design risk — 32-bit serials.** CHV serials come from
+`chv_common::gen_short_id()` (4 random bytes, 8 hex chars) and
+`nodes.certificate_serial` has no UNIQUE constraint, so a newly minted serial
+can collide with another node's *active* serial. Minting already regenerates on
+collision with a **revoked** serial (bounded 8 attempts), but it cannot detect
+this active-serial case. If it happens, the denylist — keyed only by serial —
+would revoke both nodes, and rotation proof-of-possession becomes ambiguous.
+The collision probability per issuance is roughly `N / 2³²` for `N` active
+serials (~1 in 4.3 billion for a single one), so this is a follow-up, not a
+blocker: add a UNIQUE constraint (or widen serials) once the fleet/rotation
+volume justifies it. If you suspect
+a collision, compare `node_id` values for the serial in
+`node_certificate_revocations` and `nodes` before revoking.
 
 ---
 

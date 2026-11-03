@@ -190,7 +190,8 @@ Certificate content rules:
    for RSA).
 5. Serial numbers are recorded in `nodes.certificate_serial` and checked against
    the `node_certificate_revocations` denylist by the gRPC peer-identity
-   interceptor on every production mTLS request (#661). The table is the source
+   interceptor on every steady-state production mTLS request (#661); the
+   token-authenticated `EnrollNode` recovery path is excepted. The table is the source
    of truth; a startup-loaded, atomically refreshed in-memory snapshot keeps the
    synchronous interceptor off the database hot path. Production startup fails
    closed if the snapshot cannot be loaded. There is no CRL/OCSP infrastructure
@@ -202,6 +203,10 @@ Certificate content rules:
    revoked node can present a one-time bootstrap token to `EnrollNode` (the
    token is the authentication factor); `RotateNodeCertificate` re-checks the
    denylist and every steady-state service keeps full enforcement.
+   Residual risk: serials are 32-bit `gen_short_id()` values and
+   `nodes.certificate_serial` is not UNIQUE, so a fresh serial can collide with
+   another node's active serial; minting retries only on collisions with
+   *revoked* serials. A uniqueness constraint or wider serials is a follow-up.
    Operators revoke through the admin-only `POST /v1/nodes/revoke-certificate`
    route (`chvctl node revoke-certificate`); see
    [`docs/runbooks/node-certificate-compromise.md`](../../runbooks/node-certificate-compromise.md).
