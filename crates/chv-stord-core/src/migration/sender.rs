@@ -10,6 +10,7 @@ use chv_stord_backends::{
     StorageBackend, WriteCanaryCapability, WriteCanaryFingerprint, DIRTY_TRACKING_BLOCK_SIZE,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tracing::{debug, error, info, warn};
@@ -30,6 +31,20 @@ const SOURCE_MODIFIED_CODE: &str = "source_modified_during_migration";
 const DEFAULT_BLOCK_SIZE: u64 = DIRTY_TRACKING_BLOCK_SIZE;
 const DIRTY_THRESHOLD: u64 = 1024;
 const MAX_DIRTY_ROUNDS: u32 = 10;
+
+/// Default bound on the wait for `FinalizeAck` after `FinalizeComplete`.
+/// The receiver answers immediately after its full-volume digest pass, so
+/// a healthy finalize is bounded by disk throughput; 30 s matches the
+/// existing per-Ack timeout and is generous for a local digest pass while
+/// still guaranteeing the task cannot hang forever on a dead peer.
+pub const DEFAULT_FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Production bounds for the configurable `FinalizeAck` timeout. Values
+/// outside this range are clamped by [`start_migration_to_peer`]; the
+/// [`MigrationSender::with_finalize_ack_timeout`] setter deliberately does
+/// not clamp so integration tests can drive a sub-second timeout.
+pub const MIN_FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_FINALIZE_ACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// TLS configuration for mTLS connections to the migration destination.
 ///
@@ -87,6 +102,10 @@ pub struct MigrationSender<B: StorageBackend> {
     /// time. Opt-in; the default (false) keeps the quiescent-assumed
     /// contract: write canary + finalize digest.
     pause_first: bool,
+    /// Bound on the wait for `FinalizeAck` after `FinalizeComplete`.
+    /// Without it a destination that accepts the stream but never answers
+    /// finalization leaves the sender (and the VM) paused forever.
+    finalize_ack_timeout: Duration,
 }
 
 impl<B: StorageBackend> MigrationSender<B> {
@@ -103,6 +122,7 @@ impl<B: StorageBackend> MigrationSender<B> {
             task: None,
             canary_baseline: None,
             pause_first: false,
+            finalize_ack_timeout: DEFAULT_FINALIZE_ACK_TIMEOUT,
         }
     }
 
@@ -123,6 +143,17 @@ impl<B: StorageBackend> MigrationSender<B> {
     /// coordination channel); `start_migration` fails closed otherwise.
     pub fn with_pause_first(mut self) -> Self {
         self.pause_first = true;
+        self
+    }
+
+    /// Bound the wait for `FinalizeAck` after `FinalizeComplete`.
+    ///
+    /// The value is used exactly as given (no clamping) so tests can drive
+    /// a sub-second failure path. Callers entering through
+    /// [`start_migration_to_peer`] get production bounds
+    /// ([`MIN_FINALIZE_ACK_TIMEOUT`]..=[`MAX_FINALIZE_ACK_TIMEOUT`]).
+    pub fn with_finalize_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.finalize_ack_timeout = timeout;
         self
     }
 
@@ -540,12 +571,43 @@ impl<B: StorageBackend> MigrationSender<B> {
         // Wait for FinalizeAck. Boundary acks flushed by the receiver
         // (round acknowledgments, the FinalSync flush) may still be in
         // flight; they are expected here and processed normally — a
-        // CRC-mismatch Ack still fails the migration (fail-closed).
+        // CRC-mismatch Ack still fails the migration (fail-closed). Each
+        // read is bounded so a destination that never answers cannot hang
+        // the task (and leave the VM paused) forever.
         loop {
-            let ack_msg = inbound
-                .message()
-                .await?
-                .ok_or_else(|| tonic::Status::internal("stream closed before FinalizeAck"))?;
+            let ack_msg =
+                match tokio::time::timeout(self.finalize_ack_timeout, inbound.message()).await {
+                    Ok(Ok(Some(msg))) => msg,
+                    Ok(Ok(None)) => {
+                        return Err(tonic::Status::internal("stream closed before FinalizeAck"));
+                    }
+                    Ok(Err(e)) => {
+                        return Err(tonic::Status::internal(format!("stream error: {e}")));
+                    }
+                    Err(_) => {
+                        let message = format!(
+                            "timed out waiting for FinalizeAck after {}s",
+                            self.finalize_ack_timeout.as_secs_f64()
+                        );
+                        error!(
+                            volume_id = %self.volume_id,
+                            timeout_secs = self.finalize_ack_timeout.as_secs_f64(),
+                            "migration finalization timed out waiting for FinalizeAck"
+                        );
+                        metrics::counter!(
+                            STORD_MIGRATION_ERRORS_TOTAL,
+                            "reason" => "finalize_ack_timeout"
+                        )
+                        .increment(1);
+                        if let Some(ref task) = self.task {
+                            let mut state = task.state.write().await;
+                            state.phase = MigrationPhase::Failed;
+                            state.error_message = message.clone();
+                            state.needs_vm_pause = false;
+                        }
+                        return Err(tonic::Status::deadline_exceeded(message));
+                    }
+                };
 
             match ack_msg.payload {
                 Some(migration_message::Payload::FinalizeAck(ref ack)) => {
@@ -1043,7 +1105,14 @@ impl<B: StorageBackend> MigrationSender<B> {
 /// the disk migration protocol spec. When `pause_first` is true (issue
 /// #394, Option C), the sender requests the VM pause before any source
 /// read and the transfer runs quiesced (stop-the-world, correct by
-/// construction).
+/// construction). `finalize_ack_timeout` bounds the wait for
+/// `FinalizeAck`; `None` uses the 30 s default, and values outside
+/// [`MIN_FINALIZE_ACK_TIMEOUT`]..=[`MAX_FINALIZE_ACK_TIMEOUT`] are clamped.
+// The migration entry point already threads the peer/volume identity,
+// backend, TLS, task, and pause mode; adding the #656 timeout over the
+// counter keeps the call site explicit and is preferable to an options
+// struct that would churn every caller for one new knob.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_migration_to_peer<B: StorageBackend>(
     endpoint: String,
     volume_id: String,
@@ -1052,6 +1121,7 @@ pub async fn start_migration_to_peer<B: StorageBackend>(
     tls_config: Option<MigrationTlsConfig>,
     task: Option<Arc<MigrationTask>>,
     pause_first: bool,
+    finalize_ack_timeout: Option<Duration>,
 ) -> Result<(), tonic::Status> {
     let mut sender = MigrationSender::new(backend, volume_id, handle);
     if let Some(tls) = tls_config {
@@ -1063,6 +1133,10 @@ pub async fn start_migration_to_peer<B: StorageBackend>(
     if pause_first {
         sender = sender.with_pause_first();
     }
+    let timeout = finalize_ack_timeout
+        .unwrap_or(DEFAULT_FINALIZE_ACK_TIMEOUT)
+        .clamp(MIN_FINALIZE_ACK_TIMEOUT, MAX_FINALIZE_ACK_TIMEOUT);
+    sender = sender.with_finalize_ack_timeout(timeout);
     sender.start_migration(endpoint).await
 }
 

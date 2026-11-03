@@ -597,7 +597,10 @@ was observed and how it was verified — it is recorded in the journal.
 
 ### Graceful Node Drain
 
-Draining a node evacuates all VMs via live migration before allowing maintenance.
+Draining a node evacuates all VMs via migration before allowing maintenance.
+Until #394 is proven, migration is **stop-the-world**: the VM is paused for
+the full disk+memory transfer (live migration is rejected at the user-facing
+API, UI, and chvctl).
 
 > **Qualification status:** The drain machinery is code-supported but
 > unqualified; no multi-host evidence exists.
@@ -622,8 +625,8 @@ curl -X POST http://127.0.0.1:8080/v1/nodes/mutate \
    desired-Running VM (or an undecodable fragment) remains, the agent blocks
    the `Maintenance` transition and raises a `drain_blocked` control-plane
    alert (on change, not per tick).
-3. VMs are live-migrated to other `TenantReady` nodes (legacy mode), or
-   re-homed by the control plane (core-managed mode)
+3. VMs are migrated to other `TenantReady` nodes (legacy mode; stop-the-world
+   until #394 is proven), or re-homed by the control plane (core-managed mode)
 4. When all VMs are evacuated, node transitions to `Maintenance` automatically
 5. Perform maintenance (kernel update, hardware swap, etc.)
 6. Restart agent: `sudo systemctl start chv-agent`
@@ -694,7 +697,9 @@ The control plane validates the matrix at upgrade time. If the target version fa
 
 ### Migration Monitoring
 
-Key Prometheus metrics to watch during live migration:
+Key Prometheus metrics to watch during migration (stop-the-world until #394
+is proven; the finalize wait is bounded at 30 s by default and a timeout is
+counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`):
 
 | Metric | Type | What it tells you |
 |--------|------|-------------------|

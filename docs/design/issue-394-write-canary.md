@@ -169,19 +169,23 @@ The follow-up the DP3 ruling deferred to. What landed:
   disk and memory migration and is resumed on the destination —
   the same resume contract the default mode already had at its
   final-sync pause; only the pause's position moved.
-- **Operator surface**: the BFF vm-mutate migrate action accepts an
-  optional `pause_first` JSON field — a *present* non-bool value is
-  rejected 400 rather than coerced (a quoted `"true"` silently
-  downgrading to quiescent-assumed would be the same "asked for the
-  pause, didn't get it" failure the mode exists to prevent);
-  `chvctl migrate start --pause-first` and `chvctl vm migrate
-  --pause-first` set it.
-- **Boundary (WebUI — landed 2026-10-09, #582)**: the migrate modal now
-  exposes the pause-first opt-in as a checkbox with an honest downtime
-  warning (downtime equals the full disk + memory transfer); the
-  modal's description switches from "the VM will remain running" to
-  the stop-the-world wording when checked. Threaded through the
-  vm-mutate migrate action's `pause_first` JSON field (the BFF hop
+- **Operator surface (temporary fail-closed gate, #656)**: until #394
+  is proven the user-facing surfaces no longer offer the live path.
+  The BFF vm-mutate migrate action and the control-plane mutation
+  service reject `pause_first=false` (and a missing field) with a 400
+  — "live/concurrent-write migration is not supported until #394 is
+  proven; set pause_first=true (stop-the-world)" — before any lifecycle
+  dispatch; a *present* non-bool value is likewise rejected rather than
+  coerced. `chvctl migrate start --pause-first` and `chvctl vm migrate
+  --pause-first` require the flag and fail closed client-side without
+  sending a request. Nothing silently coerces false to true; the
+  stord wire protocol still accepts false for internal/older callers.
+- **Boundary (WebUI — #582, made mandatory by #656)**: the migrate
+  modal now renders pause-first checked and disabled and always sends
+  `true`. Its description states that live migration is disabled until
+  #394 is proven and that the VM is paused for the full disk + memory
+  transfer; the downtime warning is always visible. Threaded through
+  the vm-mutate migrate action's `pause_first` JSON field (the BFF hop
   landed with #578). Version-skew note: the UI and BFF are
   release-co-packaged, and as with the API/chvctl path the
   fail-closed posture here is within-version only — a pre-`pause_first`

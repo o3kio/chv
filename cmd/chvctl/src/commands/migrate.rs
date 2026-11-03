@@ -6,15 +6,15 @@ use crate::output::{self, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum MigrateCommands {
-    /// Start a live migration for a VM
+    /// Start a stop-the-world migration for a VM
     Start {
         /// VM identifier to migrate
         vm_id: String,
         /// Target node to migrate to
         target_node: String,
-        /// Pause the VM before disk transfer (stop-the-world, issue #394
-        /// Option C): correct by construction, downtime equals the full
-        /// transfer. Omit for the default quiescent-assumed mode.
+        /// Required: pause the VM for the full transfer (stop-the-world).
+        /// Live migration is disabled until #394 is proven; omitting this
+        /// flag fails closed without sending a request.
         #[arg(long)]
         pause_first: bool,
     },
@@ -43,6 +43,7 @@ pub async fn execute(
             target_node,
             pause_first,
         } => {
+            crate::commands::require_pause_first(pause_first)?;
             // #372 DP4: there is no POST /v1/migrations route — the real
             // entry point is the vm-mutate migrate action, the exact path
             // `chvctl vm migrate` drives. The wire field is

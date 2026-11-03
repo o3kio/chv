@@ -1,6 +1,6 @@
 //! BFF route tests for the vm-mutate migrate action's `pause_first`
-//! field (issue #394, Option C) — the API-boundary discipline of the
-//! stop-the-world opt-in.
+//! field (issue #394, Option C; fail-closed gate per issue #656) — the
+//! API-boundary discipline of stop-the-world migration.
 //!
 //! The chvctl contract row (`vm_migrate_pause_first_row`) pins the
 //! CLI→body→handler→mutation-service thread with a well-typed bool;
@@ -8,14 +8,12 @@
 //!
 //! 1. **A present non-bool `pause_first` is rejected, not coerced** —
 //!    `"pause_first": "true"` (quoted) or any other non-boolean JSON
-//!    value must fail 400 before the mutation service runs. Silently
-//!    coercing to false would downgrade an operator's stop-the-world
-//!    request to quiescent-assumed — the exact "asked for the pause,
-//!    didn't get it" failure the mode exists to prevent (direct API
-//!    callers are exposed; chvctl always sends a proper bool).
+//!    value must fail 400 before the mutation service runs.
 //! 2. **A well-typed `pause_first: true` forwards with the flag set.**
-//! 3. **An absent `pause_first` forwards with the flag clear** (the
-//!    default quiescent-assumed mode).
+//! 3. **An absent or explicit `false` `pause_first` is rejected** —
+//!    live/concurrent-write migration is not supported until #394 is
+//!    proven. The old absent→false default silently chose the live path;
+//!    the gate must reject it with a clear 400, never coerce it to true.
 
 use std::sync::{Arc, Mutex};
 
@@ -323,12 +321,12 @@ async fn bool_pause_first_forwards_with_the_flag_set() {
 }
 
 #[tokio::test]
-async fn absent_pause_first_forwards_as_default_mode() {
+async fn absent_pause_first_is_rejected_as_live_migration() {
     let mutations = Arc::new(RecordingMutations::default());
     let state = build_state(mutations.clone()).await;
     let token = seed_operator_and_vm(&state).await;
 
-    let (status, _body) = send_migrate(
+    let (status, body) = send_migrate(
         state.clone(),
         &token,
         serde_json::json!({
@@ -338,11 +336,51 @@ async fn absent_pause_first_forwards_as_default_mode() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let calls = mutations.migrate_calls.lock().unwrap();
     assert_eq!(
-        calls.as_slice(),
-        [("vm-1".to_string(), "n-2".to_string(), false)],
-        "an absent pause_first must forward as the default mode"
+        status,
+        StatusCode::BAD_REQUEST,
+        "an absent pause_first must fail closed, got {status}: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|e| e.contains("#394") && e.contains("pause_first=true")),
+        "the rejection must explain the #394 gate and the remedy: {body}"
+    );
+    assert!(
+        mutations.migrate_calls.lock().unwrap().is_empty(),
+        "the mutation service must not run on an absent pause_first"
+    );
+}
+
+#[tokio::test]
+async fn false_pause_first_is_rejected_as_live_migration() {
+    let mutations = Arc::new(RecordingMutations::default());
+    let state = build_state(mutations.clone()).await;
+    let token = seed_operator_and_vm(&state).await;
+
+    let (status, body) = send_migrate(
+        state.clone(),
+        &token,
+        serde_json::json!({
+            "vm_id": "vm-1",
+            "action": "migrate",
+            "target_node_id": "n-2",
+            "pause_first": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an explicit live request must fail closed, got {status}: {body}"
+    );
+    assert!(
+        body["message"].as_str().is_some_and(|e| e.contains("#394")),
+        "the rejection must explain the #394 gate: {body}"
+    );
+    assert!(
+        mutations.migrate_calls.lock().unwrap().is_empty(),
+        "the mutation service must not run on a live request"
     );
 }

@@ -33,6 +33,17 @@ verification and the task ends Failed (`Status::data_loss`) instead of
 Completed — but converging dirty rounds under load and a post-pause sweep
 are unimplemented, so the mode is not claimed.
 
+**Temporary fail-closed gate (#656):** until #394 is proven, the
+user-facing API does not offer the live path. The BFF vm-mutate handler
+and the control-plane mutation service reject `pause_first=false` (and a
+missing field) with `400 Bad Request` — "live/concurrent-write migration
+is not supported until #394 is proven; set pause_first=true
+(stop-the-world)" — before dispatching the lifecycle RPC; both chvctl
+commands reject the live path client-side before sending; and the WebUI
+modal renders pause-first checked and disabled and always sends `true`.
+The VM is paused for the full disk+memory transfer. Live migration
+returns when #394 is proven; this gate is not a capability claim.
+
 ## State Machine
 
 ```
@@ -210,8 +221,11 @@ source agent pauses the VM before triggering stord's bulk copy (the
 transfer correct by construction at the cost of stop-the-world downtime; it
 is set per-migration from the BFF vm-mutate migrate action's `pause_first`
 field (`chvctl migrate start --pause-first` / `chvctl vm migrate
---pause-first`, and the WebUI migrate modal's pause-first checkbox —
-landed via #582, with an honest downtime warning).
+--pause-first`, and the WebUI migrate modal's mandatory checked control —
+landed via #582, with an honest downtime warning). Since #656 the
+user-facing surfaces require `true`: the BFF and chvctl fail closed on
+the live path (see *Temporary fail-closed gate*), so every
+operator-initiated migration is stop-the-world until #394 is proven.
 
 ## Operation Integration
 

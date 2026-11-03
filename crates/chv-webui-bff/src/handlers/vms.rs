@@ -1309,20 +1309,33 @@ pub async fn mutate_vm(
                 BffError::BadRequest("missing target_node_id for migrate action".into())
             })?
             .to_string();
-        // Issue #394 Option C: the opt-in stop-the-world mode. Optional,
-        // defaults to false (quiescent-assumed). A *present* non-bool
-        // value is rejected rather than coerced: `"pause_first":
-        // "true"` silently downgrading to quiescent-assumed would be
-        // exactly the "operator asked for the pause, didn't get it"
-        // failure the mode exists to prevent. Exposed in the WebUI's
-        // migrate modal (checkbox with a downtime warning, #582) and
-        // via chvctl/API.
+        // Issue #656: live/concurrent-write migration is not supported
+        // until #394 is proven. The user-facing API fails closed: only an
+        // explicit boolean `true` proceeds. A missing field is NOT
+        // defaulted to false (which used to mean live); it is rejected
+        // with the same clear 400. A *present* non-bool value is rejected
+        // rather than coerced. Do not silently coerce either case to
+        // true — that would claim a stop-the-world pause the caller did
+        // not request.
         let pause_first = match payload.get("pause_first") {
-            None => false,
             Some(v) => v.as_bool().ok_or_else(|| {
                 BffError::BadRequest("pause_first for migrate action must be a boolean".into())
             })?,
+            None => {
+                return Err(BffError::BadRequest(
+                    "live/concurrent-write migration is not supported until #394 is proven; \
+                     set pause_first=true (stop-the-world)"
+                        .into(),
+                ));
+            }
         };
+        if !pause_first {
+            return Err(BffError::BadRequest(
+                "live/concurrent-write migration is not supported until #394 is proven; \
+                 set pause_first=true (stop-the-world)"
+                    .into(),
+            ));
+        }
         state
             .mutations
             .migrate_vm(vm_id, target_node_id, pause_first, claims.sub)

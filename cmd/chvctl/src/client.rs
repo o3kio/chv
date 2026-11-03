@@ -19,6 +19,9 @@ pub enum CliError {
     /// A watched task reached a non-successful terminal status or the
     /// watch timed out (#372 DP6) — the API call itself succeeded.
     Task(String),
+    /// A client-side usage/contract rejection that never reaches the
+    /// server (e.g. the fail-closed live-migration gate, #656).
+    Usage(String),
 }
 
 impl fmt::Display for CliError {
@@ -31,6 +34,7 @@ impl fmt::Display for CliError {
             CliError::Parse(msg) => write!(f, "Parse error: {msg}"),
             CliError::Io(msg) => write!(f, "I/O error: {msg}"),
             CliError::Task(msg) => write!(f, "Task error: {msg}"),
+            CliError::Usage(msg) => write!(f, "Usage error: {msg}"),
         }
     }
 }

@@ -1302,9 +1302,10 @@ async fn vm_delete_row() {
     .expect("chvctl vm delete against POST /v1/vms/delete");
 }
 
-/// `chvctl vm migrate` — GREEN; forwarded to the mutation service with
-/// the `target_node_id` field name (this is the path `migrate start`
-/// should delegate to — design §2.3).
+/// `chvctl vm migrate --pause-first` — GREEN; forwarded to the mutation
+/// service with the `target_node_id` field name (this is the path
+/// `migrate start` should delegate to — design §2.3). Issue #656 makes
+/// pause-first mandatory, so the only positive row sends `true`.
 #[tokio::test]
 async fn vm_migrate_row() {
     let h = Harness::start().await;
@@ -1317,13 +1318,49 @@ async fn vm_migrate_row() {
         vm::VmCommands::Migrate {
             vm_id: "vm-1".to_string(),
             to: "n-2".to_string(),
+            pause_first: true,
+        },
+        &OutputFormat::Json,
+    )
+    .await
+    .expect("chvctl vm migrate --pause-first against POST /v1/vms/mutate");
+    h.mutations
+        .assert_recorded("migrate_vm:vm-1:n-2:pause_first");
+}
+
+/// Issue #656: `chvctl vm migrate` without `--pause-first` fails closed
+/// client-side. The live path must never reach the BFF (no mutation call
+/// recorded), and the error must tell the operator to pass the flag.
+#[tokio::test]
+async fn vm_migrate_without_pause_first_is_rejected_locally() {
+    let h = Harness::start().await;
+    h.seed_node().await;
+    h.seed_vm("vm-1").await;
+    let token = h.seed_jwt_as("operator").await;
+
+    let err = vm::execute(
+        &h.client(Some(token)),
+        vm::VmCommands::Migrate {
+            vm_id: "vm-1".to_string(),
+            to: "n-2".to_string(),
             pause_first: false,
         },
         &OutputFormat::Json,
     )
     .await
-    .expect("chvctl vm migrate against POST /v1/vms/mutate");
-    h.mutations.assert_recorded("migrate_vm:vm-1:n-2:live");
+    .expect_err("the live migration path must fail closed");
+    match err {
+        CliError::Usage(msg) => assert!(
+            msg.contains("#394") && msg.contains("--pause-first"),
+            "the local rejection must explain the gate and remedy: {msg}"
+        ),
+        other => panic!("expected a usage error, got {other:?}"),
+    }
+    assert!(
+        h.mutations.calls().is_empty(),
+        "no HTTP mutation may be recorded for a locally rejected live migration: {:?}",
+        h.mutations.calls()
+    );
 }
 
 /// `chvctl vm migrate --pause-first` — the issue #394 Option C opt-in
@@ -2903,7 +2940,8 @@ async fn user_delete_row() {
 /// target_node_id}` — the exact path `chvctl vm migrate` already drove
 /// (the pre-fix command called `POST /v1/migrations` with
 /// `{vm_id, target_node}`, a route and field that never existed).
-/// Forwarded to the mutation service like `vm migrate`.
+/// Forwarded to the mutation service like `vm migrate`; issue #656 makes
+/// pause-first mandatory.
 #[tokio::test]
 async fn migrate_start_row() {
     let h = Harness::start().await;
@@ -2916,13 +2954,48 @@ async fn migrate_start_row() {
         migrate::MigrateCommands::Start {
             vm_id: "vm-1".to_string(),
             target_node: "n-2".to_string(),
+            pause_first: true,
+        },
+        &OutputFormat::Json,
+    )
+    .await
+    .expect("chvctl migrate start --pause-first against POST /v1/vms/mutate");
+    h.mutations
+        .assert_recorded("migrate_vm:vm-1:n-2:pause_first");
+}
+
+/// Issue #656: `chvctl migrate start` without `--pause-first` fails
+/// closed client-side, before any HTTP request is recorded.
+#[tokio::test]
+async fn migrate_start_without_pause_first_is_rejected_locally() {
+    let h = Harness::start().await;
+    h.seed_node().await;
+    h.seed_vm("vm-1").await;
+    let token = h.seed_jwt_as("operator").await;
+
+    let err = migrate::execute(
+        &h.client(Some(token)),
+        migrate::MigrateCommands::Start {
+            vm_id: "vm-1".to_string(),
+            target_node: "n-2".to_string(),
             pause_first: false,
         },
         &OutputFormat::Json,
     )
     .await
-    .expect("chvctl migrate start against POST /v1/vms/mutate");
-    h.mutations.assert_recorded("migrate_vm:vm-1:n-2:live");
+    .expect_err("the live migration path must fail closed");
+    match err {
+        CliError::Usage(msg) => assert!(
+            msg.contains("#394") && msg.contains("--pause-first"),
+            "the local rejection must explain the gate and remedy: {msg}"
+        ),
+        other => panic!("expected a usage error, got {other:?}"),
+    }
+    assert!(
+        h.mutations.calls().is_empty(),
+        "no HTTP mutation may be recorded for a locally rejected live migration: {:?}",
+        h.mutations.calls()
+    );
 }
 
 /// `chvctl migrate status` — GREEN since the PR 4 repoint (design
