@@ -188,8 +188,15 @@ fn sqlite_url_path(database_url: &str) -> Option<PathBuf> {
     // path than the database sqlx actually opens.
     let rest = database_url.strip_prefix("sqlite:")?;
     let rest = rest.strip_prefix("//").unwrap_or(rest);
-    let database = rest.split('?').next().unwrap_or_default();
+    let (database, params) = rest.split_once('?').unwrap_or((rest, ""));
     if database.is_empty() {
+        return None;
+    }
+
+    // sqlx maps `?mode=memory` to `SQLITE_OPEN_MEMORY`: no file is opened, so
+    // the guard must fall back to the runtime directory instead of contending
+    // on a lock next to a path that never exists.
+    if query_requests_memory(params) {
         return None;
     }
 
@@ -208,6 +215,23 @@ fn sqlite_url_path(database_url: &str) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(decoded))
+}
+
+/// True when a SQLite URL query string asks for an in-memory database.
+///
+/// sqlx parses the query with `url::form_urlencoded`, so `+` means space and
+/// percent-escapes are decoded before comparing `mode` with `memory`.
+fn query_requests_memory(params: &str) -> bool {
+    params.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        decode_form_component(key) == "mode" && decode_form_component(value) == "memory"
+    })
+}
+
+fn decode_form_component(value: &str) -> String {
+    percent_encoding::percent_decode_str(&value.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 fn read_holder(file: &mut File) -> Option<String> {
@@ -390,6 +414,25 @@ mod tests {
         assert_eq!(
             lock_path_for_database(runtime, "sqlite:file:/var/lib/chv/controlplane.db?mode=rwc"),
             PathBuf::from("/var/lib/chv/.controlplane.db.instance.lock")
+        );
+        // `?mode=memory` opens an in-memory database in sqlx, so there is no
+        // file to guard and the runtime-dir fallback is used (avoids false
+        // contention next to a path that is never opened).
+        for url in [
+            "sqlite:/var/lib/chv/controlplane.db?mode=memory",
+            "sqlite:/var/lib/chv/controlplane.db?cache=shared&mode=memory",
+            "sqlite:/var/lib/chv/controlplane.db?mode=mem%6Fry",
+        ] {
+            assert_eq!(
+                lock_path_for_database(runtime, url),
+                runtime.join(LOCK_FILE_NAME),
+                "{url} must use the runtime-dir fallback"
+            );
+        }
+        assert_eq!(
+            lock_path_for_database(runtime, "sqlite:/var/lib/chv/controlplane.db?mode=rwc"),
+            PathBuf::from("/var/lib/chv/.controlplane.db.instance.lock"),
+            "a file-backed mode must still key to the database"
         );
         // Memory and non-SQLite URLs still get a guard, rooted at the runtime
         // directory.
