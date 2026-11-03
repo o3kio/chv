@@ -210,11 +210,26 @@ start_cp
 # Preflight the real login endpoint before handing the browser to Playwright:
 # a broken seed or auth route fails here with a clear message, not as a
 # mysterious UI timeout.
-# Keep the token-bearing response in the disposable temp dir, never in the
-# uploaded artifact: it is an ephemeral test credential, not evidence.
+# Build the request body with Python instead of shell string interpolation:
+# this keeps the per-run password out of curl's argv and avoids breaking on
+# characters that need JSON escaping. Both files live in the disposable temp
+# dir, never in the uploaded artifact (they are credentials/evidence, not CI
+# output).
+REAL_BFF_LOGIN_USER="$USERNAME" REAL_BFF_LOGIN_PASSWORD="$PASSWORD" \
+    python3 - "${ROOT}/login-request.json" <<'PY'
+import json, os, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "username": os.environ["REAL_BFF_LOGIN_USER"],
+            "password": os.environ["REAL_BFF_LOGIN_PASSWORD"],
+        },
+        handle,
+    )
+PY
 if ! curl -fsS -X POST "http://127.0.0.1:${PORT}/v1/auth/login" \
     -H 'Content-Type: application/json' \
-    --data "{\"username\":\"${USERNAME}\",\"password\":\"${PASSWORD}\"}" \
+    --data @"${ROOT}/login-request.json" \
     -o "${ROOT}/login-response.json"; then
     fail "real BFF login preflight failed (log: ${CP_LOG})"
 fi

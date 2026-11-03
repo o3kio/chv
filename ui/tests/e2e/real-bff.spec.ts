@@ -71,7 +71,10 @@ test.describe('Real Rust BFF', () => {
 
 		// The seeded database is empty, so a correct real-BFF response drives
 		// the honest empty state. A serde drift or a failed /v1/overview call
-		// renders the "Telemetry Failure" error state instead.
+		// renders the "Telemetry Failure" error state instead. Wait for the
+		// loading state to settle first: asserting count(0) while the panel is
+		// still loading would pass without proving the real response parsed.
+		await expect(page.getByText('Indexing topology...')).toHaveCount(0);
 		await expect(page.getByText('Fleet Overview')).toBeVisible();
 		await expect(page.getByText('Empty Fleet')).toBeVisible();
 		await expect(page.getByText('Telemetry Failure')).toHaveCount(0);
@@ -100,10 +103,25 @@ test.describe('Real Rust BFF', () => {
 		expect(Array.isArray(body.recent_tasks)).toBe(true);
 	});
 
-	test('real BFF fails closed on invalid credentials', async ({ request }) => {
+	test('real BFF fails closed on invalid credentials', async ({ page, request }) => {
+		// API-level: the real auth route returns 401, not a synthetic page.
 		const response = await request.post(`${REAL_BFF}/v1/auth/login`, {
 			data: { username: USERNAME, password: `${PASSWORD}-wrong` }
 		});
 		expect(response.status()).toBe(401);
+
+		// UI-level: the operator stays on the login gate and never reaches the
+		// overview panel. Waiting for the visible login error first makes the
+		// negative dashboard assertion meaningful instead of racing the app.
+		await forwardToRealBff(page);
+		await page.goto('/login');
+		await page.getByLabel(/operator identity/i).fill(USERNAME);
+		await page.getByLabel(/access credential/i).fill(`${PASSWORD}-wrong`);
+		await page.getByRole('button', { name: /authenticate session/i }).click();
+
+		await expect(page.locator('.login-error')).toBeVisible();
+		await expect(page).toHaveURL('/login');
+		await expect(page.getByText('Empty Fleet')).toHaveCount(0);
+		await expect(page.getByText('Telemetry Failure')).toHaveCount(0);
 	});
 });

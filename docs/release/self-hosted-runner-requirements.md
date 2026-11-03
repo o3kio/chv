@@ -153,25 +153,41 @@ M4.3–M4.8 evidence used `noble-qual-patched.img`), and runs each scenario
 through `deploy.sh --exec`. It writes `logs/<scenario>.log`, `results.tsv`,
 `summary.md`, and copies each `m4.N-artifacts` evidence directory into the
 uploaded artifact. `env-preflight.sh` now installs `qemu-utils` for the patch
-step.
+step, and the driver forwards `STOCK_GUEST_IMAGE` to it as `GUEST_IMAGE` so
+preflight downloads exactly the image the patch step consumes.
+
+Evidence hygiene: the driver sets `umask 022`, re-runs `chmod -R a+rX` after
+each scenario (so a later hang cannot hide earlier evidence), and fails loudly
+if an evidence copy fails. A dedicated upload requires `results.tsv` with
+`if-no-files-found: error`; a run with no results marker has no usable
+qualification record.
 
 Operational requirements:
 
 - **No repository secrets.** The lane uses loopback-only services and the
   runner's local qualification assets.
+- **First run is manual.** The workflow has still not been executed. After
+  merge, run the **chaos** lane once via `workflow_dispatch` before trusting
+  the schedule; the scheduled lanes remain unverified until that run reports.
 - **Offline runner = queued, never green.** There is no hosted-runner fallback
   and no skip-as-pass branch. A scheduled run with no matching runner remains
   queued and visible in the Actions UI.
-- **Missing prerequisites = failure.** If `/dev/kvm` or passwordless sudo is
-  absent, the workflow emits an `::error::` annotation and exits non-zero; the
-  driver does the same for failed staging or scenario errors.
+- **Missing prerequisites = failure.** The workflow checks `/dev/kvm` and
+  passwordless sudo before checkout/setup, emits an `::error::` annotation,
+  and exits non-zero; the driver does the same for failed staging or scenario
+  errors.
 - **Disk and time.** The full weekly sequence includes the m4.8 soak and runs
   for hours; keep the disk headroom in the table above and do not run two
   qualification jobs concurrently (the workflow has a concurrency group, and
-  the scenario scripts share `/var/lib/chv/qual` and host ports).
-- **Runner ownership.** The driver runs as root while the workspace is owned
-  by the runner user; it sets `safe.directory` for the checkout so
-  `env-preflight.sh` can record the candidate SHA.
+  the scenario scripts share `/var/lib/chv/qual` and host ports). GitHub keeps
+  at most one running and one pending run per group; a newer scheduled run
+  replaces an older **queued** run, while the active run is never cancelled.
+- **Runner ownership and cargo homes.** The driver runs as root while the
+  workspace is owned by the runner user; it sets `safe.directory` for the
+  checkout so `env-preflight.sh` can record the candidate SHA. The workflow
+  records the runner's `RUSTUP_HOME`/`CARGO_HOME`, passes them through
+  `sudo -E`, and `chown`s `target/` plus those homes back to the runner user
+  after the run so root staging cannot poison later caches or checkouts.
 
 ## Test User Expectations
 

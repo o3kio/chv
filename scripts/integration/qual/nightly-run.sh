@@ -25,6 +25,9 @@
 #                       (default: noble-server-cloudimg-amd64.img)
 
 set -uo pipefail
+# Files created as root must still be readable by the runner-user artifact
+# upload step; do not inherit a restrictive root umask.
+umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHV_QUAL_ROOT="${CHV_QUAL_ROOT:-/var/lib/chv/qual}"
@@ -84,12 +87,19 @@ write_summary() {
     chmod -R a+rX "$QUAL_ARTIFACT_ROOT" 2>/dev/null || true
 }
 
+# Best-effort readability even when a preflight check exits early. A hard
+# timeout cannot run traps, but every normal failure path still leaves the
+# logs/results readable for the upload.
+trap 'chmod -R a+rX "$QUAL_ARTIFACT_ROOT" 2>/dev/null || true' EXIT
+
 fail() {
     echo "::error::nightly-run: $*" >&2
-    {
-        echo "scenario	status	rc	duration_s	log	evidence"
-        echo "preflight	blocked	1	0		$*"
-    } > "$RESULT_FILE"
+    # Append, do not truncate: if a later preflight/scenario check fails we
+    # still want the rows already collected in results.tsv.
+    if [ ! -s "$RESULT_FILE" ]; then
+        printf 'scenario\tstatus\trc\tduration_s\tlog\tevidence\n' > "$RESULT_FILE"
+    fi
+    printf 'preflight\tblocked\t1\t0\t\t%s\n' "$*" >> "$RESULT_FILE"
     write_summary "BLOCKED"
     exit 1
 }
@@ -106,19 +116,21 @@ printf 'scenario\tstatus\trc\tduration_s\tlog\tevidence\n' > "$RESULT_FILE"
 # directory (the documented usage is `cd qual && ./deploy.sh --exec ./m4.x.sh`).
 cd "$SCRIPT_DIR" || fail "cannot cd to ${SCRIPT_DIR}"
 
+# The stock Ubuntu cloud image cannot boot through the CHV firmware chain
+# (GRUB's LABEL= root needs an initramfs the shim/firmware path never
+# delivers). All recorded M4.3–M4.8 evidence used the patched image, so the
+# nightly lane must build and use it too. Keep the stock name in one variable
+# so preflight downloads (L1) and the patch step use the same file.
+STOCK_GUEST_IMAGE="${STOCK_GUEST_IMAGE:-noble-server-cloudimg-amd64.img}"
+
 # Provision/verify the host (cloud-hypervisor, firmware, guest image, host
 # tools) and stage release binaries from the checked-out candidate. A dirty
 # checkout is a hard failure by design: evidence must name the candidate SHA.
 echo "[qual-nightly] host preflight + binary staging"
-if ! ./env-preflight.sh --stage-binaries > "${LOG_DIR}/env-preflight.log" 2>&1; then
+if ! GUEST_IMAGE="$STOCK_GUEST_IMAGE" ./env-preflight.sh --stage-binaries > "${LOG_DIR}/env-preflight.log" 2>&1; then
     fail "env-preflight.sh failed; see ${LOG_DIR}/env-preflight.log"
 fi
 
-# The stock Ubuntu cloud image cannot boot through the CHV firmware chain
-# (GRUB's LABEL= root needs an initramfs the shim/firmware path never
-# delivers). All recorded M4.3–M4.8 evidence used the patched image, so the
-# nightly lane must build and use it too.
-STOCK_GUEST_IMAGE="${STOCK_GUEST_IMAGE:-noble-server-cloudimg-amd64.img}"
 echo "[qual-nightly] preparing patched guest image"
 if ! GUEST_IMAGE="$STOCK_GUEST_IMAGE" ./patch-guest-image.sh > "${LOG_DIR}/patch-guest-image.log" 2>&1; then
     fail "patch-guest-image.sh failed; see ${LOG_DIR}/patch-guest-image.log"
@@ -152,13 +164,23 @@ for scenario in $SCENARIOS; do
 
     if [ -d "$evidence_src" ]; then
         rm -rf "$evidence_dst"
-        cp -a "$evidence_src" "$evidence_dst" || true
+        if ! cp -a "$evidence_src" "$evidence_dst"; then
+            echo "::error::nightly-run: failed to copy evidence ${evidence_src} -> ${evidence_dst}" >&2
+            status="fail"
+            RC=1
+        fi
+    else
+        echo "::warning::nightly-run: scenario ${scenario} produced no evidence directory: ${evidence_src}" >&2
     fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$scenario" "$status" "$scenario_rc" "$duration" \
         "logs/${scenario}.log" "$( [ -d "$evidence_dst" ] && echo "$evidence_name" || echo '')" \
         >> "$RESULT_FILE"
+
+    # Make this scenario's logs/evidence readable now, not only when the
+    # whole loop finishes: a timeout or hang must not lose earlier evidence.
+    chmod -R a+rX "$QUAL_ARTIFACT_ROOT" 2>/dev/null || true
 
     # Keep the tail in the job log so a failure is visible without opening
     # the artifact first (full log remains in the uploaded artifact).

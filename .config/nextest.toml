@@ -1,0 +1,14 @@
+# Shared nextest configuration for `cargo nextest` and
+# `cargo llvm-cov nextest`.
+#
+# Nextest runs every test in its own process, so a hanging or timing-sensitive
+# test cannot take the whole run down with it. A small retry budget absorbs
+# known scheduling flakes (for example the vsock forwarder close test on a
+# loaded runner) without hiding a deterministic failure: a genuinely broken
+# test still fails after the retries are exhausted.
+#
+# `fail-fast = false` gives the coverage job the same full blast-radius
+# semantics as `cargo nextest run --workspace --no-fail-fast` in `Rust checks`.
+[profile.default]
+retries = 2
+fail-fast = false

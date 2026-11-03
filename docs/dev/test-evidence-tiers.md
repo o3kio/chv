@@ -12,19 +12,33 @@ Every PR to `main` runs `.github/workflows/ci.yml` on `ubuntu-latest`:
 | Job | Evidence produced | Gate |
 |-----|-------------------|------|
 | `Rust checks` | fmt/check/clippy `--all-targets`, `cargo nextest --workspace --no-fail-fast`, doctests, process-level security/startup smokes, architecture and packaging guards | Blocking (required check) |
-| `Rust coverage (ratchet, lines >= 76%)` | lcov artifact `rust-coverage-lcov`, `cargo llvm-cov report --summary-only` in the job summary | Fails the workflow; required-check addition is an admin step |
+| `Rust coverage (ratchet, lines >= 76%)` | `cargo llvm-cov nextest` + retry profile, lcov artifact `rust-coverage-lcov`, `cargo llvm-cov report --summary-only` in the job summary | Fails the workflow below 76% lines; required-check addition is an admin step |
 | `UI checks` | `npm run build` + `svelte-check` | Blocking (required check) |
 | `UI unit tests (Vitest)` | Vitest results | Fails the workflow; required-check addition is an admin step |
 | `E2E tests` | Playwright against `ui/tests/e2e/mock-bff.mjs` and per-spec `page.route` fixtures; HTML report + traces uploaded on failure | Blocking (required check) |
 | `Real-BFF E2E` | Playwright against a **real `chv-controlplane`** (BFF router + serde), disposable SQLite, migrations, seeded admin. Control-plane log, harness log, HTML report and traces uploaded on failure | Fails the workflow; required-check addition is an admin step |
 
-### Coverage ratchet
+### Coverage floor
 
-`cargo llvm-cov` publishes line coverage on every PR. The recorded `main`
-cargo-llvm-cov baseline is **78.92% lines**; the job fails below **76%**
-(`--fail-under-lines 76`), leaving ~2.9 points of headroom for unrelated
-refactors. Raise the threshold as the baseline rises; never lower it to make a
-red PR green.
+`cargo llvm-cov nextest` publishes line coverage on every PR. The reproducible
+`main` baseline is **78.97% lines**, measured from the lcov artifact of run
+[41669901088](https://github.com/o3kio/chv/actions/runs/41669901088/job/126035158484).
+The job fails below **76%** (`--fail-under-lines 76`), leaving ~3 points of
+headroom for unrelated refactors.
+
+Nextest runs each test in its own process. The retry profile in
+`.config/nextest.toml` (`retries = 2`, `fail-fast = false`) absorbs known
+timing flakes such as the vsock forwarder close assertion; the coverage
+command also passes `--no-fail-fast`, matching `Rust checks`. This matters
+because a blocking libtest run previously aborted the whole report on one 5 s
+scheduling flake.
+
+This is a **floor, not a trend ratchet**. It does not compare the current PR
+against the previous one, so slow drift between baseline refreshes is
+invisible. Refresh the number from a `main` lcov artifact and raise it
+deliberately; never lower it to make a red PR green. A per-PR delta check is a
+follow-up (it needs a stable main-baseline service) and is intentionally not
+added yet.
 
 Publishing the report happens in the workflow. Making the
 `Rust coverage (ratchet, lines >= 76%)` check *required* for merges is a GitHub
@@ -71,7 +85,18 @@ used. The driver (`scripts/integration/qual/nightly-run.sh`) calls
 - `summary.md` + the GitHub step summary,
 - copies of each scenario's own `m4.N-artifacts` evidence directory.
 
-All of it is uploaded as an artifact on success **and** failure.
+All of it is uploaded as an artifact on success **and** failure. The driver
+sets `umask 022` and re-runs `chmod -R a+rX` after each scenario so earlier
+evidence survives a later hang, and a failed evidence copy emits an
+`::error::` annotation. A separate upload requires `results.tsv`
+(`if-no-files-found: error`); if even that marker is missing, the run has no
+usable qualification record and the upload fails.
+
+The workflow uses one concurrency group with `cancel-in-progress: false`.
+GitHub keeps at most one running and one pending run per group, so a newer
+scheduled run replaces an older **queued** run in that group (the active run
+is never killed). That prevents an unbounded backlog of stale nightly/weekly
+runs; the replacement is visible in the Actions UI.
 
 **Prerequisites are infrastructure, not secrets.** The runner needs
 `/dev/kvm`, passwordless sudo, cloud-hypervisor, the pinned firmware/guest
@@ -110,13 +135,15 @@ These still require a human, credentials, or infrastructure outside CI and are
 The PR that added the ratchet and nightly/real-BFF lanes ran on a development
 container, not the GitHub-hosted or self-hosted fleets. Specifically:
 
-- `nightly-kvm-qualification.yml` was **not executed** — no runner with
-  `/dev/kvm` and the `chv-kvm` label was available. Its YAML was parsed
-  locally; the first real signal is the scheduled/manual run on the runner.
+- `nightly-kvm-qualification.yml` has still **not been executed** — no runner
+  with `/dev/kvm` and the `chv-kvm` label was available. Its YAML was parsed
+  locally. After merge, the first real signal must be a manual
+  `workflow_dispatch` run of the **chaos** lane (m4.7) before relying on the
+  schedule; the scheduled lanes remain unverified until that run reports.
 - The real-BFF harness and Playwright spec were exercised locally against a
   `chv-controlplane` built with `--features dev` (disposable SQLite, seeded
   admin): all 3 tests passed, and the spec skipped cleanly with
-  `REAL_BFF_BASE_URL` unset. The GitHub job itself was not run; its first real
-  signal is the PR/push run.
+  `REAL_BFF_BASE_URL` unset. The GitHub-hosted `Real-BFF E2E` job also passed
+  on PR #689 (4m29s).
 - No claim is made that the self-hosted scenarios are green on the current
   candidate until the nightly lane reports on that candidate.

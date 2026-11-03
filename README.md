@@ -229,7 +229,7 @@ cargo build --workspace
 
 GitHub Actions runs on every push and PR:
 - `cargo check`, `cargo clippy -- -D warnings`, `cargo nextest run --workspace --no-fail-fast`, plus `cargo test --workspace --doc` for doctests
-- A blocking `cargo llvm-cov` line-coverage ratchet (minimum 76%; recorded `main` baseline 78.92%), with lcov artifact + job summary
+- A blocking `cargo llvm-cov nextest` line-coverage floor (minimum 76%; reproducible `main` baseline 78.97%), with lcov artifact + job summary
 - UI `npm ci`, `npm run build`, `npm run check`, and Playwright tests against the mock BFF (`ui/tests/e2e/mock-bff.mjs`)
 - A real-BFF Playwright flow against a disposable-SQLite `chv-controlplane` (real router/auth/serialization), plus a fail-closed bad-credential case
 - `chvctl` smoke test and VERSION validation
