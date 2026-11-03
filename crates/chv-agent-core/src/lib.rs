@@ -25,7 +25,7 @@ pub mod supervisor;
 pub mod telemetry;
 pub mod vm_runtime;
 
-pub use agent_server::AgentServer;
+pub use agent_server::{AgentAuth, AgentServer};
 pub use cache::NodeCache;
 pub use config::AgentConfig;
 pub use connectivity::{ConnectivityMetrics, ConnectivityState, ConnectivityTracker};

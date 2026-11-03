@@ -12,6 +12,11 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+# Domain-separated derivation of per-purpose secrets from the legacy
+# shared `jwt_secret` (HMAC-SHA256). A dedicated KDF dependency would be
+# larger than the single HMAC this needs.
+hmac = "0.12"
 # WHATWG URL parsing for webhook destination validation: reqwest's
 # HTTP stack parses URLs with this exact crate, so validating hosts
 # with it (canonicalizing integer/hex/mapped IPv6 forms) closes

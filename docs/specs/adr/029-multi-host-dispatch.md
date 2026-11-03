@@ -19,6 +19,15 @@ after the P1 dispatch gate, and console routing after the P2 gate. This ADR:
 Until the P1 gate passes, the shipped posture remains single-host and every
 statement below is a design commitment, not an implemented capability.
 
+**Implemented today (#662):** the single-host control-plane → agent hop is
+gRPC over a `0600` Unix-domain socket. Each RPC carries a per-daemon bearer
+token (`x-chv-agent-token`, constant-time comparison in the agent
+interceptor) and accepted connections are filtered by Unix `SO_PEERCRED` UID
+before HTTP/2 starts. Per-purpose secrets are split under `[secrets]` so the
+agent token, console key, user-session key, and credential-encryption key are
+not the same value. Neither mechanism is a substitute for the remote
+transport described here: an agent on another host is still unreachable.
+
 ## Date
 
 2026-11-02
@@ -43,9 +52,12 @@ The decision statuses are recorded in
 
 ### 1. The documented boundary and the implemented boundary disagree
 
-ADR-002 states that the control plane communicates with `chv-agent` over
-"gRPC over mTLS" with certificate-based steady-state trust. The
-implementation satisfies neither half for a remote host:
+ADR-002 originally stated that the control plane communicates with
+`chv-agent` over "gRPC over mTLS" with certificate-based steady-state trust.
+ADR-002 is now corrected: the shipped single-host hop is gRPC over a local
+Unix-domain socket with a per-request bearer token and Unix peer-UID checks
+(#662), while multi-host mTLS remains design-only. The remote-host gap below
+is unchanged — a remote agent still has no transport:
 
 - the control plane resolves `agent_socket_pattern` to a **filesystem path**
   and connects with `UnixStream::connect`

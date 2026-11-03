@@ -737,6 +737,52 @@ mod tests {
         assert_eq!(validated.role, "admin");
     }
 
+    /// #662: the console key and the user-session key are independent
+    /// purposes. A console token is not a user session (it has no `role`
+    /// and carries the console audience), and a token signed with the
+    /// console key cannot validate under the user key.
+    #[test]
+    fn console_token_is_not_interchangeable_with_a_user_session() {
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let user_secret = "user-session-key-0123456789abcdef0123456789";
+        let console_secret = "console-key-0123456789abcdef0123456789abcd";
+
+        let console_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "vm-1",
+                "username": "admin",
+                "aud": chv_common::CONSOLE_AUDIENCE,
+                "exp": exp,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(console_secret.as_bytes()),
+        )
+        .expect("encode console token");
+        assert!(
+            validate_token(&console_token, console_secret).is_err(),
+            "a console token lacks the user-session role and must be rejected"
+        );
+
+        let user_claims = Claims {
+            sub: "user-1".to_string(),
+            username: "admin".to_string(),
+            role: "admin".to_string(),
+            exp,
+            must_change_password: false,
+            aud: Some(SESSION_AUDIENCE.to_string()),
+            token_version: None,
+        };
+        let user_token = encode_claims(&user_claims, console_secret);
+        assert!(
+            validate_token(&user_token, user_secret).is_err(),
+            "a token signed with the console key must not validate under the user key"
+        );
+    }
+
     #[test]
     fn expired_token_is_rejected() {
         let claims = Claims {
@@ -1131,7 +1177,7 @@ mod tests {
             role: "admin".into(),
             exp: future_exp(),
             must_change_password: false,
-            aud: Some("chv:console".into()),
+            aud: Some(chv_common::CONSOLE_AUDIENCE.into()),
             token_version: Some(0),
         };
         let token = encode_claims(&claims, &test_secret());

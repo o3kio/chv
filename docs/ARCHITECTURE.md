@@ -22,7 +22,8 @@ CHV releases.
 
 ### Control Plane ↔ Agent
 
-- **Only `chv-agent` is reachable from the control plane.** All communication is gRPC over mTLS.
+- **Only `chv-agent` is reachable from the control plane.** In the shipped single-host topology the control-plane → agent hop is gRPC over a local Unix-domain socket (`0600`), authenticated per request with a per-daemon bearer token (`x-chv-agent-token`) checked before any handler runs and gated by Unix peer-UID verification (`SO_PEERCRED`). Remote control-plane → agent gRPC over mTLS is design-only (ADR-029) and is not implemented. The separately exposed control-plane management API remains mTLS-protected.
+- **Per-purpose secrets.** User session JWTs, console JWTs, the agent bearer token, and credential encryption use distinct keys under `[secrets]`; they are never the single shared `jwt_secret` (which remains only the legacy migration master). See [ADR-002](./specs/adr/002-control-plane-boundary.md#secret-separation-662).
 - The control plane owns **desired state**; the agent owns **observed state** and converges toward desired state.
 See ADR-002: [Control Plane to Node Boundary](./specs/adr/002-control-plane-boundary.md)
 

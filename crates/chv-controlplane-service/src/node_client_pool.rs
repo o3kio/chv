@@ -10,6 +10,10 @@ pub struct NodeClientPool {
     clients: DashMap<String, (NodeClient, Instant)>,
     breakers: DashMap<String, Arc<CircuitBreaker>>,
     ttl: Duration,
+    /// Per-daemon bearer token attached to every client this pool creates
+    /// (#662). `None` keeps direct/test constructions token-less; the
+    /// production bootstrap always installs the configured token.
+    auth_token: Option<Arc<str>>,
 }
 
 impl Default for NodeClientPool {
@@ -24,7 +28,17 @@ impl NodeClientPool {
             clients: DashMap::new(),
             breakers: DashMap::new(),
             ttl: Duration::from_secs(300),
+            auth_token: None,
         }
+    }
+
+    /// Attach the configured agent bearer token to every client created by
+    /// this pool (#662).
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        let token = token.trim();
+        self.auth_token = (!token.is_empty()).then(|| Arc::<str>::from(token));
+        self
     }
 
     pub async fn get_or_connect(
@@ -47,7 +61,12 @@ impl NodeClientPool {
             .entry(node_id.to_string())
             .or_insert_with(|| Arc::new(CircuitBreaker::new()))
             .clone();
-        let client = NodeClient::connect_with_breaker(socket_path, breaker).await?;
+        let client = NodeClient::connect_with_breaker_and_token(
+            socket_path,
+            breaker,
+            self.auth_token.as_deref(),
+        )
+        .await?;
         let inserted = self
             .clients
             .entry(node_id.to_string())

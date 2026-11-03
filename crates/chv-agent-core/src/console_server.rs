@@ -37,13 +37,18 @@ struct ResizeMsg {
 /// rejects session tokens (or any other JWT) that do not carry exactly this
 /// audience, so a stolen short-lived console token cannot be replayed
 /// against the session API and a full session JWT cannot open a console.
-const CONSOLE_AUDIENCE: &str = "chv:console";
+///
+/// Defined once in `chv-common`; the BFF mint path and this validator must
+/// never drift (#662 review M-2).
+const CONSOLE_AUDIENCE: &str = chv_common::CONSOLE_AUDIENCE;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct Claims {
     sub: String,
     username: String,
+    /// Domain-separation audience (#662): console tokens may only be
+    /// accepted by the console endpoint, never as a user session token.
     aud: String,
     exp: u64,
 }
@@ -428,6 +433,11 @@ fn validate_console_token(
 ) -> Result<Claims, jsonwebtoken::errors::Error> {
     let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    // Console tokens must carry exactly the console audience, and `exp`,
+    // `aud`, and `sub` are all mandatory. This stops a user session token
+    // (even one signed with the same key) from being replayed against the
+    // console endpoint, and keeps the console key useless for user-session
+    // validation.
     validation.set_audience(&[CONSOLE_AUDIENCE]);
     validation.set_required_spec_claims(&["exp", "aud", "sub"]);
     jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation).map(|d| d.claims)
@@ -588,6 +598,22 @@ mod tests {
         // matter what the (ignored) query string says.
         let headers = HeaderMap::new();
         assert_eq!(console_token_from_headers(&headers), None);
+    }
+
+    #[test]
+    fn user_secret_does_not_validate_console_token() {
+        // Console and user keys are independent (#662). A token minted
+        // with the console key must not validate under the user key, and
+        // a token minted with the user key must not validate under the
+        // console key even when it carries the console audience.
+        let console_secret = "console-secret-0123456789abcdef0123456789";
+        let user_secret = "user-secret-0123456789abcdef0123456789abcd";
+        let console_token = encode_claims("user-1", "admin", future_exp(), console_secret);
+        assert!(validate_console_token(&console_token, console_secret).is_ok());
+        assert!(validate_console_token(&console_token, user_secret).is_err());
+
+        let user_token = encode_claims("user-1", "admin", future_exp(), user_secret);
+        assert!(validate_console_token(&user_token, console_secret).is_err());
     }
 
     #[tokio::test]

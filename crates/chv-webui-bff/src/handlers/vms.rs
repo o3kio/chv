@@ -1448,7 +1448,7 @@ fn generate_console_token(
     let claims = ConsoleTokenClaims {
         sub: vm_id.to_string(),
         username: username.to_string(),
-        aud: "chv:console".to_string(),
+        aud: chv_common::CONSOLE_AUDIENCE.to_string(),
         exp,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -1497,7 +1497,7 @@ pub async fn get_vm_console_url(
             .await
             .map_err(|e| BffError::Internal(format!("failed to look up node: {}", e)))?;
 
-    let token = generate_console_token(&vm_id, &claims.username, &state.jwt_secret)
+    let token = generate_console_token(&vm_id, &claims.username, &state.console_jwt_secret)
         .map_err(|e| BffError::Internal(format!("failed to generate console token: {}", e)))?;
 
     // Determine WebSocket scheme based on incoming request protocol.

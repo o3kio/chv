@@ -431,14 +431,22 @@ pub async fn build_service(
     let alert_repo = AlertRepository::new(pool.clone());
     let desired_state_repo = DesiredStateRepository::new(pool.clone());
     let operation_repo = OperationRepository::new(pool.clone());
-    let backup_repo = BackupRepository::new(pool.clone());
+    // Explicit credential-encryption key from `[secrets] credential_encryption`
+    // (#662). `None` keeps the store's documented CHV_ENCRYPTION_KEY /
+    // legacy CHV_JWT_SECRET lookup unchanged for existing installs.
+    let credential_encryption_key = config.effective_credential_encryption_key();
+    let backup_repo = match credential_encryption_key.as_deref() {
+        Some(key) => BackupRepository::new_with_key(pool.clone(), key),
+        None => BackupRepository::new(pool.clone()),
+    };
     let topology_repo = chv_controlplane_store::TopologyRepository::new(pool.clone());
     let vtep_repo = VtepRepository::new(pool.clone());
 
     // Created before the service implementations: shared by the lifecycle
     // service's operator relays (resolve-inspect-required), the overlay
     // manager, and the orchestrator.
-    let node_client_pool = NodeClientPool::new();
+    let node_client_pool =
+        NodeClientPool::new().with_auth_token(config.effective_agent_auth_token());
 
     let lifecycle_service = Arc::new(
         LifecycleServiceImplementation::new(
@@ -481,9 +489,13 @@ pub async fn build_service(
         drift_reports: Arc::new(chv_controlplane_store::DriftReportRepository::new(
             pool.clone(),
         )),
-        netbox_config: Arc::new(
-            chv_controlplane_store::NetboxProjectionConfigRepository::new(pool.clone()),
-        ),
+        netbox_config: Arc::new(match credential_encryption_key.as_deref() {
+            Some(key) => chv_controlplane_store::NetboxProjectionConfigRepository::new_with_key(
+                pool.clone(),
+                key,
+            ),
+            None => chv_controlplane_store::NetboxProjectionConfigRepository::new(pool.clone()),
+        }),
         netbox_runs: Arc::new(chv_controlplane_store::NetboxProjectionRunRepository::new(
             pool.clone(),
         )),
@@ -493,7 +505,8 @@ pub async fn build_service(
         )),
         monitoring: monitoring_store.clone(),
         monitoring_health: monitoring_health.clone(),
-        jwt_secret: config.jwt_secret.clone(),
+        jwt_secret: config.effective_user_jwt_secret(),
+        console_jwt_secret: config.effective_console_jwt_secret(),
         agent_runtime_dir: config.agent_runtime_dir.clone(),
         cache: chv_webui_bff::BffCache::new(5),
         clock: Arc::new(chv_common::SystemClock),
@@ -854,7 +867,13 @@ pub async fn build_service(
     // run failure is marked on the run row and the loop continues.
     let netbox_projection_worker = chv_controlplane_service::NetboxProjectionWorker::new(
         chv_controlplane_store::NetboxProjectionRunRepository::new(pool.clone()),
-        chv_controlplane_store::NetboxProjectionConfigRepository::new(pool.clone()),
+        match credential_encryption_key.as_deref() {
+            Some(key) => chv_controlplane_store::NetboxProjectionConfigRepository::new_with_key(
+                pool.clone(),
+                key,
+            ),
+            None => chv_controlplane_store::NetboxProjectionConfigRepository::new(pool.clone()),
+        },
         event_repo.clone(),
         chv_controlplane_store::ApplyRunRepository::new(pool.clone()),
         chv_controlplane_store::VersionRepository::new(pool.clone()),

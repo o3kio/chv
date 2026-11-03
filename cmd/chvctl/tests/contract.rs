@@ -844,6 +844,7 @@ fn build_state(
         )),
         mutations,
         jwt_secret: "test-secret".to_string(),
+        console_jwt_secret: "test-secret".to_string(),
         agent_runtime_dir,
         monitoring: None,
         monitoring_health: chv_webui_bff::MonitoringHealth::new(),
