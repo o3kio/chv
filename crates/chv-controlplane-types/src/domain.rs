@@ -93,10 +93,11 @@ impl Error for IdentifierError {}
 string_id_newtype!(ActorId, "actor_id");
 string_id_newtype!(NodeId, "node_id");
 string_id_newtype!(OperationId, "operation_id");
-// Resource ids feed into fixed-size structures such as the 16-byte BPF
-// vm_key in chv-nwd-core, so ids are capped at 16 bytes: a longer id would
-// have to be truncated there and could collide with another resource's id.
-string_id_newtype!(ResourceId, "resource_id", max_bytes = 16);
+// Resource ids feed into fixed-size structures such as the BPF vm_key in
+// chv-nwd-core, so ids are capped at the key width (32 bytes). That is
+// exactly a 128-bit hex id (#664): a longer id would have to be truncated
+// there and could collide with another resource's id.
+string_id_newtype!(ResourceId, "resource_id", max_bytes = 32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Generation(u64);
@@ -599,14 +600,14 @@ mod tests {
     }
 
     #[test]
-    fn resource_id_caps_length_at_sixteen_bytes() {
-        // Exactly 16 bytes fits the BPF vm_key and is accepted.
-        assert!(ResourceId::new("vm-1234567890123").is_ok());
-        // 17 bytes must be rejected, not silently truncated.
-        assert!(ResourceId::new("vm-12345678901234").is_err());
+    fn resource_id_caps_length_at_the_bpf_key_width() {
+        // Exactly 32 bytes (a 128-bit hex id) fits the BPF vm_key.
+        assert!(ResourceId::new("vm-12345678901234567890123456789").is_ok());
+        // 33 bytes must be rejected, not silently truncated.
+        assert!(ResourceId::new("vm-123456789012345678901234567890").is_err());
         // Trimming still applies before the length check.
-        assert!(ResourceId::new("  vm-1234567890123  ").is_ok());
-        assert!(ResourceId::new("  vm-12345678901234 ").is_err());
+        assert!(ResourceId::new("  vm-12345678901234567890123456789  ").is_ok());
+        assert!(ResourceId::new("  vm-123456789012345678901234567890 ").is_err());
     }
 
     #[test]

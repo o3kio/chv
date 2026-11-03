@@ -441,7 +441,7 @@ async fn imported_vm_volume_is_owned_by_importing_operator() {
     let mutations = Arc::new(RecordingMutations::default());
     let runtime_dir = std::env::temp_dir().join(format!(
         "chv-bff-import-ownership-{}",
-        chv_common::gen_short_id()
+        chv_common::gen_resource_id()
     ));
     tokio::fs::create_dir_all(&runtime_dir)
         .await

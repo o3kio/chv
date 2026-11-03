@@ -410,7 +410,7 @@ impl BackupRepository {
     }
 
     pub async fn create_job(&self, input: &BackupJobCreateInput) -> Result<String, StoreError> {
-        let job_id = chv_common::gen_short_id();
+        let job_id = chv_common::gen_resource_id();
         sqlx::query(INSERT_JOB_SQL)
             .bind(&job_id)
             .bind(&input.vm_id)
@@ -562,7 +562,7 @@ impl BackupRepository {
         &self,
         input: &BackupScheduleCreateInput,
     ) -> Result<String, StoreError> {
-        let schedule_id = chv_common::gen_short_id();
+        let schedule_id = chv_common::gen_resource_id();
         let access_key = input
             .s3_access_key
             .as_deref()
@@ -795,7 +795,7 @@ impl BackupRepository {
         &self,
         input: &BackupRestoreCreateInput,
     ) -> Result<String, StoreError> {
-        let restore_id = chv_common::gen_short_id();
+        let restore_id = chv_common::gen_resource_id();
         sqlx::query(INSERT_RESTORE_SQL)
             .bind(&restore_id)
             .bind(&input.backup_job_id)

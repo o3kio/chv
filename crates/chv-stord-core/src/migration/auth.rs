@@ -102,7 +102,7 @@ impl MigrationReceiverAuthorization {
                 // claim set so callers keep one shape; the nonce is unique
                 // per stream, so replay protection cannot block a second
                 // insecure migration on a dev box.
-                let nonce = chv_common::gen_short_id();
+                let nonce = chv_common::gen_resource_id();
                 Ok(MigrationAuthorizationClaims {
                     version: chv_common::migration_auth::MIGRATION_AUTH_TOKEN_VERSION,
                     source_node: String::new(),

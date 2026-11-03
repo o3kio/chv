@@ -124,7 +124,7 @@ pub async fn create_vm_template(
 
     let cloud_init_config = payload.get("cloud_init_config").and_then(|v| v.as_str());
 
-    let template_id = chv_common::gen_short_id();
+    let template_id = chv_common::gen_resource_id();
 
     sqlx::query(
         r#"INSERT INTO vm_templates
@@ -384,9 +384,9 @@ pub async fn clone_vm_template(
     )
     .await?;
 
-    let vm_id = chv_common::gen_short_id();
-    let volume_id = chv_common::gen_short_id();
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let vm_id = chv_common::gen_resource_id();
+    let volume_id = chv_common::gen_resource_id();
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
 
     // Insert VM
     sqlx::query(
@@ -655,7 +655,7 @@ pub async fn create_cloud_init_template(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let template_id = chv_common::gen_short_id();
+    let template_id = chv_common::gen_resource_id();
 
     sqlx::query(
         r#"INSERT INTO cloud_init_templates

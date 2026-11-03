@@ -465,7 +465,7 @@ pub async fn create_architecture(
             environment: req.environment.as_deref().unwrap_or("").trim().to_string(),
         });
     }
-    let id = ArchitectureId::new(chv_common::gen_short_id())
+    let id = ArchitectureId::new(chv_common::gen_resource_id())
         .map_err(|e| BffError::Internal(format!("failed to mint architecture id: {e}")))?;
     tracing::info!(architecture_id = %id, name = %req.name, "create_architecture");
     let topo = state
@@ -1129,7 +1129,7 @@ async fn generate_plan_inner(
         let snapshot = chv_architecture_reconcile::capture(&provider, "bff/plan")
             .await
             .map_err(|e| BffError::Internal(format!("capture inventory: {e}")))?;
-        let snap_id = InventorySnapshotId::new(chv_common::gen_short_id())
+        let snap_id = InventorySnapshotId::new(chv_common::gen_resource_id())
             .map_err(|e| BffError::Internal(format!("mint inventory snapshot id: {e}")))?;
         let snapshot_json = serde_json::to_string(&snapshot)?;
         let summary_json = Some(
@@ -1191,7 +1191,7 @@ async fn generate_plan_inner(
     let version_id = match &topo.latest_version_id {
         Some(v) => v.clone(),
         None => {
-            let new_id = ArchitectureVersionId::new(chv_common::gen_short_id())
+            let new_id = ArchitectureVersionId::new(chv_common::gen_resource_id())
                 .map_err(|e| BffError::Internal(format!("mint version id: {e}")))?;
             version_repo
                 .create(VersionCreateInput {
@@ -1210,7 +1210,7 @@ async fn generate_plan_inner(
     };
 
     let plan_repo = PlanRepository::new(state.pool.clone());
-    let plan_id = ArchitecturePlanId::new(chv_common::gen_short_id())
+    let plan_id = ArchitecturePlanId::new(chv_common::gen_resource_id())
         .map_err(|e| BffError::Internal(format!("mint plan id: {e}")))?;
 
     // Capture the version id string up front; the FK move into PlanCreateInput
@@ -1408,7 +1408,7 @@ pub async fn check_fleet_architecture(
         .map_err(|e| BffError::Internal(format!("capture inventory: {e}")))?;
 
     // Persist the snapshot for plan/drift downstream.
-    let snapshot_id = InventorySnapshotId::new(chv_common::gen_short_id())
+    let snapshot_id = InventorySnapshotId::new(chv_common::gen_resource_id())
         .map_err(|e| BffError::Internal(format!("mint inventory snapshot id: {e}")))?;
     let snapshot_json = serde_json::to_string(&snapshot)?;
     let summary_json = Some(
@@ -1948,7 +1948,7 @@ pub async fn get_architecture_drift(
             {
                 matching.id
             } else {
-                let new_id = ArchitectureVersionId::new(chv_common::gen_short_id())
+                let new_id = ArchitectureVersionId::new(chv_common::gen_resource_id())
                     .map_err(|e| BffError::Internal(format!("mint baseline version id: {e}")))?;
                 let yaml = topo.latest_yaml.clone().unwrap_or_default();
                 version_repo
@@ -2067,7 +2067,7 @@ pub async fn get_architecture_drift(
         }
     };
 
-    let drift_report_id = ArchitectureDriftReportId::new(chv_common::gen_short_id())
+    let drift_report_id = ArchitectureDriftReportId::new(chv_common::gen_resource_id())
         .map_err(|e| BffError::Internal(format!("mint drift_report id: {e}")))?;
 
     match compute_outcome {

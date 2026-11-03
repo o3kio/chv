@@ -72,7 +72,26 @@ pub fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Generate a short 8-character lowercase hex resource ID (e.g. "3f7a2bc1").
+/// Generate a 128-bit lowercase hex resource ID (32 characters).
+///
+/// This is the canonical identifier for persistent resources (VMs,
+/// volumes, networks, images, users, tokens, snapshots, and architecture
+/// objects). 128 bits keeps birthday-collision pressure negligible at any
+/// realistic fleet size (#664).
+pub fn gen_resource_id() -> String {
+    use rand::RngExt;
+    let bytes: [u8; 16] = rand::rng().random();
+    hex::encode(bytes)
+}
+
+/// Generate a short 8-character lowercase hex ID (e.g. "3f7a2bc1").
+///
+/// Legacy helper retained only for values whose format is externally
+/// pinned: CHV certificate serials (exactly eight lowercase hex characters,
+/// see `CHV_CERTIFICATE_SERIAL_HEX_LEN`) and serial components that must
+/// stay eight characters (monitoring certificates concatenate two of them).
+/// Do NOT use it for persistent resource identifiers — use
+/// [`gen_resource_id`] instead.
 pub fn gen_short_id() -> String {
     use rand::RngExt;
     let bytes: [u8; 4] = rand::rng().random();
@@ -230,6 +249,21 @@ mod tests {
     fn gen_short_id_uniqueness() {
         let ids: std::collections::HashSet<String> = (0..1000).map(|_| gen_short_id()).collect();
         assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn gen_resource_id_is_128_bits_of_hex() {
+        let id = gen_resource_id();
+        assert_eq!(id.len(), 32, "128 bits encode to 32 hex characters");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(validate_id(&id), "resource ids must satisfy validate_id");
+    }
+
+    #[test]
+    fn gen_resource_id_uniqueness() {
+        let ids: std::collections::HashSet<String> =
+            (0..10_000).map(|_| gen_resource_id()).collect();
+        assert_eq!(ids.len(), 10_000);
     }
 
     #[test]

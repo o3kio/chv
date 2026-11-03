@@ -102,7 +102,7 @@ pub async fn create_token(
         .unwrap_or("full");
     validate_scope(scope)?;
 
-    let token_id = chv_common::gen_short_id();
+    let token_id = chv_common::gen_resource_id();
     let raw_token = format!("chv_{}", hex::encode(rand_bytes_32()));
     let token_hash = chv_common::sha256_hex(&raw_token);
 

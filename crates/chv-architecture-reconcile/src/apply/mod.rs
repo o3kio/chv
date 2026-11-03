@@ -150,7 +150,7 @@ pub async fn apply_plan(
     // by the orchestrator) renders a valid duration in the UI. A run
     // that fails before it ever transitions to Running still has a
     // started_at so `finished_at - started_at` is a sensible number.
-    let run_id = ArchitectureApplyRunId::new(chv_common::gen_short_id())?;
+    let run_id = ArchitectureApplyRunId::new(chv_common::gen_resource_id())?;
     let started_at = clock.now();
     let run = runs_repo
         .create(ApplyRunCreateInput {
@@ -471,7 +471,7 @@ async fn enqueue_change(
     let resource_ref = format!("{}/{}", resource_type_str, change.resource_name);
     let idempotency_key = format!("{}::{}::{}", ctx.plan_id, resource_ref, action_str);
 
-    let operation_id = OperationId::new(format!("op_{}", chv_common::gen_short_id()))?;
+    let operation_id = OperationId::new(format!("op_{}", chv_common::gen_resource_id()))?;
     let resource_kind = map_resource_kind(change.resource_type);
     let resource_id = ResourceId::new(change.resource_name.clone()).ok();
     // Preserve full architecture-domain provenance in correlation_id even

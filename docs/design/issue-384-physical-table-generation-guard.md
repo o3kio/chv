@@ -130,8 +130,11 @@ conflict-capable writer.
 
 ### 2.6 What actually protects us today (quantified)
 
-- **BFF-minted ids** (V3/V4/V5, N2): `gen_short_id()` is 8 hex chars = 32
-  bits (`chv-common/src/lib.rs:43-47`). Birthday-collision territory around
+- **BFF-minted ids** (V3/V4/V5, N2): *at the time of this design*,
+  `gen_short_id()` was 8 hex chars = 32 bits (`chv-common/src/lib.rs`).
+  Resource ids are now 128-bit (`gen_resource_id()`, #664); the historical
+  analysis below is retained because the clone/operation-id conclusions do
+  not depend on the id width. Birthday-collision territory around
   ~65–77 k rows — but these writers are plain `INSERT`s, so a collision is
   a PK violation that aborts the creating transaction: **fail-closed, not
   corrupting**. The failure mode is an ugly 500, not divergence.
@@ -543,9 +546,9 @@ the guard.
   plumbing, replayed clones with a caller-supplied `meta.operation_id`
   regress from idempotent-ack to Conflict. §4 option 3 step 3 is a
   correctness requirement, not an optional nicety.
-- **32-bit `gen_short_id` collisions** surface as 500s on the BFF
-  create/import/template paths — fail-closed, but a UX wart worth its own
-  ticket someday.
+- **32-bit `gen_short_id` collisions** (historical — resource ids are
+  128-bit since #664) surfaced as 500s on the BFF create/import/template
+  paths — fail-closed, but a UX wart worth its own ticket someday.
 
 ## 9. Non-goals / scope boundaries
 

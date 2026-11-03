@@ -591,9 +591,9 @@ pub async fn create_vm(
     )
     .await?;
 
-    let vm_id = chv_common::gen_short_id();
-    let volume_id = chv_common::gen_short_id();
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let vm_id = chv_common::gen_resource_id();
+    let volume_id = chv_common::gen_resource_id();
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
     tracing::info!(%vm_id, %volume_id, %operation_id, "create_vm: generated IDs, continuing transaction");
 
     // Insert VM
@@ -1047,7 +1047,7 @@ pub async fn delete_vm(
             .await
             .map_err(|e| BffError::Internal(format!("failed to read generation: {}", e)))?;
 
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
     let insert_operation = sqlx::query(
         r#"
         INSERT INTO operations (operation_id, idempotency_key, resource_kind, resource_id, operation_type, status, requested_by, desired_generation, requested_at, created_at, updated_at)
@@ -1139,7 +1139,7 @@ pub async fn resize_vm(
     }
 
     let requested_by = claims.sub.clone();
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
     // #406 review round: the key is args-hashed (`resize-vm-<vm_id>-<cpu>-<mem>`)
     // so the two realistic intents are both correct — a same-args retry replays
     // the recorded outcome (idempotent), while a genuinely different resize is

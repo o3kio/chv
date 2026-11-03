@@ -304,7 +304,7 @@ pub async fn create_network(
 
     let dns_scope_json = payload.get("dns_scope").map(|v| v.to_string());
 
-    let network_id = chv_common::gen_short_id();
+    let network_id = chv_common::gen_resource_id();
 
     let mut tx = state
         .pool
@@ -744,7 +744,7 @@ pub async fn update_network(
         // the DP4 baseline dispatches (a cleared network is a live,
         // FILTERED network, DP5), never a bare default-deny.
         policy_operation_id = if firewall_rules_json.is_some() {
-            let operation_id = chv_common::gen_short_id();
+            let operation_id = chv_common::gen_resource_id();
             let idempotency_key =
                 format!("update-network-policy-{}-{}", network_id, new_generation);
             let insert_operation = sqlx::query(

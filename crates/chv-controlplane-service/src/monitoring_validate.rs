@@ -85,8 +85,9 @@ pub fn reject(outcome: &'static str, detail: impl std::fmt::Display) -> SampleRe
 }
 
 /// Structural target-kind check shared by both transports: the kind
-/// must parse, and VM targets must be valid `ResourceId`s (the 16-byte
-/// resource id cap). Callers add their ownership rules on top.
+/// must parse, and VM targets must be valid `ResourceId`s (the 32-byte
+/// resource id cap, matching the 128-bit hex id width). Callers add their
+/// ownership rules on top.
 pub fn validate_target(s: &RawSample) -> Result<TargetKind, SampleRejection> {
     let target_kind = TargetKind::from_str(&s.target_kind)
         .map_err(|e| reject(OUTCOME_INVALID_BATCH, format!("target_kind: {e}")))?;
