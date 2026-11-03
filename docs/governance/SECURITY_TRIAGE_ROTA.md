@@ -117,8 +117,8 @@ Complex fixes may take longer; trivial fixes should ship sooner.
 | --------- | ------ |
 | Primary is unavailable | Backup assumes the primary role and updates the rotation table. |
 | Primary is conflicted | Backup handles the report. Record the recusal in the advisory. |
-| Both maintainers are conflicted | The organization owner appoints an uninvolved reviewer under the break-glass process in `GOVERNANCE.md`. |
-| Both maintainers are unavailable | The organization owner applies the break-glass process in `GOVERNANCE.md` and restores normal coverage at handoff. |
+| Both maintainers are conflicted | The organization owner appoints an uninvolved reviewer under the break-glass process in `GOVERNANCE.md`. See [`GOVERNANCE.md#organization-owner-residual`](../../GOVERNANCE.md#organization-owner-residual): the sole owner is also a maintainer, so if they are conflicted or unavailable use the GitHub Support organization-recovery path. |
+| Both maintainers are unavailable | The organization owner applies the break-glass process in `GOVERNANCE.md` and restores normal coverage at handoff. Same residual: use the GitHub Support organization-recovery path when the sole owner cannot act. |
 | Active exploitation is reported | Treat the report as Critical, notify both maintainers immediately, and consider an emergency patch release. Do not wait for the weekly handoff. |
 | The report concerns a maintainer | The other maintainer handles it. If both are named, the organization owner handles the escalation. |
 | The issue is in a third-party dependency or upstream component | Follow the out-of-scope routing table in `SECURITY.md`; track the upstream fix and the CHV update. |

@@ -54,8 +54,8 @@ All controls from 1.2 to 1.10 are enforced by the active `protect-main` ruleset 
 | # | Control | Status | How |
 |---|---------|--------|-----|
 | 3.1 | Only tags trigger releases | ✅ | `release.yml` triggers on `push: tags:`; manual `workflow_dispatch` without a version builds without releasing |
-| 3.2 | Version tags (`v*`) are protected | **(admin)** | Tag protection rule or ruleset |
-| 3.3 | Release publishing requires environment approval | ✅ | `release` job uses `environment: production` or `rc`; configure required reviewers in Settings → Environments |
+| 3.2 | Version tags (`v*`) are protected | ✅ | Active `protect-tags` ruleset restricts creation, update, and deletion of `refs/tags/v*` with zero bypass actors; cutting a release therefore requires an admin to grant bypass or pause the ruleset (recorded in `GOVERNANCE.md`). Verify with `apply-tag-protection.sh --audit`. |
+| 3.3 | Release publishing requires environment approval | **(admin)** | The `release`/`sign` jobs declare `environment: production`/`rc` (✅), but no environment has a required-reviewer `protection_rule` yet (`protection_rules: []`). Configure reviewers in Settings → Environments; see `docs/release/release-process.md`. Until then the environment gates by name only. |
 | 3.4 | Package repo publishing requires separate environment | ✅ | `publish-repo` job uses `production-repo` or `rc-repo` |
 | 3.5 | Changelog is required for stable releases | ✅ | `release.yml` validates CHANGELOG.md before building |
 | 3.6 | Smoke and lifecycle tests gate publishing | ✅ | `release.yml` package job runs smoke/lifecycle tests before release job starts |
@@ -155,7 +155,7 @@ confirms they are visible and have write access.
    [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md) for the required visibility
    and access checks).
 2. Branch protection is already enforced (`protect-main`, active since 2026-10-03). Re-apply the ruleset definition with `./scripts/github-setup/apply-branch-protection.sh`.
-3. Apply tag protection: run `./scripts/github-setup/apply-tag-protection.sh`.
+3. Verify tag protection: run `./scripts/github-setup/apply-tag-protection.sh --audit`. The ruleset is already active; re-apply without `--audit` only to repair drift, and remember it has no bypass actors.
 4. Enable secret scanning and push protection in repository settings.
 5. Restrict default `GITHUB_TOKEN` permissions to read-only.
 6. Verify: run `./scripts/github-setup/verify-settings.sh`.

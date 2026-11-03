@@ -206,7 +206,7 @@ maintainer leaves, becomes emeritus, or is removed:
       new status.
 - [ ] Update [`.github/CODEOWNERS`](.github/CODEOWNERS) so every path still has
       an active owner.
-- [ ] Remove the person from protected-environment approval lists.
+- [ ] Remove the person from protected-environment approval lists (when required reviewers are configured).
 - [ ] Rotate or replace release signing keys and repository-publishing
       credentials according to
       [`docs/governance/KEY_ROTATION.md`](docs/governance/KEY_ROTATION.md).

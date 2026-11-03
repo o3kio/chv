@@ -145,7 +145,7 @@ compromise. Treat the event as a security incident and follow
 
 When a custodian leaves, becomes emeritus, or is removed:
 
-1. Remove the person from protected-environment approval lists.
+1. Remove the person from protected-environment approval lists (when required reviewers are configured).
 2. Replace the environment secrets that the person could access. Rotate the
    release GPG and cosign keys and the package-repository key even when there is
    no evidence of compromise.

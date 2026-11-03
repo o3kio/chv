@@ -139,7 +139,7 @@ The organization owner and a remaining maintainer complete this checklist when
 a maintainer leaves, becomes emeritus, or is removed:
 
 - [ ] Remove organization, repository, and team roles.
-- [ ] Remove the person from protected-environment approval lists.
+- [ ] Remove the person from protected-environment approval lists (when required reviewers are configured).
 - [ ] Rotate or replace release signing keys and repository-publishing
       credentials per
       [`docs/governance/KEY_ROTATION.md`](docs/governance/KEY_ROTATION.md).
