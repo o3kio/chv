@@ -55,6 +55,13 @@ impl NetboxProjectionConfigRepository {
         }
     }
 
+    /// Test-support constructor with an injected credential cipher, so tests
+    /// can exercise fail-closed writes without mutating process-global env.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_crypto(pool: StorePool, crypto: CredentialEncryption) -> Self {
+        Self { pool, crypto }
+    }
+
     pub fn pool(&self) -> &StorePool {
         &self.pool
     }
@@ -79,7 +86,19 @@ impl NetboxProjectionConfigRepository {
         // encrypted verbatim otherwise.
         match input.token.as_deref() {
             Some(token) if !token.trim().is_empty() => {
-                let token_ciphertext = self.crypto.encrypt(token);
+                // Encrypt before touching the database: a failed encryption
+                // must not insert/update a row, and must never persist the
+                // token in plaintext (#655, fail-closed).
+                let token_ciphertext =
+                    self.crypto
+                        .encrypt(token)
+                        .map_err(|err| StoreError::InvalidConfiguration {
+                            reason: format!(
+                                "cannot store netbox API token for architecture {}: \
+                             credential encryption is unavailable (fail-closed): {err}",
+                                input.architecture_id
+                            ),
+                        })?;
                 let row = sqlx::query(
                     r#"
                     INSERT INTO netbox_projection_config (

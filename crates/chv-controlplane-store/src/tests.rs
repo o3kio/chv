@@ -4,7 +4,7 @@ use chv_controlplane_types::domain::{Generation, NodeId, ResourceId};
 // NOTE: These tests use an ephemeral Postgres instance via testcontainers.
 // No manual setup is required.
 
-use crate::test_util::TestDb;
+use crate::test_util::{test_credential_encryption, TestDb};
 
 #[tokio::test]
 async fn test_bootstrap_token_validation() {
@@ -922,6 +922,98 @@ async fn decrypt_schedule_row_nulls_undecryptable_credential() {
     // Critically, neither field may equal the ciphertext literal.
     assert_ne!(row.s3_access_key.as_deref(), Some(bad_ciphertext));
     assert_ne!(row.s3_secret_key.as_deref(), Some(bad_ciphertext));
+}
+
+/// #655: with no encryption key, creating a schedule that carries S3
+/// credentials must fail closed — no plaintext row may be written.
+#[tokio::test]
+async fn backups_create_schedule_without_key_fails_closed_and_writes_no_row() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = BackupRepository::with_crypto(pool.clone(), CredentialEncryption::without_key());
+
+    let input = BackupScheduleCreateInput {
+        vm_id: "vm-fail-closed".to_string(),
+        volume_id: None,
+        name: "no-key-schedule".to_string(),
+        cron_expression: "0 0 * * *".to_string(),
+        retention_count: 1,
+        retention_days: 7,
+        destination: None,
+        enabled: true,
+        s3_access_key: Some("AKIA-plaintext-access".to_string()),
+        s3_secret_key: Some("plaintext-secret".to_string()),
+    };
+
+    let err = repo.create_schedule(&input).await.unwrap_err();
+    match err {
+        StoreError::InvalidConfiguration { reason } => assert!(
+            reason.contains("fail-closed"),
+            "expected fail-closed reason, got {reason}"
+        ),
+        other => panic!("expected InvalidConfiguration, got {other:?}"),
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_schedules")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no schedule row may be written");
+}
+
+/// #655: an update carrying new credentials under a no-key cipher must return
+/// an error and leave the existing row (including credentials) untouched.
+#[tokio::test]
+async fn backups_update_schedule_without_key_leaves_row_unchanged() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let keyed = BackupRepository::with_crypto(pool.clone(), test_credential_encryption());
+    let create = BackupScheduleCreateInput {
+        vm_id: "vm-fail-closed".to_string(),
+        volume_id: None,
+        name: "original-name".to_string(),
+        cron_expression: "0 0 * * *".to_string(),
+        retention_count: 1,
+        retention_days: 7,
+        destination: None,
+        enabled: true,
+        s3_access_key: Some("original-access".to_string()),
+        s3_secret_key: Some("original-secret".to_string()),
+    };
+    let schedule_id = keyed.create_schedule(&create).await.unwrap();
+
+    let no_key = BackupRepository::with_crypto(pool.clone(), CredentialEncryption::without_key());
+    let update = BackupScheduleUpdateInput {
+        schedule_id: schedule_id.clone(),
+        vm_id: "vm-fail-closed".to_string(),
+        volume_id: None,
+        name: "should-not-persist".to_string(),
+        cron_expression: "0 1 * * *".to_string(),
+        retention_count: 1,
+        retention_days: 7,
+        destination: None,
+        enabled: true,
+        s3_access_key: Some("replacement-access".to_string()),
+        s3_secret_key: Some("replacement-secret".to_string()),
+    };
+    let err = no_key.update_schedule(&update).await.unwrap_err();
+    match err {
+        StoreError::InvalidConfiguration { reason } => assert!(
+            reason.contains("fail-closed"),
+            "expected fail-closed reason, got {reason}"
+        ),
+        other => panic!("expected InvalidConfiguration, got {other:?}"),
+    }
+
+    let row = keyed
+        .get_schedule(&schedule_id)
+        .await
+        .unwrap()
+        .expect("schedule row still exists");
+    assert_eq!(row.name, "original-name");
+    assert_eq!(row.cron_expression, "0 0 * * *");
+    assert_eq!(row.s3_access_key.as_deref(), Some("original-access"));
+    assert_eq!(row.s3_secret_key.as_deref(), Some("original-secret"));
 }
 
 // --- ADR-021 fabric transport IP allocation (review finding M2) ---

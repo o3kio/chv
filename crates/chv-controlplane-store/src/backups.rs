@@ -303,6 +303,27 @@ impl BackupRepository {
         }
     }
 
+    /// Test-support constructor with an injected credential cipher, so tests
+    /// can exercise fail-closed writes without mutating process-global env.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_crypto(pool: StorePool, crypto: CredentialEncryption) -> Self {
+        Self { pool, crypto }
+    }
+
+    /// Encrypts a schedule credential, mapping a fail-closed encryption
+    /// error to a store configuration error. Callers run this before the
+    /// INSERT/UPDATE so a failed encryption never writes a row.
+    fn encrypt_credential(&self, value: &str, field: &'static str) -> Result<String, StoreError> {
+        self.crypto
+            .encrypt(value)
+            .map_err(|err| StoreError::InvalidConfiguration {
+                reason: format!(
+                    "cannot store backup schedule {field}: credential encryption \
+                     is unavailable (fail-closed): {err}"
+                ),
+            })
+    }
+
     /// Decrypts the S3 credentials on a schedule row in place.
     ///
     /// Fail-closed: if a credential cannot be decrypted (wrong key, tampered
@@ -535,11 +556,13 @@ impl BackupRepository {
         let access_key = input
             .s3_access_key
             .as_deref()
-            .map(|k| self.crypto.encrypt(k));
+            .map(|k| self.encrypt_credential(k, "s3_access_key"))
+            .transpose()?;
         let secret_key = input
             .s3_secret_key
             .as_deref()
-            .map(|k| self.crypto.encrypt(k));
+            .map(|k| self.encrypt_credential(k, "s3_secret_key"))
+            .transpose()?;
         sqlx::query(INSERT_SCHEDULE_SQL)
             .bind(&schedule_id)
             .bind(&input.vm_id)
@@ -564,11 +587,13 @@ impl BackupRepository {
         let access_key = input
             .s3_access_key
             .as_deref()
-            .map(|k| self.crypto.encrypt(k));
+            .map(|k| self.encrypt_credential(k, "s3_access_key"))
+            .transpose()?;
         let secret_key = input
             .s3_secret_key
             .as_deref()
-            .map(|k| self.crypto.encrypt(k));
+            .map(|k| self.encrypt_credential(k, "s3_secret_key"))
+            .transpose()?;
         let result = sqlx::query(UPDATE_SCHEDULE_SQL)
             .bind(&input.vm_id)
             .bind(&input.volume_id)

@@ -454,19 +454,22 @@ async fn setup_config_with_token(
     retention: NetboxRetentionPolicy,
     token: &str,
 ) {
-    NetboxProjectionConfigRepository::new(db.pool.clone())
-        .upsert(NetboxProjectionConfigUpsertInput {
-            architecture_id: aid(topo_id),
-            endpoint: endpoint.to_string(),
-            token: Some(token.to_string()),
-            token_secret_ref: format!("netbox-{topo_id}"),
-            retention_policy: retention,
-            enable_post_apply: false,
-            custom_field_prefix: "chv_".to_string(),
-            site_name: Some(SITE.to_string()),
-        })
-        .await
-        .expect("config upserted");
+    NetboxProjectionConfigRepository::with_crypto(
+        db.pool.clone(),
+        chv_controlplane_store::test_util::test_credential_encryption(),
+    )
+    .upsert(NetboxProjectionConfigUpsertInput {
+        architecture_id: aid(topo_id),
+        endpoint: endpoint.to_string(),
+        token: Some(token.to_string()),
+        token_secret_ref: format!("netbox-{topo_id}"),
+        retention_policy: retention,
+        enable_post_apply: false,
+        custom_field_prefix: "chv_".to_string(),
+        site_name: Some(SITE.to_string()),
+    })
+    .await
+    .expect("config upserted");
 }
 
 async fn enqueue_run(
@@ -506,19 +509,22 @@ pub(crate) async fn setup_post_apply_config_with_token(
     topo_id: &str,
     token: &str,
 ) {
-    NetboxProjectionConfigRepository::new(db.pool.clone())
-        .upsert(NetboxProjectionConfigUpsertInput {
-            architecture_id: aid(topo_id),
-            endpoint: endpoint.to_string(),
-            token: Some(token.to_string()),
-            token_secret_ref: format!("netbox-{topo_id}"),
-            retention_policy: NetboxRetentionPolicy::MarkStale,
-            enable_post_apply: true,
-            custom_field_prefix: "chv_".to_string(),
-            site_name: Some(SITE.to_string()),
-        })
-        .await
-        .expect("config upserted");
+    NetboxProjectionConfigRepository::with_crypto(
+        db.pool.clone(),
+        chv_controlplane_store::test_util::test_credential_encryption(),
+    )
+    .upsert(NetboxProjectionConfigUpsertInput {
+        architecture_id: aid(topo_id),
+        endpoint: endpoint.to_string(),
+        token: Some(token.to_string()),
+        token_secret_ref: format!("netbox-{topo_id}"),
+        retention_policy: NetboxRetentionPolicy::MarkStale,
+        enable_post_apply: true,
+        custom_field_prefix: "chv_".to_string(),
+        site_name: Some(SITE.to_string()),
+    })
+    .await
+    .expect("config upserted");
 }
 
 /// Seed a `post_apply`-triggered run directly (the sweep's own enqueue
@@ -605,7 +611,10 @@ pub(crate) async fn setup_projection_with_token(
 pub(crate) fn worker_for(db: &TestDb) -> NetboxProjectionWorker {
     NetboxProjectionWorker::new(
         NetboxProjectionRunRepository::new(db.pool.clone()),
-        NetboxProjectionConfigRepository::new(db.pool.clone()),
+        NetboxProjectionConfigRepository::with_crypto(
+            db.pool.clone(),
+            chv_controlplane_store::test_util::test_credential_encryption(),
+        ),
         EventRepository::new(db.pool.clone()),
         ApplyRunRepository::new(db.pool.clone()),
         VersionRepository::new(db.pool.clone()),

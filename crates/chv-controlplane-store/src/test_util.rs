@@ -1,5 +1,12 @@
-use crate::{run_migrations, StorePool};
+use crate::{run_migrations, CredentialEncryption, StorePool};
 use sqlx::SqlitePool;
+
+/// Deterministic credential cipher for repository tests that must exercise
+/// the encrypt path. Injected explicitly so tests never race on the
+/// process-global `CHV_ENCRYPTION_KEY` environment variable.
+pub fn test_credential_encryption() -> CredentialEncryption {
+    CredentialEncryption::with_key("chv-controlplane-store-test-encryption-key")
+}
 
 pub struct TestDb {
     pub pool: StorePool,

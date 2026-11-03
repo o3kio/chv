@@ -8,7 +8,7 @@
 
 use crate::architectures::netbox_run::retry_backoff;
 use crate::architectures::*;
-use crate::test_util::TestDb;
+use crate::test_util::{test_credential_encryption, TestDb};
 use crate::StoreError;
 use chv_controlplane_types::architecture::{
     ArchitectureId, ArchitectureVersionId, NetboxProjectionMode, NetboxProjectionRunId,
@@ -62,6 +62,13 @@ async fn setup_architecture(db: &TestDb, topo_id: &str, version_id: &str) {
         .unwrap();
 }
 
+/// Config repository with a deterministic, injected encryption key. The
+/// encrypt path is fail-closed (#655), so token-writing tests must not rely
+/// on ambient `CHV_ENCRYPTION_KEY`.
+fn config_repo(db: &TestDb) -> NetboxProjectionConfigRepository {
+    NetboxProjectionConfigRepository::with_crypto(db.pool.clone(), test_credential_encryption())
+}
+
 fn make_config_input(topo_id: &str) -> NetboxProjectionConfigUpsertInput {
     NetboxProjectionConfigUpsertInput {
         architecture_id: aid(topo_id),
@@ -107,7 +114,7 @@ fn make_post_apply_run_input(
 async fn netbox_config_upsert_get_roundtrip() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     // The upsert input always carries explicit values (SQL defaults like
     // retention 'mark_stale' only apply to raw inserts), so the roundtrip
@@ -130,7 +137,7 @@ async fn netbox_config_upsert_get_roundtrip() {
 async fn netbox_config_upsert_is_idempotent_and_refreshes_updated_at() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     repo.upsert(make_config_input("topo-1")).await.unwrap();
 
@@ -167,7 +174,7 @@ async fn netbox_config_upsert_is_idempotent_and_refreshes_updated_at() {
 #[tokio::test]
 async fn netbox_config_upsert_unknown_topology_returns_not_found() {
     let db = TestDb::new().await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     let err = repo.upsert(make_config_input("missing")).await.unwrap_err();
     assert!(
@@ -180,7 +187,7 @@ async fn netbox_config_upsert_unknown_topology_returns_not_found() {
 #[tokio::test]
 async fn netbox_config_get_unknown_returns_none() {
     let db = TestDb::new().await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     assert!(repo.get(&aid("missing")).await.unwrap().is_none());
 }
@@ -189,7 +196,7 @@ async fn netbox_config_get_unknown_returns_none() {
 async fn netbox_config_delete_returns_true_then_false() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     repo.upsert(make_config_input("topo-1")).await.unwrap();
 
@@ -203,7 +210,7 @@ async fn netbox_config_delete_returns_true_then_false() {
 async fn netbox_config_token_roundtrip() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     let mut input = make_config_input("topo-1");
     input.token = Some("PAbCd-super-secret-token".to_string());
@@ -221,7 +228,7 @@ async fn netbox_config_token_roundtrip() {
 async fn netbox_config_update_without_token_keeps_existing_secret() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     let mut input = make_config_input("topo-1");
     input.token = Some("original-secret".to_string());
@@ -251,7 +258,7 @@ async fn netbox_config_update_without_token_keeps_existing_secret() {
 async fn netbox_config_update_with_new_token_replaces_secret() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     let mut input = make_config_input("topo-1");
     input.token = Some("original-secret".to_string());
@@ -269,7 +276,7 @@ async fn netbox_config_update_with_new_token_replaces_secret() {
 async fn netbox_config_fresh_upsert_without_token_is_invalid_configuration() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     let mut input = make_config_input("topo-1");
     input.token = None;
@@ -283,11 +290,72 @@ async fn netbox_config_fresh_upsert_without_token_is_invalid_configuration() {
     assert!(repo.get(&aid("topo-1")).await.unwrap().is_none());
 }
 
+/// #655: a NetBox token that cannot be encrypted must reject the upsert
+/// before any row is written — never fall back to storing plaintext.
+#[tokio::test]
+async fn netbox_config_upsert_without_key_fails_closed_and_writes_no_row() {
+    let db = TestDb::new().await;
+    setup_architecture(&db, "topo-1", "v-1").await;
+    let repo = NetboxProjectionConfigRepository::with_crypto(
+        db.pool.clone(),
+        crate::CredentialEncryption::without_key(),
+    );
+
+    let err = repo.upsert(make_config_input("topo-1")).await.unwrap_err();
+    match err {
+        StoreError::InvalidConfiguration { reason } => assert!(
+            reason.contains("fail-closed"),
+            "expected fail-closed reason, got {reason}"
+        ),
+        other => panic!("expected InvalidConfiguration, got {other:?}"),
+    }
+
+    assert!(
+        repo.get(&aid("topo-1")).await.unwrap().is_none(),
+        "no config row may be written when encryption fails"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM netbox_projection_config")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+/// #655: a token-bearing update under a no-key cipher must not touch the
+/// existing row (endpoint or stored ciphertext).
+#[tokio::test]
+async fn netbox_config_update_without_key_leaves_existing_row_unchanged() {
+    let db = TestDb::new().await;
+    setup_architecture(&db, "topo-1", "v-1").await;
+    let keyed = config_repo(&db);
+    keyed.upsert(make_config_input("topo-1")).await.unwrap();
+
+    let no_key = NetboxProjectionConfigRepository::with_crypto(
+        db.pool.clone(),
+        crate::CredentialEncryption::without_key(),
+    );
+    let mut edit = make_config_input("topo-1");
+    edit.endpoint = "https://should-not-persist.example.internal".to_string();
+    edit.token = Some("replacement-token".to_string());
+    assert!(no_key.upsert(edit).await.is_err());
+
+    let row = keyed
+        .get(&aid("topo-1"))
+        .await
+        .unwrap()
+        .expect("row exists");
+    assert_eq!(row.endpoint, "https://netbox.example.internal");
+    assert_eq!(
+        keyed.read_token(&aid("topo-1")).await.unwrap().as_deref(),
+        Some("netbox-api-token-plaintext")
+    );
+}
+
 #[tokio::test]
 async fn netbox_config_token_decrypt_failure_is_fail_closed() {
     let db = TestDb::new().await;
     setup_architecture(&db, "topo-1", "v-1").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     repo.upsert(make_config_input("topo-1")).await.unwrap();
 
@@ -971,7 +1039,7 @@ async fn netbox_config_list_post_apply_enabled_filters_and_orders() {
     setup_architecture(&db, "topo-1", "v-1").await;
     setup_architecture(&db, "topo-2", "v-2").await;
     setup_architecture(&db, "topo-3", "v-3").await;
-    let repo = NetboxProjectionConfigRepository::new(db.pool.clone());
+    let repo = config_repo(&db);
 
     // Insertion order differs from architecture_id order on purpose:
     // the sweep must not depend on physical row order.
