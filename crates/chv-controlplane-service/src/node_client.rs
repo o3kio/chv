@@ -184,6 +184,11 @@ pub struct NodeClient {
     reconcile: proto::reconcile_service_client::ReconcileServiceClient<Channel>,
     lifecycle: proto::lifecycle_service_client::LifecycleServiceClient<Channel>,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Control-plane agent bearer token attached to every RPC (#662). One
+    /// value is shared by every agent this control plane serves. `None` is
+    /// only used by transport-health probes and tests that do not issue
+    /// RPCs; a real dispatch client always carries the configured token.
+    auth_token: Option<Arc<str>>,
 }
 
 impl NodeClient {
@@ -191,9 +196,27 @@ impl NodeClient {
         Self::connect_with_breaker(socket_path, Arc::new(CircuitBreaker::new())).await
     }
 
+    /// Connect with an explicit agent authentication token (#662).
+    pub async fn connect_with_token(socket_path: &Path, token: &str) -> Result<Self, ChvError> {
+        Self::connect_with_breaker_and_token(
+            socket_path,
+            Arc::new(CircuitBreaker::new()),
+            Some(token),
+        )
+        .await
+    }
+
     pub async fn connect_with_breaker(
         socket_path: &Path,
         circuit_breaker: Arc<CircuitBreaker>,
+    ) -> Result<Self, ChvError> {
+        Self::connect_with_breaker_and_token(socket_path, circuit_breaker, None).await
+    }
+
+    pub async fn connect_with_breaker_and_token(
+        socket_path: &Path,
+        circuit_breaker: Arc<CircuitBreaker>,
+        token: Option<&str>,
     ) -> Result<Self, ChvError> {
         let path = socket_path.to_path_buf();
         let channel = Endpoint::try_from("http://[::]:50051")
@@ -219,6 +242,10 @@ impl NodeClient {
             ),
             lifecycle: proto::lifecycle_service_client::LifecycleServiceClient::new(channel),
             circuit_breaker,
+            auth_token: token
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(Arc::<str>::from),
         })
     }
 
@@ -256,7 +283,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.reconcile
-                .apply_vm_desired_state(with_operation_id_metadata(req, operation_id))
+                .apply_vm_desired_state(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -304,7 +335,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.reconcile
-                .apply_volume_desired_state(with_operation_id_metadata(req, operation_id))
+                .apply_volume_desired_state(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -352,7 +387,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.reconcile
-                .apply_network_desired_state(with_operation_id_metadata(req, operation_id))
+                .apply_network_desired_state(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -394,7 +433,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .create_vm(with_operation_id_metadata(req, operation_id))
+                .create_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -432,7 +475,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .start_vm(with_operation_id_metadata(req, operation_id))
+                .start_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -472,7 +519,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .stop_vm(with_operation_id_metadata(req, operation_id))
+                .stop_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -512,7 +563,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .reboot_vm(with_operation_id_metadata(req, operation_id))
+                .reboot_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -552,7 +607,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .delete_vm(with_operation_id_metadata(req, operation_id))
+                .delete_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -592,7 +651,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .snapshot_vm(with_operation_id_metadata(req, operation_id))
+                .snapshot_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -632,7 +695,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .restore_snapshot(with_operation_id_metadata(req, operation_id))
+                .restore_snapshot(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -683,7 +750,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .attach_volume(with_operation_id_metadata(req, operation_id))
+                .attach_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -740,7 +811,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .create_volume(with_operation_id_metadata(req, operation_id))
+                .create_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -790,7 +865,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .delete_volume(with_operation_id_metadata(req, operation_id))
+                .delete_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -836,7 +915,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .apply_network_policy(with_operation_id_metadata(req, operation_id))
+                .apply_network_policy(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -882,7 +965,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .resolve_inspect_required_operation(with_operation_id_metadata(req, operation_id))
+                .resolve_inspect_required_operation(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -925,7 +1012,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .detach_volume(with_operation_id_metadata(req, operation_id))
+                .detach_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -965,7 +1056,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .resize_volume(with_operation_id_metadata(req, operation_id))
+                .resize_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1005,7 +1100,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .snapshot_volume(with_operation_id_metadata(req, operation_id))
+                .snapshot_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1045,7 +1144,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .restore_volume(with_operation_id_metadata(req, operation_id))
+                .restore_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1085,7 +1188,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .delete_volume_snapshot(with_operation_id_metadata(req, operation_id))
+                .delete_volume_snapshot(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1125,7 +1232,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .clone_volume(with_operation_id_metadata(req, operation_id))
+                .clone_volume(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1163,7 +1274,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .start_network(with_operation_id_metadata(req, operation_id))
+                .start_network(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1203,7 +1318,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .stop_network(with_operation_id_metadata(req, operation_id))
+                .stop_network(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1241,7 +1360,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .restart_network(with_operation_id_metadata(req, operation_id))
+                .restart_network(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1279,7 +1402,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .pause_vm(with_operation_id_metadata(req, operation_id))
+                .pause_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1317,7 +1444,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .resume_vm(with_operation_id_metadata(req, operation_id))
+                .resume_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1355,7 +1486,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .power_button_vm(with_operation_id_metadata(req, operation_id))
+                .power_button_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1395,7 +1530,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .coredump_vm(with_operation_id_metadata(req, operation_id))
+                .coredump_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1440,7 +1579,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .migrate_vm(with_operation_id_metadata(req, operation_id))
+                .migrate_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1490,7 +1633,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .update_overlay(with_operation_id_metadata(req, operation_id))
+                .update_overlay(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1531,7 +1678,11 @@ impl NodeClient {
         self.circuit_breaker.check(method)?;
         let result = with_timeout(
             self.lifecycle
-                .send_gratuitous_arp(with_operation_id_metadata(req, operation_id))
+                .send_gratuitous_arp(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
                 .instrument(span),
             "agent",
             method,
@@ -1546,12 +1697,23 @@ impl NodeClient {
     }
 }
 
-fn with_operation_id_metadata<T>(req: T, operation_id: &str) -> tonic::Request<T> {
+fn with_operation_id_metadata<T>(
+    req: T,
+    operation_id: &str,
+    auth_token: &Option<Arc<str>>,
+) -> tonic::Request<T> {
     let mut grpc_req = tonic::Request::new(req);
     if let Ok(val) = tonic::metadata::MetadataValue::try_from(operation_id) {
         grpc_req
             .metadata_mut()
             .insert(chv_common::OPERATION_ID_METADATA_KEY, val);
+    }
+    if let Some(token) = auth_token {
+        if let Ok(val) = tonic::metadata::MetadataValue::try_from(token.as_ref()) {
+            grpc_req
+                .metadata_mut()
+                .insert(chv_common::NODE_AUTH_METADATA_KEY, val);
+        }
     }
     grpc_req
 }
@@ -1663,7 +1825,46 @@ fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{volume_attach_spec_json, volume_create_spec_json};
+    use super::{volume_attach_spec_json, volume_create_spec_json, with_operation_id_metadata};
+    use std::sync::Arc;
+
+    /// #662: every dispatch request carries both the operation id and the
+    /// control-plane agent token, so no RPC can be sent unauthenticated once
+    /// the pool is configured.
+    #[test]
+    fn dispatch_metadata_carries_operation_id_and_agent_token() {
+        let token: Option<Arc<str>> = Some(Arc::from("agent-token-0123456789abcdef"));
+        let request = with_operation_id_metadata((), "op-42", &token);
+        let metadata = request.metadata();
+        assert_eq!(
+            metadata
+                .get(chv_common::OPERATION_ID_METADATA_KEY)
+                .expect("operation id")
+                .to_str()
+                .unwrap(),
+            "op-42"
+        );
+        assert_eq!(
+            metadata
+                .get(chv_common::NODE_AUTH_METADATA_KEY)
+                .expect("agent token")
+                .to_str()
+                .unwrap(),
+            "agent-token-0123456789abcdef"
+        );
+    }
+
+    /// Token-less clients (health probes / tests) must not emit an empty
+    /// credential header: absence is a clean `Unauthenticated`, whereas an
+    /// empty value would look like a malformed credential.
+    #[test]
+    fn dispatch_metadata_omits_absent_token() {
+        let request = with_operation_id_metadata((), "op-42", &None);
+        assert!(request
+            .metadata()
+            .get(chv_common::NODE_AUTH_METADATA_KEY)
+            .is_none());
+    }
 
     /// #513 PR 1 (DP2/DP3, the dispatch-carrier producer): the create
     /// spec_json is `{"size_bytes": N}` — and ONLY that key — for a

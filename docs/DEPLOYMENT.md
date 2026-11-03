@@ -526,7 +526,26 @@ http_bind = "127.0.0.1:8080"
 metrics_bind = "127.0.0.1:9103"
 log_level = "info"
 runtime_dir = "/run/chv/controlplane"
+# Legacy migration master. Per-purpose keys below are derived from this
+# value when they are not configured explicitly.
 jwt_secret = "<generate with: openssl rand -base64 32>"
+
+# Per-purpose secrets (#662): >=32 chars each and distinct from one another.
+# user_jwt signs end-user sessions; console_jwt signs serial-console JWTs;
+# agent_auth_token authenticates every control-plane → agent RPC.
+# The control plane sends ONE agent_auth_token to every agent it serves, so
+# all of those agents must use this same value. Per-node tokens are future
+# ADR-029 work; rotating one agent's token alone requires re-keying the
+# control plane or a maintenance window.
+[secrets]
+user_jwt = "<generate with: openssl rand -hex 32>"
+console_jwt = "<generate once; use the SAME value in agent.toml>"
+agent_auth_token = "<generate once; use the SAME value in every served agent.toml>"
+# credential_encryption = "<optional; overrides CHV_ENCRYPTION_KEY>"
+
+[security]
+# Fail-closed default. The local-dev bypass is refused while this is true.
+production = true
 
 [database]
 url = "sqlite:///var/lib/chv/controlplane.db"
@@ -562,6 +581,26 @@ bootstrap_token_path = "/etc/chv/bootstrap.token"
 tls_cert_path = "/run/chv/agent/agent.crt"
 tls_key_path = "/run/chv/agent/agent.key"
 ca_cert_path = "/etc/chv/certs/ca.crt"
+
+# Per-purpose secrets (#662). These MUST match the control plane's values.
+# On a single-host upgrade you may omit [secrets] entirely: both sides
+# derive the same keys from a matching legacy jwt_secret. Configure them
+# explicitly to rotate a purpose independently. agent_auth_token is shared:
+# every agent served by one control plane uses that control plane's single
+# token (per-node tokens are future ADR-029 work).
+[secrets]
+console_jwt = "<same as controlplane.toml [secrets] console_jwt>"
+agent_auth_token = "<same as controlplane.toml [secrets] agent_auth_token>"
+
+[security]
+# Fail-closed default. On the agent, allow_insecure_agent_auth is a
+# local-development bypass and is refused while production = true. On the
+# control plane this key only relaxes config validation; it never changes
+# the token sent to agents.
+production = true
+# Agent-only: Unix UIDs allowed to connect to the agent socket. Empty means
+# the agent's own effective UID. The control plane ignores this key.
+# agent_auth_allowed_peer_uids = []
 
 # Stord respawn config fidelity (#385): point the supervisor at the
 # operator's stord.toml so a respawned stord keeps every operator key
@@ -599,6 +638,24 @@ max_reboots = 2                 # per unhealthy episode, then stand down
 healthy_reset_secs = 900        # sustained health resets the budget
 ```
 
+The control-plane → agent hop is a local Unix-domain socket (`0600`), not
+mTLS. Every RPC carries the `x-chv-agent-token` metadata credential; the
+agent compares it in constant time and also verifies the connecting UID via
+`SO_PEERCRED` before accepting the HTTP/2 connection. A missing or wrong
+token is rejected with `UNAUTHENTICATED`, and the agent logs those token
+rejections at `warn` (rate-limited to one per 60 seconds with a suppressed
+count; token material is never logged). The control plane holds one
+`agent_auth_token` and sends it to every agent it serves, so all of those
+agents must share it; this is not per-node isolation. On the agent,
+`allow_insecure_agent_auth = true` is accepted only with
+`production = false`, logs a loud warning, and is for local development only; the agent
+also requires a `dev`-feature build (`cargo build --features dev`) or it
+refuses to start with the bypass enabled. On the control plane the same key
+only relaxes config validation. `agent_auth_allowed_peer_uids` is an
+agent-only setting. Rotation and migration from the legacy shared
+`jwt_secret` are documented in
+[`runbooks/agent-auth-and-secret-rotation.md`](runbooks/agent-auth-and-secret-rotation.md).
+
 **`/etc/chv/nwd.toml`**
 ```toml
 socket_path = "/run/chv/nwd/api.sock"
@@ -622,10 +679,12 @@ metrics_bind = "127.0.0.1:9101"
 
 ### 8. Credential Encryption Key
 
-The control plane encrypts S3 backup credentials at rest
-(AES-256-GCM). Generate the key once and never regenerate it — a
-database restored without the matching key cannot read stored
-credentials:
+The control plane encrypts S3 backup credentials and NetBox API tokens at
+rest (AES-256-GCM). The key can be supplied either as
+`[secrets] credential_encryption` in `controlplane.toml` (#662) or through
+the `CHV_ENCRYPTION_KEY` environment variable; the explicit config value
+takes precedence. Generate the key once and never regenerate it — a database
+restored without the matching key cannot read stored credentials:
 
 ```bash
 sudo sh -c 'umask 077; printf "CHV_ENCRYPTION_KEY=%s\n" "$(openssl rand -hex 32)" > /etc/chv/encryption.env'

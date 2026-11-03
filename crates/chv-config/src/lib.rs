@@ -149,6 +149,226 @@ fn resolve_jwt_secret(current: &str, service_name: &str) -> String {
     generated
 }
 
+const DEV_SECRET: &str = "chv-dev-secret-change-in-production";
+
+/// Domain-separate the per-purpose secrets that used to be the single
+/// shared `jwt_secret`.
+///
+/// The derivation is HMAC-SHA256 keyed by the legacy master with a
+/// versioned, purpose-specific label. It preserves existing single-host
+/// installs (both the control plane and the agent derive the same console
+/// key) while ensuring a user JWT, a console JWT, and the agent credential
+/// are different cryptographic keys even before an operator configures the
+/// new `[secrets]` fields. Independent rotation requires explicit values —
+/// rotating the legacy master rotates every derived key together.
+fn derive_domain_secret(master: &str, domain: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(master.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(b"chv-secret-v1");
+    mac.update(b"\0");
+    mac.update(domain.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn explicit_secret(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+}
+
+fn secret_is_weak(secret: &str) -> bool {
+    secret.trim().is_empty() || secret == DEV_SECRET || secret.len() < 32
+}
+
+/// Per-purpose credentials. Every field is optional: when omitted, the
+/// legacy `jwt_secret` is expanded with domain separation (see
+/// [`derive_domain_secret`]). Fields that are present must be strong and
+/// must not duplicate another purpose (validation fails closed).
+#[derive(Clone, Default, Deserialize)]
+pub struct SecretsConfig {
+    /// Signing key for end-user session JWTs (BFF/control-plane login).
+    #[serde(default)]
+    pub user_jwt: Option<String>,
+    /// Signing key for short-lived serial-console JWTs. The agent must be
+    /// configured with the same value as the control plane.
+    #[serde(default)]
+    pub console_jwt: Option<String>,
+    /// Bearer token the control plane presents on every agent RPC today.
+    /// The control plane holds one value and sends it to every agent it
+    /// serves, so all of those agents must be configured with this same
+    /// token. Per-node token selection is future ADR-029 (multi-host)
+    /// work, not an implemented capability. Rotating one agent's token in
+    /// isolation therefore requires re-keying the control plane or a
+    /// maintenance window.
+    #[serde(default)]
+    pub agent_auth_token: Option<String>,
+    /// Key used for credential encryption at rest (backup S3 secrets,
+    /// NetBox API tokens). Takes precedence over `CHV_ENCRYPTION_KEY`.
+    #[serde(default)]
+    pub credential_encryption: Option<String>,
+}
+
+// `AgentConfig` and `ControlPlaneConfig` derive `Debug` and embed this
+// struct, so a plain derive here would print every secret through `{:?}`.
+// Report only whether a purpose is configured, never the value or length.
+impl std::fmt::Debug for SecretsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn presence(value: &Option<String>) -> &'static str {
+            if value.is_some() {
+                "<redacted>"
+            } else {
+                "<unset>"
+            }
+        }
+
+        f.debug_struct("SecretsConfig")
+            .field("user_jwt", &presence(&self.user_jwt))
+            .field("console_jwt", &presence(&self.console_jwt))
+            .field("agent_auth_token", &presence(&self.agent_auth_token))
+            .field(
+                "credential_encryption",
+                &presence(&self.credential_encryption),
+            )
+            .finish()
+    }
+}
+
+/// Deployment-security switches shared by the control plane and agent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecurityConfig {
+    /// Declares a production deployment. The default is fail-closed: it
+    /// refuses the insecure agent-auth bypass. Development setups must opt
+    /// out explicitly (`production = false`) AND enable the bypass.
+    #[serde(default = "default_production")]
+    pub production: bool,
+    /// Explicitly disables token authentication and the peer-UID gate on
+    /// the agent's Unix socket. On the control plane this only relaxes
+    /// config validation (it never changes the token the control plane
+    /// sends). Logged loudly at startup; refused when `production = true`.
+    /// Only for local development.
+    #[serde(default)]
+    pub allow_insecure_agent_auth: bool,
+    /// Agent-only: Unix UIDs allowed to connect to the agent socket. Empty
+    /// means "the agent's own effective UID" (the control plane normally
+    /// runs as the same service user on a single host). Ignored by the
+    /// control plane and when the insecure bypass is active.
+    #[serde(default)]
+    pub agent_auth_allowed_peer_uids: Vec<u32>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            production: default_production(),
+            allow_insecure_agent_auth: false,
+            agent_auth_allowed_peer_uids: Vec::new(),
+        }
+    }
+}
+
+fn default_production() -> bool {
+    true
+}
+
+impl SecretsConfig {
+    fn user_jwt(&self, master: &str) -> String {
+        explicit_secret(&self.user_jwt)
+            .map(str::to_owned)
+            .unwrap_or_else(|| derive_domain_secret(master, "user-jwt"))
+    }
+
+    fn console_jwt(&self, master: &str) -> String {
+        explicit_secret(&self.console_jwt)
+            .map(str::to_owned)
+            .unwrap_or_else(|| derive_domain_secret(master, "console-jwt"))
+    }
+
+    fn agent_auth_token(&self, master: &str) -> String {
+        explicit_secret(&self.agent_auth_token)
+            .map(str::to_owned)
+            .unwrap_or_else(|| derive_domain_secret(master, "agent-auth-token"))
+    }
+
+    fn credential_encryption(&self) -> Option<String> {
+        explicit_secret(&self.credential_encryption)
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("CHV_ENCRYPTION_KEY")
+                    .ok()
+                    .map(|key| key.trim().to_owned())
+                    .filter(|key| !key.is_empty())
+            })
+    }
+
+    fn validate_explicit(&self, include_control_plane_only: bool) -> Result<(), ConfigError> {
+        let mut fields = vec![
+            ("secrets.console_jwt", &self.console_jwt),
+            ("secrets.agent_auth_token", &self.agent_auth_token),
+        ];
+        if include_control_plane_only {
+            fields.push(("secrets.user_jwt", &self.user_jwt));
+            fields.push(("secrets.credential_encryption", &self.credential_encryption));
+        }
+        for (name, value) in fields {
+            if let Some(secret) = explicit_secret(value) {
+                if secret_is_weak(secret) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{name} must be at least 32 characters and must not be the \
+                         development placeholder"
+                    )));
+                }
+                // The agent token is carried as gRPC metadata. A non-ASCII
+                // value would make `MetadataValue::try_from` fail at send
+                // time and silently omit the header, so reject it at load
+                // time with an actionable error instead.
+                if name == "secrets.agent_auth_token"
+                    && !secret.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "{name} must contain only printable ASCII characters so it can be \
+                         sent as gRPC metadata"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ensure_distinct_secrets(secrets: &[(&str, &str)]) -> Result<(), ConfigError> {
+    for (index, (left_name, left)) in secrets.iter().enumerate() {
+        for (right_name, right) in secrets.iter().skip(index + 1) {
+            if chv_common::constant_time_eq(left.as_bytes(), right.as_bytes()) {
+                return Err(ConfigError::Invalid(format!(
+                    "{left_name} and {right_name} must be distinct secrets; \
+                     configure separate values under [secrets]"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_security_mode(security: &SecurityConfig) -> Result<(), ConfigError> {
+    if security.production && security.allow_insecure_agent_auth {
+        return Err(ConfigError::Invalid(
+            "security.allow_insecure_agent_auth is forbidden when security.production = true; \
+             it is a local-development bypass only"
+                .to_string(),
+        ));
+    }
+    if security.allow_insecure_agent_auth {
+        tracing::warn!(
+            "SECURITY: agent token authentication is DISABLED \
+             (security.allow_insecure_agent_auth = true). Never use this in production."
+        );
+    }
+    Ok(())
+}
+
 /// Fabric overlay (ADR-021) configuration for the network daemon.
 ///
 /// When `enabled` is false (the default), `chv-nwd` runs bridge-only and every
@@ -507,6 +727,19 @@ pub struct AgentConfig {
     pub console_bind: String,
     #[serde(default = "default_agent_jwt_secret")]
     pub jwt_secret: String,
+    /// Per-purpose secrets (#662). `console_jwt` must match the control
+    /// plane's value; `agent_auth_token` must match the control plane's
+    /// `[secrets] agent_auth_token`. The control plane sends one token to
+    /// every agent it serves today, so all agents behind one control plane
+    /// share that token (per-node tokens are future ADR-029 work). Both may
+    /// instead be derived from the same legacy `jwt_secret` on a
+    /// single-host install.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    /// Production/development security switches (#662). Production is the
+    /// default: the unauthenticated agent bypass is refused.
+    #[serde(default)]
+    pub security: SecurityConfig,
     #[serde(default)]
     pub watchdog: BootWatchdogAgentConfig,
 }
@@ -618,6 +851,8 @@ impl Default for AgentConfig {
             nwd_config_path: None,
             console_bind: default_console_bind(),
             jwt_secret: default_agent_jwt_secret(),
+            secrets: SecretsConfig::default(),
+            security: SecurityConfig::default(),
             watchdog: BootWatchdogAgentConfig::default(),
         }
     }
@@ -654,17 +889,63 @@ pub fn load_agent_config(path: Option<&Path>) -> Result<AgentConfig, ConfigError
         cfg = toml::from_str(&text)?;
     }
     materialize_agent_jwt_secret(&mut cfg);
+    cfg.validate_secrets()?;
     Ok(cfg)
 }
 
+impl AgentConfig {
+    /// Console JWT signing key. Explicit `[secrets] console_jwt` wins;
+    /// otherwise it is derived from the legacy `jwt_secret` with domain
+    /// separation, matching the control plane's derived value on a
+    /// single-host install.
+    pub fn effective_console_jwt_secret(&self) -> String {
+        self.secrets.console_jwt(&self.jwt_secret)
+    }
+
+    /// Bearer token the control plane presents on every agent RPC.
+    /// Explicit `[secrets] agent_auth_token` wins; otherwise this is a
+    /// distinct domain-separated derivation of the legacy master. The
+    /// control plane uses one token for all agents it serves, so every one
+    /// of those agents must use the same effective value. Per-node tokens
+    /// are future ADR-029 work.
+    pub fn effective_agent_auth_token(&self) -> String {
+        self.secrets.agent_auth_token(&self.jwt_secret)
+    }
+
+    /// Fail-closed validation of the #662 secret split. Run by
+    /// [`load_agent_config`]; kept public so startup code can re-check a
+    /// programmatically constructed config.
+    pub fn validate_secrets(&self) -> Result<(), ConfigError> {
+        validate_security_mode(&self.security)?;
+        // The agent never uses `user_jwt` or `credential_encryption`; skip
+        // validating control-plane-only keys it would not consume, so a
+        // weak value in agent.toml cannot block startup confusingly.
+        self.secrets.validate_explicit(false)?;
+        if self.security.allow_insecure_agent_auth {
+            return Ok(());
+        }
+        let console = self.effective_console_jwt_secret();
+        let agent = self.effective_agent_auth_token();
+        if secret_is_weak(&console) || secret_is_weak(&agent) {
+            return Err(ConfigError::Invalid(
+                "console/agent secrets must be at least 32 characters".to_string(),
+            ));
+        }
+        ensure_distinct_secrets(&[
+            ("secrets.console_jwt (effective)", console.as_str()),
+            ("secrets.agent_auth_token (effective)", agent.as_str()),
+        ])
+    }
+}
+
 fn materialize_agent_jwt_secret(cfg: &mut AgentConfig) {
-    // main.rs constructs ConsoleServer (the jwt_secret consumer) in legacy
+    // main.rs constructs ConsoleServer (the console_jwt consumer) in legacy
     // and core-managed modes, so a default or short secret must not survive
     // config load in either. Core-native returns into run_core_native before
     // the console exists: no in-process consumer, so the configured value is
     // left untouched and no secret is minted on disk.
     if cfg.authority_mode != AgentAuthorityMode::CoreNative
-        && (cfg.jwt_secret == "chv-dev-secret-change-in-production" || cfg.jwt_secret.len() < 32)
+        && (cfg.jwt_secret == DEV_SECRET || cfg.jwt_secret.len() < 32)
     {
         cfg.jwt_secret = resolve_jwt_secret(&cfg.jwt_secret, "agent");
     }
@@ -1630,6 +1911,17 @@ pub struct ControlPlaneConfig {
     pub runtime_dir: PathBuf,
     #[serde(default = "default_jwt_secret")]
     pub jwt_secret: String,
+    /// Per-purpose secrets (#662): user JWT, console JWT, agent bearer
+    /// token, and credential-encryption key. Omitted values are derived
+    /// from `jwt_secret` with domain separation so existing single-host
+    /// installations keep working; explicit values are required for
+    /// independent rotation.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    /// Production/development security switches (#662). Production is the
+    /// default; the unauthenticated agent bypass is refused there.
+    #[serde(default)]
+    pub security: SecurityConfig,
     #[serde(default)]
     pub database: ControlPlaneDatabaseConfig,
     #[serde(default)]
@@ -1728,6 +2020,8 @@ impl Default for ControlPlaneConfig {
             log_level: DEFAULT_CONTROLPLANE_LOG_LEVEL.to_string(),
             runtime_dir: PathBuf::from(DEFAULT_CONTROLPLANE_RUNTIME_DIR),
             jwt_secret: default_jwt_secret(),
+            secrets: SecretsConfig::default(),
+            security: SecurityConfig::default(),
             database: ControlPlaneDatabaseConfig::default(),
             tls: ControlPlaneTlsConfig::default(),
             monitoring: MonitoringConfig::default(),
@@ -1781,11 +2075,76 @@ pub fn load_controlplane_config(path: Option<&Path>) -> Result<ControlPlaneConfi
         let text = std::fs::read_to_string(p)?;
         cfg = toml::from_str(&text)?;
     }
-    if cfg.jwt_secret == "chv-dev-secret-change-in-production" || cfg.jwt_secret.len() < 32 {
+    if cfg.jwt_secret == DEV_SECRET || cfg.jwt_secret.len() < 32 {
         cfg.jwt_secret = resolve_jwt_secret(&cfg.jwt_secret, "controlplane");
     }
     cfg.audit.validate().map_err(ConfigError::Invalid)?;
+    cfg.validate_secrets()?;
     Ok(cfg)
+}
+
+impl ControlPlaneConfig {
+    /// End-user session JWT signing key.
+    pub fn effective_user_jwt_secret(&self) -> String {
+        self.secrets.user_jwt(&self.jwt_secret)
+    }
+
+    /// Short-lived console JWT signing key. The agent must be configured
+    /// with the same effective value.
+    pub fn effective_console_jwt_secret(&self) -> String {
+        self.secrets.console_jwt(&self.jwt_secret)
+    }
+
+    /// Bearer token presented on every agent RPC. Explicit configuration
+    /// wins; otherwise it is derived from the legacy master. One value is
+    /// sent to every agent this control plane serves, so all of those
+    /// agents must share it. Per-node tokens are future ADR-029 work.
+    pub fn effective_agent_auth_token(&self) -> String {
+        self.secrets.agent_auth_token(&self.jwt_secret)
+    }
+
+    /// Explicit credential-encryption key, falling back to
+    /// `CHV_ENCRYPTION_KEY`. `None` means the store keeps its legacy
+    /// environment lookup (including the documented `CHV_JWT_SECRET`
+    /// compatibility path) unchanged.
+    pub fn effective_credential_encryption_key(&self) -> Option<String> {
+        self.secrets.credential_encryption()
+    }
+
+    /// Fail-closed validation of the #662 secret split. Run by
+    /// [`load_controlplane_config`]; public for programmatic configs.
+    pub fn validate_secrets(&self) -> Result<(), ConfigError> {
+        validate_security_mode(&self.security)?;
+        self.secrets.validate_explicit(true)?;
+        let user = self.effective_user_jwt_secret();
+        let console = self.effective_console_jwt_secret();
+        let agent = self.effective_agent_auth_token();
+        if !self.security.allow_insecure_agent_auth && secret_is_weak(&agent) {
+            return Err(ConfigError::Invalid(
+                "secrets.agent_auth_token (effective) must be at least 32 characters".to_string(),
+            ));
+        }
+        let credential = self.effective_credential_encryption_key();
+        let mut all = vec![
+            ("secrets.user_jwt (effective)", user.as_str()),
+            ("secrets.console_jwt (effective)", console.as_str()),
+            ("secrets.agent_auth_token (effective)", agent.as_str()),
+        ];
+        if let Some(ref key) = credential {
+            all.push(("secrets.credential_encryption (effective)", key.as_str()));
+        }
+        ensure_distinct_secrets(&all)?;
+        if self.security.production
+            && explicit_secret(&self.secrets.user_jwt).is_none()
+            && explicit_secret(&self.secrets.console_jwt).is_none()
+        {
+            tracing::warn!(
+                "user/console JWT keys are derived from the legacy jwt_secret; \
+                 set [secrets] user_jwt/console_jwt for independent rotation"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2626,5 +2985,218 @@ nonsense = true
         let mut cfg = export_config_for_validate();
         cfg.ca_cert_path = Some(dir.path().join("missing-ca.pem"));
         assert!(cfg.validate().unwrap_err().contains("ca_cert_path"));
+    }
+
+    // ---------------------------------------------------------------------
+    // #662: per-purpose secrets and fail-closed agent authentication.
+    // ---------------------------------------------------------------------
+
+    const TEST_MASTER: &str = "legacy-master-0123456789abcdef0123456789abcdef";
+
+    fn control_plane_with_master(master: &str) -> ControlPlaneConfig {
+        ControlPlaneConfig {
+            jwt_secret: master.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn agent_with_master(master: &str) -> AgentConfig {
+        AgentConfig {
+            jwt_secret: master.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_master_derives_distinct_stable_per_purpose_secrets() {
+        let cfg = control_plane_with_master(TEST_MASTER);
+        let user = cfg.effective_user_jwt_secret();
+        let console = cfg.effective_console_jwt_secret();
+        let agent = cfg.effective_agent_auth_token();
+        assert_eq!(user, cfg.effective_user_jwt_secret());
+        assert_eq!(console, cfg.effective_console_jwt_secret());
+        assert_eq!(agent, cfg.effective_agent_auth_token());
+        assert_ne!(user, console, "user and console keys must be distinct");
+        assert_ne!(user, agent, "user and agent keys must be distinct");
+        assert_ne!(console, agent, "console and agent keys must be distinct");
+        // Not simply the legacy master re-used verbatim.
+        assert_ne!(user, TEST_MASTER);
+        assert!(cfg.validate_secrets().is_ok());
+
+        // A single-host agent sharing the legacy master derives the same
+        // console + agent keys, which is what keeps existing installs
+        // working without new configuration.
+        let agent_cfg = agent_with_master(TEST_MASTER);
+        assert_eq!(agent_cfg.effective_console_jwt_secret(), console);
+        assert_eq!(agent_cfg.effective_agent_auth_token(), agent);
+    }
+
+    #[test]
+    fn explicit_secrets_override_derivations() {
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.secrets.user_jwt = Some("user-key-0123456789abcdef0123456789aaaa".into());
+        cfg.secrets.console_jwt = Some("console-key-0123456789abcdef0123456789".into());
+        cfg.secrets.agent_auth_token = Some("agent-key-0123456789abcdef0123456789ab".into());
+        cfg.secrets.credential_encryption =
+            Some("credential-key-0123456789abcdef0123456789".into());
+        assert_eq!(
+            cfg.effective_user_jwt_secret(),
+            "user-key-0123456789abcdef0123456789aaaa"
+        );
+        assert_eq!(
+            cfg.effective_console_jwt_secret(),
+            "console-key-0123456789abcdef0123456789"
+        );
+        assert_eq!(
+            cfg.effective_agent_auth_token(),
+            "agent-key-0123456789abcdef0123456789ab"
+        );
+        assert_eq!(
+            cfg.effective_credential_encryption_key().as_deref(),
+            Some("credential-key-0123456789abcdef0123456789")
+        );
+        assert!(cfg.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn duplicate_or_weak_explicit_secrets_fail_closed() {
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.secrets.user_jwt = Some("same-key-0123456789abcdef0123456789abcd".into());
+        cfg.secrets.console_jwt = Some("same-key-0123456789abcdef0123456789abcd".into());
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("distinct"), "{err}");
+
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.secrets.user_jwt = Some("short".into());
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("at least 32"), "{err}");
+
+        // The shipped development placeholder is never acceptable as an
+        // explicit production secret.
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.secrets.console_jwt = Some(DEV_SECRET.into());
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("development placeholder"), "{err}");
+
+        // The agent token is sent as gRPC metadata: non-printable/non-ASCII
+        // values would be silently dropped at send time.
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.secrets.agent_auth_token = Some("agent-token-0123456789abcdef0123456789é".into());
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("printable ASCII"), "{err}");
+    }
+
+    #[test]
+    fn secrets_config_is_debug_redacted() {
+        let cfg = SecretsConfig {
+            user_jwt: Some("user-secret-value-never-in-logs".into()),
+            console_jwt: Some("console-secret-value-never-in-logs".into()),
+            agent_auth_token: Some("agent-secret-value-never-in-logs".into()),
+            credential_encryption: Some("credential-secret-value-never-in-logs".into()),
+        };
+        let rendered = format!("{cfg:?}");
+        for secret in [
+            "user-secret-value-never-in-logs",
+            "console-secret-value-never-in-logs",
+            "agent-secret-value-never-in-logs",
+            "credential-secret-value-never-in-logs",
+        ] {
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("user_jwt"));
+        assert!(rendered.contains("credential_encryption"));
+
+        let rendered = format!("{:?}", SecretsConfig::default());
+        assert!(rendered.contains("<unset>"));
+        assert!(!rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn agent_ignores_control_plane_only_secrets() {
+        // The agent never consumes `user_jwt` or `credential_encryption`;
+        // values that are invalid for the control plane must not block
+        // agent startup.
+        let mut agent = agent_with_master(TEST_MASTER);
+        agent.secrets.user_jwt = Some("short".into());
+        agent.secrets.credential_encryption = Some("short".into());
+        assert!(agent.validate_secrets().is_ok());
+
+        let mut control_plane = control_plane_with_master(TEST_MASTER);
+        control_plane.secrets.user_jwt = Some("short".into());
+        assert!(control_plane.validate_secrets().is_err());
+
+        let mut control_plane = control_plane_with_master(TEST_MASTER);
+        control_plane.secrets.credential_encryption = Some("short".into());
+        assert!(control_plane.validate_secrets().is_err());
+    }
+
+    #[test]
+    fn production_refuses_the_insecure_agent_bypass() {
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.security.production = true;
+        cfg.security.allow_insecure_agent_auth = true;
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("forbidden"), "{err}");
+
+        let mut cfg = control_plane_with_master(TEST_MASTER);
+        cfg.security.production = false;
+        cfg.security.allow_insecure_agent_auth = true;
+        assert!(
+            cfg.validate_secrets().is_ok(),
+            "explicit local-dev opt-out may disable agent auth"
+        );
+
+        // The agent side enforces the same polarity.
+        let mut agent = agent_with_master(TEST_MASTER);
+        agent.security.production = true;
+        agent.security.allow_insecure_agent_auth = true;
+        assert!(agent.validate_secrets().is_err());
+        agent.security.production = false;
+        assert!(agent.validate_secrets().is_ok());
+    }
+
+    #[test]
+    fn agent_console_and_daemon_keys_must_differ() {
+        let mut cfg = agent_with_master(TEST_MASTER);
+        cfg.secrets.console_jwt = Some("shared-key-0123456789abcdef0123456789ab".into());
+        cfg.secrets.agent_auth_token = Some("shared-key-0123456789abcdef0123456789ab".into());
+        let err = cfg.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("distinct"), "{err}");
+    }
+
+    #[test]
+    fn secrets_and_security_sections_parse_from_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("controlplane.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+grpc_bind = "127.0.0.1:8443"
+http_bind = "127.0.0.1:8080"
+log_level = "info"
+runtime_dir = "/run/chv/controlplane"
+jwt_secret = "legacy-master-0123456789abcdef0123456789abcdef"
+
+[secrets]
+user_jwt = "user-key-0123456789abcdef0123456789aaaa"
+console_jwt = "console-key-0123456789abcdef0123456789"
+agent_auth_token = "agent-key-0123456789abcdef0123456789ab"
+
+[security]
+production = false
+allow_insecure_agent_auth = true
+agent_auth_allowed_peer_uids = [1000, 1001]
+"#,
+        )
+        .expect("write config");
+        let cfg = load_controlplane_config(Some(&config_path)).expect("load config");
+        assert_eq!(
+            cfg.effective_user_jwt_secret(),
+            "user-key-0123456789abcdef0123456789aaaa"
+        );
+        assert!(!cfg.security.production);
+        assert!(cfg.security.allow_insecure_agent_auth);
+        assert_eq!(cfg.security.agent_auth_allowed_peer_uids, vec![1000, 1001]);
     }
 }

@@ -303,6 +303,16 @@ impl BackupRepository {
         }
     }
 
+    /// Production constructor keyed from `[secrets] credential_encryption`
+    /// (#662), bypassing the environment lookup. Callers must use the same
+    /// key to read rows written by this instance.
+    pub fn new_with_key(pool: StorePool, key: &str) -> Self {
+        Self {
+            pool,
+            crypto: CredentialEncryption::from_key(key),
+        }
+    }
+
     /// Test-support constructor with an injected credential cipher, so tests
     /// can exercise fail-closed writes without mutating process-global env.
     #[cfg(any(test, feature = "test-util"))]

@@ -7,14 +7,146 @@ use crate::vm_runtime::VmRuntime;
 use chv_errors::ChvError;
 use chv_hypervisor_api::VmConfig;
 use control_plane_node_api::control_plane_node_api as proto;
+use futures_util::StreamExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
+use tonic::service::InterceptorLayer;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
+
+/// Interval between agent-auth rejection warnings. Prevents a broken or
+/// hostile local client from flooding the log while still surfacing the
+/// first failure and a suppressed count on the next interval.
+const AUTH_REJECTION_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct AuthWarnState {
+    last_warn: Option<Instant>,
+    suppressed: u64,
+}
+
+/// Application-layer authentication for the control-plane → agent hop
+/// (#662).
+///
+/// The transport is a local Unix-domain socket (0600), so the filesystem
+/// permission check is the first boundary. This layer adds two more:
+///
+/// 1. Unix peer credentials: only the configured UID set (default: the
+///    agent's own effective UID) may complete a connection.
+/// 2. The control plane's agent bearer token, carried in gRPC metadata on
+///    every RPC and compared in constant time before any handler runs.
+///    The control plane has one token and sends it to every agent it
+///    serves today; per-node tokens are future ADR-029 work.
+///
+/// `allow_insecure` is an explicit local-development bypass. It is refused
+/// when the config declares `security.production = true` (the default).
+#[derive(Clone)]
+pub struct AgentAuth {
+    token: Option<Arc<str>>,
+    allow_insecure: bool,
+    allowed_peer_uids: Arc<Vec<u32>>,
+    warn_state: Arc<std::sync::Mutex<AuthWarnState>>,
+}
+
+impl AgentAuth {
+    pub fn new(
+        token: impl Into<String>,
+        allow_insecure: bool,
+        allowed_peer_uids: Vec<u32>,
+    ) -> Self {
+        let token = token.into();
+        let token = token.trim();
+        Self {
+            token: (!token.is_empty()).then(|| Arc::<str>::from(token)),
+            allow_insecure,
+            allowed_peer_uids: Arc::new(allowed_peer_uids),
+            warn_state: Arc::new(std::sync::Mutex::new(AuthWarnState::default())),
+        }
+    }
+
+    /// Fail-closed default used by direct constructors and tests that do
+    /// not exercise the transport: every request is rejected. Production
+    /// startup always installs a concrete token via
+    /// [`AgentServer::with_agent_auth`].
+    pub fn deny_all() -> Self {
+        Self {
+            token: None,
+            allow_insecure: false,
+            allowed_peer_uids: Arc::new(Vec::new()),
+            warn_state: Arc::new(std::sync::Mutex::new(AuthWarnState::default())),
+        }
+    }
+
+    fn peer_uid_allowed(&self, uid: u32) -> bool {
+        if self.allow_insecure {
+            return true;
+        }
+        if self.allowed_peer_uids.is_empty() {
+            return uid == nix::unistd::geteuid().as_raw();
+        }
+        self.allowed_peer_uids.contains(&uid)
+    }
+
+    /// Log a rejection at most once per [`AUTH_REJECTION_WARN_INTERVAL`].
+    /// The `reason` is always a static string; token material is never
+    /// logged.
+    fn warn_rejection(&self, reason: &'static str) {
+        let now = Instant::now();
+        let Ok(mut state) = self.warn_state.lock() else {
+            // A poisoned lock must not turn a rejected RPC into a panic.
+            return;
+        };
+        let should_warn = state
+            .last_warn
+            .map(|last| now.duration_since(last) >= AUTH_REJECTION_WARN_INTERVAL)
+            .unwrap_or(true);
+        if !should_warn {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return;
+        }
+        let suppressed = state.suppressed;
+        state.last_warn = Some(now);
+        state.suppressed = 0;
+        drop(state);
+        warn!(
+            reason,
+            suppressed, "agent rejected a control-plane RPC authentication attempt"
+        );
+    }
+}
+
+impl tonic::service::Interceptor for AgentAuth {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        if self.allow_insecure {
+            return Ok(req);
+        }
+        let Some(expected) = self.token.as_deref() else {
+            self.warn_rejection("agent authentication is not configured");
+            return Err(Status::unauthenticated(
+                "agent authentication is not configured",
+            ));
+        };
+        let Some(presented) = req.metadata().get(chv_common::NODE_AUTH_METADATA_KEY) else {
+            self.warn_rejection("missing agent authentication token");
+            return Err(Status::unauthenticated(
+                "missing agent authentication token",
+            ));
+        };
+        if chv_common::constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            Ok(req)
+        } else {
+            self.warn_rejection("invalid agent authentication token");
+            Err(Status::unauthenticated(
+                "invalid agent authentication token",
+            ))
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentServer {
@@ -51,6 +183,9 @@ pub struct AgentServer {
     /// still matches the last applied state).
     pub network_policy_fence: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
     pub core_authority: Option<cellhv_core_operations::AuthorityHandle>,
+    /// Inbound control-plane authentication (#662). Deny-all until
+    /// production wiring calls [`AgentServer::with_agent_auth`].
+    pub auth: AgentAuth,
 }
 
 impl AgentServer {
@@ -75,7 +210,14 @@ impl AgentServer {
                 std::collections::HashMap::new(),
             )),
             core_authority: None,
+            auth: AgentAuth::deny_all(),
         }
+    }
+
+    /// Install the inbound control-plane authentication policy (#662).
+    pub fn with_agent_auth(mut self, auth: AgentAuth) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Set the node's stord backend info (#379 DP5): the LVM volume
@@ -183,11 +325,54 @@ impl AgentServer {
             source: e,
         })?;
         // Restrict the socket to the agent's own user; the control plane runs
-        // as the same user, so no group access is required.
-        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
-        let uds_stream = UnixListenerStream::new(uds);
+        // as the same user, so no group access is required. Log a failure
+        // rather than silently keeping a wider mode; the peer-UID gate still
+        // applies, but operators should know the filesystem boundary is weak.
+        if let Err(err) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            warn!(
+                error = %err,
+                path = %socket_path.display(),
+                "failed to restrict agent socket permissions to 0600"
+            );
+        }
+        // Pre-auth peer-credential gate (#662): a peer whose UID is not in
+        // the allowlist is dropped before HTTP/2 is spoken, so an
+        // unauthorized local process cannot even reach the token check.
+        let auth_for_peers = self.auth.clone();
+        let uds_stream = UnixListenerStream::new(uds).filter_map(move |item| {
+            let auth = auth_for_peers.clone();
+            async move {
+                match item {
+                    Ok(stream) => match stream.peer_cred() {
+                        Ok(cred) => {
+                            if auth.peer_uid_allowed(cred.uid()) {
+                                Some(Ok(stream))
+                            } else {
+                                warn!(
+                                    peer_uid = cred.uid(),
+                                    peer_pid = cred.pid(),
+                                    "agent rejected Unix peer outside the allowed UID set"
+                                );
+                                None
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "agent could not read Unix peer credentials; connection dropped"
+                            );
+                            None
+                        }
+                    },
+                    Err(error) => Some(Err(error)),
+                }
+            }
+        });
         tonic::transport::Server::builder()
             .layer(chv_observability::GrpcMetricsLayer::new())
+            .layer(InterceptorLayer::new(self.auth.clone()))
             .add_service(proto::reconcile_service_server::ReconcileServiceServer::new(self.clone()))
             .add_service(proto::lifecycle_service_server::LifecycleServiceServer::new(self))
             .serve_with_incoming(uds_stream)
@@ -3650,6 +3835,193 @@ mod tests {
             desired_state_version: desired_state_version.to_string(),
             request_unix_ms: 0,
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // #662: control-plane → agent authentication over the Unix socket.
+    // ---------------------------------------------------------------------
+
+    const TEST_AGENT_TOKEN: &str = "agent-token-0123456789abcdef0123456789";
+
+    async fn spawn_agent_with_auth(auth: AgentAuth) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("agent.sock");
+        let server = test_server().with_agent_auth(auth);
+        let server_socket = socket.clone();
+        tokio::spawn(async move {
+            let _ = server.serve(&server_socket).await;
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "agent socket was not bound");
+        (dir, socket)
+    }
+
+    async fn connect_reconcile(
+        socket: &std::path::Path,
+    ) -> proto::reconcile_service_client::ReconcileServiceClient<tonic::transport::Channel> {
+        let path = socket.to_path_buf();
+        let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")
+            .expect("endpoint")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let path = path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await
+            .expect("connect to agent");
+        proto::reconcile_service_client::ReconcileServiceClient::new(channel)
+    }
+
+    fn node_desired_state_request() -> proto::ApplyNodeDesiredStateRequest {
+        proto::ApplyNodeDesiredStateRequest {
+            meta: Some(test_meta("1")),
+            node_id: "node-1".to_string(),
+            fragment: None,
+        }
+    }
+
+    fn with_token<T>(req: T, token: &str) -> Request<T> {
+        let mut request = Request::new(req);
+        request.metadata_mut().insert(
+            chv_common::NODE_AUTH_METADATA_KEY,
+            tonic::metadata::MetadataValue::try_from(token).expect("metadata value"),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_missing_token_over_uds() {
+        let (_dir, socket) = spawn_agent_with_auth(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+        let mut client = connect_reconcile(&socket).await;
+        let status = client
+            .apply_node_desired_state(node_desired_state_request())
+            .await
+            .expect_err("missing token must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert!(status.message().contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_wrong_token_over_uds() {
+        let (_dir, socket) = spawn_agent_with_auth(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+        let mut client = connect_reconcile(&socket).await;
+        let status = client
+            .apply_node_desired_state(with_token(
+                node_desired_state_request(),
+                "wrong-token-0123456789abcdef0123456789",
+            ))
+            .await
+            .expect_err("wrong token must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn agent_accepts_authorized_control_plane_token() {
+        let (_dir, socket) = spawn_agent_with_auth(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+        let mut client = connect_reconcile(&socket).await;
+        let response = client
+            .apply_node_desired_state(with_token(node_desired_state_request(), TEST_AGENT_TOKEN))
+            .await
+            .expect("authorized token must reach the handler");
+        assert_eq!(
+            response.into_inner().result.expect("result meta").status,
+            "ok"
+        );
+    }
+
+    #[test]
+    fn agent_auth_deny_all_rejects_every_token() {
+        let mut auth = AgentAuth::deny_all();
+        let err = tonic::service::Interceptor::call(&mut auth, with_token((), TEST_AGENT_TOKEN))
+            .expect_err("deny-all must reject");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// Minimal per-thread WARN counter: enough to prove the token-rejection
+    /// warning is rate-limited without duplicating the full field-capture
+    /// subscriber used by the console/supervisor tests.
+    #[derive(Clone, Default)]
+    struct WarnCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn agent_token_rejections_warn_at_most_once_per_interval() {
+        let counter = WarnCounter::default();
+        let _guard = tracing::subscriber::set_default(counter.clone());
+        let mut auth = AgentAuth::new(TEST_AGENT_TOKEN, false, Vec::new());
+
+        for _ in 0..3 {
+            let err = tonic::service::Interceptor::call(&mut auth, Request::new(()))
+                .expect_err("missing token must be rejected");
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        }
+
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first rejection in the interval may warn"
+        );
+    }
+
+    #[test]
+    fn agent_peer_uid_gate_defaults_to_own_euid() {
+        let auth = AgentAuth::new(TEST_AGENT_TOKEN, false, Vec::new());
+        let own = nix::unistd::geteuid().as_raw();
+        assert!(auth.peer_uid_allowed(own));
+        assert!(!auth.peer_uid_allowed(own.wrapping_add(1)));
+    }
+
+    #[test]
+    fn insecure_agent_auth_bypasses_token_and_peer_checks() {
+        let mut auth = AgentAuth::new(TEST_AGENT_TOKEN, true, Vec::new());
+        assert!(auth.peer_uid_allowed(12345));
+        assert!(tonic::service::Interceptor::call(&mut auth, Request::new(()),).is_ok());
     }
 
     #[tokio::test]

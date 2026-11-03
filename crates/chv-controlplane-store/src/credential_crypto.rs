@@ -139,13 +139,14 @@ impl CredentialEncryption {
         // failure path we fall back to a no-cipher state and log a clear
         // operator-visible warning instead of crashing the process. The
         // no-cipher state rejects credential writes (fail-closed).
-        Self::from_secret(&key_str)
+        Self::from_key(&key_str)
     }
 
     /// Builds a cipher from an explicit key secret, bypassing environment
-    /// lookup. Used by [`Self::new`] after key selection and by the
-    /// test-support constructors.
-    fn from_secret(key_str: &str) -> Self {
+    /// lookup. Used by [`Self::new`] after key selection, by the
+    /// control-plane bootstrap when `[secrets] credential_encryption` is
+    /// configured (#662), and by the test-support constructors.
+    pub fn from_key(key_str: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(key_str.as_bytes());
         let key_bytes = hasher.finalize();
@@ -176,7 +177,7 @@ impl CredentialEncryption {
     /// without mutating process-global environment.
     #[cfg(any(test, feature = "test-util"))]
     pub fn with_key(key: &str) -> Self {
-        Self::from_secret(key)
+        Self::from_key(key)
     }
 
     /// Encrypts a credential for storage.

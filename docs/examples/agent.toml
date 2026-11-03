@@ -33,8 +33,34 @@ tls_cert_path = "/run/chv/agent/agent.crt"
 tls_key_path = "/run/chv/agent/agent.key"
 ca_cert_path = "/etc/chv/certs/ca.crt"
 
-# JWT secret — MUST match controlplane.toml jwt_secret for console access
+# Legacy shared secret (#662). It is now only the migration master: when
+# [secrets] keys are absent they are derived from this value with
+# HMAC-SHA256 domain separation, matching the control plane's derivation on
+# a single-host install. Configure [secrets] explicitly to rotate a purpose
+# independently.
 jwt_secret = "<same-as-controlplane>"
+
+# Per-purpose secrets (#662).
+[secrets]
+# console_jwt = "<same as controlplane.toml [secrets] console_jwt>"
+# agent_auth_token = "<same as controlplane.toml [secrets] agent_auth_token; one shared value for every agent behind that control plane>"
+# credential_encryption is a control-plane-only key; it is accepted here
+# for config symmetry but is not used or validated by the agent.
+
+[security]
+# Default true. The control plane refuses to start when this is true and
+# allow_insecure_agent_auth is also true. On the control plane,
+# allow_insecure_agent_auth only relaxes config validation; it never changes
+# the token sent to agents.
+production = true
+# LOCAL DEVELOPMENT ONLY (agent). Disables the per-RPC agent token check and
+# the Unix peer-UID gate; refused unless production = false, and a non-dev
+# agent build refuses to start with it enabled.
+# allow_insecure_agent_auth = false
+# Agent-only: Unix UIDs allowed to connect to the agent socket. Empty means
+# the agent's own effective UID (the normal single-host control-plane user).
+# The control plane ignores this key.
+# agent_auth_allowed_peer_uids = []
 
 # Stord path confinement preserved across supervisor respawns (#376).
 # Empty/omitted = the respawned daemon runs allow-all (historical

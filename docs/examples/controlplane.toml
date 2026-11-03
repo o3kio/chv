@@ -13,8 +13,36 @@ log_level = "info"
 runtime_dir = "/run/chv/controlplane"
 agent_runtime_dir = "/var/lib/chv/agent"
 
-# REQUIRED: generate with: openssl rand -base64 32 | tr -d '=+/'
+# Legacy shared secret (#662). It is now only the migration master: the
+# per-purpose keys below are derived from it when they are not configured
+# explicitly. Keep it to avoid re-keying existing installs, but configure
+# [secrets] for independent rotation.
+# Generate with: openssl rand -base64 32 | tr -d '=+/'
 jwt_secret = "<replace-me>"
+
+# Per-purpose secrets (#662). Every value must be >=32 characters and
+# distinct from the others. When omitted, the key is derived from the
+# legacy jwt_secret with HMAC-SHA256 domain separation, so an existing
+# single-host install stays operational (the first upgrade invalidates
+# existing user sessions / console URLs once); explicit values are
+# required to rotate one purpose without rotating the others.
+[secrets]
+# user_jwt = "<openssl rand -hex 32>"
+# console_jwt = "<same as agent.toml [secrets] console_jwt>"
+# agent_auth_token is one shared value sent to every agent this control
+# plane serves, so all of their agent.toml files must match it. Per-node
+# tokens are future ADR-029 work; rotating one agent alone requires re-keying
+# the control plane or a maintenance window.
+# agent_auth_token = "<same as every served agent.toml [secrets] agent_auth_token>"
+# credential_encryption = "<dedicated at-rest key; overrides CHV_ENCRYPTION_KEY>"
+
+[security]
+# Fail-closed default: the agent-auth development bypass is refused.
+production = true
+# allow_insecure_agent_auth = false   # LOCAL DEVELOPMENT ONLY, never production
+# On the control plane this key only relaxes config validation; it never
+# changes the token sent to agents. agent_auth_allowed_peer_uids is an
+# agent-only key and is ignored here.
 
 [database]
 url = "sqlite:///var/lib/chv/controlplane.db"

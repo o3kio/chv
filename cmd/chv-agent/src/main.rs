@@ -1,5 +1,5 @@
 use chv_agent_core::{
-    agent_server::AgentServer,
+    agent_server::{AgentAuth, AgentServer},
     cache::{NodeCache, PendingControlPlaneMessage},
     config::{load_agent_config, AgentAuthorityMode, AgentConfig},
     connectivity::{ConnectivityState, ConnectivityTracker},
@@ -685,6 +685,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // #662: the agent-auth bypass is a second local-development escape
+    // hatch. Config validation already refuses it when production = true;
+    // also require the same compile-time `dev` feature as CHV_ALLOW_INSECURE
+    // so a production build cannot be talked into disabling authentication
+    // by configuration alone.
+    if config.security.allow_insecure_agent_auth && !cfg!(feature = "dev") {
+        return Err(
+            "security.allow_insecure_agent_auth = true is set but this build does not have \
+             the 'dev' Cargo feature. The bypass disables control-plane authentication on the \
+             agent socket and must never be enabled in production. To use it for local \
+             development, rebuild with: cargo build --features dev"
+                .into(),
+        );
+    }
+
     info!(
         "{} starting (version {}, commit {}, channel {})",
         env!("CARGO_PKG_NAME"),
@@ -931,7 +946,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(config.cache_path.clone()),
         config.runtime_dir.clone(),
     )
-    .with_stord_backend(stord_backend.clone());
+    .with_stord_backend(stord_backend.clone())
+    // #662: fail-closed application-layer authentication for the
+    // control-plane → agent Unix socket. Config validation has already
+    // refused the insecure bypass in production.
+    .with_agent_auth(AgentAuth::new(
+        config.effective_agent_auth_token(),
+        config.security.allow_insecure_agent_auth,
+        config.security.agent_auth_allowed_peer_uids.clone(),
+    ));
     if let Some(owner) = &core_owner {
         agent_server = agent_server.with_core_authority(owner.authority());
     }
@@ -962,7 +985,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     };
-    let console_server = ConsoleServer::new(vm_runtime.clone(), config.jwt_secret.clone());
+    let console_server =
+        ConsoleServer::new(vm_runtime.clone(), config.effective_console_jwt_secret());
     tokio::spawn(async move {
         if let Err(e) = console_server.run(console_listener).await {
             warn!(error = %e, bind = %console_bind, "console server exited");

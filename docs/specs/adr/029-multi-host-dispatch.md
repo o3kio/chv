@@ -19,6 +19,19 @@ after the P1 dispatch gate, and console routing after the P2 gate. This ADR:
 Until the P1 gate passes, the shipped posture remains single-host and every
 statement below is a design commitment, not an implemented capability.
 
+**Implemented today (#662):** the single-host control-plane → agent hop is
+gRPC over a `0600` Unix-domain socket. Each RPC carries the control plane's
+agent bearer token (`x-chv-agent-token`, constant-time comparison in the
+agent interceptor) and accepted connections are filtered by Unix `SO_PEERCRED`
+UID before HTTP/2 starts. The control plane has one token and sends it to
+every agent it serves, so all of those agents share it: this is not per-node
+isolation. Per-node token selection (and the remote transport) is part of the
+multi-host work this ADR tracks; it is not implemented. Per-purpose secrets
+are split under `[secrets]` so the agent token, console key, user-session key,
+and credential-encryption key are not the same value. Neither mechanism is a
+substitute for the remote transport described here: an agent on another host
+is still unreachable.
+
 ## Date
 
 2026-11-02
@@ -43,9 +56,12 @@ The decision statuses are recorded in
 
 ### 1. The documented boundary and the implemented boundary disagree
 
-ADR-002 states that the control plane communicates with `chv-agent` over
-"gRPC over mTLS" with certificate-based steady-state trust. The
-implementation satisfies neither half for a remote host:
+ADR-002 originally stated that the control plane communicates with
+`chv-agent` over "gRPC over mTLS" with certificate-based steady-state trust.
+ADR-002 is now corrected: the shipped single-host hop is gRPC over a local
+Unix-domain socket with a per-request bearer token and Unix peer-UID checks
+(#662), while multi-host mTLS remains design-only. The remote-host gap below
+is unchanged — a remote agent still has no transport:
 
 - the control plane resolves `agent_socket_pattern` to a **filesystem path**
   and connects with `UnixStream::connect`
@@ -77,10 +93,14 @@ it. What is missing is the transport, not the model.
   (`DEPLOYMENT-ARCHITECTURE.md` §3.1) and its install-time certificate has
   SANs `localhost`/`127.0.0.1` only (`scripts/install.sh`). A remote agent
   cannot enroll against it even if a listener were opened.
-- Every CHV service shares one symmetric `jwt_secret`
-  (`crates/chv-config/src/lib.rs` `resolve_jwt_secret`; `scripts/install.sh`
-  writes the same value into the control-plane and agent configs). In a
-  fleet, any node can mint a console token accepted by any other node.
+- **Historically**, every CHV service shared one symmetric `jwt_secret`
+  (`crates/chv-config/src/lib.rs`; `scripts/install.sh` wrote the same value
+  into the control-plane and agent configs). #662 replaced that with separate
+  `[secrets]` keys for user sessions, console tokens, the agent token, and
+  credential encryption, derived from the legacy master only when omitted. A
+  fleet still shares the console key across the control plane and its agents,
+  so any node holding it can mint a console token accepted by another node
+  until §6's per-node audience and asymmetric signing land.
 
 ### 4. Why now
 

@@ -868,9 +868,12 @@ dependencies = [
 name = "chv-config"
 version = "0.3.0"
 dependencies = [
+ "chv-common",
  "hex",
+ "hmac",
  "rand 0.10.3",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "toml",

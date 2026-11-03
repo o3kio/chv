@@ -632,6 +632,7 @@ mod tests {
             )),
             mutations: Arc::new(NoopMutations),
             jwt_secret: "test-secret".to_string(),
+            console_jwt_secret: "test-secret".to_string(),
             monitoring: None,
             monitoring_health: crate::MonitoringHealth::new(),
             agent_runtime_dir: std::path::PathBuf::from("/var/lib/chv/agent"),

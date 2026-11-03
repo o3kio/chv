@@ -104,6 +104,9 @@ pub struct AppState {
     pub netbox_runs: std::sync::Arc<NetboxProjectionRunRepository>,
     pub mutations: Arc<dyn MutationService>,
     pub jwt_secret: String,
+    /// Separate signing key for short-lived console JWTs (#662). Never
+    /// used to validate user session tokens and vice versa.
+    pub console_jwt_secret: String,
     pub agent_runtime_dir: PathBuf,
     pub cache: BffCache,
     /// Native monitoring history store (ADR-027, #602). `None` ⇒

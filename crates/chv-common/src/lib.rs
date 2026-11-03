@@ -2,6 +2,38 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const OPERATION_ID_METADATA_KEY: &str = "x-operation-id";
 
+/// Audience bound into every short-lived console ticket (#660, #662).
+///
+/// Domain separation between the console endpoint and the rest of the API:
+/// a session JWT carries `chv:session` and is rejected by the console
+/// validator, while a console ticket is rejected by the session extractor.
+/// Defined once so the BFF mint path and the agent validator cannot drift.
+pub const CONSOLE_AUDIENCE: &str = "chv:console";
+
+/// Application-layer credential the control plane presents on the
+/// control-plane → agent hop. The transport is a local Unix-domain socket
+/// (0600); this metadata key carries the control plane's agent bearer
+/// token, which the agent validates before any handler runs. See
+/// `docs/ARCHITECTURE.md` and
+/// `docs/runbooks/agent-auth-and-secret-rotation.md`.
+pub const NODE_AUTH_METADATA_KEY: &str = "x-chv-agent-token";
+
+/// Constant-time byte comparison for bearer credentials.
+///
+/// Length is not secret (tokens have a fixed configured size), but the
+/// content comparison must not short-circuit on the first differing byte.
+/// Used by the agent's inbound authentication interceptor.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
 pub mod clock;
 pub mod firewall;
 pub mod hypervisor;
