@@ -2,10 +2,10 @@
 
 ## Status
 
-Proposed — not accepted. The decisions (D-MH1–D-MH8) are ratified at Gate P0
-of the transition plan; the multi-host posture may be declared and enforced
-only after the P1 dispatch gate, and console routing after the P2 gate. On
-acceptance this ADR:
+Accepted — implementation not started (ratified 2026-11-03). The decisions
+(D-MH1–D-MH8) are ratified at Gate P0 of the transition plan; no multi-host
+dispatch code exists. The multi-host posture may be declared and enforced only
+after the P1 dispatch gate, and console routing after the P2 gate. This ADR:
 
 - implements the external transport already required by
   [ADR-002](002-control-plane-boundary.md) ("gRPC over mTLS") for the
@@ -16,12 +16,28 @@ acceptance this ADR:
 - does **not** supersede ADR-021 (tenant fabric) or ADR-028 (storage
   authority).
 
-Until accepted, the shipped posture remains single-host and every statement
-below is a proposal.
+Until the P1 gate passes, the shipped posture remains single-host and every
+statement below is a design commitment, not an implemented capability.
 
 ## Date
 
 2026-11-02
+
+## Ratification
+
+- **Date:** 2026-11-03
+- **Ratified by:** project maintainers
+- **Scope:** the 15 Gate P0 decisions — D-MH1–D-MH8 (this ADR) and
+  D-VS1–D-VS7 (the volume-backend contract) — plus P0.6 of the transition
+  plan (`project_id` = VM tenant id; `seed_from` refused for Volvisor-owned
+  volumes).
+- **Status:** accepted as the design baseline. **Implementation is pending** —
+  no multi-host dispatch or Volvisor code exists. Capability claims remain
+  gated by the P1/P2 (multi-host) and P3/P4 (Volvisor) evidence gates.
+
+The decision statuses are recorded in
+[`../../plans/2026-11-02-multihost-and-volvisor-transition.md`](../../plans/2026-11-02-multihost-and-volvisor-transition.md)
+§4 and §7 (Gate P0).
 
 ## Context
 
