@@ -47,7 +47,7 @@ axum = { workspace = true }
 # Independent HMAC-SHA256 verification of the rig's webhook
 # signatures (g4b evidence: the test must not reuse the signer's
 # code). Same version line as chv-controlplane-service.
-hmac = "0.12"
+hmac = "0.13"
 # Digest pin verification of the VictoriaMetrics binary (g5b export
 # rig): the evidence run must state and check the binary sha256.
 hex = "0.4"
