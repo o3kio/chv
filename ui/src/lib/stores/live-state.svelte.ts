@@ -1,6 +1,6 @@
 import { browser } from '$app/env';
 import { refreshAll } from '$app/navigation';
-import { getStoredToken } from '#lib/api/client.ts';
+import { isLoggedIn } from '#lib/api/client.ts';
 import type { NodeWithResources, VM } from '#lib/api/types.ts';
 import { listNodes } from '#lib/bff/nodes.ts';
 import { listVms } from '#lib/bff/vms.ts';
@@ -121,15 +121,14 @@ class LiveState {
 	}
 
 	async fetchInventory() {
-		const token = getStoredToken();
-		if (!token) {
+		if (!isLoggedIn()) {
 			this.inventoryLoading = false;
 			return;
 		}
 		try {
 			const [nodesRes, vmsRes] = await Promise.all([
-				listNodes({ page: 1, page_size: 100, filters: {} }, token),
-				listVms({ page: 1, page_size: 100, filters: {} }, token),
+				listNodes({ page: 1, page_size: 100, filters: {} }),
+				listVms({ page: 1, page_size: 100, filters: {} }),
 			]);
 			this.nodes = (nodesRes.items || []).map((item) => this.mapNode(item));
 			this.vms = (vmsRes.items || []).map((item) => this.mapVm(item));

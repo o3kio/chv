@@ -192,6 +192,7 @@ fn claims_for(role: &str) -> Claims {
         role: role.to_string(),
         exp: u64::MAX / 2,
         must_change_password: false,
+        token_version: None,
     }
 }
 

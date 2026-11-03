@@ -1,4 +1,5 @@
 import { redirect } from '@sveltejs/kit';
+import { isLoggedIn } from '#lib/api/client.ts';
 import type { LayoutLoad } from './$types';
 
 const PUBLIC_PATHS = ['/login', '/install'];
@@ -8,8 +9,9 @@ export const load: LayoutLoad = ({ url }) => {
 	if (isPublic) return {};
 
 	if (typeof window !== 'undefined') {
-		const token = localStorage.getItem('chv-api-token');
-		if (!token) {
+		// Browser auth is an HttpOnly cookie (#660); only the non-credential
+		// hint cookie is readable here.
+		if (!isLoggedIn()) {
 			throw redirect(302, '/login');
 		}
 	}

@@ -108,6 +108,7 @@ fn test_token_for_role(role: &str) -> String {
         role: role.to_string(),
         exp,
         must_change_password: false,
+        token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     jsonwebtoken::encode(
@@ -4473,7 +4474,9 @@ async fn test_logout_clears_session_cookie() {
     );
 
     // Logout must terminate the cookie session: clear chv_session with
-    // Max-Age=0 and the same attributes the login path sets.
+    // Max-Age=0 and the same attributes the login path sets. The two
+    // non-credential UX hint cookies (`chv_role`, `chv_logged_in`) are
+    // cleared as well (#660).
     let response = app
         .oneshot(
             axum::http::Request::post("/api/v1/auth/logout")
@@ -4483,16 +4486,31 @@ async fn test_logout_clears_session_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let set_cookie = response
+    let set_cookies: Vec<&str> = response
         .headers()
-        .get(axum::http::header::SET_COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .expect("logout must clear the session cookie");
-    assert!(set_cookie.starts_with("chv_session=;"), "got: {set_cookie}");
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(set_cookies.len(), 3, "got: {set_cookies:?}");
+
+    let set_cookie = set_cookies
+        .iter()
+        .find(|c| c.starts_with("chv_session=;"))
+        .unwrap_or_else(|| panic!("logout must clear the session cookie: {set_cookies:?}"));
     assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
     assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
     assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
     assert!(set_cookie.contains("SameSite=Strict"), "got: {set_cookie}");
+
+    for hint in ["chv_role=;", "chv_logged_in=;"] {
+        let cookie = set_cookies
+            .iter()
+            .find(|c| c.starts_with(hint))
+            .unwrap_or_else(|| panic!("logout must clear {hint}: {set_cookies:?}"));
+        assert!(cookie.contains("Max-Age=0"), "got: {cookie}");
+        assert!(cookie.contains("Path=/"), "got: {cookie}");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -4,35 +4,34 @@ vi.mock('$app/env/public', () => ({
 	PUBLIC_CHV_API_BASE_URL: ''
 }));
 
-import { APIError, clearToken, createAPIClient, getStoredRole, getStoredToken, storeToken } from '#lib/api/client.ts';
-
-function makeJwt(payload: Record<string, unknown>): string {
-	const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-	const body = btoa(JSON.stringify(payload));
-	return `${header}.${body}.fake-signature`;
-}
+import {
+	APIError,
+	clearToken,
+	createAPIClient,
+	getStoredRole,
+	getStoredToken,
+	isLoggedIn,
+	storeToken
+} from '#lib/api/client.ts';
 
 function jsonHeaders(): Headers {
 	return new Headers({ 'content-type': 'application/json' });
 }
 
+function setCookie(name: string, value: string): void {
+	document.cookie = `${name}=${value}; Path=/`;
+}
+
 describe('createAPIClient', () => {
 	beforeEach(() => {
 		vi.restoreAllMocks();
-		const storage = new Map<string, string>();
-		vi.stubGlobal('localStorage', {
-			getItem: (key: string) => storage.get(key) ?? null,
-			setItem: (key: string, value: string) => {
-				storage.set(key, value);
-			},
-			removeItem: (key: string) => {
-				storage.delete(key);
-			}
-		});
-		clearToken();
+		// No credential is ever persisted client-side (#660).
+		document.cookie = 'chv_api_hint=; Max-Age=0; Path=/';
+		localStorage.clear();
+		sessionStorage.clear();
 	});
 
-	it('uses an explicit base URL and stores bearer tokens', async () => {
+	it('uses an explicit base URL and an explicit in-memory token for non-browser clients', async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,
 			status: 200,
@@ -49,13 +48,36 @@ describe('createAPIClient', () => {
 		client.setToken('token-123');
 		await client.listNodes();
 
-		expect(getStoredToken()).toBe('token-123');
 		expect(fetchMock).toHaveBeenCalledWith(
 			'http://controller.example/api/v1/nodes',
 			expect.objectContaining({
+				credentials: 'include',
 				headers: expect.any(Headers)
 			})
 		);
+
+		const headers = fetchMock.mock.calls[0][1].headers as Headers;
+		expect(headers.get('Authorization')).toBe('Bearer token-123');
+		// The token is in-memory only: never localStorage/sessionStorage.
+		expect(localStorage.getItem('chv-api-token')).toBeNull();
+		expect(sessionStorage.getItem('chv-api-token')).toBeNull();
+	});
+
+	it('authenticates the browser with the HttpOnly cookie, not a bearer header', async () => {
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 200,
+			headers: jsonHeaders(),
+			json: async () => ([])
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		const client = createAPIClient();
+		await client.listNodes();
+
+		const init = fetchMock.mock.calls[0][1] as RequestInit;
+		expect(init.credentials).toBe('include');
+		expect((init.headers as Headers).get('Authorization')).toBeNull();
 	});
 
 	it('throws APIError on successful HTML response instead of uncaught JSON parse failure', async () => {
@@ -80,48 +102,43 @@ describe('createAPIClient', () => {
 	});
 });
 
-describe('getStoredRole', () => {
+describe('cookie-session helpers', () => {
 	beforeEach(() => {
-		vi.restoreAllMocks();
-		const storage = new Map<string, string>();
-		vi.stubGlobal('localStorage', {
-			getItem: (key: string) => storage.get(key) ?? null,
-			setItem: (key: string, value: string) => {
-				storage.set(key, value);
-			},
-			removeItem: (key: string) => {
-				storage.delete(key);
-			}
-		});
-		clearToken();
+		document.cookie = 'chv_role=; Max-Age=0; Path=/';
+		document.cookie = 'chv_logged_in=; Max-Age=0; Path=/';
+		localStorage.clear();
+		sessionStorage.clear();
 	});
 
-	it('returns "admin" for a valid admin JWT', () => {
-		storeToken(makeJwt({ sub: 'user1', role: 'admin' }));
+	it('never returns or stores a bearer token', () => {
+		storeToken('header.payload.signature');
+		expect(getStoredToken()).toBeNull();
+		expect(localStorage.getItem('chv-api-token')).toBeNull();
+		expect(sessionStorage.getItem('chv-api-token')).toBeNull();
+	});
+
+	it('reads the non-credential role hint cookie', () => {
+		setCookie('chv_role', 'admin');
 		expect(getStoredRole()).toBe('admin');
-	});
-
-	it('returns a non-admin role string for a non-admin JWT', () => {
-		storeToken(makeJwt({ sub: 'user2', role: 'viewer' }));
+		setCookie('chv_role', 'viewer');
 		expect(getStoredRole()).toBe('viewer');
 	});
 
-	it('returns null when no token is in localStorage', () => {
+	it('returns null when the role hint cookie is absent', () => {
 		expect(getStoredRole()).toBeNull();
 	});
 
-	it('returns null for a token with fewer than 3 parts', () => {
-		storeToken('abc.def');
-		expect(getStoredRole()).toBeNull();
+	it('uses the logged-in hint cookie for the login redirect', () => {
+		expect(isLoggedIn()).toBe(false);
+		setCookie('chv_logged_in', '1');
+		expect(isLoggedIn()).toBe(true);
 	});
 
-	it('returns null for a malformed/non-base64 token', () => {
-		storeToken('header.!!!not-valid-base64!!!.signature');
+	it('clearToken removes the hint cookies', () => {
+		setCookie('chv_role', 'admin');
+		setCookie('chv_logged_in', '1');
+		clearToken();
 		expect(getStoredRole()).toBeNull();
-	});
-
-	it('returns null when payload has no role claim', () => {
-		storeToken(makeJwt({ sub: 'user3', exp: 9999999999 }));
-		expect(getStoredRole()).toBeNull();
+		expect(isLoggedIn()).toBe(false);
 	});
 });

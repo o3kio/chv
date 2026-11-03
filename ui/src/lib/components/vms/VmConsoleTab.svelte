@@ -2,13 +2,19 @@
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
 	import { Terminal } from 'lucide-svelte';
 
+	interface ConsoleConnection {
+		url: string;
+		token: string;
+	}
+
 	interface Props {
 		vmId: string;
 		consoleLoading: boolean;
 		liveConsoleUrl: string | undefined;
+		liveConsoleToken: string | undefined;
 		VmConsoleComponent: typeof import('#lib/components/vms/VmConsole.svelte').default | null;
 		running: boolean;
-		getConsoleUrl: () => Promise<string>;
+		getConsoleUrl: () => Promise<ConsoleConnection>;
 		consoleExpiresAt?: string;
 	}
 
@@ -16,6 +22,7 @@
 		vmId,
 		consoleLoading,
 		liveConsoleUrl,
+		liveConsoleToken,
 		VmConsoleComponent,
 		running,
 		getConsoleUrl,
@@ -30,6 +37,7 @@
 		<VmConsoleComponent
 			{vmId}
 			consoleUrl={liveConsoleUrl}
+			consoleToken={liveConsoleToken}
 			{running}
 			{getConsoleUrl}
 			consoleExpiresAt={consoleExpiresAt}

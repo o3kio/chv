@@ -522,6 +522,7 @@ impl Harness {
             role: role.to_string(),
             exp,
             must_change_password: false,
+            token_version: None,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         jsonwebtoken::encode(
@@ -944,10 +945,12 @@ async fn journal_counts(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
 // Rows — auth
 // ---------------------------------------------------------------------------
 
-/// `chvctl login` — GREEN. Fields match `handlers/auth.rs` (`username`,
-/// `password` → `token`); the credentials write is redirected to a
-/// tempdir via `XDG_CONFIG_HOME`. The login rate limiter is a static
-/// in-process map; a single row stays far under its window.
+/// `chvctl login` — GREEN. Fields match the control-plane token endpoint
+/// (`/api/v1/auth/login`: `username`, `password` → `token`); the browser
+/// endpoint `/v1/auth/login` deliberately returns no token (#660). The
+/// credentials write is redirected to a tempdir via `XDG_CONFIG_HOME`. The
+/// login rate limiter is a static in-process map; a single row stays far
+/// under its window.
 #[tokio::test]
 async fn login_row() {
     let h = Harness::start().await;
@@ -979,7 +982,7 @@ async fn login_row() {
         },
     )
     .await
-    .expect("chvctl login against /v1/auth/login");
+    .expect("chvctl login against /api/v1/auth/login");
 
     let credentials = std::fs::read_to_string(dir.path().join("chvctl/credentials"))
         .expect("credentials file written under XDG_CONFIG_HOME");

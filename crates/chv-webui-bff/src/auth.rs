@@ -7,16 +7,24 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::BffError;
 
 /// Name of the HttpOnly session cookie set at login and accepted by the
 /// bearer extractor as a fallback credential (Security S1, staged item 3.B).
-/// The UI still keeps the JWT in localStorage for now; the cookie is a
-/// server-side session channel that survives page reloads without script
-/// access.
+/// As of #660 this is the ONLY browser credential: the JWT is never
+/// returned to JavaScript or written to localStorage.
 pub const SESSION_COOKIE_NAME: &str = "chv_session";
+
+/// Non-credential UX hint cookies set alongside the session cookie.
+///
+/// Neither is an authentication credential: the server authorizes every
+/// request from the `chv_session` JWT and never reads these. They exist so
+/// the static SPA can hide controls (role) and show the login redirect
+/// (logged-in hint) without script access to the HttpOnly session cookie.
+/// Tampering with either one grants nothing.
+pub const ROLE_COOKIE_NAME: &str = "chv_role";
+pub const AUTH_HINT_COOKIE_NAME: &str = "chv_logged_in";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Claims {
@@ -30,6 +38,85 @@ pub struct Claims {
     /// outstanding tokens required.
     #[serde(default)]
     pub must_change_password: bool,
+    /// Server-side session revocation counter (#660). Newly issued session
+    /// tokens always carry the user's current `users.token_version`; the
+    /// auth extractor compares it with the database on every request.
+    ///
+    /// `None` means the token predates #660 (or is an API token built from
+    /// a DB row, which is already authoritative). Legacy tokens are
+    /// accepted without a database lookup but cannot outlive their 24-hour
+    /// `exp`; see `docs/OPERATIONS.md` for the rollout. They are skipped
+    /// from serialization so a legacy token round-trips unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_version: Option<u64>,
+}
+
+impl Claims {
+    /// True when this token predates the #660 `token_version` claim.
+    pub fn is_legacy_session(&self) -> bool {
+        self.token_version.is_none()
+    }
+}
+
+/// Why a session JWT was rejected. Kept separate from
+/// `jsonwebtoken::errors::Error` so callers can distinguish a malformed or
+/// expired token (401) from a revoked one (401, different message) and a
+/// database outage (503) without string matching.
+#[derive(Debug)]
+pub enum SessionAuthError {
+    /// Signature, algorithm, expiry, or payload shape failed.
+    Invalid(jsonwebtoken::errors::Error),
+    /// The token is well-formed but its `token_version` is behind the
+    /// user's current value — logout or password change revoked it.
+    Revoked,
+    /// The user row no longer exists (deleted account) or the version
+    /// lookup failed. Both fail closed.
+    Unavailable,
+}
+
+impl std::fmt::Display for SessionAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionAuthError::Invalid(e) => write!(f, "invalid token: {e}"),
+            SessionAuthError::Revoked => write!(f, "token has been revoked"),
+            SessionAuthError::Unavailable => write!(f, "token version unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for SessionAuthError {}
+
+/// Decode a session JWT and enforce server-side revocation.
+///
+/// Crypto validation is delegated to [`validate_token`]; if the token
+/// carries a `token_version` claim (every token issued after #660) the
+/// claim must match `users.token_version` exactly. A missing user row is
+/// rejected. Legacy tokens without the claim are accepted without a DB
+/// lookup — they expire within the 24-hour session TTL and cannot be
+/// revoked; the rollout is documented in `docs/OPERATIONS.md`.
+pub async fn validate_session_token(
+    pool: &chv_controlplane_store::StorePool,
+    token: &str,
+    secret: &str,
+) -> Result<Claims, SessionAuthError> {
+    let claims = validate_token(token, secret).map_err(SessionAuthError::Invalid)?;
+
+    let Some(expected) = claims.token_version else {
+        return Ok(claims);
+    };
+
+    let repo = chv_controlplane_store::UserRepository::new(pool.clone());
+    match repo.token_version(&claims.sub).await {
+        Ok(Some(current)) if current == expected => Ok(claims),
+        Ok(Some(_)) => Err(SessionAuthError::Revoked),
+        // Deleted user: the token is no longer backed by an account, so it
+        // is revoked rather than a transient outage.
+        Ok(None) => Err(SessionAuthError::Revoked),
+        Err(e) => {
+            tracing::error!(error = %e, "token_version lookup failed");
+            Err(SessionAuthError::Unavailable)
+        }
+    }
 }
 
 /// Paths a user with `must_change_password=true` is permitted to hit. Every
@@ -83,14 +170,7 @@ pub fn has_apply_permission(role: &Role) -> bool {
     }
 }
 
-/// Warn-once flag for API tokens whose `scope` column holds a value outside
-/// the defined set. Legacy rows (or rows written by a newer/older control
-/// plane) must not lock users out — they fall back to `full` — but the
-/// anomaly should surface exactly once per process instead of spamming logs
-/// on every request.
-static WARNED_UNKNOWN_API_TOKEN_SCOPE: AtomicBool = AtomicBool::new(false);
-
-/// Enforce `api_tokens.scope` (Security T1).
+/// Enforce `api_tokens.scope` (Security T1, hardened by #660).
 ///
 /// Scope semantics:
 ///
@@ -98,21 +178,20 @@ static WARNED_UNKNOWN_API_TOKEN_SCOPE: AtomicBool = AtomicBool::new(false);
 /// - `"readonly"` — the token is demoted to the `viewer` role, regardless
 ///   of the user's own role: read-only endpoints only, every mutating route
 ///   rejects it at the role middleware.
-/// - anything else (including `NULL` → `""` from legacy rows) — treated as
-///   `"full"` (fail-safe: no lockout), with a one-time warning so the
-///   anomaly is visible in logs.
-fn effective_role_for_scope(scope: &str, user_role: &str) -> String {
+/// - anything else (including `NULL` → `""` from legacy rows, typo'd, or
+///   future/unknown values) — the token is REJECTED. There is no fallback
+///   to the user's role: an unrecognized scope must never inherit mutation
+///   authority. Fail closed.
+fn effective_role_for_scope(scope: &str, user_role: &str) -> Option<String> {
     match scope {
-        "full" => user_role.to_string(),
-        "readonly" => "viewer".to_string(),
+        "full" => Some(user_role.to_string()),
+        "readonly" => Some("viewer".to_string()),
         other => {
-            if !WARNED_UNKNOWN_API_TOKEN_SCOPE.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    scope = %other,
-                    "api_token has unrecognized scope; treating as \"full\" (fail-safe)"
-                );
-            }
-            user_role.to_string()
+            tracing::warn!(
+                scope = %other,
+                "api_token has unrecognized scope; rejecting the token (fail closed)"
+            );
+            None
         }
     }
 }
@@ -267,7 +346,24 @@ impl AuthSource {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AuthFailure {
+    /// HTTP status the extractor must return. Kept here (rather than
+    /// inferred from the message) so the audit middleware and the
+    /// authorizer cannot disagree about why a credential was rejected.
+    pub status: StatusCode,
+    /// Stable machine-readable code returned to clients, e.g.
+    /// `SESSION_REVOKED` or `AUTH_UNAVAILABLE` (#660).
+    pub code: &'static str,
     pub message: &'static str,
+}
+
+impl AuthFailure {
+    fn unauthorized(code: &'static str, message: &'static str) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code,
+            message,
+        }
+    }
 }
 
 /// The credential decode the audit middleware already performed,
@@ -293,79 +389,99 @@ pub(crate) struct VerifiedAuth(pub Result<(Claims, AuthSource), AuthFailure>);
 ///
 /// This is the single credential-decoding implementation: the extractor
 /// below delegates here, so JWT, session-cookie, and API-token semantics
-/// cannot drift between authorization and audit.
+/// cannot drift between authorization and audit. #660's session
+/// revocation (`token_version`) check lives here for the same reason.
 pub(crate) async fn authenticate_headers(
     headers: &axum::http::HeaderMap,
     state: &crate::router::AppState,
 ) -> Result<(Claims, AuthSource), AuthFailure> {
     let auth_header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
 
-    // Session-cookie fallback (Security S1, staged item 3.B). When no
-    // Authorization header is present, the HttpOnly `chv_session` cookie
-    // (set by /v1/auth/login) is accepted as the JWT and goes through
-    // the exact same verification path (constant-time HMAC, exp check).
-    //
-    // Deliberate behaviors:
-    // - If BOTH are present, the Authorization header wins (the cookie
-    //   is not even parsed).
-    // - An invalid cookie JWT is a hard 401 — we never silently fall
-    //   back to an anonymous request.
-    // - Cookie auth is NOT restricted to non-mutating methods: the
-    //   csrf_middleware requires an un-forgeable request shape for
-    //   every non-GET — `application/json` content-type or (multipart
-    //   routes, #496) a non-empty `x-csrf-token` header, neither of
-    //   which a cross-site HTML form can produce without a CORS
-    //   preflight — and SameSite=Strict blocks the cookie from being
-    //   sent on cross-site requests at all. That reasoning is the
-    //   documented CSRF posture for this staged flow.
-    let auth = match auth_header {
-        Some(header) => header,
-        None => {
-            return match session_cookie_token(headers) {
-                Some(token) => match validate_token(&token, &state.jwt_secret) {
-                    Ok(claims) => Ok((claims, AuthSource::SessionCookie)),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "session cookie JWT validation failed");
-                        Err(AuthFailure {
-                            message: "invalid or expired session cookie",
-                        })
-                    }
-                },
-                None => Err(AuthFailure {
-                    message: "missing authorization header",
-                }),
-            };
+    let (token, from_cookie, source) = match auth_header {
+        Some(header) => {
+            if !header.to_ascii_lowercase().starts_with("bearer ") {
+                return Err(AuthFailure::unauthorized(
+                    "UNAUTHORIZED",
+                    "invalid authorization scheme",
+                ));
+            }
+            (header[7..].to_string(), false, AuthSource::BearerJwt)
         }
+        // Session-cookie fallback (Security S1, staged item 3.B). When no
+        // Authorization header is present, the HttpOnly `chv_session` cookie
+        // (set by /v1/auth/login) is accepted as the JWT and goes through
+        // the exact same verification path (constant-time HMAC, exp check,
+        // and the #660 token_version revocation check).
+        //
+        // Deliberate behaviors:
+        // - If BOTH are present, the Authorization header wins (the cookie
+        //   is not even parsed).
+        // - An invalid cookie JWT is a hard 401 — we never silently fall
+        //   back to an anonymous request.
+        // - Cookie auth is NOT restricted to non-mutating methods: the
+        //   csrf_middleware requires an un-forgeable request shape for
+        //   every non-GET — `application/json` content-type or (multipart
+        //   routes, #496) a non-empty `x-csrf-token` header, neither of
+        //   which a cross-site HTML form can produce without a CORS
+        //   preflight — and SameSite=Strict blocks the cookie from being
+        //   sent on cross-site requests at all. That reasoning is the
+        //   documented CSRF posture for this staged flow.
+        None => match session_cookie_token(headers) {
+            Some(token) => (token, true, AuthSource::SessionCookie),
+            None => {
+                return Err(AuthFailure::unauthorized(
+                    "UNAUTHORIZED",
+                    "missing authorization header",
+                ))
+            }
+        },
     };
 
-    if !auth.to_ascii_lowercase().starts_with("bearer ") {
-        return Err(AuthFailure {
-            message: "invalid authorization scheme",
-        });
-    }
-    let token = &auth[7..];
-
-    // Try JWT first
-    match validate_token(token, &state.jwt_secret) {
-        Ok(claims) => return Ok((claims, AuthSource::BearerJwt)),
-        Err(e) => {
+    // Try the session JWT first. A well-formed token with a stale
+    // `token_version` is a revoked session: reject it outright (never
+    // fall through to the API-token path).
+    match validate_session_token(&state.pool, &token, &state.jwt_secret).await {
+        Ok(claims) => return Ok((claims, source)),
+        Err(SessionAuthError::Revoked) => {
+            return Err(AuthFailure::unauthorized(
+                "SESSION_REVOKED",
+                "session has been revoked",
+            ))
+        }
+        Err(SessionAuthError::Unavailable) => {
+            return Err(AuthFailure {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "AUTH_UNAVAILABLE",
+                message: "authentication service unavailable",
+            })
+        }
+        Err(SessionAuthError::Invalid(e)) => {
             tracing::debug!(error = %e, "JWT validation failed, checking API token");
         }
     }
 
+    // A cookie is only ever a session JWT. An invalid cookie must not
+    // be reinterpreted as an API token.
+    if from_cookie {
+        return Err(AuthFailure::unauthorized(
+            "UNAUTHORIZED",
+            "invalid or expired session cookie",
+        ));
+    }
+
     // Try API token (chv_ prefix)
     if token.starts_with("chv_") {
-        let token_hash = chv_common::sha256_hex(token);
+        let token_hash = chv_common::sha256_hex(&token);
 
         #[derive(sqlx::FromRow)]
         struct ApiTokenUser {
             user_id: String,
             username: String,
             role: String,
-            /// Enforced per Security T1: `"full"` keeps the user's role,
-            /// `"readonly"` demotes to viewer, unknown values are
-            /// fail-safe-treated as `"full"` (see
-            /// [`effective_role_for_scope`]).
+            /// Enforced per Security T1 and hardened by #660: `"full"`
+            /// keeps the user's role, `"readonly"` demotes to viewer,
+            /// and every unknown value rejects the token in
+            /// [`effective_role_for_scope`].
             scope: String,
         }
 
@@ -382,6 +498,16 @@ pub(crate) async fn authenticate_headers(
 
         match result {
             Ok(Some(row)) => {
+                // Fail closed: an unrecognized scope never inherits the
+                // user's role (and therefore never grants mutation).
+                let Some(role) = effective_role_for_scope(&row.scope, &row.role) else {
+                    return Err(AuthFailure {
+                        status: StatusCode::FORBIDDEN,
+                        code: "INVALID_TOKEN_SCOPE",
+                        message: "api token has an unrecognized scope",
+                    });
+                };
+
                 // Update last_used_at in the background (best effort)
                 let pool = state.pool.clone();
                 let hash = token_hash.clone();
@@ -397,15 +523,16 @@ pub(crate) async fn authenticate_headers(
                 let claims = Claims {
                     sub: row.user_id,
                     username: row.username,
-                    // Scope enforcement: the token's role on the wire is
-                    // the user's role as narrowed by api_tokens.scope.
-                    role: effective_role_for_scope(&row.scope, &row.role),
+                    role,
                     // Far future expiry for API tokens — their expiry is managed by expires_at in DB
                     exp: u64::MAX / 2,
                     // API tokens bypass the must-change-password gate: they are
                     // service credentials minted explicitly by an authenticated
                     // user, not the seeded bootstrap admin row.
                     must_change_password: false,
+                    // API tokens are already resolved through the DB on every
+                    // request; no JWT revocation counter applies.
+                    token_version: None,
                 };
                 return Ok((claims, AuthSource::ApiToken));
             }
@@ -418,9 +545,33 @@ pub(crate) async fn authenticate_headers(
         }
     }
 
-    Err(AuthFailure {
-        message: "invalid or expired token",
-    })
+    Err(AuthFailure::unauthorized(
+        "UNAUTHORIZED",
+        "invalid or expired token",
+    ))
+}
+
+/// Extract the raw credential a logout handler should revoke.
+///
+/// Prefers the `Authorization: Bearer` header (API clients, chvctl) and
+/// falls back to the HttpOnly `chv_session` cookie (browser). The value is
+/// not validated here — callers decode it with [`validate_token`] and only
+/// bump the version when it is a genuine, unexpired token.
+pub fn request_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(auth) = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        let lower = auth.to_ascii_lowercase();
+        if lower.starts_with("bearer ") {
+            let token = auth[7..].trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    session_cookie_token(headers)
 }
 
 #[async_trait]
@@ -431,10 +582,10 @@ impl FromRequestParts<crate::router::AppState> for BearerToken {
         parts: &mut Parts,
         state: &crate::router::AppState,
     ) -> Result<Self, Self::Rejection> {
-        let reject = |msg: &'static str| {
+        let reject = |status: StatusCode, code: &'static str, msg: &'static str| {
             (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "message": msg, "code": "UNAUTHORIZED" })),
+                status,
+                Json(serde_json::json!({ "message": msg, "code": code })),
             )
         };
         // Reuse the audit middleware's decode when it ran: one decode
@@ -446,11 +597,11 @@ impl FromRequestParts<crate::router::AppState> for BearerToken {
                 .0
                 .clone()
                 .map(|(claims, _source)| BearerToken(claims))
-                .map_err(|failure| reject(failure.message));
+                .map_err(|failure| reject(failure.status, failure.code, failure.message));
         }
         let (claims, _source) = authenticate_headers(&parts.headers, state)
             .await
-            .map_err(|failure| reject(failure.message))?;
+            .map_err(|failure| reject(failure.status, failure.code, failure.message))?;
         Ok(BearerToken(claims))
     }
 }
@@ -487,6 +638,7 @@ mod tests {
             role: "admin".to_string(),
             exp,
             must_change_password: false,
+            token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
         let result = validate_token(&token, &test_secret());
@@ -505,6 +657,7 @@ mod tests {
             role: "admin".to_string(),
             exp: 1, // expired in 1970
             must_change_password: false,
+            token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
         let result = validate_token(&token, &test_secret());
@@ -530,6 +683,7 @@ mod tests {
             role: "admin".to_string(),
             exp,
             must_change_password: false,
+            token_version: None,
         };
         let token = encode_claims(&claims, "wrong-secret");
         let result = validate_token(&token, &test_secret());
@@ -571,6 +725,7 @@ mod tests {
             role: "viewer".into(),
             exp,
             must_change_password: false,
+            token_version: None,
         };
         let forged = Claims {
             sub: "user-1".into(),
@@ -578,6 +733,7 @@ mod tests {
             role: "admin".into(), // privilege escalation attempt
             exp,
             must_change_password: false,
+            token_version: None,
         };
         let original_token = encode_claims(&original, &secret);
         let forged_token = encode_claims(&forged, &secret);
@@ -610,6 +766,7 @@ mod tests {
             role: "admin".into(),
             exp: future_exp(),
             must_change_password: false,
+            token_version: None,
         };
         let token = encode_claims(&claims, &secret);
 
@@ -636,6 +793,7 @@ mod tests {
             role: "admin".into(),
             exp: future_exp(),
             must_change_password: false,
+            token_version: None,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS512);
         let token = jsonwebtoken::encode(
@@ -667,6 +825,7 @@ mod tests {
             role: "admin".into(),
             exp: now - 300,
             must_change_password: false,
+            token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
         let result = validate_token(&token, &test_secret());
@@ -686,6 +845,7 @@ mod tests {
             role: "operator".into(),
             exp: u64::MAX / 2,
             must_change_password: false,
+            token_version: None,
         };
         let token = encode_claims(&claims, &test_secret());
         let result = validate_token(&token, &test_secret());
@@ -698,26 +858,45 @@ mod tests {
 
     #[test]
     fn full_scope_keeps_user_role() {
-        assert_eq!(effective_role_for_scope("full", "operator"), "operator");
-        assert_eq!(effective_role_for_scope("full", "admin"), "admin");
-        assert_eq!(effective_role_for_scope("full", "viewer"), "viewer");
+        assert_eq!(
+            effective_role_for_scope("full", "operator").as_deref(),
+            Some("operator")
+        );
+        assert_eq!(
+            effective_role_for_scope("full", "admin").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            effective_role_for_scope("full", "viewer").as_deref(),
+            Some("viewer")
+        );
     }
 
     #[test]
     fn readonly_scope_demotes_to_viewer() {
-        assert_eq!(effective_role_for_scope("readonly", "operator"), "viewer");
-        assert_eq!(effective_role_for_scope("readonly", "admin"), "viewer");
-        assert_eq!(effective_role_for_scope("readonly", "viewer"), "viewer");
+        assert_eq!(
+            effective_role_for_scope("readonly", "operator").as_deref(),
+            Some("viewer")
+        );
+        assert_eq!(
+            effective_role_for_scope("readonly", "admin").as_deref(),
+            Some("viewer")
+        );
+        assert_eq!(
+            effective_role_for_scope("readonly", "viewer").as_deref(),
+            Some("viewer")
+        );
     }
 
     #[test]
-    fn unknown_scope_fails_safe_to_full() {
-        // Fail-safe contract: an unrecognized scope must never grant MORE
-        // than the user's own role, and must never lock the user out either
-        // — it degrades to the user's role ("full" semantics).
-        assert_eq!(effective_role_for_scope("banana", "operator"), "operator");
-        assert_eq!(effective_role_for_scope("", "admin"), "admin");
-        assert_eq!(effective_role_for_scope("READONLY", "operator"), "operator");
+    fn unknown_scope_is_rejected_not_fail_open() {
+        // Security T1 hardening (#660): an unrecognized scope must never
+        // inherit the user's role (and therefore never grant mutation).
+        assert_eq!(effective_role_for_scope("banana", "operator"), None);
+        assert_eq!(effective_role_for_scope("", "admin"), None);
+        assert_eq!(effective_role_for_scope("READONLY", "operator"), None);
+        assert_eq!(effective_role_for_scope("read only", "operator"), None);
+        assert_eq!(effective_role_for_scope("full ", "admin"), None);
     }
 
     // ── session cookie parsing (Security S1) ──────────────────────────────

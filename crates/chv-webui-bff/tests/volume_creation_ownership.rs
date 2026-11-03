@@ -257,6 +257,7 @@ async fn seed_jwt_for(state: &AppState, user_id: &str, role: &str) -> String {
         role: role.to_string(),
         exp,
         must_change_password: false,
+        token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     jsonwebtoken::encode(
@@ -389,6 +390,7 @@ async fn import_vm_as(state: AppState, vm_name: &str) -> (StatusCode, serde_json
         role: "operator".to_string(),
         exp,
         must_change_password: false,
+        token_version: None,
     };
     let result = chv_webui_bff::handlers::imports::import_vm(
         chv_webui_bff::BearerToken(claims),

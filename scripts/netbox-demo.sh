@@ -375,7 +375,7 @@ SQL
 login() {
     local body status
     body="$(curl -s -w '\n%{http_code}' -H 'Content-Type: application/json' \
-        -X POST "${CP_URL}/v1/auth/login" \
+        -X POST "${CP_URL}/api/v1/auth/login" \
         -d "{\"username\":\"admin\",\"password\":\"${ADMIN_PASSWORD}\"}")"
     status="$(echo "$body" | tail -n1)"
     body="$(echo "$body" | sed '$d')"

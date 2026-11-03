@@ -1,36 +1,28 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { createAPIClient, getStoredToken } from '#lib/api/client.ts';
-  import { syncAuthCookieFromLocalStorage } from '#lib/bff/auth-cookie.ts';
+  import { isLoggedIn } from '#lib/api/client.ts';
   import { toast } from '#lib/stores/toast.svelte.ts';
 
   let username = '';
   let password = '';
   let error = '';
   let loading = false;
-  const client = createAPIClient();
 
-  // Redirect if already logged in with a valid token
+  // Redirect if the server has already established a session. The HttpOnly
+  // cookie is not readable here; the non-credential hint cookie is.
   onMount(async () => {
-    const token = getStoredToken();
-    if (!token) return;
-    
+    if (!isLoggedIn()) return;
+
     try {
-      // Validate token by making a lightweight API call
       const response = await fetch('/v1/overview', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
       });
       if (response.ok) {
-        goto('/');
-      } else {
-        // Token is invalid — clear it so user can log in again
-        client.clearToken();
+        await goto('/');
       }
     } catch {
       // Network or other error — stay on login page
@@ -49,6 +41,7 @@
     try {
       const response = await fetch('/v1/auth/login', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
       });
@@ -72,11 +65,9 @@
         throw new Error('Login endpoint returned an unexpected response format.');
       }
 
+      // The JWT is delivered only as an HttpOnly cookie (#660); the body
+      // carries non-credential metadata. Nothing is stored client-side.
       const data = await response.json();
-      
-      // Store token and sync to cookie for server-side loads
-      client.setToken(data.token);
-      syncAuthCookieFromLocalStorage();
 
       if (data.must_change_password) {
         toast.info('Password change required. Please set a new password.');

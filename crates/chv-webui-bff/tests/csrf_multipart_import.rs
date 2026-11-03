@@ -248,6 +248,7 @@ async fn seed_operator(state: &AppState) -> String {
         role: "operator".to_string(),
         exp,
         must_change_password: false,
+        token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     jsonwebtoken::encode(

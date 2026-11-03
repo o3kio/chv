@@ -8,12 +8,29 @@
 	interface Props {
 		vmId: string;
 		consoleUrl: string;
-		getConsoleUrl?: () => Promise<string>;
+		/**
+		 * Short-lived console ticket issued by the BFF. Passed as the
+		 * WebSocket subprotocol (#660), never appended to the URL.
+		 */
+		consoleToken?: string;
+		getConsoleUrl?: () => Promise<ConsoleConnection>;
 		running?: boolean;
 		consoleExpiresAt?: string;
 	}
 
-	let { vmId, consoleUrl, getConsoleUrl, running = true, consoleExpiresAt }: Props = $props();
+	interface ConsoleConnection {
+		url: string;
+		token: string;
+	}
+
+	let {
+		vmId,
+		consoleUrl,
+		consoleToken,
+		getConsoleUrl,
+		running = true,
+		consoleExpiresAt
+	}: Props = $props();
 
 	let terminalEl: HTMLDivElement;
 	let terminal: Terminal;
@@ -73,9 +90,15 @@
 		reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
 	}
 
-	function connectWith(url: string) {
+	function connectWith(url: string, token: string | undefined) {
 		if (!terminal) return;
 		if (socket?.readyState === WebSocket.CONNECTING) return;
+		if (!token) {
+			wsError = 'Console ticket missing. Please reconnect.';
+			statusText = 'Token missing';
+			terminal.writeln('\r\n\x1b[31m[Console ticket missing — please reconnect]\x1b[0m');
+			return;
+		}
 		if (!validateWsUrl(url)) {
 			wsError = `Refused to connect: WebSocket URL does not match the application origin.`;
 			statusText = 'Connection blocked';
@@ -106,7 +129,9 @@
 		}
 		activeSocketUrl = wsUrl;
 		statusText = 'Connecting';
-		socket = new WebSocket(wsUrl);
+		// The ticket travels as the WebSocket subprotocol, not in the URL
+		// (#660), so it never reaches access logs or browser history.
+		socket = new WebSocket(wsUrl, [token]);
 		socket.binaryType = 'arraybuffer';
 
 		socket.onopen = () => {
@@ -150,11 +175,14 @@
 				tokenRefreshFailures = 0;
 			}
 			let urlToUse = consoleUrl;
+			let tokenToUse = consoleToken;
 
 			if (getConsoleUrl) {
 				statusText = 'Refreshing token...';
 				try {
-					urlToUse = await getConsoleUrl();
+					const connection = await getConsoleUrl();
+					urlToUse = connection.url;
+					tokenToUse = connection.token;
 					tokenRefreshFailures = 0;
 				} catch {
 					tokenRefreshFailures++;
@@ -171,7 +199,7 @@
 				}
 			}
 
-			connectWith(urlToUse);
+			connectWith(urlToUse, tokenToUse);
 		} finally {
 			reconnecting = false;
 		}
@@ -242,7 +270,7 @@
 	$effect(() => {
 		if (!terminalReady) return;
 		if (running && consoleUrl && !manualDisconnect) {
-			connectWith(consoleUrl);
+			connectWith(consoleUrl, consoleToken);
 		} else {
 			if (socket) {
 				socket.onopen = null;

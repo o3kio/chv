@@ -81,7 +81,7 @@ The script runs all five endpoints in sequence. To test a single endpoint, copy 
 ```bash
 # 1. Obtain a token (same logic as the script)
 ADMIN_PASS=$(sudo cat /etc/chv/initial_admin_password 2>/dev/null || echo "YOUR_ADMIN_PASSWORD")
-TOKEN_RESPONSE=$(curl -s -X POST "http://localhost:8080/v1/auth/login" \
+TOKEN_RESPONSE=$(curl -s -X POST "http://localhost:8080/api/v1/auth/login" \
   -H "Content-Type: application/json" \
   -d "{\"username\":\"admin\",\"password\":\"${ADMIN_PASS}\"}")
 TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token // .access_token // empty')

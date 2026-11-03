@@ -319,6 +319,11 @@ export type GetVmConsoleRequest = {
 export type GetVmConsoleUrlResponse = {
 	vm_id: string;
 	url: string;
+	/**
+	 * Short-lived console ticket. Delivered separately from `url` (#660) and
+	 * passed as the WebSocket subprotocol, never appended to the URL.
+	 */
+	token: string;
 	expires_at: string;
 };
 

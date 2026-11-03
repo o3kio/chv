@@ -68,16 +68,12 @@ function ruleRow(overrides: Record<string, unknown> = {}) {
 	};
 }
 
-/** The stored token must carry an operator/admin role claim. */
+/** The role hint cookie must carry an operator/admin role. */
 async function loginAsOperator(page: Page) {
-	await page.addInitScript(() => {
-		const b64url = (obj: unknown) =>
-			btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-		localStorage.setItem(
-			'chv-api-token',
-			`${b64url({ alg: 'none' })}.${b64url({ role: 'admin' })}.sig`
-		);
-	});
+	await page.context().addCookies([
+		{ name: 'chv_logged_in', value: '1', domain: 'localhost', path: '/', sameSite: 'Strict' },
+		{ name: 'chv_role', value: 'admin', domain: 'localhost', path: '/', sameSite: 'Strict' }
+	]);
 }
 
 async function mockAlerting(
@@ -304,9 +300,11 @@ test('rule update conflict shows the reload notice', async ({ page }) => {
 });
 
 test('viewer sessions see no operator actions', async ({ page }) => {
-	// The shared admin helper's opaque token carries no role claim —
-	// exactly the viewer path.
-	await loginAsAdmin(page);
+	// The role hint is a viewer, exactly the read-only path the server gates.
+	await page.context().addCookies([
+		{ name: 'chv_logged_in', value: '1', domain: 'localhost', path: '/', sameSite: 'Strict' },
+		{ name: 'chv_role', value: 'viewer', domain: 'localhost', path: '/', sameSite: 'Strict' }
+	]);
 	await mockAlerting(page, { incidents: { incidents: [incidentRow()], total: 1 } });
 	await page.goto('/alerts');
 

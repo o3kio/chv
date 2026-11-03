@@ -1062,7 +1062,7 @@ import_base_image() {
         return
     fi
     local login_response
-    login_response=$(curl -sf -X POST "${api_base}/v1/auth/login" \
+    login_response=$(curl -sf -X POST "${api_base}/api/v1/auth/login" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"admin\",\"password\":\"${admin_pw}\"}" 2>/dev/null || true)
     if [ -z "$login_response" ]; then
@@ -1140,7 +1140,7 @@ seed_dev_resources() {
         return
     fi
     local login_response
-    login_response=$(curl -sf -X POST "${api_base}/v1/auth/login" \
+    login_response=$(curl -sf -X POST "${api_base}/api/v1/auth/login" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"admin\",\"password\":\"${admin_pw}\"}" 2>/dev/null || true)
     if [ -z "$login_response" ]; then

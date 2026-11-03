@@ -921,6 +921,62 @@ sudo systemctl start chv-controlplane
 - Restrict `/etc/chv/certs/` to `root:chv` with `640` permissions
 - Run `chv-stord` under a dedicated service account with device/path allowlists
 - Enable firewall rules limiting gRPC port 8443 to known hypervisor IPs
+- Set `CHV_COOKIE_SECURE=1` when the BFF is reachable only over TLS (adds
+  `Secure` to the session and hint cookies)
+
+### Browser sessions, revocation, and console tickets (#660)
+
+**The browser credential is an HttpOnly cookie.** `POST /v1/auth/login`
+returns no JWT in its response body. It sets:
+
+| Cookie | Scope | Purpose |
+|--------|-------|---------|
+| `chv_session` | `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=86400` | The session JWT. Script cannot read it. |
+| `chv_role` | script-readable, non-credential | Role hint used only to hide UI controls; the server never authorizes from it. |
+| `chv_logged_in=1` | script-readable, non-credential | Authenticated-session hint for the SPA login redirect. |
+
+The UI no longer writes tokens to `localStorage` or `sessionStorage`. Non-browser
+clients that need a bearer token (for example `chvctl`) must use the separate
+API-only endpoint `POST /api/v1/auth/login`.
+
+**Server-side revocation.** Migration `0064_user_token_version.sql` adds
+`users.token_version INTEGER NOT NULL DEFAULT 0`. Every newly issued session
+JWT carries a `token_version` claim; the auth extractor compares it with the
+database on every request. `POST /v1/auth/logout` and a successful password
+change increment the counter, so every token issued earlier — including a
+copied one — fails immediately with:
+
+- `401 SESSION_REVOKED` — the token's version is stale, or the user row is gone.
+- `503 AUTH_UNAVAILABLE` — the version lookup itself failed (database outage).
+
+Pre-#660 tokens carry no `token_version` claim and are accepted without a
+database lookup until their 24-hour `exp` fires. This is the documented
+rollout gap: it avoids logging every operator out on deploy, but those legacy
+tokens cannot be revoked server-side. To close the gap immediately after an
+upgrade, ask users to log out and back in (or rotate the JWT secret, which
+invalidates all tokens). Rolling the migration back is safe — older binaries
+ignore the extra column — but it disables revocation until the column and the
+#660 binary are restored.
+
+**API-token scopes fail closed.** `api_tokens.scope` accepts exactly `full`
+(user's role) and `readonly` (viewer). Any other value — `NULL`/empty,
+mixed case, or an unknown future scope — is rejected with
+`403 INVALID_TOKEN_SCOPE`; it never falls back to the user's role. Audit
+existing rows before upgrading:
+
+```sql
+SELECT scope, COUNT(*) FROM api_tokens GROUP BY scope;
+```
+
+Fix or recreate any row whose scope is not `full` or `readonly`.
+
+**Console tickets are audience-bound and out-of-URL.** Console tickets are
+minted with `aud: "chv:console"` and a 60-second TTL. The agent console server
+requires that audience (a session JWT or API token cannot open a console) and
+reads the ticket from the `Sec-WebSocket-Protocol` handshake header, not from
+`?token=`. The BFF returns the URL and ticket separately; the UI calls
+`new WebSocket(url, [ticket])`. nginx forwards the subprotocol header by
+default.
 
 ---
 

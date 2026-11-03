@@ -34,6 +34,7 @@
 	const detail = $derived(data.detail);
 	let pendingAction = $state<string | null>(null);
 	let liveConsoleUrl = $state<string | undefined>(undefined);
+	let liveConsoleToken = $state<string | undefined>(undefined);
 	let liveConsoleExpiresAt = $state<string | undefined>(undefined);
 	let VmConsoleComponent = $state<typeof import('#lib/components/vms/VmConsole.svelte').default | null>(null);
 	let consoleLoading = $state(false);
@@ -61,8 +62,16 @@
 			ensureVmConsole();
 			consoleLoading = true;
 			getVmConsoleUrl(detail.summary.vm_id, getStoredToken() ?? undefined)
-				.then(res => { liveConsoleUrl = res.url; liveConsoleExpiresAt = res.expires_at; })
-				.catch(() => { liveConsoleUrl = undefined; liveConsoleExpiresAt = undefined; })
+				.then(res => {
+					liveConsoleUrl = res.url;
+					liveConsoleToken = res.token;
+					liveConsoleExpiresAt = res.expires_at;
+				})
+				.catch(() => {
+					liveConsoleUrl = undefined;
+					liveConsoleToken = undefined;
+					liveConsoleExpiresAt = undefined;
+				})
 				.finally(() => { consoleLoading = false; });
 		}
 	});
@@ -237,13 +246,16 @@
 						vmId={detail.summary.vm_id}
 						{consoleLoading}
 						{liveConsoleUrl}
+						{liveConsoleToken}
 						{VmConsoleComponent}
 						running={detail.summary.power_state.toLowerCase() === 'running'}
 						consoleExpiresAt={liveConsoleExpiresAt}
 						getConsoleUrl={async () => {
 							const res = await getVmConsoleUrl(detail.summary.vm_id, getStoredToken() ?? undefined);
+							liveConsoleUrl = res.url;
+							liveConsoleToken = res.token;
 							liveConsoleExpiresAt = res.expires_at;
-							return res.url;
+							return { url: res.url, token: res.token };
 						}}
 					/>
 				</div>
