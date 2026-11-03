@@ -39,7 +39,7 @@ of performing its legacy side effect.
 | Console WebSocket / legacy console server (`127.0.0.1:8444` default) | Yes | Yes | **No** — no legacy console server (the Core adapter still owns VMM process/console cleanup) |
 | Agent metrics listener (packaged default `127.0.0.1:9901`) and `chv_agent_journal_*` families | Yes (legacy metrics; journal families absent) | Yes (journal families present) | **No** — no legacy metrics listener |
 | Supervised `chv-stord` / `chv-nwd` daemons | Yes | Yes | **No** — the Core resource controller connects to the sockets; it does not supervise the daemons |
-| Core state prerequisites | None | `StartupTransaction` imports/prepares the Core store and archive | Cache, Core store/archive, and native socket parents must be pre-existing `chv`-owned `0700` directories; an absent database is created with the configured non-placeholder `node_id` |
+| Core state prerequisites | None | `StartupTransaction` imports/prepares the Core store and archive | Cache, Core store/archive, and native socket parents must be pre-existing `chv`-owned `0700` directories; an absent database is created with the configured non-placeholder `node_id`, or a one-time UUID when that id is empty |
 | Legacy mutation RPCs after Core is authoritative | N/A — legacy is the authority | Fail closed with gRPC `unimplemented` (e.g. `apply_node_desired_state`, legacy provider effectors) | N/A — no legacy RPC surface |
 | Executor-fatal behavior | N/A | Agent exits non-zero for supervisor restart; in-flight `running` operations become InspectRequired | Same |
 

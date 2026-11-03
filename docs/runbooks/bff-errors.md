@@ -105,7 +105,7 @@ line; structured fields need `CHV_LOG_FORMAT=json`):
 
 ```bash
 journalctl -u chv-controlplane -o cat --since '-30 min' \
-  | jq 'select(.span.operation_id=="<OP_ID>")'
+  | jq 'select((.span.operation_id // .span.op_id // .fields.operation_id) == "<OP_ID>")'
 ```
 
 The audit row tells you the route, the acting user/role, and whether the
@@ -129,6 +129,7 @@ request was denied or failed; the journal tells you the server-side error.
 | 422 | `GRAPH_EMPTY`, `QUOTA_EXCEEDED` | The request is well-formed but cannot be applied yet. |
 | 429 | `RATE_LIMITED` ("too many login attempts, try again later") | Login is limited to 10 attempts per username per 60 s. Wait, or investigate a credential-stuffing attempt. |
 | 500 | `INTERNAL_ERROR` | Server bug or unexpected dependency failure. Correlate the `request_id` and inspect the journal. |
+| 500 | `AUDIT_LOG_WRITE_FAILED` | The mutation succeeded but its audit row could not be persisted, so the success body was replaced. Treat as an incident: check the database and disk (`sqlite3 … 'PRAGMA quick_check'`, `df -h /var/lib/chv`), and do not assume the write was rolled back. |
 | 501 | `NOT_IMPLEMENTED` | Deliberately fenced feature (for example backup). Expected; do not chase it as an outage. |
 | 502 | `DRIFT_CHECK_FAILED`, `NETBOX_UNREACHABLE`, `NETBOX_AUTH_FAILED` | An upstream integration failed. Check NetBox reachability/credentials. |
 | 503 | `AUTH_UNAVAILABLE` | The per-request revocation lookup failed (database outage). Fail-closed by design. Fix the database. |

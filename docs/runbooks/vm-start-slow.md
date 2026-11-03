@@ -28,12 +28,30 @@ returns after the Cloud Hypervisor `/api/v1/vm.boot` call. It **does not**
 measure guest boot to login or application readiness. A guest that takes two minutes to reach
 sshd will not breach this alert if `/vm.boot` returned quickly.
 
+## Metrics availability caveat
+
+**As shipped, the agent does not expose these series.** `VmOpGuard` records
+`chv_vm_ops_total` and `chv_vm_op_duration_seconds` into the global Prometheus
+registry, but the agent's `:9901` handler renders only the hand-built
+`chv_agent_*` families; it does not render that registry. `cmd/chv-agent` does
+not enable the `http-metrics` feature the other daemons use, and no other
+process records these names.
+
+Until [issue #702](https://github.com/o3kio/chv/issues/702) lands, the PromQL
+below returns no data from a packaged agent, and `VmStartLatencyHighP99`
+cannot fire from agent scrapes. If this alert is paging you, the scrape target
+is running a build with #702 or an external exporter — confirm that first. The
+operation-journal and log steps work today; use them while the series is
+missing.
+
 ## Prerequisites
 
 - `ssh` and `sudo` on the node, plus `chvctl` configured against the control
   plane.
 - Access to the node's agent metrics listener (packaged default
-  `127.0.0.1:9901`) or the Prometheus instance that scrapes it.
+  `127.0.0.1:9901`) or the Prometheus instance that scrapes it. See
+  [Metrics availability caveat](#metrics-availability-caveat) — the listener
+  currently exposes `chv_agent_*` only.
 - Knowledge of the node's authority mode:
   `grep -E '^authority_mode' /etc/chv/agent.toml`.
   Shipped configurations select `core-managed`; a missing key defaults to
@@ -58,12 +76,17 @@ sshd will not breach this alert if `/vm.boot` returned quickly.
 2. If `result="err"` is a meaningful share, stop here and use
    [VM Operation Failures](vm-op-failures.md). This runbook assumes the starts
    eventually succeed.
-3. On the node, the raw counters/histogram are visible directly:
+3. On the node, confirm the listener is healthy. It currently renders
+   `chv_agent_*` only — the VM-op families are not exported
+   ([metrics availability caveat](#metrics-availability-caveat), #702):
 
    ```bash
-   curl -s http://127.0.0.1:9901/metrics \
-     | grep -E 'chv_vm_ops_total\{op="start"|chv_vm_op_duration_seconds_(bucket|count|sum)\{op="start"'
+   curl -s http://127.0.0.1:9901/metrics | grep -c '^chv_agent_'
    ```
+
+   When #702 lands, the same endpoint will also carry
+   `chv_vm_ops_total{op="start"}` and
+   `chv_vm_op_duration_seconds_{bucket,count,sum}{op="start"}`.
 
 4. Record whether the latency is one VM, one node, or fleet-wide. A single
    node points at host/storage/network; fleet-wide points at a shared

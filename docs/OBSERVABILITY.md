@@ -72,6 +72,15 @@ changes it. The packages and `scripts/install.sh` leave the HTTP listener on
 SLIs are the measurable properties we use to assess service health. Each SLI is expressed
 as a PromQL expression that can be evaluated continuously.
 
+> **Availability caveat ([#702](https://github.com/o3kio/chv/issues/702)).**
+> SLI-1 and SLI-2 are backed by `chv_vm_ops_total` /
+> `chv_vm_op_duration_seconds`. The shipped agent records those samples into
+> the global Prometheus registry but its `:9901` handler renders only the
+> hand-built `chv_agent_*` families, so packaged agents expose neither series.
+> Until #702 lands, SLI-1/SLI-2 have no data from agent scrapes and
+> `VmStartLatencyHighP99` / `VmOpFailureRateHigh` cannot fire. The
+> journal-based diagnosis in their runbooks works today.
+
 ### SLI-1: VM start latency (p99)
 
 **Definition:** 99th percentile of the time from `create_vm` invocation on the Cloud Hypervisor
@@ -270,7 +279,7 @@ fallback.
 ```bash
 # systemd journal (requires CHV_LOG_FORMAT=json)
 journalctl -u chv-agent -o cat | jq 'select(.fields.op == "abc123ef")'
-journalctl -u chv-controlplane -o cat | jq 'select(.span.operation_id == "abc123ef")'
+journalctl -u chv-controlplane -o cat | jq 'select((.span.operation_id // .span.op_id // .fields.operation_id) == "abc123ef")'
 
 # File log
 grep '"operation_id":"abc123ef"' /var/log/chv/agent.log
