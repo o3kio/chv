@@ -541,6 +541,20 @@ impl Harness {
         .expect("seed node");
     }
 
+    /// A node with a recorded certificate serial — the revocation
+    /// command's default target (`nodes.certificate_serial`).
+    async fn seed_node_with_serial(&self, node_id: &str, serial: &str) {
+        sqlx::query(
+            "INSERT INTO nodes (node_id, hostname, display_name, certificate_serial) \
+             VALUES (?, 'h', 'h', ?)",
+        )
+        .bind(node_id)
+        .bind(serial)
+        .execute(&self.pool)
+        .await
+        .expect("seed node with serial");
+    }
+
     /// A node plus a HEALTHY observed-state row — the vm-import
     /// handler's placement rule (it joins `node_observed_state` on
     /// `health_status = 'healthy'`, unlike the JSON create paths'
@@ -1864,6 +1878,37 @@ async fn node_maintenance_exit_row() {
     .expect("chvctl node maintenance (exit) against POST /v1/nodes/mutate");
     h.mutations
         .assert_recorded("mutate_node:n-1:exit_maintenance");
+}
+
+/// `chvctl node revoke-certificate` — GREEN (#661). Revokes the node's
+/// recorded serial, is idempotent on a second call, and writes exactly one
+/// denylist row.
+#[tokio::test]
+async fn node_revoke_certificate_row() {
+    let h = Harness::start().await;
+    h.seed_node_with_serial("n-1", "serial-live").await;
+    let token = h.seed_jwt_as("admin").await;
+    let client = h.client(Some(token));
+
+    let command = || node::NodeCommands::RevokeCertificate {
+        node_id: "n-1".to_string(),
+        certificate_serial: None,
+        reason: "host compromise".to_string(),
+        expires_at: None,
+    };
+
+    node::execute(&client, command(), &OutputFormat::Json)
+        .await
+        .expect("chvctl node revoke-certificate against POST /v1/nodes/revoke-certificate");
+    node::execute(&client, command(), &OutputFormat::Json)
+        .await
+        .expect("repeat revocation must be idempotent");
+
+    let repo = chv_controlplane_store::CertificateRevocationRepository::new(h.pool.clone());
+    let rows = repo.list_for_node("n-1").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].certificate_serial, "serial-live");
+    assert_eq!(rows[0].reason, "host compromise");
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ mod alerts;
 mod architectures;
 mod backups;
 mod bootstrap_tokens;
+mod certificate_revocations;
 mod credential_crypto;
 
 /// Test-support access to the credential cipher so repository tests can
@@ -50,6 +51,10 @@ pub use backups::{
     BackupScheduleRow, BackupScheduleUpdateInput,
 };
 pub use bootstrap_tokens::{BootstrapTokenRepository, BootstrapTokenValidation};
+pub use certificate_revocations::{
+    CertificateRevocationRepository, NodeCertificateRevocation, RevokeCertificateInput,
+    RevokeCertificateOutcome,
+};
 pub use db::{
     connect_pool, migrations_path, migrator, run_migrations, ControlPlaneStoreConfig, StoreError,
     StorePool,

@@ -89,6 +89,10 @@ pub struct EnrollmentServiceImplementation {
     token_repo: BootstrapTokenRepository,
     cert_issuer: Option<Arc<dyn CertificateIssuer>>,
     vtep_repo: VtepRepository,
+    /// Durable certificate denylist (#661). The store-level compare-and-swap
+    /// always rejects revoked serials; wiring this in adds a pre-mint check
+    /// with an operator-actionable error instead of a "lost race" conflict.
+    revocation_repo: Option<chv_controlplane_store::CertificateRevocationRepository>,
 }
 
 impl EnrollmentServiceImplementation {
@@ -103,7 +107,18 @@ impl EnrollmentServiceImplementation {
             token_repo,
             cert_issuer,
             vtep_repo,
+            revocation_repo: None,
         }
+    }
+
+    /// Attach the certificate denylist so rotation fails fast (with the
+    /// revocation reason class) before minting key material.
+    pub fn with_certificate_revocations(
+        mut self,
+        revocation_repo: chv_controlplane_store::CertificateRevocationRepository,
+    ) -> Self {
+        self.revocation_repo = Some(revocation_repo);
+        self
     }
 
     fn now_ms(&self) -> i64 {
@@ -375,6 +390,26 @@ impl EnrollmentService for EnrollmentServiceImplementation {
                      re-enroll if the current certificate was lost"
                         .into(),
                 ));
+            }
+
+            // A revoked serial must never be exchangeable for a fresh
+            // certificate: otherwise a thief holding the stolen certificate
+            // could rotate to a new, unrevoked one. This pre-check gives a
+            // clear error; the store's compare-and-swap independently refuses
+            // the same serial, closing the check-to-commit race.
+            if let Some(repo) = &self.revocation_repo {
+                if repo.is_revoked(expected).await? {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        certificate_serial = %expected,
+                        "rejecting certificate rotation: presented certificate is revoked"
+                    );
+                    return Err(ControlPlaneServiceError::PermissionDenied(
+                        "the presented certificate has been revoked; re-enroll the node with a \
+                         fresh bootstrap token"
+                            .into(),
+                    ));
+                }
             }
         }
 

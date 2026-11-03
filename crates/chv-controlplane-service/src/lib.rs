@@ -24,6 +24,7 @@ mod orchestrator;
 pub mod overlay;
 pub mod peer_identity;
 mod reconcile;
+mod revocation;
 mod server;
 mod telemetry;
 
@@ -64,6 +65,10 @@ pub use peer_identity::{
     InsecurePeer, PeerCertificateSerial, PeerIdentityError, PeerIdentityInterceptor, PeerNodeId,
 };
 pub use reconcile::{ReconcileService, ReconcileServiceImplementation};
+pub use revocation::{
+    load_startup_snapshot, refresh_interval_from_env, run_refresh_loop, RevocationSnapshot,
+    DEFAULT_REFRESH_INTERVAL, REFRESH_INTERVAL_ENV,
+};
 pub use server::{
     EnrollmentServer, InventoryServer, LifecycleServer, MonitoringServer, ReconcileServer,
     TelemetryServer,

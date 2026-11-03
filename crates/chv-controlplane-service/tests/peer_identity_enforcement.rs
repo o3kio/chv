@@ -19,6 +19,7 @@
 use chv_controlplane_service::{
     parse_node_id_from_der, EnrollmentServer, EnrollmentServiceImplementation, InsecurePeer,
     IssuedCertificate, PeerCertificateSerial, PeerIdentityInterceptor, PeerNodeId,
+    RevocationSnapshot,
 };
 use chv_controlplane_store::{
     test_util::create_test_pool, BootstrapTokenRepository, NodeRepository, NodeUpsertInput,
@@ -93,6 +94,9 @@ async fn build_enrollment_server() -> (EnrollmentServer, NodeRepository) {
         token_repo,
         Some(Arc::new(StubIssuer)),
         vtep_repo,
+    )
+    .with_certificate_revocations(
+        chv_controlplane_store::CertificateRevocationRepository::new(pool.clone()),
     );
     (EnrollmentServer::new(Arc::new(svc)), node_repo)
 }
@@ -229,6 +233,58 @@ async fn rotate_node_certificate_rejects_stale_serial_without_mutation() {
         Code::PermissionDenied,
         "stale serial must produce permission_denied; got: {} ({})",
         status.code(),
+        status.message()
+    );
+    assert_eq!(
+        repo.get_certificate_serial(&NodeId::new("node-a").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-serial"),
+        "rejected rotation must leave the stored serial unchanged"
+    );
+}
+
+/// A revoked serial must not rotate, even though it still matches the stored
+/// active serial. Otherwise a thief holding the stolen certificate could
+/// exchange it for a fresh, unrevoked certificate and defeat revocation.
+#[tokio::test]
+async fn rotate_node_certificate_rejects_revoked_serial() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, repo) = build_enrollment_server().await;
+    chv_controlplane_store::CertificateRevocationRepository::new(repo.pool().clone())
+        .revoke(&chv_controlplane_store::RevokeCertificateInput {
+            certificate_serial: "old-serial",
+            node_id: "node-a",
+            reason: "host compromise",
+            revoked_by: Some("admin"),
+            revoked_at: None,
+            expires_at: None,
+        })
+        .await
+        .expect("revoke old-serial");
+
+    let req = request_with_peer_serial(
+        rotate_payload("node-a", "op-revoked"),
+        "node-a",
+        Some("old-serial"),
+    );
+
+    let status = server
+        .rotate_node_certificate(req)
+        .await
+        .expect_err("revoked serial must not rotate");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "revoked serial must produce permission_denied; got: {} ({})",
+        status.code(),
+        status.message()
+    );
+    assert!(
+        status.message().contains("revoked"),
+        "operator-actionable message expected, got: {}",
         status.message()
     );
     assert_eq!(
@@ -415,7 +471,8 @@ fn cert_parser_round_trips_node_id() {
 #[test]
 #[cfg(feature = "dev")]
 fn interceptor_insecure_mode_marks_request() {
-    let interceptor = PeerIdentityInterceptor::new(true).expect("dev build permits insecure mode");
+    let interceptor = PeerIdentityInterceptor::new(true, RevocationSnapshot::empty())
+        .expect("dev build permits insecure mode");
     let req: Request<()> = Request::new(());
     let out = interceptor.intercept(req).expect("insecure passthrough");
     assert!(out.extensions().get::<InsecurePeer>().is_some());
@@ -427,7 +484,8 @@ fn interceptor_insecure_mode_marks_request() {
 /// production request without a pinned peer identity.
 #[test]
 fn interceptor_secure_mode_rejects_when_tls_info_absent() {
-    let interceptor = PeerIdentityInterceptor::new(false).expect("secure mode always valid");
+    let interceptor = PeerIdentityInterceptor::new(false, RevocationSnapshot::empty())
+        .expect("secure mode always valid");
     let req: Request<()> = Request::new(());
     let err = interceptor
         .intercept(req)

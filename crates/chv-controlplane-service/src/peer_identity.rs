@@ -19,17 +19,24 @@
 //! 2. Parses the certificate's CN and DNS-type SANs with `x509-parser`.
 //! 3. Stores the authorized peer node identity in request extensions as a typed
 //!    [`PeerNodeId`] marker via the [`PeerIdentityInterceptor`].
-//! 4. Provides [`verify_peer_matches`] for handlers to reject any request whose
+//! 4. Rejects a peer whose leaf certificate serial appears in the durable
+//!    revocation denylist (#661), using a startup-loaded, atomically refreshed
+//!    [`RevocationSnapshot`]. A certificate with no usable serial is rejected
+//!    in secure mode because it cannot be checked against the denylist.
+//! 5. Provides [`verify_peer_matches`] for handlers to reject any request whose
 //!    asserted `node_id` does not match the peer's certificate-derived identity.
 //!
 //! ## Insecure-mode passthrough
 //!
-//! When `CHV_ALLOW_INSECURE=1` is set (dev/test mode), the interceptor and verification
-//! become no-ops. Production deployments MUST run with mTLS enabled.
+//! When `CHV_ALLOW_INSECURE=1` is set (dev/test mode, gated behind the `dev`
+//! Cargo feature), the interceptor and verification become no-ops — including
+//! certificate revocation. Production deployments MUST run with mTLS enabled and
+//! without this flag.
 //!
 //! See ADR-008 (error handling) and ADR-014 (mTLS / certificate trust boundary).
 
 use crate::error::ControlPlaneServiceError;
+use crate::revocation::RevocationSnapshot;
 use chv_controlplane_types::domain::NodeId;
 use std::sync::Arc;
 use tonic::transport::server::TlsConnectInfo;
@@ -57,8 +64,9 @@ impl PeerNodeId {
 /// trusted certificate rather than merely knowing the node id (#661).
 ///
 /// `None` means the certificate carried a serial that could not be represented
-/// in the issuer's textual form. Handlers MUST fail closed in production mode
-/// when this is absent or when no extension was inserted at all.
+/// in the issuer's textual form. The interceptor fails closed in secure mode
+/// when this is absent (it cannot be checked against the revocation denylist);
+/// handlers that consume the extension directly must do the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCertificateSerial(pub Option<String>);
 
@@ -87,10 +95,16 @@ pub struct InsecurePeer;
 #[derive(Clone)]
 pub struct PeerIdentityInterceptor {
     allow_insecure: bool,
+    revocation: RevocationSnapshot,
 }
 
 impl PeerIdentityInterceptor {
     /// Construct the interceptor after validating the requested security mode.
+    ///
+    /// `revocation` is the startup-loaded denylist snapshot. The container
+    /// loads it from `node_certificate_revocations` *before* binding the gRPC
+    /// listener and fails closed if that read fails in production mode. It is
+    /// refreshed in the background by [`crate::revocation::run_refresh_loop`].
     ///
     /// # Errors
     ///
@@ -104,18 +118,25 @@ impl PeerIdentityInterceptor {
     /// ```text
     /// cargo build --features dev
     /// ```
-    pub fn new(allow_insecure: bool) -> Result<Self, ControlPlaneServiceError> {
+    pub fn new(
+        allow_insecure: bool,
+        revocation: RevocationSnapshot,
+    ) -> Result<Self, ControlPlaneServiceError> {
         validate_security_mode(allow_insecure)?;
-        Ok(Self { allow_insecure })
+        Ok(Self {
+            allow_insecure,
+            revocation,
+        })
     }
 
     /// Apply the interceptor to a request, mutating its extensions in-place.
     #[allow(clippy::result_large_err)] // tonic::Status is the required error type for tonic interceptors.
     pub fn intercept<T>(
         &self,
-        mut request: tonic::Request<T>,
+        request: tonic::Request<T>,
     ) -> Result<tonic::Request<T>, tonic::Status> {
         if self.allow_insecure {
+            let mut request = request;
             request.extensions_mut().insert(InsecurePeer);
             return Ok(request);
         }
@@ -141,6 +162,52 @@ impl PeerIdentityInterceptor {
                 ));
             }
         };
+
+        self.authorize_peer(request, peer_node_id, peer_serial)
+    }
+
+    /// Revocation + extension insertion for an already-extracted peer identity.
+    ///
+    /// Split out so the security decision is unit-testable without a real TLS
+    /// stream (`tonic`'s `TlsConnectInfo` has no public constructor).
+    /// Production always reaches it through [`Self::intercept`] after parsing
+    /// the actual mTLS leaf certificate.
+    #[allow(clippy::result_large_err)]
+    fn authorize_peer<T>(
+        &self,
+        mut request: tonic::Request<T>,
+        peer_node_id: NodeId,
+        peer_serial: Option<String>,
+    ) -> Result<tonic::Request<T>, tonic::Status> {
+        // Revocation is keyed by serial. A certificate whose serial cannot be
+        // represented cannot be checked against the denylist, so it is not a
+        // usable production credential: fail closed instead of admitting an
+        // unrevokable peer. CHV-issued certificates always carry an 8-char
+        // ASCII serial, so this only affects foreign/binary-serial certs.
+        let serial = match peer_serial.as_deref() {
+            Some(serial) if !serial.is_empty() => serial,
+            _ => {
+                tracing::warn!(
+                    peer_node_id = %peer_node_id,
+                    "rejecting request: peer certificate has no usable serial for revocation check"
+                );
+                return Err(tonic::Status::unauthenticated(
+                    "peer certificate serial unavailable",
+                ));
+            }
+        };
+
+        if self.revocation.is_revoked(Some(serial)) {
+            metrics::counter!("chv_revoked_peer_rejected_total").increment(1);
+            tracing::warn!(
+                peer_node_id = %peer_node_id,
+                certificate_serial = %serial,
+                "rejecting request: peer certificate serial is revoked"
+            );
+            return Err(tonic::Status::unauthenticated(
+                "peer certificate is revoked",
+            ));
+        }
 
         request.extensions_mut().insert(PeerNodeId(peer_node_id));
         request
@@ -548,12 +615,101 @@ mod tests {
         // certificate (no TlsConnectInfo extension — e.g. a plain TCP or
         // in-process call) must be rejected with UNAUTHENTICATED, never
         // passed through to the handler.
-        let interceptor = PeerIdentityInterceptor::new(false).unwrap();
+        let interceptor = PeerIdentityInterceptor::new(false, RevocationSnapshot::empty()).unwrap();
         let status = interceptor
             .intercept(tonic::Request::new(()))
             .expect_err("cert-less request must be rejected");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
         assert_eq!(status.message(), "peer mTLS certificate required");
+    }
+
+    #[test]
+    fn interceptor_rejects_revoked_peer_serial() {
+        let interceptor = PeerIdentityInterceptor::new(
+            false,
+            RevocationSnapshot::from_serials(["revoked-serial"]),
+        )
+        .unwrap();
+
+        let status = interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                Some("revoked-serial".into()),
+            )
+            .expect_err("revoked peer must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(status.message(), "peer certificate is revoked");
+    }
+
+    #[test]
+    fn interceptor_accepts_non_revoked_peer_serial() {
+        let interceptor = PeerIdentityInterceptor::new(
+            false,
+            RevocationSnapshot::from_serials(["revoked-serial"]),
+        )
+        .unwrap();
+
+        let request = interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                Some("good-serial".into()),
+            )
+            .expect("non-revoked peer must pass");
+
+        assert_eq!(
+            request
+                .extensions()
+                .get::<PeerNodeId>()
+                .map(|id| id.as_node_id().to_string()),
+            Some("node-a".into())
+        );
+        assert_eq!(
+            request.extensions().get::<PeerCertificateSerial>(),
+            Some(&PeerCertificateSerial(Some("good-serial".into())))
+        );
+    }
+
+    #[test]
+    fn interceptor_rejects_peer_without_usable_serial() {
+        let interceptor =
+            PeerIdentityInterceptor::new(false, RevocationSnapshot::from_serials(["anything"]))
+                .unwrap();
+
+        for serial in [None, Some(String::new())] {
+            let status = interceptor
+                .authorize_peer(
+                    tonic::Request::new(()),
+                    NodeId::new("node-a").unwrap(),
+                    serial,
+                )
+                .expect_err("a peer that cannot be checked against the denylist must be rejected");
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(status.message(), "peer certificate serial unavailable");
+        }
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn interceptor_insecure_mode_bypasses_revocation() {
+        // Explicit dev-mode behavior: CHV_ALLOW_INSECURE=1 disables peer
+        // identity AND revocation. Production builds cannot reach this path
+        // (validate_security_mode rejects the flag without the `dev` feature).
+        let interceptor = PeerIdentityInterceptor::new(
+            true,
+            RevocationSnapshot::from_serials(["revoked-serial"]),
+        )
+        .unwrap();
+
+        let mut request = tonic::Request::new(());
+        request
+            .extensions_mut()
+            .insert(PeerCertificateSerial(Some("revoked-serial".into())));
+        let out = interceptor
+            .intercept(request)
+            .expect("insecure mode intentionally bypasses revocation");
+        assert!(out.extensions().get::<InsecurePeer>().is_some());
     }
 
     #[test]

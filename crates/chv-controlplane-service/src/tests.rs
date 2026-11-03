@@ -92,6 +92,10 @@ fn test_app_state(pool: StorePool) -> chv_webui_bff::AppState {
 }
 
 fn test_admin_token() -> String {
+    test_token_for_role("admin")
+}
+
+fn test_token_for_role(role: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -99,9 +103,9 @@ fn test_admin_token() -> String {
         .as_secs()
         + 3600;
     let claims = chv_webui_bff::auth::Claims {
-        sub: "test-admin-id".to_string(),
-        username: "admin".to_string(),
-        role: "admin".to_string(),
+        sub: format!("test-{role}-id"),
+        username: role.to_string(),
+        role: role.to_string(),
         exp,
         must_change_password: false,
     };
@@ -158,6 +162,110 @@ async fn test_ready_endpoint() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `POST /v1/nodes/revoke-certificate` (#661): admin-only, idempotent, and
+/// durable. A viewer must be rejected before the handler; the first admin
+/// call inserts the denylist row, the second reports `already_revoked`.
+#[tokio::test]
+async fn revoke_certificate_endpoint_is_admin_only_and_idempotent() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let node_id = NodeId::new("node-revoke").unwrap();
+    NodeRepository::new(pool.clone())
+        .upsert_node(&NodeUpsertInput {
+            node_id: node_id.clone(),
+            hostname: "host-revoke".into(),
+            display_name: "node-revoke".into(),
+            certificate_serial: Some("serial-live".into()),
+            agent_version: None,
+            control_plane_version: None,
+            enrolled_unix_ms: 1_000,
+            last_seen_unix_ms: 1_000,
+        })
+        .await
+        .unwrap();
+
+    let app = crate::api::router::admin_router(
+        test_app_state(pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+
+    let body = serde_json::json!({
+        "node_id": "node-revoke",
+        "reason": "host compromise"
+    })
+    .to_string();
+
+    // Viewer is forbidden at the router's admin middleware.
+    let viewer_response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/nodes/revoke-certificate")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", test_token_for_role("viewer")),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_response.status(), StatusCode::FORBIDDEN);
+
+    // First admin call revokes the node's active serial.
+    let first = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/nodes/revoke-certificate")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["certificate_serial"], "serial-live");
+    assert_eq!(parsed["already_revoked"], false);
+
+    // Repeat: same serial, 200, flagged idempotent.
+    let second = app
+        .oneshot(
+            axum::http::Request::post("/v1/nodes/revoke-certificate")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["already_revoked"], true);
+
+    let repo = chv_controlplane_store::CertificateRevocationRepository::new(pool);
+    let rows = repo.list_for_node("node-revoke").await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "idempotent revocation must not duplicate rows"
+    );
+    assert_eq!(rows[0].certificate_serial, "serial-live");
+    assert_eq!(rows[0].revoked_by.as_deref(), Some("admin"));
 }
 
 /// Regression (CI webui container smoke, G3 round 1): the guest-agent

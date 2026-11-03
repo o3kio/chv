@@ -188,11 +188,18 @@ Certificate content rules:
    `localhost`/`127.0.0.1`-only certificate is insufficient for multi-host.
 4. EKUs are explicit. `keyUsage` is `digitalSignature` (+ `keyEncipherment`
    for RSA).
-5. Serial numbers are recorded in `nodes.certificate_serial` (already present)
-   and checked against a denylist on every new connection (the denylist is
-   new work in P1; it does not exist today). There is no CRL/OCSP
-   infrastructure in v1; short lifetimes plus the denylist are the
-   revocation story.
+5. Serial numbers are recorded in `nodes.certificate_serial` and checked against
+   the `node_certificate_revocations` denylist by the gRPC peer-identity
+   interceptor on every production mTLS request (#661). The table is the source
+   of truth; a startup-loaded, atomically refreshed in-memory snapshot keeps the
+   synchronous interceptor off the database hot path. Production startup fails
+   closed if the snapshot cannot be loaded. There is no CRL/OCSP infrastructure
+   in v1; short lifetimes plus the denylist are the revocation story. Revoking a
+   serial also burns rotation for it — the store's compare-and-swap refuses to
+   exchange a revoked serial for a new certificate — so the node must re-enroll.
+   Operators revoke through the admin-only `POST /v1/nodes/revoke-certificate`
+   route (`chvctl node revoke-certificate`); see
+   [`docs/runbooks/node-certificate-compromise.md`](../../runbooks/node-certificate-compromise.md).
 
 The CP MUST verify that the agent's server certificate chains to the node CA,
 carries `serverAuth`, and has `CN == expected node_id` for the endpoint being

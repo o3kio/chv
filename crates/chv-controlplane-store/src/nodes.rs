@@ -173,11 +173,21 @@ WHERE node_id = $1
 /// service checks the presented peer certificate serial before minting a new
 /// cert, and this conditional write closes the remaining race between that
 /// check and the commit.
+///
+/// A serial present in `node_certificate_revocations` never matches, even
+/// when it is still the recorded active serial: revoking a stolen certificate
+/// must also kill rotation, otherwise the thief could present the stolen
+/// certificate and walk away with a freshly minted, not-yet-revoked one.
+/// Callers see `Ok(false)` and must not hand out key material.
 const ROTATE_NODE_CERTIFICATE_SQL: &str = r#"
 UPDATE nodes SET
     certificate_serial = $3,
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
 WHERE node_id = $1 AND certificate_serial = $2
+  AND NOT EXISTS (
+      SELECT 1 FROM node_certificate_revocations
+      WHERE certificate_serial = $2
+  )
 "#;
 
 const UPSERT_BOOTSTRAP_RESULT_SQL: &str = r#"

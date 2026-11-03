@@ -5,6 +5,12 @@ use std::path::Path;
 use crate::auth::{require_admin, require_operator_or_admin, BearerToken};
 use crate::router::AppState;
 use crate::BffError;
+use chv_controlplane_store::{
+    CertificateRevocationRepository, EventAppendInput, RevokeCertificateInput,
+};
+use chv_controlplane_types::domain::{
+    ActorId, EventSeverity, EventType, NodeId, ResourceId, ResourceKind,
+};
 
 pub async fn list_nodes(
     BearerToken(_claims): BearerToken,
@@ -395,6 +401,169 @@ pub async fn enroll_node(
         } else {
             "No stale enrollment cache found. If the agent is not enrolling, ensure the bootstrap token is valid and restart the agent service."
         },
+    })))
+}
+
+/// `POST /v1/nodes/revoke-certificate` (admin only).
+///
+/// Adds the node certificate serial to the durable denylist checked by the
+/// gRPC peer-identity interceptor. Body:
+///
+/// ```json
+/// {"node_id":"node-a","certificate_serial":"0a3f7b2c","reason":"host compromise"}
+/// ```
+///
+/// `certificate_serial` is optional and defaults to the serial currently
+/// recorded for the node; operators should pass it explicitly when revoking a
+/// stale/previous certificate. `expires_at` (RFC 3339) is optional pruning
+/// metadata only — a row always denies its serial regardless of that value.
+///
+/// Idempotent: a repeat request for an already-revoked serial returns 200 with
+/// `already_revoked: true`, keeps the original reason/time/actor, and does not
+/// duplicate the audit event. Revoking also burns certificate rotation for the
+/// serial: the store's compare-and-swap refuses it, forcing re-enrollment.
+pub async fn revoke_node_certificate(
+    BearerToken(claims): BearerToken,
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, BffError> {
+    require_admin(&claims)?;
+
+    let node_id_text = payload
+        .get("node_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| BffError::BadRequest("node_id is required".into()))?;
+    let node_id = NodeId::new(node_id_text.to_string())
+        .map_err(|e| BffError::BadRequest(format!("invalid node_id: {e}")))?;
+
+    let reason = payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            BffError::BadRequest(
+                "reason is required: record why the certificate is being revoked".into(),
+            )
+        })?;
+    if reason.len() > 1024 {
+        return Err(BffError::BadRequest(
+            "reason must not exceed 1024 bytes".into(),
+        ));
+    }
+
+    let expires_at = payload
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(value) = expires_at {
+        chrono::DateTime::parse_from_rfc3339(value).map_err(|e| {
+            BffError::BadRequest(format!(
+                "expires_at must be RFC 3339, e.g. 2027-01-01T00:00:00Z: {e}"
+            ))
+        })?;
+    }
+
+    // Verify the node exists and resolve the default serial. A missing node is
+    // a 404 (likely a typo); a legacy row with no serial requires an explicit
+    // serial because guessing is not safe.
+    let recorded_serial = state.node_repo.get_certificate_serial(&node_id).await?;
+    let certificate_serial = match payload
+        .get("certificate_serial")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(serial) => serial.to_string(),
+        None => recorded_serial.clone().ok_or_else(|| {
+            BffError::BadRequest(format!(
+                "node {node_id} has no recorded certificate serial (legacy enrollment); \
+                 pass certificate_serial explicitly"
+            ))
+        })?,
+    };
+    if certificate_serial.len() > 256 {
+        return Err(BffError::BadRequest(
+            "certificate_serial must not exceed 256 bytes".into(),
+        ));
+    }
+
+    let repo = CertificateRevocationRepository::new(state.pool.clone());
+    let outcome = repo
+        .revoke(&RevokeCertificateInput {
+            certificate_serial: &certificate_serial,
+            node_id: node_id.as_str(),
+            reason,
+            revoked_by: Some(claims.username.as_str()),
+            revoked_at: None,
+            expires_at,
+        })
+        .await?;
+
+    // Audit trail: durable event plus the structured tracing target. Emit only
+    // on the first revocation so retries cannot inflate the journal. Both are
+    // best-effort because the security boundary (the denylist row) is already
+    // committed.
+    if !outcome.already_revoked {
+        tracing::warn!(
+            target: "audit",
+            user = %claims.username,
+            action = "revoke_node_certificate",
+            resource_kind = "node",
+            resource_id = %node_id,
+            certificate_serial = %certificate_serial,
+            reason = %reason,
+            "node certificate revoked"
+        );
+
+        let event = EventAppendInput {
+            occurred_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default(),
+            event_type: EventType::Audit,
+            severity: EventSeverity::Warning,
+            resource_kind: Some(ResourceKind::Node),
+            resource_id: ResourceId::new(node_id.as_str().to_string()).ok(),
+            node_id: Some(node_id.clone()),
+            operation_id: None,
+            actor_id: ActorId::new(claims.username.clone()).ok(),
+            requested_by: Some(claims.username.clone()),
+            correlation_id: None,
+            message: format!(
+                "node certificate revoked for {node_id} (serial {certificate_serial}): {reason}"
+            ),
+            details: Some(
+                json!({
+                    "certificate_serial": certificate_serial,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                })
+                .to_string(),
+            ),
+        };
+        if let Err(error) = state.event_repo.append(&event).await {
+            tracing::warn!(
+                %error,
+                node_id = %node_id,
+                "failed to append certificate-revocation audit event"
+            );
+        }
+    }
+
+    let revocation = outcome.revocation;
+    Ok(Json(json!({
+        "node_id": revocation.node_id,
+        "certificate_serial": revocation.certificate_serial,
+        "reason": revocation.reason,
+        "revoked_at": revocation.revoked_at,
+        "revoked_by": revocation.revoked_by,
+        "expires_at": revocation.expires_at,
+        "already_revoked": outcome.already_revoked,
+        "active_serial": recorded_serial,
     })))
 }
 
