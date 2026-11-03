@@ -18,7 +18,7 @@
 
 use chv_controlplane_service::{
     parse_node_id_from_der, EnrollmentServer, EnrollmentServiceImplementation, InsecurePeer,
-    IssuedCertificate, PeerIdentityInterceptor, PeerNodeId,
+    IssuedCertificate, PeerCertificateSerial, PeerIdentityInterceptor, PeerNodeId,
 };
 use chv_controlplane_store::{
     test_util::create_test_pool, BootstrapTokenRepository, NodeRepository, NodeUpsertInput,
@@ -105,6 +105,28 @@ fn request_with_peer<T>(payload: T, peer_node_id: &str) -> Request<T> {
     req
 }
 
+/// Production-shaped request: peer identity plus the serial of the leaf
+/// certificate the peer presented.
+fn request_with_peer_serial<T>(payload: T, peer_node_id: &str, serial: Option<&str>) -> Request<T> {
+    let mut req = request_with_peer(payload, peer_node_id);
+    req.extensions_mut()
+        .insert(PeerCertificateSerial(serial.map(str::to_string)));
+    req
+}
+
+fn rotate_payload(node_id: &str, operation_id: &str) -> proto::RotateNodeCertificateRequest {
+    proto::RotateNodeCertificateRequest {
+        meta: Some(proto::RequestMeta {
+            operation_id: operation_id.into(),
+            requested_by: "node-a".into(),
+            target_node_id: node_id.into(),
+            desired_state_version: "1".into(),
+            request_unix_ms: 0,
+        }),
+        node_id: node_id.into(),
+    }
+}
+
 // ---- regression tests for C1 + H1 -----------------------------------------
 
 /// C1 regression: a peer authenticated as `node-a` MUST NOT be able to rotate
@@ -148,12 +170,13 @@ async fn rotate_node_certificate_rejects_peer_node_id_mismatch() {
     );
 }
 
-/// Positive path: when the peer matches, rotation proceeds.
+/// Positive path: when the peer matches and presents the serial of its
+/// currently trusted certificate, rotation proceeds.
 #[tokio::test]
-async fn rotate_node_certificate_accepts_matching_peer() {
+async fn rotate_node_certificate_accepts_matching_peer_and_serial() {
     use proto::enrollment_service_server::EnrollmentService as _;
 
-    let (server, _repo) = build_enrollment_server().await;
+    let (server, repo) = build_enrollment_server().await;
 
     let payload = proto::RotateNodeCertificateRequest {
         meta: Some(proto::RequestMeta {
@@ -166,13 +189,115 @@ async fn rotate_node_certificate_accepts_matching_peer() {
         node_id: "node-a".into(),
     };
 
-    let req = request_with_peer(payload, "node-a");
+    let req = request_with_peer_serial(payload, "node-a", Some("old-serial"));
     let resp = server
         .rotate_node_certificate(req)
         .await
-        .expect("matching peer must succeed");
+        .expect("matching peer and serial must succeed");
     let body = resp.into_inner();
     assert!(!body.certificate_pem.is_empty());
+    assert_eq!(
+        repo.get_certificate_serial(&NodeId::new("node-a").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("stub-serial"),
+        "successful rotation must persist the newly issued serial"
+    );
+}
+
+/// Stale/foreign serial: the peer's node id matches, but the presented
+/// certificate is not the one the control plane currently trusts. This is the
+/// replay/old-cert case #661 closes: reject without minting or mutating.
+#[tokio::test]
+async fn rotate_node_certificate_rejects_stale_serial_without_mutation() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, repo) = build_enrollment_server().await;
+    let req = request_with_peer_serial(
+        rotate_payload("node-a", "op-stale"),
+        "node-a",
+        Some("stale-serial"),
+    );
+
+    let status = server
+        .rotate_node_certificate(req)
+        .await
+        .expect_err("stale serial must be rejected");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "stale serial must produce permission_denied; got: {} ({})",
+        status.code(),
+        status.message()
+    );
+    assert_eq!(
+        repo.get_certificate_serial(&NodeId::new("node-a").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-serial"),
+        "rejected rotation must leave the stored serial unchanged"
+    );
+}
+
+/// Production requests without a presented serial (no extension at all) must
+/// fail closed even when the node id matches.
+#[tokio::test]
+async fn rotate_node_certificate_rejects_missing_presented_serial() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, repo) = build_enrollment_server().await;
+    let req = request_with_peer(rotate_payload("node-a", "op-missing-serial"), "node-a");
+
+    let status = server
+        .rotate_node_certificate(req)
+        .await
+        .expect_err("missing presented serial must be rejected");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(
+        repo.get_certificate_serial(&NodeId::new("node-a").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-serial")
+    );
+}
+
+/// Explicit `None` serial (extension present but unrepresentable) is equally
+/// rejected in production.
+#[tokio::test]
+async fn rotate_node_certificate_rejects_none_presented_serial() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, _repo) = build_enrollment_server().await;
+    let req = request_with_peer_serial(rotate_payload("node-a", "op-none-serial"), "node-a", None);
+
+    let status = server
+        .rotate_node_certificate(req)
+        .await
+        .expect_err("None presented serial must be rejected");
+    assert_eq!(status.code(), Code::PermissionDenied);
+}
+
+/// A missing node row must still surface NotFound (not a serial/permission
+/// error) even when the request is otherwise production-shaped.
+#[tokio::test]
+async fn rotate_node_certificate_missing_node_returns_not_found() {
+    use proto::enrollment_service_server::EnrollmentService as _;
+
+    let (server, _repo) = build_enrollment_server().await;
+    let req = request_with_peer_serial(
+        rotate_payload("node-missing", "op-missing-node"),
+        "node-missing",
+        Some("any-serial"),
+    );
+
+    let status = server
+        .rotate_node_certificate(req)
+        .await
+        .expect_err("missing node must be rejected");
+    assert_eq!(status.code(), Code::NotFound);
 }
 
 /// H1 regression: bootstrap-result reports must also be peer-pinned. An
@@ -236,12 +361,13 @@ async fn rotate_node_certificate_rejects_when_peer_identity_missing() {
 
 /// Insecure-mode passthrough: when the request carries [`InsecurePeer`]
 /// (CHV_ALLOW_INSECURE=1 dev mode), peer verification is intentionally
-/// bypassed. Production deployments MUST NOT enable insecure mode.
+/// bypassed. Production deployments MUST NOT enable insecure mode, but the
+/// new serial is still recorded so dev/test rotation stays coherent.
 #[tokio::test]
 async fn rotate_node_certificate_insecure_mode_skips_check() {
     use proto::enrollment_service_server::EnrollmentService as _;
 
-    let (server, _repo) = build_enrollment_server().await;
+    let (server, repo) = build_enrollment_server().await;
 
     let payload = proto::RotateNodeCertificateRequest {
         meta: Some(proto::RequestMeta {
@@ -263,6 +389,14 @@ async fn rotate_node_certificate_insecure_mode_skips_check() {
         .expect("insecure mode must skip peer check");
     let body = resp.into_inner();
     assert!(!body.certificate_pem.is_empty());
+    assert_eq!(
+        repo.get_certificate_serial(&NodeId::new("node-a").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("stub-serial"),
+        "insecure rotation must still record the new serial"
+    );
 }
 
 /// Sanity: the cert parser used by the production interceptor recovers the

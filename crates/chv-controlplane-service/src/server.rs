@@ -1,7 +1,7 @@
 use crate::enrollment::EnrollmentService;
 use crate::inventory::InventoryService;
 use crate::lifecycle::LifecycleService;
-use crate::peer_identity::{verify_peer_matches, InsecurePeer, PeerNodeId};
+use crate::peer_identity::{verify_peer_matches, InsecurePeer, PeerCertificateSerial, PeerNodeId};
 use crate::reconcile::ReconcileService;
 use crate::telemetry::TelemetryService;
 use chv_controlplane_types::domain::NodeId;
@@ -116,10 +116,19 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             &request.get_ref().node_id,
             "rotate_node_certificate",
         )?;
+        // Read the peer certificate serial and security-mode marker before
+        // `into_inner()` consumes the request. In secure mode the serial is
+        // proof that the caller possesses the currently trusted certificate;
+        // in insecure/dev mode the marker preserves the existing bypass.
+        let presented_serial = request
+            .extensions()
+            .get::<PeerCertificateSerial>()
+            .and_then(|serial| serial.0.clone());
+        let allow_insecure = request.extensions().get::<InsecurePeer>().is_some();
         let _span = tracing::info_span!("rotate_node_certificate", %op_id);
         let resp = self
             .service
-            .rotate_node_certificate(request.into_inner())
+            .rotate_node_certificate(request.into_inner(), presented_serial, allow_insecure)
             .instrument(_span)
             .await
             .map_err(tonic::Status::from)?;

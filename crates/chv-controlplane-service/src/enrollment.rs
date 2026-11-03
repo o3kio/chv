@@ -58,9 +58,23 @@ pub trait EnrollmentService: Send + Sync {
         peer_addr: Option<SocketAddr>,
     ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError>;
 
+    /// Rotate a node's certificate.
+    ///
+    /// `presented_serial` is the serial of the mTLS leaf certificate the peer
+    /// actually presented (from [`crate::PeerCertificateSerial`]); in secure
+    /// mode it must match the serial currently recorded for the node. This is
+    /// the proof-of-possession check that prevents a compromised node holding
+    /// its own valid certificate from rotating another node's certificate, and
+    /// prevents replay with a stale certificate after a rotation.
+    ///
+    /// `allow_insecure` is the dev-mode (`CHV_ALLOW_INSECURE=1`) bypass. It
+    /// still records the new serial, but skips the presented/stored equality
+    /// check; it must never be set in production.
     async fn rotate_node_certificate(
         &self,
         request: proto::RotateNodeCertificateRequest,
+        presented_serial: Option<String>,
+        allow_insecure: bool,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError>;
 
     async fn report_bootstrap_result(
@@ -320,6 +334,8 @@ impl EnrollmentService for EnrollmentServiceImplementation {
     async fn rotate_node_certificate(
         &self,
         request: proto::RotateNodeCertificateRequest,
+        presented_serial: Option<String>,
+        allow_insecure: bool,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError> {
         let node_id = NodeId::new(request.node_id).map_err(|e| {
             ControlPlaneServiceError::InvalidArgument(format!("invalid node_id: {}", e))
@@ -329,17 +345,70 @@ impl EnrollmentService for EnrollmentServiceImplementation {
             .meta
             .ok_or_else(|| ControlPlaneServiceError::InvalidArgument("missing meta".into()))?;
 
-        // Issue new certificates
+        // Load the currently trusted serial before minting anything. A missing
+        // node is NotFound (not a proof-of-possession failure); an existing
+        // node with a NULL serial is a legacy row we cannot safely rotate.
+        let stored_serial = self.node_repo.get_certificate_serial(&node_id).await?;
+
+        if !allow_insecure {
+            let expected = stored_serial.as_deref().ok_or_else(|| {
+                ControlPlaneServiceError::FailedPrecondition(format!(
+                    "node {node_id} has no recorded certificate serial (legacy enrollment); \
+                     re-enroll the node before rotating its certificate"
+                ))
+            })?;
+            let presented = presented_serial.as_deref().ok_or_else(|| {
+                ControlPlaneServiceError::PermissionDenied(
+                    "certificate rotation requires proof of possession of the current node \
+                     certificate serial"
+                        .into(),
+                )
+            })?;
+            if presented != expected {
+                tracing::warn!(
+                    node_id = %node_id,
+                    presented_serial = %presented,
+                    "rejecting certificate rotation: presented serial does not match active serial"
+                );
+                return Err(ControlPlaneServiceError::PermissionDenied(
+                    "presented certificate serial does not match the node's active certificate; \
+                     re-enroll if the current certificate was lost"
+                        .into(),
+                ));
+            }
+        }
+
+        // Only now, after the proof-of-possession check, mint the new cert.
         let cert_issuer = self
             .cert_issuer
             .as_ref()
             .ok_or_else(|| ControlPlaneServiceError::Internal("CA not configured".into()))?;
         let cert = cert_issuer.issue_node_certificate(&node_id).await?;
 
-        // UPDATE STORE FIRST
-        self.node_repo
-            .update_certificate_serial(&node_id, &cert.serial)
-            .await?;
+        // Commit with a compare-and-swap against the serial we validated. If a
+        // concurrent rotation won the race, do not hand out this key material.
+        match stored_serial.as_deref() {
+            Some(expected) => {
+                if !self
+                    .node_repo
+                    .rotate_certificate_serial(&node_id, expected, &cert.serial)
+                    .await?
+                {
+                    return Err(ControlPlaneServiceError::Conflict(format!(
+                        "certificate rotation for node {node_id} lost a concurrent rotation \
+                         race; retry with the current certificate"
+                    )));
+                }
+            }
+            // Insecure/dev mode only: no stored serial to compare against
+            // (legacy row). Preserve the existing unconditional update so
+            // local development/tests keep working.
+            None => {
+                self.node_repo
+                    .update_certificate_serial(&node_id, &cert.serial)
+                    .await?;
+            }
+        }
 
         Ok(proto::RotateNodeCertificateResponse {
             result: Some(proto::ResultMeta {

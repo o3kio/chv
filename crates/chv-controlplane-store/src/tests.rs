@@ -166,6 +166,88 @@ async fn test_update_certificate_serial_missing_node() {
         other => panic!("Expected NotFound error for missing node, got {:?}", other),
     }
 }
+
+async fn seed_node_for_serial_test(repo: &NodeRepository, node_id: &NodeId, serial: Option<&str>) {
+    repo.upsert_node(&NodeUpsertInput {
+        node_id: node_id.clone(),
+        hostname: "host".into(),
+        display_name: node_id.to_string(),
+        certificate_serial: serial.map(str::to_string),
+        agent_version: None,
+        control_plane_version: None,
+        enrolled_unix_ms: 1000,
+        last_seen_unix_ms: 1000,
+    })
+    .await
+    .expect("seed node");
+}
+
+#[tokio::test]
+async fn test_get_certificate_serial_distinguishes_missing_node_from_null_serial() {
+    let test_db = TestDb::new().await;
+    let repo = NodeRepository::new(test_db.pool.clone());
+    let node_id = NodeId::new("node-serial-null").unwrap();
+
+    let missing = repo.get_certificate_serial(&node_id).await;
+    assert!(
+        matches!(missing, Err(StoreError::NotFound { .. })),
+        "missing node must be NotFound, got {missing:?}"
+    );
+
+    seed_node_for_serial_test(&repo, &node_id, None).await;
+    assert_eq!(
+        repo.get_certificate_serial(&node_id).await.unwrap(),
+        None,
+        "an existing legacy row with NULL serial is Ok(None)"
+    );
+
+    seed_node_for_serial_test(&repo, &node_id, Some("serial-a")).await;
+    assert_eq!(
+        repo.get_certificate_serial(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("serial-a")
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_serial_is_compare_and_swap() {
+    let test_db = TestDb::new().await;
+    let repo = NodeRepository::new(test_db.pool.clone());
+    let node_id = NodeId::new("node-serial-cas").unwrap();
+    seed_node_for_serial_test(&repo, &node_id, Some("serial-a")).await;
+
+    assert!(
+        !repo
+            .rotate_certificate_serial(&node_id, "stale", "serial-b")
+            .await
+            .unwrap(),
+        "stale expected serial must not update"
+    );
+    assert_eq!(
+        repo.get_certificate_serial(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("serial-a")
+    );
+
+    assert!(
+        repo.rotate_certificate_serial(&node_id, "serial-a", "serial-b")
+            .await
+            .unwrap(),
+        "matching expected serial must update"
+    );
+    assert_eq!(
+        repo.get_certificate_serial(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("serial-b")
+    );
+}
+
 #[tokio::test]
 async fn test_telemetry_missing_parent_node() {
     let test_db = TestDb::new().await;

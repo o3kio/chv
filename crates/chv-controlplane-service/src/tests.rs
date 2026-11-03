@@ -1104,11 +1104,207 @@ async fn test_rotate_certificate_missing_node() {
         }),
     };
 
-    let result = service.rotate_node_certificate(request).await;
+    let result = service.rotate_node_certificate(request, None, false).await;
     match result {
         Err(ControlPlaneServiceError::NotFound(_)) => { /* Correct */ }
         other => panic!("Expected NotFound error for missing node, got {:?}", other),
     }
+}
+
+fn rotate_certificate_request(node_id: &str) -> proto::RotateNodeCertificateRequest {
+    proto::RotateNodeCertificateRequest {
+        node_id: node_id.into(),
+        meta: Some(proto::RequestMeta {
+            operation_id: "op-rotate".into(),
+            requested_by: "test".into(),
+            target_node_id: node_id.into(),
+            desired_state_version: "1".into(),
+            request_unix_ms: 1000,
+        }),
+    }
+}
+
+async fn seed_node_with_certificate_serial(
+    repo: &NodeRepository,
+    node_id: &str,
+    serial: Option<&str>,
+) {
+    repo.upsert_node(&NodeUpsertInput {
+        node_id: NodeId::new(node_id).unwrap(),
+        hostname: "host".into(),
+        display_name: node_id.into(),
+        certificate_serial: serial.map(str::to_string),
+        agent_version: Some("0.1.0".into()),
+        control_plane_version: Some("0.1.0".into()),
+        enrolled_unix_ms: 1000,
+        last_seen_unix_ms: 1000,
+    })
+    .await
+    .expect("seed node");
+}
+
+async fn rotate_test_service() -> (EnrollmentServiceImplementation, NodeRepository) {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let node_repo = NodeRepository::new(test_db.pool.clone());
+    let token_repo = BootstrapTokenRepository::new(test_db.pool.clone());
+    let vtep_repo = VtepRepository::new(test_db.pool.clone());
+    let service = EnrollmentServiceImplementation::new(
+        node_repo.clone(),
+        token_repo,
+        Some(Arc::new(MockCertIssuer)),
+        vtep_repo,
+    );
+    (service, node_repo)
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_accepts_matching_presented_serial() {
+    let (service, node_repo) = rotate_test_service().await;
+    seed_node_with_certificate_serial(&node_repo, "node-rot", Some("old-serial")).await;
+
+    service
+        .rotate_node_certificate(
+            rotate_certificate_request("node-rot"),
+            Some("old-serial".into()),
+            false,
+        )
+        .await
+        .expect("matching serial must rotate");
+
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&NodeId::new("node-rot").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("mock-serial"),
+        "rotation must persist the newly issued serial"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_rejects_stale_presented_serial() {
+    let (service, node_repo) = rotate_test_service().await;
+    seed_node_with_certificate_serial(&node_repo, "node-rot", Some("old-serial")).await;
+
+    let result = service
+        .rotate_node_certificate(
+            rotate_certificate_request("node-rot"),
+            Some("stale-serial".into()),
+            false,
+        )
+        .await;
+
+    match result {
+        Err(ControlPlaneServiceError::PermissionDenied(msg)) => {
+            assert!(msg.contains("serial"), "got: {msg}");
+        }
+        other => panic!("expected PermissionDenied for stale serial, got {other:?}"),
+    }
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&NodeId::new("node-rot").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-serial"),
+        "a rejected rotation must not mutate the stored serial"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_rejects_missing_presented_serial() {
+    let (service, node_repo) = rotate_test_service().await;
+    seed_node_with_certificate_serial(&node_repo, "node-rot", Some("old-serial")).await;
+
+    let result = service
+        .rotate_node_certificate(rotate_certificate_request("node-rot"), None, false)
+        .await;
+
+    assert!(
+        matches!(result, Err(ControlPlaneServiceError::PermissionDenied(_))),
+        "missing presented serial must fail closed, got {result:?}"
+    );
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&NodeId::new("node-rot").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-serial")
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_rejects_legacy_null_serial() {
+    let (service, node_repo) = rotate_test_service().await;
+    seed_node_with_certificate_serial(&node_repo, "node-legacy", None).await;
+
+    let result = service
+        .rotate_node_certificate(
+            rotate_certificate_request("node-legacy"),
+            Some("any-serial".into()),
+            false,
+        )
+        .await;
+
+    match result {
+        Err(ControlPlaneServiceError::FailedPrecondition(msg)) => {
+            assert!(
+                msg.contains("re-enroll"),
+                "legacy-node error must tell the operator to re-enroll; got: {msg}"
+            );
+        }
+        other => panic!("expected FailedPrecondition for legacy NULL serial, got {other:?}"),
+    }
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&NodeId::new("node-legacy").unwrap())
+            .await
+            .unwrap(),
+        None,
+        "legacy NULL serial must not be bootstrapped by a rejected rotation"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_insecure_mode_succeeds_without_presented_serial() {
+    let (service, node_repo) = rotate_test_service().await;
+    seed_node_with_certificate_serial(&node_repo, "node-dev", Some("old-serial")).await;
+
+    service
+        .rotate_node_certificate(rotate_certificate_request("node-dev"), None, true)
+        .await
+        .expect("insecure/dev mode must preserve the bypass");
+
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&NodeId::new("node-dev").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("mock-serial")
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_insecure_mode_bootstraps_legacy_null_serial() {
+    let (service, node_repo) = rotate_test_service().await;
+    seed_node_with_certificate_serial(&node_repo, "node-dev-legacy", None).await;
+
+    service
+        .rotate_node_certificate(rotate_certificate_request("node-dev-legacy"), None, true)
+        .await
+        .expect("insecure/dev mode must still update a legacy NULL serial");
+
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&NodeId::new("node-dev-legacy").unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("mock-serial")
+    );
 }
 
 #[tokio::test]
@@ -1216,6 +1412,40 @@ async fn test_ca_backed_issuer_issuance() {
     // Verify signature
     leaf.verify_signature(Some(ca.public_key()))
         .expect("Certificate signature verification failed");
+}
+
+#[tokio::test]
+async fn test_ca_backed_issuer_serial_round_trips_through_peer_parser() {
+    // #661 proof-of-possession relies on the peer parser recovering the exact
+    // string that CaBackedCertificateIssuer stored at enrollment/rotation time.
+    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    let mut ca_params = CertificateParams::default();
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Test CA");
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+
+    let ca_key_pair = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
+    let issuer = CaBackedCertificateIssuer::new(&ca_cert.pem(), &ca_key_pair.serialize_pem())
+        .expect("create issuer");
+
+    let issued = issuer
+        .issue_node_certificate(&NodeId::new("node-serial-round-trip").unwrap())
+        .await
+        .expect("issue cert");
+
+    let (_, leaf_pem) =
+        x509_parser::prelude::parse_x509_pem(&issued.certificate_pem).expect("parse leaf PEM");
+    let parsed = crate::parse_serial_from_der(&leaf_pem.contents)
+        .expect("parse serial")
+        .expect("certificate must carry a textual serial");
+
+    assert_eq!(
+        parsed, issued.serial,
+        "parser must return the exact serial stored by CaBackedCertificateIssuer"
+    );
 }
 
 #[tokio::test]
