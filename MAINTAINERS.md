@@ -20,6 +20,15 @@ Access was verified on 2026-11-03 with
 `gh api repos/o3kio/chv/collaborators`; both accounts returned
 `role_name: admin`.
 
+**Organization ownership.** The `o3kio` organization has one owner,
+`@senolcolak`, who is also a maintainer. `@zoorpha` is a repository
+administrator but not an organization owner
+(`gh api 'orgs/o3kio/members?role=admin'` returns only `senolcolak`). Escalation
+paths that name "the organization owner" therefore have no independent actor
+if the sole owner is unavailable or conflicted; see the residual in
+[`GOVERNANCE.md`](GOVERNANCE.md#organization-owner-residual). Appointing a
+third, uninvolved organization owner is an open action.
+
 The areas column summarizes where work is visible in commit history. It is not
 a restriction on review authority: both maintainers are code owners for every
 path, and either may review any area.

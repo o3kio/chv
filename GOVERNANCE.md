@@ -285,13 +285,14 @@ the security rota are the mechanisms for adding coverage.
 - Security reports take priority over feature review when the rota primary is
   handling an active report.
 
-**Organization-owner residual.** The `o3kio` organization currently has one
-owner, `@senolcolak`, who is also a maintainer; `@zoorpha` is a repository
-administrator but not an organization owner. The escalation paths that name
-"the organization owner" therefore do not have an independent third party
-today. If the sole owner is unavailable or conflicted, use the GitHub Support
-organization-recovery path and record the incident; appointing a third,
-uninvolved organization owner is the durable fix.
+### Organization-owner residual
+
+The `o3kio` organization currently has one owner, `@senolcolak`, who is also a
+maintainer; `@zoorpha` is a repository administrator but not an organization
+owner. The escalation paths that name "the organization owner" therefore do
+not have an independent third party today. If the sole owner is unavailable or
+conflicted, use the GitHub Support organization-recovery path and record the
+incident; appointing a third, uninvolved organization owner is the durable fix.
 
 ### Break-glass access
 
