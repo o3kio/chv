@@ -954,7 +954,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.effective_agent_auth_token(),
         config.security.allow_insecure_agent_auth,
         config.security.agent_auth_allowed_peer_uids.clone(),
-    ));
+    ))
+    .with_allow_insecure_migration_dispatch(config.allow_insecure_migration_dispatch);
+    if config.allow_insecure_migration_dispatch {
+        tracing::warn!(
+            "SECURITY: allow_insecure_migration_dispatch = true — this agent will honor a \
+             control-plane request to dispatch disk migrations WITHOUT per-volume \
+             authorizations. Development-only; never run this in production"
+        );
+    }
     if let Some(owner) = &core_owner {
         agent_server = agent_server.with_core_authority(owner.authority());
     }

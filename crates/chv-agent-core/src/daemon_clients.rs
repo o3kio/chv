@@ -516,9 +516,18 @@ impl StordClient {
             .trigger_disk_migration(with_operation_id(req, operation_id))
             .instrument(span)
             .await
-            .map_err(|e| ChvError::BackendUnavailable {
-                backend: "stord".to_string(),
-                reason: e.to_string(),
+            .map_err(|e| match e.code() {
+                // Destination admission is a transient, retryable capacity
+                // signal. Keep it distinct from a transport/backend failure
+                // so the migration loop can back off and retry the trigger
+                // without consuming the (still unused) authorization token.
+                tonic::Code::ResourceExhausted => ChvError::ResourceExhausted {
+                    reason: e.message().to_string(),
+                },
+                _ => ChvError::BackendUnavailable {
+                    backend: "stord".to_string(),
+                    reason: e.to_string(),
+                },
             })?
             .into_inner();
         if let Some(ref result) = resp.result {

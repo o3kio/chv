@@ -65,8 +65,9 @@ production = true
 # CHV_MIGRATION_SIGNING_SECRET is the environment fallback.
 #
 # Development-only: dispatch disk migrations without tokens. NEVER enable in
-# production (destination stords must also opt in, and any CA-certified peer
-# could then create receiving volumes).
+# production (the source agent must also set
+# allow_insecure_migration_dispatch = true, the destination stords must opt in,
+# and any CA-certified peer could then create receiving volumes).
 #
 # allow_insecure_unauthenticated = true
 

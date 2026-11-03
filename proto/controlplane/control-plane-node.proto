@@ -708,6 +708,14 @@ message MigrationConfig {
   // TriggerDiskMigration and the destination stord verifies it before
   // creating the receiving volume.
   repeated MigrationVolumeAuthorization volume_authorizations = 6;
+  // Explicit development-only marker (issue #663): the control plane set
+  // migration.allow_insecure_unauthenticated and is intentionally
+  // dispatching without per-volume tokens. The source agent honors this
+  // ONLY when its own `allow_insecure_migration_dispatch` config gate is
+  // enabled; otherwise it refuses the migration. Never set in production:
+  // combined with the destination stord's matching flag, any CA-certified
+  // peer could create receiving volumes.
+  bool allow_insecure_unauthenticated = 7;
 }
 
 message MigrationVolumeAuthorization {

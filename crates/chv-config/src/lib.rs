@@ -617,22 +617,27 @@ pub struct StordMigrationConfig {
     #[serde(default)]
     pub allow_insecure_unauthenticated: bool,
     /// Maximum number of concurrently active inbound receiving migrations
-    /// on this stord (issue #663). Default 2. Rejected migrations never
-    /// reach `create_receiving_volume`.
+    /// **on this destination node** (issue #663). Default 16 (enough for a
+    /// VM with up to 16 attached volumes). The ceiling is aggregate across
+    /// all peers, not per VM. Rejected migrations never reach
+    /// `create_receiving_volume`.
     #[serde(default = "default_max_inflight_receiving")]
     pub max_inflight_receiving: usize,
     /// Maximum total bytes reserved by concurrently active inbound
-    /// receiving migrations on this stord (issue #663). Default 2 TiB.
+    /// receiving migrations **on this destination node** (issue #663).
+    /// Default 64 TiB; the sum of every stream's token-authorized size,
+    /// not a per-VM limit. Still a hard DoS bound on receiving-volume
+    /// creation.
     #[serde(default = "default_max_inflight_receiving_bytes")]
     pub max_inflight_receiving_bytes: u64,
 }
 
 fn default_max_inflight_receiving() -> usize {
-    2
+    16
 }
 
 fn default_max_inflight_receiving_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024 * 1024
+    64 * 1024 * 1024 * 1024 * 1024
 }
 
 impl Default for StordMigrationConfig {
@@ -851,6 +856,14 @@ pub struct AgentConfig {
     pub security: SecurityConfig,
     #[serde(default)]
     pub watchdog: BootWatchdogAgentConfig,
+    /// Development-only gate for the control plane's explicit tokenless
+    /// disk-migration marker (issue #663). The control plane must ALSO have
+    /// `migration.allow_insecure_unauthenticated = true`, the destination
+    /// stord must run its own insecure mode, and this agent must set this
+    /// flag; otherwise a volume with no per-volume authorization is refused
+    /// before `TriggerDiskMigration`. Never enable in production.
+    #[serde(default)]
+    pub allow_insecure_migration_dispatch: bool,
 }
 
 /// Node-level guest-liveness (boot) watchdog settings, from the agent
@@ -963,6 +976,7 @@ impl Default for AgentConfig {
             secrets: SecretsConfig::default(),
             security: SecurityConfig::default(),
             watchdog: BootWatchdogAgentConfig::default(),
+            allow_insecure_migration_dispatch: false,
         }
     }
 }
@@ -2934,15 +2948,16 @@ log_level = "info"
         assert_eq!(cfg.migration.server_key_path, None);
         assert_eq!(cfg.migration.client_ca_path, None);
         // Issue #663 defaults: no authorization material, fail-closed
-        // insecure flag off, conservative admission limits.
+        // insecure flag off, and aggregate per-destination-node admission
+        // limits sized for multi-volume VMs (16 streams / 64 TiB).
         assert_eq!(cfg.migration.node_id, None);
         assert_eq!(cfg.migration.signing_secret, None);
         assert_eq!(cfg.migration.signing_secret_file, None);
         assert!(!cfg.migration.allow_insecure_unauthenticated);
-        assert_eq!(cfg.migration.max_inflight_receiving, 2);
+        assert_eq!(cfg.migration.max_inflight_receiving, 16);
         assert_eq!(
             cfg.migration.max_inflight_receiving_bytes,
-            2 * 1024 * 1024 * 1024 * 1024
+            64 * 1024 * 1024 * 1024 * 1024
         );
 
         // With receiver fields set: every field round-trips as configured

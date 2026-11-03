@@ -142,6 +142,7 @@ impl MigrationConfig {
             pause_first: self.pause_first,
             // Transient dispatch data, never part of the persisted config.
             volume_authorizations: Vec::new(),
+            allow_insecure_unauthenticated: false,
         }
     }
 
@@ -840,6 +841,12 @@ pub async fn execute_migration(
         // written to the operation row/correlation_id.
         let mut dispatch_config = state.config.to_proto();
         dispatch_config.volume_authorizations = volume_authorizations;
+        // The tokenless marker is explicit and rides only the transient
+        // dispatch config. It is true only when this CP opted into the
+        // development bypass AND no tokens were minted (no secret); the
+        // source agent still requires its own opt-in gate.
+        dispatch_config.allow_insecure_unauthenticated =
+            allow_insecure_unauthenticated && dispatch_config.volume_authorizations.is_empty();
 
         let precopy_result = tokio::time::timeout(
             Duration::from_secs(timeouts.precopy_disk_secs),
@@ -2467,6 +2474,7 @@ mod tests {
             total_timeout_seconds: 7200,
             pause_first: true,
             volume_authorizations: Vec::new(),
+            allow_insecure_unauthenticated: false,
         };
         let config = MigrationConfig::from_proto(&proto_config);
 
@@ -2486,6 +2494,7 @@ mod tests {
             total_timeout_seconds: 0,
             pause_first: false,
             volume_authorizations: Vec::new(),
+            allow_insecure_unauthenticated: false,
         };
         let config = MigrationConfig::from_proto(&proto_config);
         let defaults = MigrationConfig::default();
@@ -2992,6 +3001,194 @@ mod tests {
         .await
         .expect("read migration");
         assert_eq!(round, 1);
+    }
+
+    /// Seed a VM plus attached volumes (`volumes` + `volume_desired_state`).
+    async fn seed_attached_volumes(pool: &StorePool, vm_id: &str, volumes: &[(&str, i64)]) {
+        sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES (?, ?)")
+            .bind(vm_id)
+            .bind(vm_id)
+            .execute(pool)
+            .await
+            .expect("insert vm");
+        for (volume_id, capacity_bytes) in volumes {
+            sqlx::query(
+                "INSERT INTO volumes (volume_id, display_name, capacity_bytes) VALUES (?, ?, ?)",
+            )
+            .bind(volume_id)
+            .bind(volume_id)
+            .bind(capacity_bytes)
+            .execute(pool)
+            .await
+            .expect("insert volume");
+            sqlx::query(
+                "INSERT INTO volume_desired_state \
+                 (volume_id, desired_generation, attached_vm_id) VALUES (?, 1, ?)",
+            )
+            .bind(volume_id)
+            .bind(vm_id)
+            .execute(pool)
+            .await
+            .expect("insert volume desired state");
+        }
+    }
+
+    fn migration_state_for(vm_id: &str) -> MigrationState {
+        MigrationState {
+            migration_id: "mig-authz".to_string(),
+            operation_id: "op-authz".to_string(),
+            vm_id: vm_id.to_string(),
+            source_node_id: "node-a".to_string(),
+            dest_node_id: "node-b".to_string(),
+            phase: MigrationPhase::Pending,
+            config: MigrationConfig::default(),
+            bytes_transferred: 0,
+            total_bytes: 0,
+            convergence_round: 0,
+            dirty_blocks_remaining: 0,
+        }
+    }
+
+    const TEST_MIGRATION_SECRET: &[u8] = b"test-migration-signing-secret-0123456789abcdef";
+
+    #[tokio::test]
+    async fn migration_authorizations_fail_closed_when_volumes_exist_and_no_secret() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_attached_volumes(&test_db.pool, "vm-authz", &[("vol-1", 4096)]).await;
+        let state = migration_state_for("vm-authz");
+
+        let result = build_migration_volume_authorizations(
+            &test_db.pool,
+            &state,
+            None,
+            DEFAULT_MIGRATION_TOKEN_TTL,
+            false,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ChvError::Unauthorized { .. })));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("signing secret"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn migration_authorizations_diskless_vm_is_empty_even_without_secret() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES ('vm-diskless', 'vm-diskless')")
+            .execute(&test_db.pool)
+            .await
+            .expect("insert vm");
+        let state = migration_state_for("vm-diskless");
+
+        let result = build_migration_volume_authorizations(
+            &test_db.pool,
+            &state,
+            None,
+            DEFAULT_MIGRATION_TOKEN_TTL,
+            false,
+        )
+        .await
+        .expect("no destination volume means nothing to authorize");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_authorizations_insecure_mode_returns_empty_only_when_explicitly_allowed() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_attached_volumes(&test_db.pool, "vm-insecure", &[("vol-1", 4096)]).await;
+        let state = migration_state_for("vm-insecure");
+
+        let result = build_migration_volume_authorizations(
+            &test_db.pool,
+            &state,
+            None,
+            DEFAULT_MIGRATION_TOKEN_TTL,
+            true,
+        )
+        .await
+        .expect("explicit insecure opt-in returns no tokens");
+        assert!(result.is_empty());
+    }
+
+    async fn minted_tokens_for(
+        state: &MigrationState,
+        ttl: Duration,
+    ) -> Vec<proto::MigrationVolumeAuthorization> {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_attached_volumes(
+            &test_db.pool,
+            &state.vm_id,
+            &[("vol-a", 4096), ("vol-b", 8192)],
+        )
+        .await;
+        build_migration_volume_authorizations(
+            &test_db.pool,
+            state,
+            Some(TEST_MIGRATION_SECRET),
+            ttl,
+            false,
+        )
+        .await
+        .expect("secret is configured")
+    }
+
+    #[tokio::test]
+    async fn migration_authorizations_bind_each_volume_and_normalize_zero_ttl() {
+        let state = migration_state_for("vm-tokens");
+        let tokens = minted_tokens_for(&state, Duration::ZERO).await;
+        assert_eq!(tokens.len(), 2, "one token per attached volume");
+        assert_eq!(tokens[0].volume_id, "vol-a");
+        assert_eq!(tokens[1].volume_id, "vol-b");
+
+        let first = MigrationTokenCodec::decode_claims_unverified(&tokens[0].token).unwrap();
+        let second = MigrationTokenCodec::decode_claims_unverified(&tokens[1].token).unwrap();
+        assert_eq!(first.source_node, state.source_node_id);
+        assert_eq!(first.destination_node, state.dest_node_id);
+        assert_eq!(first.volume_id, "vol-a");
+        assert_eq!(first.size_bytes, 4096);
+        assert_eq!(second.volume_id, "vol-b");
+        assert_eq!(second.size_bytes, 8192);
+        assert_ne!(
+            first.nonce, second.nonce,
+            "each volume gets an independent single-use nonce"
+        );
+        assert_eq!(
+            first.expires_at_unix_ms - first.issued_at_unix_ms,
+            DEFAULT_MIGRATION_TOKEN_TTL.as_millis() as i64,
+            "token_ttl_seconds = 0 must normalize to the 300 s default"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_authorizations_clamp_overlong_ttl_to_900_seconds() {
+        let state = migration_state_for("vm-long-ttl");
+        let tokens = minted_tokens_for(&state, Duration::from_secs(86_400)).await;
+        let claims = MigrationTokenCodec::decode_claims_unverified(&tokens[0].token).unwrap();
+        assert_eq!(
+            claims.expires_at_unix_ms - claims.issued_at_unix_ms,
+            MAX_MIGRATION_TOKEN_TTL.as_millis() as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_authorizations_reject_negative_capacity() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_attached_volumes(&test_db.pool, "vm-negative", &[("vol-negative", -1)]).await;
+        let state = migration_state_for("vm-negative");
+
+        let result = build_migration_volume_authorizations(
+            &test_db.pool,
+            &state,
+            Some(TEST_MIGRATION_SECRET),
+            DEFAULT_MIGRATION_TOKEN_TTL,
+            false,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ChvError::Internal { .. })));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("negative capacity"), "{message}");
+        assert!(message.contains("vol-negative"), "{message}");
     }
 
     #[tokio::test]

@@ -270,6 +270,23 @@ async fn invalid_tokens_are_rejected_before_volume_creation() {
             "{name} token must map to {expected_code:?}: {}",
             status.message()
         );
+        if name == "wrong-size" {
+            // MEDIUM-2: both the token-authorized size and the receiver's
+            // expected (backend) size must be visible to the operator.
+            let message = status.message();
+            assert!(
+                message.contains(&(BLOCK * 2).to_string()),
+                "expected token size in {message:?}"
+            );
+            assert!(
+                message.contains(&BLOCK.to_string()),
+                "expected receiver/backend size in {message:?}"
+            );
+            assert!(
+                message.contains("token authorizes") && message.contains("receiver/backend volume"),
+                "size diagnostic must name both sides: {message:?}"
+            );
+        }
         assert_no_volume(dir.path(), volume_id);
     }
 }

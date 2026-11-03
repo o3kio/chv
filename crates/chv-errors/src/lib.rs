@@ -29,6 +29,13 @@ pub enum ChvError {
     #[error("backend unavailable: {backend} — {reason}")]
     BackendUnavailable { backend: String, reason: String },
 
+    /// A downstream service refused the request because a capacity/admission
+    /// bound is currently full. Distinct from `QuotaExceeded` (a structured
+    /// per-resource quota) so callers can retry a transient admission
+    /// rejection without guessing from the message text.
+    #[error("resource exhausted: {reason}")]
+    ResourceExhausted { reason: String },
+
     #[error("network unavailable: {resource} — {reason}")]
     NetworkUnavailable { resource: String, reason: String },
 
@@ -73,6 +80,7 @@ impl ErrorCode {
     pub const ACCESS_DENIED: &str = "ACCESS_DENIED";
     pub const QUOTA_EXCEEDED: &str = "QUOTA_EXCEEDED";
     pub const BACKEND_UNAVAILABLE: &str = "BACKEND_UNAVAILABLE";
+    pub const RESOURCE_EXHAUSTED: &str = "RESOURCE_EXHAUSTED";
     pub const NETWORK_UNAVAILABLE: &str = "NETWORK_UNAVAILABLE";
     pub const UNIMPLEMENTED: &str = "UNIMPLEMENTED";
     pub const CONFLICT: &str = "CONFLICT";
@@ -93,6 +101,7 @@ impl ChvError {
             ChvError::AccessDenied { .. } => ErrorCode::ACCESS_DENIED,
             ChvError::QuotaExceeded { .. } => ErrorCode::QUOTA_EXCEEDED,
             ChvError::BackendUnavailable { .. } => ErrorCode::BACKEND_UNAVAILABLE,
+            ChvError::ResourceExhausted { .. } => ErrorCode::RESOURCE_EXHAUSTED,
             ChvError::NetworkUnavailable { .. } => ErrorCode::NETWORK_UNAVAILABLE,
             ChvError::Unimplemented { .. } => ErrorCode::UNIMPLEMENTED,
             ChvError::Conflict { .. } => ErrorCode::CONFLICT,
@@ -149,6 +158,9 @@ impl From<ChvError> for tonic::Status {
             )),
             ChvError::BackendUnavailable { backend, .. } => {
                 tonic::Status::unavailable(format!("{backend} unavailable"))
+            }
+            ChvError::ResourceExhausted { reason } => {
+                tonic::Status::resource_exhausted(reason.clone())
             }
             ChvError::ControlPlaneUnavailable { .. } => {
                 tonic::Status::unavailable("control plane unavailable")

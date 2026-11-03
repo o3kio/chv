@@ -348,7 +348,9 @@ fn load_migration_materials(
     )?;
     ensure_migration_half_configured(migration.enabled, client_tls.as_ref(), server_tls.as_ref())?;
     // Only reachable for a *clean* disabled section: `enabled = false`
-    // with any field set anywhere in the section already failed above.
+    // with any client/receiver *TLS* field set already failed above.
+    // Authorization/admission keys are not listener fields and remain
+    // inert here.
     if !migration.enabled {
         info!(
             "storage migration is disabled (migration.enabled = false): migration actions will be unavailable"
@@ -803,8 +805,8 @@ mod tests {
     fn migration_limits_reject_zero_and_accept_configured_values() {
         let mut migration = StordMigrationConfig::default();
         let defaults = load_migration_limits(&migration).expect("defaults must be valid");
-        assert!(defaults.max_inflight > 0);
-        assert!(defaults.max_inflight_bytes > 0);
+        assert_eq!(defaults.max_inflight, 16);
+        assert_eq!(defaults.max_inflight_bytes, 64 * 1024 * 1024 * 1024 * 1024);
 
         migration.max_inflight_receiving = 0;
         assert!(load_migration_limits(&migration)

@@ -100,8 +100,17 @@ pub enum MigrationAuthError {
     WrongDestination,
     #[error("migration authorization is for a different volume")]
     WrongVolume,
-    #[error("migration authorization is for a different volume size")]
-    WrongSize,
+    #[error(
+        "migration authorization size mismatch: token authorizes {token_size_bytes} bytes, \
+         receiver/backend volume is {expected_size_bytes} bytes"
+    )]
+    WrongSize {
+        /// Size the receiver was asked to create (and the source's backend
+        /// reports for the volume).
+        expected_size_bytes: u64,
+        /// Size bound into the token by the control plane.
+        token_size_bytes: u64,
+    },
     #[error("migration signing secret is too short (minimum {MIN_MIGRATION_SIGNING_SECRET_BYTES} bytes)")]
     SecretTooShort,
     #[error("migration authorization is not configured on this receiver")]
@@ -223,6 +232,26 @@ impl MigrationTokenCodec {
         self.verify_at(token, expected, now_unix_ms())
     }
 
+    /// Decode the claims without checking the HMAC.
+    ///
+    /// **Diagnostics only.** The returned claims are unauthenticated and
+    /// must never authorize a migration. The source stord uses this for a
+    /// best-effort size cross-check before opening the peer stream; the
+    /// destination still performs the full signature/claim verification.
+    /// Structure (prefix, hex, JSON, version) is still validated so a
+    /// malformed token is distinguishable from a genuine size mismatch.
+    pub fn decode_claims_unverified(
+        token: &str,
+    ) -> Result<MigrationAuthorizationClaims, MigrationAuthError> {
+        let (payload, _) = split_token(token)?;
+        let claims: MigrationAuthorizationClaims =
+            serde_json::from_slice(&payload).map_err(|_| MigrationAuthError::Malformed)?;
+        if claims.version != MIGRATION_AUTH_TOKEN_VERSION {
+            return Err(MigrationAuthError::UnsupportedVersion);
+        }
+        Ok(claims)
+    }
+
     /// Verify at an explicit time (deterministic tests).
     pub fn verify_at(
         &self,
@@ -234,16 +263,11 @@ impl MigrationTokenCodec {
         if claims.version != MIGRATION_AUTH_TOKEN_VERSION {
             return Err(MigrationAuthError::UnsupportedVersion);
         }
-        if claims.destination_node != expected.destination_node {
-            return Err(MigrationAuthError::WrongDestination);
-        }
-        if claims.volume_id != expected.volume_id {
-            return Err(MigrationAuthError::WrongVolume);
-        }
-        if claims.size_bytes != expected.size_bytes {
-            return Err(MigrationAuthError::WrongSize);
-        }
 
+        // Time validity is checked before the claim bindings: an expired or
+        // not-yet-valid token is diagnosed as such even if its destination/
+        // volume/size also happen to be wrong. This is purely diagnostic
+        // ordering — every check must pass either way.
         let now = now_unix_ms;
         if claims.expires_at_unix_ms <= now {
             return Err(MigrationAuthError::Expired);
@@ -260,6 +284,20 @@ impl MigrationTokenCodec {
         if lifetime_ms <= 0 || lifetime_ms > max_ms {
             return Err(MigrationAuthError::InvalidLifetime);
         }
+
+        if claims.destination_node != expected.destination_node {
+            return Err(MigrationAuthError::WrongDestination);
+        }
+        if claims.volume_id != expected.volume_id {
+            return Err(MigrationAuthError::WrongVolume);
+        }
+        if claims.size_bytes != expected.size_bytes {
+            return Err(MigrationAuthError::WrongSize {
+                expected_size_bytes: expected.size_bytes,
+                token_size_bytes: claims.size_bytes,
+            });
+        }
+
         Ok(claims)
     }
 
@@ -294,18 +332,7 @@ impl MigrationTokenCodec {
         &self,
         token: &str,
     ) -> Result<MigrationAuthorizationClaims, MigrationAuthError> {
-        if token.is_empty() {
-            return Err(MigrationAuthError::Missing);
-        }
-        let mut parts = token.split('.');
-        let prefix = parts.next().ok_or(MigrationAuthError::Malformed)?;
-        let payload_hex = parts.next().ok_or(MigrationAuthError::Malformed)?;
-        let signature_hex = parts.next().ok_or(MigrationAuthError::Malformed)?;
-        if parts.next().is_some() || prefix != TOKEN_PREFIX {
-            return Err(MigrationAuthError::Malformed);
-        }
-        let payload = hex::decode(payload_hex).map_err(|_| MigrationAuthError::Malformed)?;
-        let signature = hex::decode(signature_hex).map_err(|_| MigrationAuthError::Malformed)?;
+        let (payload, signature) = split_token(token)?;
 
         let mut mac = HmacSha256::new_from_slice(&self.key)
             .map_err(|_| MigrationAuthError::SecretTooShort)?;
@@ -325,6 +352,26 @@ impl MigrationTokenCodec {
         mac.update(payload);
         mac.finalize().into_bytes().to_vec()
     }
+}
+
+/// Split and hex-decode the `v1.<payload>.<signature>` wire form.
+///
+/// Shared by signed verification and the source-side unverified diagnostic
+/// decode so both reject the same malformed shapes.
+fn split_token(token: &str) -> Result<(Vec<u8>, Vec<u8>), MigrationAuthError> {
+    if token.is_empty() {
+        return Err(MigrationAuthError::Missing);
+    }
+    let mut parts = token.split('.');
+    let prefix = parts.next().ok_or(MigrationAuthError::Malformed)?;
+    let payload_hex = parts.next().ok_or(MigrationAuthError::Malformed)?;
+    let signature_hex = parts.next().ok_or(MigrationAuthError::Malformed)?;
+    if parts.next().is_some() || prefix != TOKEN_PREFIX {
+        return Err(MigrationAuthError::Malformed);
+    }
+    let payload = hex::decode(payload_hex).map_err(|_| MigrationAuthError::Malformed)?;
+    let signature = hex::decode(signature_hex).map_err(|_| MigrationAuthError::Malformed)?;
+    Ok((payload, signature))
 }
 
 fn now_unix_ms() -> i64 {
@@ -519,7 +566,76 @@ mod tests {
             codec
                 .verify_at(&token, expectation("node-dst", "vol-1", 8192), now)
                 .unwrap_err(),
-            MigrationAuthError::WrongSize
+            MigrationAuthError::WrongSize {
+                expected_size_bytes: 8192,
+                token_size_bytes: 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn expired_token_is_reported_before_claim_mismatches() {
+        // LOW-5: an expired token that also names the wrong volume/size must
+        // be diagnosable as expired first, so operators do not chase a
+        // volume/size mismatch when the real problem is clock/TTL.
+        let codec = codec();
+        let now = 1_700_000_000_000;
+        let token = codec
+            .mint_at(
+                "node-src",
+                "node-dst",
+                "vol-1",
+                4096,
+                now,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            codec
+                .verify_at(
+                    &token,
+                    expectation("node-other", "vol-other", 9999),
+                    now + 60_000
+                )
+                .unwrap_err(),
+            MigrationAuthError::Expired
+        );
+    }
+
+    #[test]
+    fn unverified_decode_is_diagnostic_only_and_rejects_malformed_input() {
+        let codec = codec();
+        let now = 1_700_000_000_000;
+        let token = codec
+            .mint_at(
+                "node-src",
+                "node-dst",
+                "vol-1",
+                4096,
+                now,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let claims = MigrationTokenCodec::decode_claims_unverified(&token).unwrap();
+        assert_eq!(claims.volume_id, "vol-1");
+        assert_eq!(claims.size_bytes, 4096);
+
+        // A tampered signature still decodes (no HMAC check) — which is
+        // exactly why callers may use it only for diagnostics, never
+        // authorization.
+        let mut parts: Vec<String> = token.split('.').map(str::to_string).collect();
+        let mut signature = hex::decode(&parts[2]).unwrap();
+        signature[0] ^= 0x80;
+        parts[2] = hex::encode(signature);
+        assert!(MigrationTokenCodec::decode_claims_unverified(&parts.join(".")).is_ok());
+
+        assert_eq!(
+            MigrationTokenCodec::decode_claims_unverified("").unwrap_err(),
+            MigrationAuthError::Missing
+        );
+        assert_eq!(
+            MigrationTokenCodec::decode_claims_unverified("not-a-token").unwrap_err(),
+            MigrationAuthError::Malformed
         );
     }
 

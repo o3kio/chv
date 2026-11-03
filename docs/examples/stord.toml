@@ -57,15 +57,18 @@ device_allowlist = ["/dev/dm-*", "/dev/mapper/*"]
 # signing_secret       = "..."                                 # inline alternative, >= 32 bytes
 # CHV_MIGRATION_SIGNING_SECRET is the environment fallback.
 #
-# Per-node back-pressure for inbound migrations. Both must be > 0; a zero
-# aborts startup rather than meaning "unlimited". Capacity is released when
-# the stream closes.
+# Per-destination-node aggregate back-pressure for inbound migrations. These
+# are NOT per-VM limits: the count covers every concurrent receiving stream on
+# this node and the byte budget sums each stream's token-authorized size. Both
+# must be > 0; a zero aborts startup rather than meaning "unlimited". Capacity
+# is released when the stream closes (or after the 300 s receiver idle timeout).
 #
-# max_inflight_receiving       = 2                                  # concurrent receivers
-# max_inflight_receiving_bytes = 2199023255552                      # total reserved bytes (2 TiB)
+# max_inflight_receiving       = 16                                 # concurrent receivers (node-wide)
+# max_inflight_receiving_bytes = 70368744177664                     # total reserved bytes (64 TiB)
 #
 # Development-only escape hatch. NEVER enable in production: any
-# CA-certified peer could create receiving volumes.
+# CA-certified peer could create receiving volumes. The control plane and the
+# source agent must also opt in.
 #
 # allow_insecure_unauthenticated = true
 #

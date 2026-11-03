@@ -264,15 +264,18 @@ startup error, never a plaintext or skipped-verify fallback.
 | migration.node_id | receiver enabled and authorization not explicitly disabled | This stord's node id; must match the token's `destination_node` claim and the owning agent's node id |
 | migration.signing_secret | alternative to `signing_secret_file` | Dedicated migration HMAC secret (≥ 32 bytes), never the JWT/enrollment secret. Prefer the file form |
 | migration.signing_secret_file | required for a receiver unless `signing_secret`/`CHV_MIGRATION_SIGNING_SECRET` is set | File containing the dedicated migration-signing secret (trimmed), root:chv 0640 |
-| migration.allow_insecure_unauthenticated | development only | Explicit bypass: inbound streams need no token. Default false = fail closed; logged loudly. The control plane needs its matching flag to dispatch without tokens |
-| migration.max_inflight_receiving | no (default 2) | Max concurrent inbound receiving migrations. Zero aborts startup |
-| migration.max_inflight_receiving_bytes | no (default 2 TiB) | Max total bytes reserved by concurrent inbound receiving migrations. Zero aborts startup |
+| migration.allow_insecure_unauthenticated | development only | Explicit bypass: inbound streams need no token. Default false = fail closed; logged loudly. The control plane needs its matching flag to dispatch without tokens, and the source agent needs `allow_insecure_migration_dispatch = true` |
+| migration.max_inflight_receiving | no (default 16) | Per-destination-node aggregate max concurrent inbound receiving migrations. Zero aborts startup |
+| migration.max_inflight_receiving_bytes | no (default 64 TiB / 70,368,744,177,664 bytes) | Per-destination-node aggregate max total bytes reserved by concurrent inbound receiving migrations. Zero aborts startup |
 
 Fail-closed gating rules (issues #390, #395, #401, #663):
 
 - `enabled = false` with **any** client identity field set → startup error
-- `enabled = false` with **any** receiver field set → startup error (an
-  operator who believes migration is off must not get an inbound TCP listener)
+- `enabled = false` with **any** receiver TLS field set
+  (`listen_addr`, `server_cert_path`, `server_key_path`, `client_ca_path`) →
+  startup error (an operator who believes migration is off must not get an
+  inbound TCP listener). Authorization/admission keys are not listener
+  fields and remain inert while `enabled = false`
 - `enabled = true` with **no** client fields → destination-only stord: no
   client identity, outbound migration actions fail with a
   `failed_precondition` error (issue #401). The client half is
@@ -307,7 +310,13 @@ compromise the other.
 | migration.signing_secret | alternative to `signing_secret_file` | Dedicated HMAC secret (≥ 32 bytes) used to mint per-volume tokens |
 | migration.signing_secret_file | yes for production disk migration | File containing the dedicated secret (trimmed). Mutually exclusive with `signing_secret` |
 | migration.token_ttl_seconds | no (default 300) | Minted token lifetime; clamped to the receiver's 900 s maximum |
-| migration.allow_insecure_unauthenticated | development only | Dispatch disk migrations without minting tokens. Default false: a VM with attached volumes and no secret fails closed before the agent is contacted |
+| migration.allow_insecure_unauthenticated | development only | Dispatch disk migrations without minting tokens. Default false: a VM with attached volumes and no secret fails closed before the agent is contacted. The source agent must also set `allow_insecure_migration_dispatch = true`, and the destination stord must run its own insecure mode |
+
+The source agent's `allow_insecure_migration_dispatch` (default `false`) is a
+second, independent gate on the explicit tokenless marker carried in
+`MigrateVm`. A control plane that asks for tokenless dispatch while the agent
+gate is off gets a `FAILED_PRECONDITION` before any `TriggerDiskMigration`;
+the agent never silently falls back to an unauthenticated receiver.
 
 `CHV_MIGRATION_SIGNING_SECRET` is the fallback when neither secret config key
 is set. Missing secret at CP startup is allowed (a deployment that never

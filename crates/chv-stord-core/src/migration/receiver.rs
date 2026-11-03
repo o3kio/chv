@@ -10,6 +10,14 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_ACK_INTERVAL: u32 = 64;
 
+/// Maximum time the receiver will wait for the next message from an
+/// authorized peer before closing the stream. Without this, a peer that
+/// completes authorization and then stalls (or vanishes without a TCP reset)
+/// could pin its admission slot indefinitely. Bulk copy sends continuously,
+/// so 5 minutes is far longer than any healthy inter-message gap; a stalled
+/// stream is failed and its RAII reservation released.
+pub const RECEIVER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Drives the destination side of a storage migration.
 ///
 /// The receiver is created when an incoming stream starts with InitMigration.
@@ -98,11 +106,25 @@ impl<B: StorageBackend> MigrationReceiver<B> {
         tx: &mpsc::Sender<MigrationMessage>,
     ) -> Result<(), tonic::Status> {
         loop {
-            let msg = match inbound.message().await? {
-                Some(m) => m,
-                None => {
-                    info!(volume_id = %self.volume_id, "inbound stream closed");
-                    break;
+            let msg = match tokio::time::timeout(RECEIVER_IDLE_TIMEOUT, inbound.message()).await {
+                Ok(result) => match result? {
+                    Some(m) => m,
+                    None => {
+                        info!(volume_id = %self.volume_id, "inbound stream closed");
+                        break;
+                    }
+                },
+                Err(_) => {
+                    warn!(
+                        volume_id = %self.volume_id,
+                        idle_timeout_secs = RECEIVER_IDLE_TIMEOUT.as_secs(),
+                        "migration receiver idle timeout: closing stalled authorized stream"
+                    );
+                    return Err(tonic::Status::deadline_exceeded(format!(
+                        "migration receiver idle for {}s with no message from peer; \
+                         closing stream and releasing its admission slot",
+                        RECEIVER_IDLE_TIMEOUT.as_secs()
+                    )));
                 }
             };
 

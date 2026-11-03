@@ -1,6 +1,7 @@
 use crate::migration::sender::{start_migration_to_peer, MigrationTlsConfig};
 use crate::migration::task::{MigrationPhase, MigrationTask, MigrationTaskTable};
 use crate::session::{Session, SessionTable};
+use chv_common::migration_auth::MigrationTokenCodec;
 use chv_common::types::{BackendLocator, DevicePolicy};
 use chv_errors::{ChvError, ErrorCode};
 use chv_observability::{operation_span, Metrics};
@@ -1272,6 +1273,60 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
         {
             let mut state = task.state.write().await;
             state.total_bytes = volume_size;
+        }
+
+        // Issue #663 MEDIUM-2: best-effort source-side cross-check. The
+        // destination is the authority (it verifies the HMAC), but decoding
+        // the already-minted token here catches a size mismatch before we
+        // open the peer stream and lets the operator see both numbers. The
+        // claims are NOT trusted — this is diagnostics only.
+        if !req.migration_authorization.is_empty() {
+            match MigrationTokenCodec::decode_claims_unverified(&req.migration_authorization) {
+                Ok(claims) if claims.size_bytes != volume_size => {
+                    return Ok(Response::new(proto::TriggerDiskMigrationResponse {
+                        result: Some(
+                            ChvError::InvalidArgument {
+                                field: "migration_authorization".to_string(),
+                                reason: format!(
+                                    "size mismatch for volume {}: token authorizes {} bytes, \
+                                     source backend reports {} bytes; refusing to start a \
+                                     migration the destination would reject",
+                                    req.volume_id, claims.size_bytes, volume_size
+                                ),
+                            }
+                            .to_proto_result(),
+                        ),
+                        migration_id: String::new(),
+                        pause_first: false,
+                    }));
+                }
+                Ok(claims) if claims.volume_id != req.volume_id => {
+                    return Ok(Response::new(proto::TriggerDiskMigrationResponse {
+                        result: Some(
+                            ChvError::InvalidArgument {
+                                field: "migration_authorization".to_string(),
+                                reason: format!(
+                                    "volume mismatch: token authorizes {:?}, trigger is for {:?}",
+                                    claims.volume_id, req.volume_id
+                                ),
+                            }
+                            .to_proto_result(),
+                        ),
+                        migration_id: String::new(),
+                        pause_first: false,
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Malformed/older tokens are left for the destination's
+                    // full verifier to reject with the authoritative error.
+                    tracing::warn!(
+                        volume_id = %req.volume_id,
+                        error = %error,
+                        "could not preflight-decode migration authorization; destination will verify"
+                    );
+                }
+            }
         }
 
         // Ensure dirty tracking is enabled before the sender reads the

@@ -186,6 +186,11 @@ pub struct AgentServer {
     /// Inbound control-plane authentication (#662). Deny-all until
     /// production wiring calls [`AgentServer::with_agent_auth`].
     pub auth: AgentAuth,
+    /// Development-only gate for the control plane's explicit tokenless
+    /// disk-migration marker (issue #663). Default false; set via
+    /// [`AgentServer::with_allow_insecure_migration_dispatch`] from the
+    /// agent config.
+    pub allow_insecure_migration_dispatch: bool,
 }
 
 impl AgentServer {
@@ -211,12 +216,22 @@ impl AgentServer {
             )),
             core_authority: None,
             auth: AgentAuth::deny_all(),
+            allow_insecure_migration_dispatch: false,
         }
     }
 
     /// Install the inbound control-plane authentication policy (#662).
     pub fn with_agent_auth(mut self, auth: AgentAuth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Enable the explicit, development-only tokenless migration dispatch
+    /// path (issue #663). This is a second gate on top of the control
+    /// plane's marker: production deployments leave it false, so a missing
+    /// per-volume token is always refused before stord is contacted.
+    pub fn with_allow_insecure_migration_dispatch(mut self, enabled: bool) -> Self {
+        self.allow_insecure_migration_dispatch = enabled;
         self
     }
 
@@ -3425,11 +3440,31 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     })
                     .unwrap_or_default();
 
+                // Issue #663 MEDIUM-1: the control plane's explicit
+                // tokenless marker is honored only when this agent's own
+                // development gate is also on. A CP that (wrongly) asks for
+                // tokenless dispatch against a production agent fails here,
+                // before any volume is handed to stord.
+                let cp_requested_insecure = inner
+                    .config
+                    .as_ref()
+                    .is_some_and(|c| c.allow_insecure_unauthenticated);
+                if cp_requested_insecure && !self.allow_insecure_migration_dispatch {
+                    return Err(Status::failed_precondition(
+                        "control plane requested a tokenless disk migration \
+                         (allow_insecure_unauthenticated = true) but this agent has \
+                         allow_insecure_migration_dispatch = false; refusing the migration",
+                    ));
+                }
+                let allow_insecure_unauthenticated =
+                    cp_requested_insecure && self.allow_insecure_migration_dispatch;
+
                 let disk_config = crate::migration::DiskPrecopyConfig {
                     stord_socket: self.stord_socket.clone(),
                     dest_stord_endpoint,
                     volumes,
                     volume_authorizations,
+                    allow_insecure_unauthenticated,
                     // Issue #394 Option C: the operator's opt-in
                     // stop-the-world mode. The config message's tuning
                     // fields remain defaults-only (0 = "use stord's

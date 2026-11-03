@@ -266,6 +266,7 @@ impl MutationService for ControlPlaneMutationService {
                     // Minted later by the orchestrator, immediately before
                     // dispatching to the source agent (issue #663).
                     volume_authorizations: Vec::new(),
+                    allow_insecure_unauthenticated: false,
                 }),
             })
             .await;

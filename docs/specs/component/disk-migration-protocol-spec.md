@@ -159,24 +159,49 @@ the nonce (the token may be retried after capacity is released). Tokens are
 transient dispatch data and are never persisted in operations rows,
 migration records, or `correlation_id`.
 
+The replay cache is **memory-only** and bounded by token TTL: it is not
+persisted across a stord restart, and each entry is purged once its token
+expires (lazily on the next admission). A restart therefore loses replay
+history, but the 900 s maximum token lifetime bounds the exposure — a token
+can never be replayed after it expires regardless of cache state.
+
+A receiver that has authorized a peer but then sees no message closes the
+stream after a 300 s idle timeout (`RECEIVER_IDLE_TIMEOUT`), releasing its
+admission slot. Without that bound a stalled authorized peer could pin a
+slot until TCP eventually gave up.
+
+`source_node` is signed but is **not** compared against the TLS peer
+certificate identity. It is defense-in-depth metadata only; the enforced
+authorization boundary is the signed destination node, volume, size, expiry,
+and single-use nonce. A stolen token is therefore usable by any
+CA-certified peer until it expires or is consumed.
+
 A receiver with no valid authorization material **fails closed**:
 `DenyAll` rejects every inbound stream. `DisabledInsecure` is reachable only
 with the explicit development-only `migration.allow_insecure_unauthenticated
 = true` and is loudly logged at startup. The control plane likewise refuses
 to dispatch a disk migration when attached volumes exist and no signing
-secret is configured, unless its own insecure flag is explicitly set.
+secret is configured, unless its own insecure flag is explicitly set; even
+then the source agent refuses the tokenless dispatch unless
+`allow_insecure_migration_dispatch = true` in its own config, and the
+destination stord must also be in insecure mode.
 
 ### Admission limits
 
-Each stord bounds inbound migrations independently of the token:
+Each destination stord bounds inbound migrations independently of the token:
 
-- `migration.max_inflight_receiving` (default **2**)
-- `migration.max_inflight_receiving_bytes` (default **2 TiB**)
+- `migration.max_inflight_receiving` (default **16**)
+- `migration.max_inflight_receiving_bytes` (default **64 TiB**, i.e. 70,368,744,177,664 bytes)
 
-Both are checked before volume creation and must be non-zero (zero aborts
-startup rather than meaning "unlimited"). The byte budget counts the
-token-authorized size for every active stream; over-limit streams get
-`RESOURCE_EXHAUSTED` and create nothing.
+These are **per-destination-node aggregate** ceilings, not per-VM limits: the
+count covers every concurrent receiving stream on the node, and the byte
+budget is the sum of each stream's token-authorized `size_bytes`. The default
+16 admits a VM with up to 16 attached volumes; the 64 TiB byte budget keeps a
+single node from accepting more than 64 TiB of concurrently receiving volume
+storage. Both are checked before volume creation and must be non-zero (zero
+aborts startup rather than meaning "unlimited"). Over-limit streams get
+`RESOURCE_EXHAUSTED` and create nothing; the token is not consumed, so the
+source may retry after capacity is released.
 
 ## Protocol Phases
 
@@ -192,7 +217,7 @@ Source                          Destination
   │◄────────────────────────────────│
 ```
 
-- Source sends: `volume_id`, `size_bytes`, `block_size` (4 MiB), `format` (always `"raw"` today), `checksum_type` (always `"crc32"`), and the per-volume control-plane `authorization` token (`crates/chv-stord-core/src/migration/sender.rs`). A missing token is an error at the agent before the trigger; stord then rejects the stream.
+- Source sends: `volume_id`, `size_bytes`, `block_size` (4 MiB), `format` (always `"raw"` today), `checksum_type` (always `"crc32"`), and the per-volume control-plane `authorization` token (`crates/chv-stord-core/src/migration/sender.rs`). A missing token is an error at the agent before the trigger, except in the explicit development-only triple-gated insecure mode; stord then rejects the stream unless the destination is also in that mode.
 - The sender sends `InitMigration` **before** awaiting the stream response: the tonic client future resolves only when the server sends response headers, and the server sends them only after it has read the first message, authorized it, and created the receiving volume (`crates/chv-stord-core/src/migration/sender.rs`)
 - Dest validates before creating anything (`crates/chv-stord-core/src/migration/service.rs`):
   - `size_bytes` ≤ 16 TiB (`MAX_MIGRATION_SIZE_BYTES`)
@@ -510,9 +535,9 @@ TLS. All validation is fail-closed at startup
 | migration.node_id | receiver enabled and authorization not explicitly disabled | This stord's node id; the token's `destination_node` claim must match it. Must equal the owning agent's node id |
 | migration.signing_secret | alternative to `signing_secret_file` | Dedicated migration HMAC secret (≥ 32 bytes). Prefer the file form; never the JWT/enrollment secret. Never logged |
 | migration.signing_secret_file | required for a receiver unless `signing_secret`/`CHV_MIGRATION_SIGNING_SECRET` is set | File containing the dedicated migration-signing secret (trimmed). Mutually exclusive with `signing_secret`; root:chv 0640 |
-| migration.allow_insecure_unauthenticated | development only | Explicit bypass: inbound streams need no token. Default false = fail closed. Requires the control plane's matching flag to dispatch without tokens; logged loudly |
-| migration.max_inflight_receiving | no (default 2) | Maximum concurrent inbound receiving migrations on this node. Zero aborts startup |
-| migration.max_inflight_receiving_bytes | no (default 2 TiB) | Maximum total bytes reserved by concurrent inbound receiving migrations. Zero aborts startup |
+| migration.allow_insecure_unauthenticated | development only | Explicit bypass: inbound streams need no token. Default false = fail closed. Requires the control plane's matching flag and the source agent's `allow_insecure_migration_dispatch`; logged loudly |
+| migration.max_inflight_receiving | no (default 16) | Per-destination-node aggregate maximum concurrent inbound receiving migrations. Zero aborts startup |
+| migration.max_inflight_receiving_bytes | no (default 64 TiB / 70,368,744,177,664 bytes) | Per-destination-node aggregate maximum total bytes reserved by concurrent inbound receiving migrations. Zero aborts startup |
 
 The `CHV_MIGRATION_SIGNING_SECRET` environment variable is the last-resort
 fallback when neither config key is set. It is shared with the control-plane
@@ -520,8 +545,8 @@ process on nodes that run both, and must still be a dedicated secret.
 
 Fail-closed gating rules (issues #390, #395, #401, #663):
 
-- `enabled = false` with **any** client identity field set → startup error
-- `enabled = false` with **any** receiver field set → startup error (an operator who believes migration is off must not get an inbound TCP listener)
+- `enabled = false` with **any** client identity field (`client_cert_path`, `client_key_path`, `ca_cert_path`, `dest_server_name`) set → startup error
+- `enabled = false` with **any** receiver TLS field (`listen_addr`, `server_cert_path`, `server_key_path`, `client_ca_path`) set → startup error (an operator who believes migration is off must not get an inbound TCP listener). Authorization/admission keys (`node_id`, `signing_secret*`, `max_inflight_*`, `allow_insecure_unauthenticated`) are not TLS-listener fields and remain inert while `enabled = false`
 - `enabled = true` with **no** client fields → destination-only stord: no client identity, outbound migration actions fail with a `failed_precondition` error (issue #401). The client half is all-or-nothing *when any client field is set*. The receiver half is all-or-nothing *when any receiver field is set*; `enabled = true` with **no** receiver fields is a legitimate source-only stord (no listener, logged at startup)
 - `enabled = true` with **neither** half configured → startup error (an enabled migration section that configures nothing is a misconfiguration)
 - Receiver files unreadable, keypair mismatch, empty/invalid CA bundle, or an unparseable `listen_addr` → startup error

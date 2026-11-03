@@ -185,7 +185,7 @@ fn migration_auth_status(error: MigrationAuthError) -> Status {
         ),
         MigrationAuthError::WrongDestination
         | MigrationAuthError::WrongVolume
-        | MigrationAuthError::WrongSize => {
+        | MigrationAuthError::WrongSize { .. } => {
             Status::permission_denied(format!("migration authorization rejected: {error}"))
         }
         MigrationAuthError::Malformed

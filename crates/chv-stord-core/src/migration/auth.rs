@@ -128,11 +128,15 @@ pub struct MigrationLimits {
 
 impl Default for MigrationLimits {
     fn default() -> Self {
-        // Keep in sync with `StordMigrationConfig` defaults. Conservative:
-        // two concurrent receivers and 2 TiB total reserved bytes.
+        // Keep in sync with `StordMigrationConfig` defaults. These are
+        // per-destination-node aggregate ceilings, not per-VM: 16 concurrent
+        // receivers (enough for a VM with up to 16 attached volumes) and
+        // 64 TiB of summed token-authorized bytes in flight. Both remain a
+        // hard ceiling against an authorized peer opening unbounded or
+        // arbitrarily large receiving volumes.
         Self {
-            max_inflight: 2,
-            max_inflight_bytes: 2 * 1024 * 1024 * 1024 * 1024,
+            max_inflight: 16,
+            max_inflight_bytes: 64 * 1024 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -253,6 +257,12 @@ impl Drop for MigrationReservation {
 
 /// Single-use nonce cache. Entries are kept only until their token expires;
 /// a replay during the token's lifetime is rejected.
+///
+/// The cache is **memory-only** (not persisted across a stord restart) and
+/// its size is bounded by the number of distinct unexpired tokens that can
+/// be minted: each successful admission inserts at most one entry, purged
+/// lazily on the next `consume` once `expires_at_unix_ms` passes. It is not
+/// an unbounded history of every nonce ever seen.
 #[derive(Debug, Default)]
 pub struct MigrationReplayCache {
     used: Mutex<HashMap<String, i64>>,
