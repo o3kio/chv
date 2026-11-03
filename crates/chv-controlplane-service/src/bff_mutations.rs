@@ -73,9 +73,64 @@ impl ControlPlaneMutationService {
         }
     }
 
-    fn build_meta(&self, node_id: String, requested_by: String) -> Option<proto::RequestMeta> {
+    /// Highest generation already durably recorded, across every table a
+    /// generation can order. The control plane mints wall-clock
+    /// milliseconds, so a clock rollback across a restart could otherwise
+    /// produce a generation below an existing row and have the guarded
+    /// desired-state upserts silently discard the write (#664).
+    async fn generation_floor(&self) -> Result<u64, BffError> {
+        let floor: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT MAX(generation) FROM (
+                SELECT MAX(desired_generation) AS generation FROM vm_desired_state
+                UNION ALL
+                SELECT MAX(desired_generation) FROM volume_desired_state
+                UNION ALL
+                SELECT MAX(desired_generation) FROM network_desired_state
+                UNION ALL
+                SELECT MAX(desired_generation) FROM node_desired_state
+                UNION ALL
+                SELECT MAX(desired_generation) FROM operations
+            ) WHERE generation IS NOT NULL
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to read generation floor: {}", e)))?;
+        Ok(floor.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Raise the process-local counter to at least `floor`, preserving the
+    /// in-process monotonicity guarantee while seeding it from durable
+    /// state after a restart.
+    fn observe_generation_floor(&self, floor: u64) {
+        let mut prev = self.last_generation.load(Ordering::Acquire);
+        while prev < floor {
+            match self.last_generation.compare_exchange_weak(
+                prev,
+                floor,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    async fn build_meta(
+        &self,
+        node_id: String,
+        requested_by: String,
+    ) -> Result<proto::RequestMeta, BffError> {
+        // Read the durable floor on every mint. It is a single statement of
+        // indexed MAX lookups; correctness matters more than the microseconds
+        // saved by caching it, and a cached floor could be stale after a
+        // database restore.
+        let floor = self.generation_floor().await?;
+        self.observe_generation_floor(floor);
         let generation = self.fresh_generation();
-        Some(proto::RequestMeta {
+        Ok(proto::RequestMeta {
             operation_id: "".into(),
             requested_by,
             target_node_id: node_id,
@@ -124,7 +179,7 @@ impl MutationService for ControlPlaneMutationService {
                 .map_err(|e| BffError::Internal(format!("failed to look up vm: {}", e)))?
                 .ok_or_else(|| BffError::NotFound(format!("vm {} not found", vm_id)))?;
 
-        let meta = self.build_meta(node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(node_id.clone(), requested_by).await?);
 
         let ack = match action.as_str() {
             "start" => {
@@ -244,7 +299,10 @@ impl MutationService for ControlPlaneMutationService {
             ));
         }
 
-        let meta = self.build_meta(source_node_id.clone(), requested_by);
+        let meta = Some(
+            self.build_meta(source_node_id.clone(), requested_by)
+                .await?,
+        );
         let ack = self
             .lifecycle_service
             .migrate_vm(proto::MigrateVmRequest {
@@ -298,7 +356,7 @@ impl MutationService for ControlPlaneMutationService {
                 .map_err(|e| BffError::Internal(format!("failed to look up vm: {}", e)))?
                 .ok_or_else(|| BffError::NotFound(format!("vm {} not found", vm_id)))?;
 
-        let meta = self.build_meta(node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
             .snapshot_vm(proto::SnapshotVmRequest {
@@ -336,7 +394,7 @@ impl MutationService for ControlPlaneMutationService {
                 .map_err(|e| BffError::Internal(format!("failed to look up vm: {}", e)))?
                 .ok_or_else(|| BffError::NotFound(format!("vm {} not found", vm_id)))?;
 
-        let meta = self.build_meta(node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
             .restore_snapshot(proto::RestoreSnapshotRequest {
@@ -366,7 +424,7 @@ impl MutationService for ControlPlaneMutationService {
         action: String,
         requested_by: String,
     ) -> Result<MutateNodeResponse, BffError> {
-        let meta = self.build_meta(node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(node_id.clone(), requested_by).await?);
 
         let ack = match action.as_str() {
             "pause_scheduling" => {
@@ -456,7 +514,7 @@ impl MutationService for ControlPlaneMutationService {
         .map_err(|e| BffError::Internal(format!("failed to look up volume: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("volume {} not found", volume_id)))?;
 
-        let meta = self.build_meta(row.node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
 
         let ack = match action.as_str() {
             "attach" => {
@@ -554,7 +612,7 @@ impl MutationService for ControlPlaneMutationService {
         .map_err(|e| BffError::Internal(format!("failed to look up volume: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("volume {} not found", volume_id)))?;
 
-        let meta = self.build_meta(row.node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
             .snapshot_volume(proto::SnapshotVolumeRequest {
@@ -603,7 +661,7 @@ impl MutationService for ControlPlaneMutationService {
         .map_err(|e| BffError::Internal(format!("failed to look up volume: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("volume {} not found", volume_id)))?;
 
-        let meta = self.build_meta(row.node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
             .restore_volume(proto::RestoreVolumeRequest {
@@ -652,7 +710,7 @@ impl MutationService for ControlPlaneMutationService {
         .map_err(|e| BffError::Internal(format!("failed to look up volume: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("volume {} not found", volume_id)))?;
 
-        let meta = self.build_meta(row.node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
             .delete_volume_snapshot(proto::DeleteVolumeSnapshotRequest {
@@ -701,7 +759,7 @@ impl MutationService for ControlPlaneMutationService {
         .map_err(|e| BffError::Internal(format!("failed to look up volume: {}", e)))?
         .ok_or_else(|| BffError::NotFound(format!("volume {} not found", source_volume_id)))?;
 
-        let meta = self.build_meta(row.node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
             .clone_volume(proto::CloneVolumeRequest {
@@ -755,7 +813,7 @@ impl MutationService for ControlPlaneMutationService {
         .flatten()
         .ok_or_else(|| BffError::NotFound(format!("network {} not found", network_id)))?;
 
-        let meta = self.build_meta(node_id.clone(), requested_by);
+        let meta = Some(self.build_meta(node_id.clone(), requested_by).await?);
 
         let ack = match action.as_str() {
             "start" => {
@@ -1167,6 +1225,84 @@ mod tests {
         assert!(
             request.config.as_ref().is_some_and(|c| c.pause_first),
             "the stop-the-world flag must be forwarded"
+        );
+    }
+
+    /// #664: a restart after a clock rollback must not mint generations
+    /// below rows already in the database. The mint reads the durable
+    /// floor (here, a future-dated `vm_desired_state` row) and the next
+    /// two mutations remain strictly above it and above each other.
+    #[tokio::test]
+    async fn generation_floor_is_seeded_from_durable_state() {
+        // Larger than wall-clock milliseconds and comfortably inside i64.
+        const SEEDED: i64 = 4_000_000_000_000_000;
+
+        let pool = chv_controlplane_store::test_util::create_test_pool().await;
+        sqlx::query(
+            "INSERT INTO nodes (node_id, hostname, display_name) \
+             VALUES ('node-floor', 'node-floor', 'node-floor')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO vms (vm_id, display_name, node_id) \
+             VALUES ('vm-floor', 'vm-floor', 'node-floor')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO vm_desired_state (vm_id, desired_generation) VALUES ('vm-floor', ?)",
+        )
+        .bind(SEEDED)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migrate_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ControlPlaneMutationService::new(
+            pool,
+            std::sync::Arc::new(RecordingLifecycle {
+                attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                migrate_calls: migrate_calls.clone(),
+            }),
+        );
+
+        for _ in 0..2 {
+            service
+                .migrate_vm(
+                    "vm-floor".to_string(),
+                    "node-floor-b".to_string(),
+                    true,
+                    "test-user".to_string(),
+                )
+                .await
+                .expect("pause-first migration must be accepted");
+        }
+
+        let calls = migrate_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let generations: Vec<u64> = calls
+            .iter()
+            .map(|request| {
+                request
+                    .meta
+                    .as_ref()
+                    .expect("meta")
+                    .desired_state_version
+                    .parse()
+                    .expect("numeric generation")
+            })
+            .collect();
+        assert!(
+            generations[0] > SEEDED as u64,
+            "first mint {} must exceed the durable floor {SEEDED}",
+            generations[0]
+        );
+        assert!(
+            generations[1] > generations[0],
+            "successive mints must strictly increase: {generations:?}"
         );
     }
 
