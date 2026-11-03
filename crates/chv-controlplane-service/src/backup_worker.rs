@@ -754,4 +754,25 @@ mod tests {
             "an unreachable shipper must retain the row for retry"
         );
     }
+
+    #[tokio::test]
+    async fn malformed_endpoint_keeps_row_without_panicking() {
+        // Regression for #677: the endpoint used to reach object_store, whose
+        // sigv4 request builder panicked on the space, aborting retention
+        // cleanup. Credentials keep the test on the signing path (otherwise
+        // construction fails earlier while resolving the credential chain).
+        let row = job(
+            Some("s3://bucket/prefix?endpoint=not a url"),
+            Some("prefix/artifact"),
+        );
+        assert!(
+            !BackupWorker::artifact_removal_allows_row_delete(
+                &row,
+                Some("ak".to_string()),
+                Some("sk".to_string())
+            )
+            .await,
+            "a malformed endpoint must retain the row instead of panicking"
+        );
+    }
 }
