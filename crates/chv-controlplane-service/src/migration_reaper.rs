@@ -101,6 +101,8 @@ impl MigrationReaper {
                 m.phase,
                 m.started_at,
                 m.updated_at AS last_progress_at,
+                m.interrupted_from_phase,
+                m.interrupted_at,
                 CAST(
                     (julianday('now') - julianday(m.started_at)) * 86400
                     AS INTEGER
@@ -214,6 +216,8 @@ impl MigrationReaper {
                 m.phase,
                 m.started_at,
                 m.updated_at AS last_progress_at,
+                m.interrupted_from_phase,
+                m.interrupted_at,
                 CAST(
                     (julianday('now') - julianday(m.started_at)) * 86400
                     AS INTEGER
@@ -280,6 +284,22 @@ impl MigrationReaper {
                 }
                 Ok(ResumeOutcome::SkippedNotTerminal { .. }) => Some("cancelled"),
                 Ok(ResumeOutcome::SkippedMissing) => Some("missing"),
+                Ok(outcome @ ResumeOutcome::SkippedInterruptedAmbiguous { .. }) => {
+                    metrics::counter!(
+                        "migration_reaper_resume_skipped_total",
+                        "reason" => outcome.reason()
+                    )
+                    .increment(1);
+                    warn!(
+                        migration_id = %row.migration_id,
+                        vm_id = %row.vm_id,
+                        source_node_id = %row.source_node_id,
+                        interrupted_phase = row.interrupted_from_phase.as_deref().unwrap_or("unknown"),
+                        outcome = ?outcome,
+                        "migration reaper: refusing to auto-resume source VM for an ambiguous restart-interrupted phase; operator review required"
+                    );
+                    Some("blocked")
+                }
                 Ok(
                     outcome @ (ResumeOutcome::SkippedSenderActive { .. }
                     | ResumeOutcome::SkippedSourceNodeNotReporting { .. }),
@@ -342,19 +362,32 @@ impl MigrationReaper {
             row.stalled_secs, row.started_age_secs, self.stall_timeout_secs, row.phase
         );
 
+        // A row that restart recovery observed in `MemoryMigration` or
+        // `Paused` must not enter the automatic resume queue, even if it moved
+        // to one of those phases after the restart marker was written. Fail
+        // closed and let an operator decide.
+        let resume_state = if row.interrupted_at.is_some()
+            && matches!(row.phase.as_str(), "MemoryMigration" | "Paused")
+        {
+            "blocked"
+        } else {
+            "pending"
+        };
+
         let result = sqlx::query(
             r#"UPDATE migrations
                SET phase = 'Failed',
                    error_message = ?,
                    completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                   reaper_resume_state = 'pending',
+                   reaper_resume_state = ?,
                    reaper_stalled_secs = ?
                WHERE migration_id = ?
                  AND phase NOT IN ('Completed', 'Failed', 'RolledBack')
                  AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' seconds')"#,
         )
         .bind(&error_msg)
+        .bind(resume_state)
         .bind(row.stalled_secs)
         .bind(&row.migration_id)
         .bind(format!("-{}", self.stall_timeout_secs))
@@ -436,6 +469,24 @@ impl MigrationReaper {
                 });
             }
             None => return Ok(ResumeOutcome::SkippedMissing),
+        }
+
+        // Restart recovery cannot prove an agent-side task stopped. If it
+        // observed an ambiguous phase (`MemoryMigration` speaks for itself;
+        // `Paused` may own the only live VM state), never auto-resume even
+        // when the reaper's normal silence gate is satisfied. `interrupted_at`
+        // is set both for terminalized rows and for rows recovery could only
+        // observe; `interrupted_from_phase` preserves the phase.
+        if row.interrupted_at.is_some() {
+            let interrupted_phase = row
+                .interrupted_from_phase
+                .as_deref()
+                .unwrap_or(row.phase.as_str());
+            if matches!(interrupted_phase, "MemoryMigration" | "Paused") {
+                return Ok(ResumeOutcome::SkippedInterruptedAmbiguous {
+                    phase: interrupted_phase.to_string(),
+                });
+            }
         }
 
         // 2. The candidate's pre-failure progress age is the authoritative
@@ -566,6 +617,12 @@ enum ResumeOutcome {
     SkippedSourceNodeNotReporting {
         heartbeat_age_secs: Option<i64>,
     },
+    /// A restart observed this migration in `MemoryMigration` or `Paused`.
+    /// Recovery cannot prove the agent-side task stopped, so automatic resume
+    /// is blocked permanently for operator review.
+    SkippedInterruptedAmbiguous {
+        phase: String,
+    },
     /// The migration row disappeared between the scan and the resume.
     SkippedMissing,
 }
@@ -577,6 +634,7 @@ impl ResumeOutcome {
             Self::SkippedNotTerminal { .. } => "not_terminal",
             Self::SkippedSenderActive { .. } => "sender_active",
             Self::SkippedSourceNodeNotReporting { .. } => "source_node_not_reporting",
+            Self::SkippedInterruptedAmbiguous { .. } => "interrupted_ambiguous",
             Self::SkippedMissing => "missing",
         }
     }
@@ -591,6 +649,8 @@ struct StuckMigrationRow {
     phase: String,
     started_at: String,
     last_progress_at: String,
+    interrupted_from_phase: Option<String>,
+    interrupted_at: Option<String>,
     started_age_secs: i64,
     stalled_secs: i64,
 }
@@ -842,6 +902,99 @@ mod tests {
         );
     }
 
+    /// An `unresolved` row that recovery marked and that later stalls in an
+    /// ambiguous phase must be failed without entering the resume queue.
+    #[tokio::test]
+    async fn stalled_interrupted_memory_phase_is_failed_without_resume_intent() {
+        let test_db = TestDb::new().await;
+        seed_migration(
+            &test_db.pool,
+            "stalled-memory",
+            "MemoryMigration",
+            -10_800,
+            -600,
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE migrations
+               SET interrupted_from_phase = 'ConvergingDisk',
+                   interrupted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+               WHERE migration_id = 'stalled-memory'"#,
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("mark restart observation");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        reaper
+            .reap_stuck_migrations()
+            .await
+            .expect("reap stalled migration");
+
+        let (phase, resume_state): (String, Option<String>) = sqlx::query_as(
+            "SELECT phase, reaper_resume_state FROM migrations \
+             WHERE migration_id = 'stalled-memory'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Failed");
+        assert_eq!(
+            resume_state.as_deref(),
+            Some("blocked"),
+            "a row that reached an ambiguous phase after a restart must not auto-resume"
+        );
+    }
+
+    /// Defense in depth for rows that still carry a resume intent after a
+    /// restart observed an ambiguous phase (for example an `unresolved` row
+    /// that recovery could only mark): the reaper must fail it but refuse to
+    /// resume the source.
+    #[tokio::test]
+    async fn restart_interrupted_memory_phase_blocks_auto_resume() {
+        let test_db = TestDb::new().await;
+        seed_migration(
+            &test_db.pool,
+            "interrupted-memory",
+            "MemoryMigration",
+            -10_800,
+            -10,
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE migrations
+               SET phase = 'Failed',
+                   interrupted_from_phase = 'MemoryMigration',
+                   interrupted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   reaper_resume_state = 'pending',
+                   reaper_stalled_secs = 10000
+               WHERE migration_id = 'interrupted-memory'"#,
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed interrupted ambiguous migration");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        reaper
+            .drain_pending_resumes()
+            .await
+            .expect("drain pending resumes");
+
+        let (phase, resume_state): (String, Option<String>) = sqlx::query_as(
+            "SELECT phase, reaper_resume_state FROM migrations \
+             WHERE migration_id = 'interrupted-memory'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Failed");
+        assert_eq!(
+            resume_state.as_deref(),
+            Some("blocked"),
+            "an ambiguous restart-interrupted phase must not be auto-resumed"
+        );
+    }
+
     /// A resume whose frozen pre-reap gap is below the quiescence floor must
     /// not defer forever: the effective silence grows with the time elapsed
     /// since the reap, so a later retry tick can satisfy the floor.
@@ -1012,6 +1165,8 @@ mod tests {
             phase: "Failed".to_string(),
             started_at: "ignored".to_string(),
             last_progress_at: "ignored".to_string(),
+            interrupted_from_phase: None,
+            interrupted_at: None,
             started_age_secs: 10_800,
             stalled_secs: 5,
         };

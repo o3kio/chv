@@ -10,8 +10,10 @@ use chv_controlplane_store::{
 };
 use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// Phases of a live migration.
@@ -262,16 +264,21 @@ impl MigrationRegistry {
     ///
     /// Mapping is deterministic and conservative:
     /// - `Pending`, `PreCopyDisk`, `ConvergingDisk` → `RolledBack`: the source
-    ///   VM is still authoritative, so the migration can be abandoned there.
+    ///   VM is *presumed* authoritative, so abandoning the migration there is
+    ///   the least destructive choice. This is an inference, not proof: the
+    ///   control-plane task did not survive, but the agent-side task may still
+    ///   be running.
     /// - `MemoryMigration`, `Paused`, and any unrecognized non-terminal phase →
-    ///   `Failed`: VM state may already be on the destination, so an automatic
-    ///   rollback would be unsafe.
+    ///   `Failed`: VM state may already be on the destination, so even a
+    ///   presumed rollback would be unsafe.
     ///
     /// No recovered row gets an automatic source-VM resume, in either mapping.
     /// Once the row is terminal the progress path drops late reports, so the
     /// reaper's "sender has been silent" evidence would be self-fulfilling
     /// rather than proof that the agent-side task stopped. Operators inspect
-    /// the row and resume placement explicitly.
+    /// the row and resume placement explicitly. Under the pause-first gate the
+    /// source is normally paused even in the pre-memory phases, so "confirm the
+    /// VM is running on the source" must include an explicit resume step.
     ///
     /// The original phase is preserved in `interrupted_from_phase` and the
     /// reason in `error_message`; the parent operation is failed with
@@ -291,7 +298,7 @@ impl MigrationRegistry {
             match self.reconcile_row(row).await? {
                 ReconcileRowOutcome::Reconciled(recovered) => {
                     metrics::counter!(
-                        "chv_migration_restart_reconciled_total",
+                        chv_observability::CHV_MIGRATION_RESTART_RECONCILED_TOTAL,
                         "recovered_phase" => recovered.recovered_phase.as_str()
                     )
                     .increment(1);
@@ -379,9 +386,20 @@ impl MigrationRegistry {
             }
         }
 
+        let marked = self
+            .repository
+            .record_restart_observed(&row.migration_id, &row.phase, &row.updated_at)
+            .await
+            .map_err(|e| ChvError::Internal {
+                reason: format!(
+                    "failed to record restart observation for migration {}: {e}",
+                    row.migration_id
+                ),
+            })?;
         warn!(
             migration_id = %row.migration_id,
             phase = %row.phase,
+            marked,
             "migration kept changing during restart recovery; leaving it non-terminal for the reaper"
         );
         Ok(ReconcileRowOutcome::Unresolved)
@@ -410,16 +428,18 @@ fn migration_interrupted_reason(observed_phase: &str, recovered_phase: Migration
     match recovered_phase {
         MigrationPhase::RolledBack => format!(
             "control-plane restarted while migration was in phase {observed_phase}; \
-             no migration task survived. Recovery marked it RolledBack because the source \
-             VM is still authoritative. No automatic resume is queued: confirm the VM \
-             state on the source and resume it manually if needed; the migration is not \
-             retried automatically."
+             no control-plane migration task survived, but the agent-side task may still \
+             be running. Recovery marked it RolledBack because the source VM is presumed \
+             authoritative. No automatic resume is queued: inspect both nodes, then resume \
+             the source explicitly if needed (it is normally paused under pause-first). \
+             The migration is not retried automatically."
         ),
         _ => format!(
             "control-plane restarted while migration was in phase {observed_phase}; \
-             no migration task survived. VM state may already be on the destination, so \
-             recovery marked it Failed rather than guess a rollback. Inspect VM placement \
-             on both nodes before resuming or retrying; no automatic action is taken."
+             no control-plane migration task survived, but the agent-side task may still \
+             be running. VM state may already be on the destination, so recovery marked it \
+             Failed rather than guess a rollback. Inspect VM placement on both nodes before \
+             resuming or retrying; no automatic action is taken."
         ),
     }
 }
@@ -1721,6 +1741,38 @@ pub async fn create_migration_record(
     Ok(())
 }
 
+/// How often a dropped terminal progress report is logged for the same
+/// migration. The counter is never rate-limited; only the log line is.
+const DROPPED_PROGRESS_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Last time a dropped-progress warning was emitted per migration. A late
+/// `Completed` report bypasses the limiter because it is the highest-signal
+/// case: the destination may be claiming success after recovery already
+/// declared the migration terminal.
+static DROPPED_PROGRESS_WARN_AT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn should_warn_dropped_progress(migration_id: &str, reported_phase: &str) -> bool {
+    if reported_phase == "Completed" {
+        return true;
+    }
+
+    let now = Instant::now();
+    let mut last_warned = DROPPED_PROGRESS_WARN_AT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Bound the map: entries older than ten intervals can no longer suppress
+    // a warning, so dropping them is lossless.
+    last_warned.retain(|_, at| now.duration_since(*at) < DROPPED_PROGRESS_WARN_INTERVAL * 10);
+    match last_warned.get(migration_id) {
+        Some(at) if now.duration_since(*at) < DROPPED_PROGRESS_WARN_INTERVAL => false,
+        _ => {
+            last_warned.insert(migration_id.to_string(), now);
+            true
+        }
+    }
+}
+
 /// Update migration progress in the database (called from telemetry).
 ///
 /// `node_id` is the authenticated sender (the control plane pins it to the
@@ -1790,8 +1842,8 @@ pub async fn update_migration_progress(
     // The guarded update matched nothing. Classify the no-op so the caller
     // can distinguish "late terminal report, safely dropped" (Ok) from
     // "this node does not own this migration" (denied) and "no such row".
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        r#"SELECT source_node_id, destination_node_id, phase
+    let row: Option<(String, String, String, String)> = sqlx::query_as(
+        r#"SELECT migration_id, source_node_id, destination_node_id, phase
            FROM migrations
            WHERE vm_id = ? AND operation_id = ?
            ORDER BY started_at DESC
@@ -1805,7 +1857,7 @@ pub async fn update_migration_progress(
         reason: format!("failed to classify migration progress update: {e}"),
     })?;
 
-    let Some((source_node_id, destination_node_id, current_phase)) = row else {
+    let Some((migration_id, source_node_id, destination_node_id, current_phase)) = row else {
         // Progress can race the control plane's own record creation; treat a
         // missing row as an idempotent no-op rather than a poison-pill error
         // that the agent would retry forever.
@@ -1823,8 +1875,29 @@ pub async fn update_migration_progress(
         current_phase.as_str(),
         "Completed" | "Failed" | "RolledBack"
     ) {
-        // Terminal: the report arrived too late (reaper won). Dropping it is
-        // correct; returning an error would make the agent retry forever.
+        // Terminal: the report arrived too late (reaper or restart recovery
+        // won). Dropping it is correct; returning an error would make the agent
+        // retry forever. Keep it observable, though: a still-running agent task
+        // is exactly the case restart recovery cannot prove is gone, and a late
+        // `Completed` after recovery is the highest-signal variant.
+        metrics::counter!(
+            chv_observability::CHV_MIGRATION_PROGRESS_DROPPED_TOTAL,
+            "stored_phase" => current_phase.clone(),
+            "reported_phase" => phase_str,
+        )
+        .increment(1);
+        if should_warn_dropped_progress(&migration_id, phase_str) {
+            warn!(
+                migration_id = %migration_id,
+                operation_id = %operation_id,
+                vm_id = %vm_id,
+                node_id = %node_id,
+                reported_phase = %phase_str,
+                stored_phase = %current_phase,
+                "dropped migration progress report for a terminal migration; \
+                 an agent-side task may still be running"
+            );
+        }
         return Ok(());
     }
 

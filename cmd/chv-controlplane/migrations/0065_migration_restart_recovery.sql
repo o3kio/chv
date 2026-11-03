@@ -8,11 +8,14 @@
 --
 -- `interrupted_from_phase` preserves the phase the row was in when the restart
 -- was observed (the terminal `phase` overwrites it during reconciliation).
--- `interrupted_at` is the reconciliation timestamp.
+-- `interrupted_at` is the reconciliation/observation timestamp. It can also be
+-- non-NULL on a still-non-terminal row when recovery saw the row but could not
+-- safely terminalize it because progress kept racing the scan.
 --
 -- Both columns are additive and nullable: rows written by older control
--- planes, and terminal rows that were never interrupted, keep NULL. Code that
--- predates this migration ignores them, so rollback to an older binary is safe
--- (SQLite migrations are forward-only; dropping the columns is not required).
+-- planes, and terminal rows that were never interrupted, keep NULL. The schema
+-- change is backward-compatible (an older binary ignores the columns), but
+-- rolling the binary back is still blocked by sqlx's applied-migration
+-- validation, exactly like every other migration in this directory.
 ALTER TABLE migrations ADD COLUMN interrupted_from_phase TEXT;
 ALTER TABLE migrations ADD COLUMN interrupted_at TEXT;

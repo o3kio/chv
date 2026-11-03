@@ -10,7 +10,7 @@
 use crate::{StoreError, StorePool};
 
 /// A row from the `migrations` table, including the restart-recovery columns
-/// added by migration `0064`.
+/// added by migration `0065`.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
 pub struct MigrationRecord {
     pub migration_id: String,
@@ -144,6 +144,11 @@ impl MigrationRepository {
 
         let mut tx = self.pool.begin().await?;
 
+        // `updated_at` has one-second resolution. Two writes in the same
+        // second therefore share a guard value, and this optimistic check
+        // cannot distinguish them; the later one wins as long as both still
+        // observe the same phase. Terminal-state protection is unaffected
+        // because every UPDATE re-checks `phase NOT IN (...)`.
         let result = sqlx::query(
             r#"
             UPDATE migrations
@@ -207,6 +212,42 @@ impl MigrationRepository {
 
         tx.commit().await?;
         Ok(InterruptedMigrationOutcome::Reconciled)
+    }
+
+    /// Mark a still-non-terminal row as observed by restart recovery when the
+    /// row could not be terminalized because progress kept racing the scan.
+    ///
+    /// `phase`, `updated_at`, and the resume bookkeeping are intentionally left
+    /// untouched: the migration may still be alive, so recovery only records
+    /// what it saw. The reaper consults `interrupted_from_phase` later and
+    /// refuses to auto-resume ambiguous (`MemoryMigration`/`Paused`) phases.
+    ///
+    /// Returns `true` when the observation matched, `false` when the row moved
+    /// on again (in which case the caller still reports it unresolved).
+    pub async fn record_restart_observed(
+        &self,
+        migration_id: &str,
+        observed_phase: &str,
+        observed_updated_at: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE migrations
+               SET interrupted_from_phase = ?,
+                   interrupted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE migration_id = ?
+               AND phase = ?
+               AND updated_at = ?
+               AND phase NOT IN ('Completed', 'Failed', 'RolledBack')
+            "#,
+        )
+        .bind(observed_phase)
+        .bind(migration_id)
+        .bind(observed_phase)
+        .bind(observed_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -376,5 +417,44 @@ mod tests {
         assert_eq!(status, "Failed");
         assert_eq!(error_code.as_deref(), Some("MIGRATION_INTERRUPTED"));
         assert_eq!(updated_by.as_deref(), Some("migration_registry"));
+    }
+
+    /// Recovery may only observe a row it could not terminalize. That marker
+    /// must not move the phase or touch resume bookkeeping, so a live agent
+    /// task is not disturbed; it only lets the reaper fail safe later.
+    #[tokio::test]
+    async fn record_restart_observed_marks_without_changing_phase() {
+        let test_db = TestDb::new().await;
+        let repo = MigrationRepository::new(test_db.pool.clone());
+        seed_migration(
+            &test_db.pool,
+            "unresolved",
+            "MemoryMigration",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        sqlx::query("UPDATE migrations SET reaper_resume_state = 'pending' WHERE migration_id = 'unresolved'")
+            .execute(&test_db.pool)
+            .await
+            .expect("seed resume state");
+
+        assert!(repo
+            .record_restart_observed("unresolved", "MemoryMigration", "2026-01-01T00:00:00Z")
+            .await
+            .expect("record observation"));
+        let row = repo.get("unresolved").await.unwrap().unwrap();
+        assert_eq!(row.phase, "MemoryMigration");
+        assert_eq!(
+            row.interrupted_from_phase.as_deref(),
+            Some("MemoryMigration")
+        );
+        assert!(row.interrupted_at.is_some());
+        assert_eq!(row.reaper_resume_state.as_deref(), Some("pending"));
+
+        // A row that moved on after the observation must not be marked stale.
+        assert!(!repo
+            .record_restart_observed("unresolved", "MemoryMigration", "2025-12-31T23:59:59Z")
+            .await
+            .expect("stale observation is a no-op"));
     }
 }

@@ -231,7 +231,7 @@ operator-initiated migration is stop-the-world until #394 is proven.
 
 - New operation type: `MigrateVm` in orchestrator dispatch table
 - Operation follows existing retry/timeout pattern (but migration is NOT retried automatically — failure requires operator review)
-- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The source VM is resumed only after a liveness gate: the row is terminal, no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`).
+- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The source VM is resumed only after a liveness gate: the row is terminal, no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`). Rows marked by restart recovery with `interrupted_at` and an ambiguous `interrupted_from_phase` (`MemoryMigration`/`Paused`) are failed but never auto-resumed; the reaper records `reaper_resume_state = 'blocked'`.
 
 ## Configuration
 
@@ -315,7 +315,7 @@ constants above.
 | Phase 5: Completed / cleanup | migration.rs | DONE |
 | Rollback per phase | migration.rs | DONE |
 | Migration reaper (stale ops) | migration_reaper.rs | DONE |
-| Restart reconciliation | migration.rs `MigrationRegistry`, chv-controlplane-store `migrations.rs` | DONE — non-terminal rows become `RolledBack` (pre-memory) or `Failed` (memory/paused/unknown), operator-only; terminal rows untouched; migration `0064` records `interrupted_from_phase`/`interrupted_at` (#656) |
+| Restart reconciliation | migration.rs `MigrationRegistry`, chv-controlplane-store `migrations.rs` | DONE — non-terminal rows become `RolledBack` (pre-memory) or `Failed` (memory/paused/unknown), operator-only; terminal rows untouched; migration `0065` records `interrupted_from_phase`/`interrupted_at` (#656) |
 | Phase timeouts | migration.rs `PhaseTimeouts` | DONE |
 | MigrationProgress proto | control-plane-node.proto | DONE |
 | Source stord: bulk copy | sender.rs `bulk_copy()` | DONE |
@@ -369,21 +369,26 @@ constants above.
   migration registry reconciles every row still in a non-terminal phase (the
   in-process migration task did not survive the restart). The mapping is
   deterministic and conservative:
-  - `Pending`, `PreCopyDisk`, `ConvergingDisk` → `RolledBack`: the source VM is
-    still authoritative. `interrupted_from_phase` and `interrupted_at` preserve
-    what was interrupted.
+  - `Pending`, `PreCopyDisk`, `ConvergingDisk` → `RolledBack`: the source is
+    *presumed* authoritative. `interrupted_from_phase` and `interrupted_at`
+    preserve what was interrupted.
   - `MemoryMigration`, `Paused`, or any unrecognized non-terminal phase →
     `Failed`: VM state may already be on the destination, so recovery does not
     guess a rollback.
   - `Completed`, `Failed`, and `RolledBack` rows are never modified (a terminal
     migration must never be resurrected).
 
-  No recovered row gets an automatic source-VM resume. The row becomes terminal
-  immediately, and the normal progress path drops late reports from a
-  still-running agent task; reaper "silence" would therefore not prove the
-  sender stopped. `reaper_resume_state` is cleared and an operator must inspect
-  placement and resume explicitly. The parent operation is failed with
-  `error_code = 'MIGRATION_INTERRUPTED'`.
+  Only the control-plane task is known to be gone; the agent-side task may
+  still be running. No recovered row gets an automatic source-VM resume. The
+  row becomes terminal immediately, and the normal progress path drops late
+  reports from a still-running agent task; reaper "silence" would therefore not
+  prove the sender stopped. `reaper_resume_state` is cleared and an operator
+  must inspect placement and resume explicitly (the pause-first gate normally
+  leaves the source paused). If recovery cannot terminalize a row because
+  progress keeps racing it, it marks the row with `interrupted_at` without
+  changing its phase; the reaper later fails it but does not auto-resume a
+  marked `MemoryMigration`/`Paused` row (`reaper_resume_state = 'blocked'`).
+  The parent operation is failed with `error_code = 'MIGRATION_INTERRUPTED'`.
   Interrupted migrations are not retried automatically; a second startup is a
   no-op because only terminal rows remain. Operators inspect the original phase
   via `interrupted_from_phase` (also returned by `GET /v1/migrations[/:id]`)

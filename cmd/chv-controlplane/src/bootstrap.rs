@@ -1207,6 +1207,31 @@ max_version = "999.0.0"
         }
     }
 
+    /// Pin the startup invariant that restart recovery runs before anything
+    /// that can serve traffic or start a background worker. `build_service` is
+    /// too heavy to drive end-to-end in a unit test, so this asserts the
+    /// source order directly.
+    #[test]
+    fn restart_recovery_precedes_listener_and_workers() {
+        let source = include_str!("bootstrap.rs");
+        let recovery = source
+            .find(".recover_after_restart()")
+            .expect("restart recovery call must exist");
+        for marker in [
+            "let http_listener = tokio::net::TcpListener::bind(config.http_bind)",
+            "let orchestrator = Orchestrator::new(",
+            "let mut migration_reaper = chv_controlplane_service::MigrationReaper::new(",
+        ] {
+            let position = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("startup marker {marker:?} must exist"));
+            assert!(
+                recovery < position,
+                "restart recovery must run before {marker:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn compat_matrix_query_failure_when_opt_out_continues() {
         // Operator has NOT opted in: in build_service that means the env var
