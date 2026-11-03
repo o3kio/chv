@@ -921,6 +921,78 @@ sudo systemctl start chv-controlplane
 - Restrict `/etc/chv/certs/` to `root:chv` with `640` permissions
 - Run `chv-stord` under a dedicated service account with device/path allowlists
 - Enable firewall rules limiting gRPC port 8443 to known hypervisor IPs
+- Set `CHV_COOKIE_SECURE=1` when the BFF is reachable only over TLS (adds
+  `Secure` to the session and hint cookies)
+
+### Browser sessions, revocation, and console tickets (#660)
+
+**The browser credential is an HttpOnly cookie.** `POST /v1/auth/login`
+returns no JWT in its response body. It sets:
+
+| Cookie | Scope | Purpose |
+|--------|-------|---------|
+| `chv_session` | `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=86400` | The session JWT. Script cannot read it. |
+| `chv_role` | script-readable, non-credential | Role hint used only to hide UI controls; the server never authorizes from it. |
+| `chv_logged_in=1` | script-readable, non-credential | Authenticated-session hint for the SPA login redirect. |
+
+The UI no longer writes tokens to `localStorage` or `sessionStorage`. Non-browser
+clients that need a bearer token (for example `chvctl`) must use the separate
+API-only endpoint `POST /api/v1/auth/login`.
+
+**Server-side revocation.** Migration `0066_user_token_version.sql` adds
+`users.token_version INTEGER NOT NULL DEFAULT 0`. Every newly issued session
+JWT carries a `token_version` claim; the auth extractor compares it with the
+database on **every authenticated request**, so revocation is immediate.
+`POST /v1/auth/logout`, a successful password change, and an admin
+password reset or role change (including demotion) increment the counter, so
+every token issued earlier — including a copied one — fails immediately with:
+
+- `401 SESSION_REVOKED` — the token's version is stale, or the user row is gone.
+- `503 AUTH_UNAVAILABLE` — the lookup itself failed (database outage).
+
+The per-request read is deliberate fail-closed behavior: if the database is
+unavailable, a cookie that looks valid still yields `503 AUTH_UNAVAILABLE`
+rather than being trusted without a revocation check.
+
+Pre-#660 tokens carry no `token_version` claim (and no `aud`). During the
+rollout they are still accepted for users that exist — the extractor does a
+cheap existence/version lookup and rejects a legacy token whose `sub` has no
+user row. They cannot be revoked server-side, so they remain a bounded
+24-hour `exp` gap. To close it immediately:
+
+1. Ask users to log out and back in, or rotate the JWT secret (invalidates
+   all tokens); or
+2. Set `CHV_REQUIRE_TOKEN_VERSION=1` on the BFF/control plane. This rejects
+   **every** token without a `token_version` claim outright (401
+   `SESSION_REVOKED`). Default is off during rollout; enable it after the
+   upgrade window or after a suspected compromise.
+
+Rolling the migration back is safe — older binaries ignore the extra column —
+but it disables revocation until the column and the #660 binary are restored.
+
+**API-token scopes fail closed.** `api_tokens.scope` is `NOT NULL` and
+accepts exactly `full` (user's role) and `readonly` (viewer). Any other
+value — empty, mixed case, or an unknown future scope — is rejected with
+`403 INVALID_TOKEN_SCOPE`; it never falls back to the user's role. (A NULL
+is impossible through the schema; a hand-edited NULL row fails token
+deserialization as `401` before the scope check.) Audit existing rows
+before upgrading:
+
+```sql
+SELECT scope, COUNT(*) FROM api_tokens GROUP BY scope;
+```
+
+Fix or recreate any row whose scope is not `full` or `readonly`.
+
+**Console tickets are audience-bound and out-of-URL.** Console tickets are
+minted with `aud: "chv:console"` and a 60-second TTL; session JWTs carry
+`aud: "chv:session"`. Each side enforces its own audience, so a session JWT
+or API token cannot open a console and a console ticket cannot be replayed
+against the session API. The agent reads the ticket from the
+`Sec-WebSocket-Protocol` handshake header, not from `?token=`. The BFF
+returns the URL and ticket separately; the UI calls
+`new WebSocket(url, [ticket])`. nginx forwards the subprotocol header by
+default.
 
 ---
 

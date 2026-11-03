@@ -100,15 +100,28 @@ struct UserRow {
     /// install.sh sets this to 1 on the seeded admin row so the operator
     /// is forced to rotate the credential on first login.
     must_change_password: i64,
+    /// Session revocation counter (#660, migration 0066). Embedded in the
+    /// issued JWT and re-checked on every request by the auth extractor.
+    token_version: i64,
 }
 
 /// Login endpoint (`POST /v1/auth/login`).
 ///
-/// On success the response body carries the JWT (the UI still stores it in
-/// localStorage) AND a `Set-Cookie: chv_session=<JWT>` HttpOnly session
-/// cookie (Security S1, staged item 3.B). The BFF auth middleware accepts
-/// that cookie as a fallback credential when no Authorization header is
-/// present.
+/// This is the **browser** login. On success the response body carries only
+/// non-credential session metadata (user + `must_change_password`) — never
+/// the JWT. The JWT lives exclusively in the HttpOnly `chv_session` cookie
+/// (Security S1, staged item 3.B), so JavaScript cannot read or exfiltrate
+/// it after login.
+///
+/// Two additional *non-credential* cookies are set for client-side UX:
+/// - `chv_role` — the caller's role, used only to hide controls the server
+///   already gates; it grants nothing.
+/// - `chv_logged_in=1` — an authenticated-session hint so the SPA can
+///   redirect before the first API call. It grants nothing either.
+///
+/// API clients that legitimately need a bearer token (chvctl) use the
+/// control-plane-only `POST /api/v1/auth/login`, which is a separate,
+/// documented API surface and not reachable from the browser flow.
 ///
 /// Cookie attributes:
 /// - `HttpOnly` — script-immune; the UI cannot read it.
@@ -138,7 +151,7 @@ pub async fn login(
         .ok_or_else(|| BffError::BadRequest("missing password".into()))?;
 
     let user = sqlx::query_as::<_, UserRow>(
-        "SELECT user_id, username, password_hash, role, must_change_password \
+        "SELECT user_id, username, password_hash, role, must_change_password, token_version \
          FROM users WHERE username = ?",
     )
     .bind(username)
@@ -176,13 +189,16 @@ pub async fn login(
     let exp = now + TOKEN_TTL_SECS;
 
     let must_change_password = user.must_change_password != 0;
+    let token_version = user.token_version.max(0) as u64;
 
     let claims = crate::auth::Claims {
         sub: user.user_id.clone(),
         username: user.username.clone(),
         role: user.role.clone(),
         exp,
+        aud: Some(crate::auth::SESSION_AUDIENCE.to_string()),
         must_change_password,
+        token_version: Some(token_version),
     };
 
     let token = jsonwebtoken::encode(
@@ -197,24 +213,34 @@ pub async fn login(
     // — never from a client-supplied header. Behind nginx the BFF sees
     // plain http, so the default is NO Secure flag; operators enable it
     // when the BFF is reachable only over TLS.
-    let mut cookie = format!(
-        "{}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age={TOKEN_TTL_SECS}",
+    let secure_suffix = if *COOKIE_SECURE { "; Secure" } else { "" };
+    let session_cookie = format!(
+        "{}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age={TOKEN_TTL_SECS}{secure_suffix}",
         crate::auth::SESSION_COOKIE_NAME
     );
-    if *COOKIE_SECURE {
-        cookie.push_str("; Secure");
-    }
+    // Non-credential UX hints: the server still authorizes every request
+    // from the JWT, so tampering with either cookie grants nothing.
+    let role_cookie = format!(
+        "{}={}; Path=/; SameSite=Strict; Max-Age={TOKEN_TTL_SECS}{secure_suffix}",
+        crate::auth::ROLE_COOKIE_NAME,
+        user.role
+    );
+    let hint_cookie = format!(
+        "{}=1; Path=/; SameSite=Strict; Max-Age={TOKEN_TTL_SECS}{secure_suffix}",
+        crate::auth::AUTH_HINT_COOKIE_NAME
+    );
 
     let mut response_headers = axum::http::HeaderMap::new();
-    let cookie_value = cookie
-        .parse::<axum::http::HeaderValue>()
-        .map_err(|e| BffError::Internal(format!("failed to build session cookie: {e}")))?;
-    response_headers.insert(axum::http::header::SET_COOKIE, cookie_value);
+    for cookie in [session_cookie, role_cookie, hint_cookie] {
+        let cookie_value = cookie
+            .parse::<axum::http::HeaderValue>()
+            .map_err(|e| BffError::Internal(format!("failed to build session cookie: {e}")))?;
+        response_headers.append(axum::http::header::SET_COOKIE, cookie_value);
+    }
 
     Ok((
         response_headers,
         Json(json!({
-            "token": token,
             "user": {
                 "username": user.username,
                 "role": user.role
@@ -226,24 +252,76 @@ pub async fn login(
 
 /// Logout endpoint (`POST /v1/auth/logout`).
 ///
-/// Terminates the cookie session minted by [`login`]: the `chv_session`
-/// cookie is cleared with `Max-Age=0` and the same attributes it was set
-/// with, so the browser stops sending the JWT on subsequent requests. The
-/// route is deliberately unauthenticated — clearing the cookie must
-/// succeed even when the caller's token is already invalid or absent, and
-/// it performs no authorization decision of its own. JWTs are stateless
-/// and cannot be revoked server-side; expiring the cookie is the
-/// termination this endpoint owns.
-pub async fn logout() -> Result<(axum::http::HeaderMap, Json<Value>), BffError> {
-    let cookie = format!(
-        "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
-        crate::auth::SESSION_COOKIE_NAME
-    );
+/// Clears the cookie session minted by [`login`] AND revokes the presented
+/// token server-side (#660): when the request carries a valid
+/// `chv_session` JWT (or `Authorization: Bearer`), the user's
+/// `token_version` is incremented, so every token issued before this
+/// logout — including a copy an attacker extracted — fails the
+/// revocation check immediately. The cookie is then cleared with
+/// `Max-Age=0` and the same attributes it was set with.
+///
+/// The route stays deliberately unauthenticated: clearing the cookie must
+/// succeed even when the caller's token is already invalid or absent. If a
+/// valid token is present but the version bump fails (database outage), the
+/// endpoint fails with 500 rather than pretending the session was revoked;
+/// the browser still clears the cookie client-side on redirect.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::HeaderMap, Json<Value>), BffError> {
+    if let Some(token) = crate::auth::request_token(&headers) {
+        match crate::auth::validate_token(&token, &state.jwt_secret) {
+            Ok(claims) => {
+                match chv_controlplane_store::UserRepository::new(state.pool.clone())
+                    .bump_token_version(&claims.sub)
+                    .await
+                {
+                    Ok(_) => {}
+                    // The account is already gone: there is no session left
+                    // to revoke. Treat logout as successful and still clear
+                    // every cookie (M2).
+                    Err(chv_controlplane_store::StoreError::NotFound { .. }) => {
+                        tracing::debug!(
+                            sub = %claims.sub,
+                            "logout for deleted user: nothing to revoke, clearing cookies"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "logout failed to bump token_version");
+                        return Err(BffError::Internal("failed to revoke session".into()));
+                    }
+                }
+            }
+            Err(e) => {
+                // Already invalid/expired: clearing the cookie is the whole
+                // operation. Do not leak which condition applied.
+                tracing::debug!(error = %e, "logout token was not valid; clearing cookie only");
+            }
+        }
+    }
+
     let mut headers = axum::http::HeaderMap::new();
-    let cookie_value = cookie
-        .parse::<axum::http::HeaderValue>()
-        .map_err(|e| BffError::Internal(format!("failed to build logout cookie: {e}")))?;
-    headers.insert(axum::http::header::SET_COOKIE, cookie_value);
+    for cookie in [
+        // Credential: also HttpOnly to match the original.
+        format!(
+            "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
+            crate::auth::SESSION_COOKIE_NAME
+        ),
+        // Non-credential UX hints.
+        format!(
+            "{}=; Max-Age=0; Path=/; SameSite=Strict",
+            crate::auth::ROLE_COOKIE_NAME
+        ),
+        format!(
+            "{}=; Max-Age=0; Path=/; SameSite=Strict",
+            crate::auth::AUTH_HINT_COOKIE_NAME
+        ),
+    ] {
+        let cookie_value = cookie
+            .parse::<axum::http::HeaderValue>()
+            .map_err(|e| BffError::Internal(format!("failed to build logout cookie: {e}")))?;
+        headers.append(axum::http::header::SET_COOKIE, cookie_value);
+    }
     Ok((headers, Json(json!({ "ok": true }))))
 }
 
@@ -264,15 +342,16 @@ struct PasswordRow {
 
 /// `POST /v1/auth/change-password`
 ///
-/// Changes the authenticated caller's password and clears the
-/// `must_change_password` flag. The caller's identity comes from `claims.sub`
-/// in the bearer token — a user can only change their OWN password through
-/// this endpoint.
+/// Changes the authenticated caller's password, clears the
+/// `must_change_password` flag, and increments `users.token_version`
+/// (#660). The caller's identity comes from `claims.sub` in the bearer
+/// token — a user can only change their OWN password through this endpoint.
 ///
-/// On success the existing JWT is left in place; the caller must re-login to
-/// obtain a token whose `must_change_password` claim is false. This keeps the
-/// flow simple and forces the user to confirm the new credential works before
-/// regaining full access.
+/// The version bump revokes every token issued before this request,
+/// including the one that authenticated it. The client must re-login with
+/// the new password; the UI redirects to `/login` after success. This is
+/// deliberate: a password change is a credential-rotation event, so all
+/// pre-rotation sessions die.
 pub async fn change_password(
     BearerToken(claims): BearerToken,
     State(state): State<AppState>,
@@ -321,6 +400,7 @@ pub async fn change_password(
         "UPDATE users \
          SET password_hash = ?, \
              must_change_password = 0, \
+             token_version = token_version + 1, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
          WHERE user_id = ?",
     )
@@ -584,6 +664,15 @@ mod tests {
     }
 
     fn admin_token_for(state: &AppState, user_id: &str, must_change: bool) -> String {
+        admin_token_with_version(state, user_id, must_change, Some(0))
+    }
+
+    fn admin_token_with_version(
+        state: &AppState,
+        user_id: &str,
+        must_change: bool,
+        token_version: Option<u64>,
+    ) -> String {
         let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -595,6 +684,8 @@ mod tests {
             role: "admin".to_string(),
             exp,
             must_change_password: must_change,
+            aud: None,
+            token_version,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         jsonwebtoken::encode(
@@ -603,6 +694,21 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
         )
         .expect("encode test token")
+    }
+
+    /// Pull the `chv_session` JWT out of a login response's Set-Cookie
+    /// headers (the body no longer carries it).
+    fn session_cookie_token(headers: &axum::http::HeaderMap) -> String {
+        headers
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|cookie| {
+                let rest =
+                    cookie.strip_prefix(&format!("{}=", crate::auth::SESSION_COOKIE_NAME))?;
+                Some(rest.split(';').next().unwrap_or_default().to_string())
+            })
+            .expect("login must set the chv_session cookie")
     }
 
     /// Map a `BffError` variant to its HTTP status code so tests can pin
@@ -649,7 +755,7 @@ mod tests {
         seed_user(&state.pool, "u-must-1", "alice", "correctpassword", true).await;
 
         let body = serde_json::json!({"username": "alice", "password": "correctpassword"});
-        let (_headers, resp) = login(axum::extract::State(state.clone()), axum::Json(body))
+        let (headers, resp) = login(axum::extract::State(state.clone()), axum::Json(body))
             .await
             .expect("login should succeed");
         let v = resp.0;
@@ -658,12 +764,17 @@ mod tests {
             Some(true),
             "response JSON must include must_change_password=true"
         );
-        assert!(v.get("token").and_then(|x| x.as_str()).is_some());
+        assert!(
+            v.get("token").is_none(),
+            "the browser login must never return the JWT to JavaScript"
+        );
 
-        // The token itself must carry the flag so middleware can enforce it.
-        let token = v["token"].as_str().unwrap();
-        let claims = crate::auth::validate_token(token, &state.jwt_secret).expect("decode token");
+        // The token lives only in the cookie and must carry the flag so
+        // middleware can enforce it.
+        let token = session_cookie_token(&headers);
+        let claims = crate::auth::validate_token(&token, &state.jwt_secret).expect("decode token");
         assert!(claims.must_change_password);
+        assert_eq!(claims.token_version, Some(0));
     }
 
     #[tokio::test]
@@ -672,7 +783,7 @@ mod tests {
         seed_user(&state.pool, "u-clear-1", "bob", "correctpassword", false).await;
 
         let body = serde_json::json!({"username": "bob", "password": "correctpassword"});
-        let (_headers, resp) = login(axum::extract::State(state.clone()), axum::Json(body))
+        let (headers, resp) = login(axum::extract::State(state.clone()), axum::Json(body))
             .await
             .expect("login should succeed");
         let v = resp.0;
@@ -680,12 +791,45 @@ mod tests {
             v.get("must_change_password").and_then(|x| x.as_bool()),
             Some(false)
         );
-        let token = v["token"].as_str().unwrap();
-        let claims = crate::auth::validate_token(token, &state.jwt_secret).expect("decode token");
+        assert!(v.get("token").is_none());
+        let token = session_cookie_token(&headers);
+        let claims = crate::auth::validate_token(&token, &state.jwt_secret).expect("decode token");
         assert!(!claims.must_change_password);
     }
 
+    #[tokio::test]
+    async fn login_token_version_matches_user_row() {
+        let state = build_test_state().await;
+        seed_user(&state.pool, "u-ver-1", "vera", "correctpassword", false).await;
+        sqlx::query("UPDATE users SET token_version = 7 WHERE user_id = 'u-ver-1'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({"username": "vera", "password": "correctpassword"});
+        let (headers, _resp) = login(axum::extract::State(state.clone()), axum::Json(body))
+            .await
+            .expect("login should succeed");
+        let claims =
+            crate::auth::validate_token(&session_cookie_token(&headers), &state.jwt_secret)
+                .expect("decode token");
+        assert_eq!(claims.token_version, Some(7));
+        assert_eq!(
+            claims.aud.as_deref(),
+            Some(crate::auth::SESSION_AUDIENCE),
+            "freshly minted session tokens must carry the session audience"
+        );
+    }
+
     // ── session cookie (Security S1, staged item 3.B) ─────────────────────
+
+    fn set_cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|cookie| cookie.starts_with(&format!("{name}=")))
+    }
 
     #[tokio::test]
     async fn login_sets_session_cookie_with_expected_attributes() {
@@ -697,15 +841,17 @@ mod tests {
             .await
             .expect("login should succeed");
 
-        let token = resp.0["token"].as_str().unwrap().to_string();
-        let cookie = headers
-            .get(axum::http::header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
+        assert!(
+            resp.0.get("token").is_none(),
+            "no JWT may be returned in the login body"
+        );
+        let token = session_cookie_token(&headers);
+        let cookie = set_cookie(&headers, crate::auth::SESSION_COOKIE_NAME)
             .expect("login must set the session cookie");
 
         assert!(
             cookie.starts_with(&format!("{}={token};", crate::auth::SESSION_COOKIE_NAME)),
-            "cookie must carry the same JWT as the body; got: {cookie}"
+            "session cookie must carry the issued JWT; got: {cookie}"
         );
         assert!(cookie.contains("; HttpOnly"), "cookie must be HttpOnly");
         assert!(cookie.contains("; Path=/"), "cookie must be Path=/");
@@ -728,12 +874,24 @@ mod tests {
 
         // The cookie JWT must verify through the exact same path the
         // middleware uses.
-        let cookie_token =
-            cookie.trim_start_matches(&format!("{}=", crate::auth::SESSION_COOKIE_NAME));
-        let cookie_token = cookie_token.split(';').next().unwrap();
         let claims =
-            crate::auth::validate_token(cookie_token, &state.jwt_secret).expect("cookie JWT valid");
+            crate::auth::validate_token(&token, &state.jwt_secret).expect("cookie JWT valid");
         assert_eq!(claims.username, "gina");
+
+        // Non-credential UX hints accompany the credential: the role is
+        // readable by the SPA and the hint drives the login redirect; the
+        // server never authorizes from either.
+        let role_cookie = set_cookie(&headers, crate::auth::ROLE_COOKIE_NAME)
+            .expect("login must set the role hint cookie");
+        assert!(role_cookie.starts_with("chv_role=admin;"));
+        assert!(
+            !role_cookie.contains("HttpOnly"),
+            "the role hint is intentionally script-readable and grants nothing"
+        );
+        let hint_cookie = set_cookie(&headers, crate::auth::AUTH_HINT_COOKIE_NAME)
+            .expect("login must set the logged-in hint cookie");
+        assert!(hint_cookie.starts_with("chv_logged_in=1;"));
+        assert!(!hint_cookie.contains("HttpOnly"));
     }
 
     #[test]
@@ -773,9 +931,12 @@ mod tests {
         .expect("change_password should succeed");
         assert_eq!(resp.0.get("ok").and_then(|v| v.as_bool()), Some(true));
 
-        // DB row: new hash verifies, must_change_password cleared.
-        let row: (String, i64) = sqlx::query_as(
-            "SELECT password_hash, must_change_password FROM users WHERE user_id = ?",
+        // DB row: new hash verifies, must_change_password cleared, and the
+        // token_version bumped so the token that authenticated this request
+        // is revoked (#660).
+        let row: (String, i64, i64) = sqlx::query_as(
+            "SELECT password_hash, must_change_password, token_version \
+             FROM users WHERE user_id = ?",
         )
         .bind("u-cp-ok")
         .fetch_one(&state.pool)
@@ -783,6 +944,7 @@ mod tests {
         .unwrap();
         assert!(bcrypt::verify("BrandNewPassword!42", &row.0).unwrap());
         assert_eq!(row.1, 0, "must_change_password must be cleared");
+        assert_eq!(row.2, 1, "password change must revoke older tokens");
     }
 
     #[tokio::test]
@@ -920,6 +1082,14 @@ mod tests {
         use tower::ServiceExt;
 
         let state = build_test_state().await;
+        seed_user(
+            &state.pool,
+            "u-cookie-mw-1",
+            "cookie1",
+            "irrelevant12",
+            false,
+        )
+        .await;
         let token = admin_token_for(&state, "u-cookie-mw-1", false);
 
         let app = crate::bff_router(state.clone()).with_state(state);
@@ -980,6 +1150,14 @@ mod tests {
         use tower::ServiceExt;
 
         let state = build_test_state().await;
+        seed_user(
+            &state.pool,
+            "u-cookie-mw-2",
+            "cookie2",
+            "irrelevant12",
+            false,
+        )
+        .await;
         let token = admin_token_for(&state, "u-cookie-mw-2", false);
 
         let app = crate::bff_router(state.clone()).with_state(state);
@@ -1005,65 +1183,368 @@ mod tests {
         );
     }
 
-    // ── logout clears the session cookie (Security S1 review) ─────────────
+    // ── logout and server-side revocation (#660) ──────────────────────────
+
+    fn json_post(uri: &str) -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+    }
+
+    async fn overview_status(
+        app: &axum::Router,
+        token: Option<&str>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let mut builder = json_post("/v1/overview");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
 
     #[tokio::test]
-    async fn logout_clears_session_cookie_and_cleared_cookie_no_longer_authenticates() {
+    async fn logout_revokes_the_presented_token_server_side() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
         let state = build_test_state().await;
+        seed_user(&state.pool, "u-logout", "logout", "irrelevant12", false).await;
+        let token = admin_token_for(&state, "u-logout", false);
         let app = crate::bff_router(state.clone()).with_state(state.clone());
 
-        // Logout is deliberately unauthenticated: clearing the cookie must
-        // succeed even with no (or an invalid) token. The clearing cookie
-        // empties the value with Max-Age=0 and the same attributes login
-        // set.
+        // A browser logout presents the HttpOnly cookie. The endpoint must
+        // both clear the cookie and bump the user's token_version.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/logout")
+            .header(
+                axum::http::header::COOKIE,
+                format!("{}={token}", crate::auth::SESSION_COOKIE_NAME),
+            )
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cleared: Vec<&str> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(cleared.iter().any(|c| c.starts_with("chv_session=;")
+            && c.contains("Max-Age=0")
+            && c.contains("HttpOnly")));
+        assert!(cleared
+            .iter()
+            .any(|c| c.starts_with("chv_role=;") && c.contains("Max-Age=0")));
+        assert!(cleared
+            .iter()
+            .any(|c| c.starts_with("chv_logged_in=;") && c.contains("Max-Age=0")));
+
+        let (version,): (i64,) =
+            sqlx::query_as("SELECT token_version FROM users WHERE user_id = 'u-logout'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 1, "logout must bump token_version");
+
+        // The exact token that just logged out must be dead, even though its
+        // JWT signature and exp are still valid.
+        let (status, body) = overview_status(&app, Some(&token)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "SESSION_REVOKED");
+    }
+
+    #[tokio::test]
+    async fn logout_without_a_token_still_clears_the_cookies() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = build_test_state().await;
+        let app = crate::bff_router(state.clone()).with_state(state);
+
         let req = Request::builder()
             .method("POST")
             .uri("/v1/auth/logout")
             .header("content-type", "application/json")
             .body(Body::empty())
             .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let set_cookie = resp
+        assert!(resp
             .headers()
-            .get(axum::http::header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .expect("logout must clear the session cookie")
-            .to_string();
-        assert!(
-            set_cookie.starts_with(&format!("{}=;", crate::auth::SESSION_COOKIE_NAME)),
-            "clearing cookie must empty the value; got: {set_cookie}"
-        );
-        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
-        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
-        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
-        assert!(set_cookie.contains("SameSite=Strict"), "got: {set_cookie}");
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["ok"], true);
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .any(|v| v
+                .to_str()
+                .map(|c| c.starts_with("chv_session=;"))
+                .unwrap_or(false)));
+    }
 
-        // A request carrying the cleared cookie value must NOT
-        // authenticate: the empty value is rejected by the cookie parser
-        // and the request falls through to the missing-credential 401.
-        let req2 = Request::builder()
-            .method("POST")
-            .uri("/v1/overview")
-            .header(
-                axum::http::header::COOKIE,
-                format!("{}=", crate::auth::SESSION_COOKIE_NAME),
-            )
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
+    #[tokio::test]
+    async fn bumped_token_version_rejects_and_current_version_accepts() {
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        seed_user(&state.pool, "u-ver", "ver", "irrelevant12", false).await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+
+        let current = admin_token_with_version(&state, "u-ver", false, Some(1));
+        let stale = admin_token_with_version(&state, "u-ver", false, Some(0));
+
+        // Version 0 is current before the bump.
+        let (status, _) = overview_status(&app, Some(&stale)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        sqlx::query("UPDATE users SET token_version = 1 WHERE user_id = 'u-ver'")
+            .execute(&state.pool)
+            .await
             .unwrap();
-        let resp2 = app.oneshot(req2).await.unwrap();
+
+        let (status, body) = overview_status(&app, Some(&stale)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "stale version must die");
+        assert_eq!(body["code"], "SESSION_REVOKED");
+
+        let (status, _) = overview_status(&app, Some(&current)).await;
+        assert_eq!(status, StatusCode::OK, "current version must authenticate");
+    }
+
+    #[tokio::test]
+    async fn legacy_token_without_version_claim_is_accepted_during_rollout() {
+        // Documented rollout: tokens issued before #660 have no
+        // token_version. They are accepted (bounded by their 24h exp) so a
+        // deploy does not log every operator out; newly issued tokens always
+        // carry the claim and are checked strictly.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        seed_user(&state.pool, "u-legacy", "legacy", "irrelevant12", false).await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+        let legacy = admin_token_with_version(&state, "u-legacy", false, None);
+
+        let (status, _) = overview_status(&app, Some(&legacy)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn versioned_token_for_missing_user_is_rejected() {
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+        let orphan = admin_token_with_version(&state, "u-does-not-exist", false, Some(0));
+
+        let (status, _) = overview_status(&app, Some(&orphan)).await;
         assert_eq!(
-            resp2.status(),
+            status,
             StatusCode::UNAUTHORIZED,
-            "cleared cookie must no longer authenticate"
+            "a versioned token with no backing user must fail closed"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_token_for_missing_user_is_rejected() {
+        // M3: pre-#660 tokens have no version claim, but a deleted user's
+        // token must not survive on the legacy path.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+        let orphan = admin_token_with_version(&state, "u-deleted-legacy", false, None);
+
+        let (status, body) = overview_status(&app, Some(&orphan)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a legacy token with no backing user must fail closed"
+        );
+        assert_eq!(body["code"], "SESSION_REVOKED");
+    }
+
+    #[tokio::test]
+    async fn logout_for_deleted_user_returns_200_and_clears_cookies() {
+        // M2: the account is already gone, so there is nothing to revoke.
+        // Logout must still succeed and clear every cookie instead of
+        // returning 500 with the browser stuck holding a stale session.
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = build_test_state().await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+        let orphan = admin_token_with_version(&state, "u-deleted-logout", false, None);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/logout")
+                    .header(
+                        axum::http::header::COOKIE,
+                        format!("{}={orphan}", crate::auth::SESSION_COOKIE_NAME),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cleared: Vec<&str> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        for name in ["chv_session=;", "chv_role=;", "chv_logged_in=;"] {
+            assert!(
+                cleared.iter().any(|c| c.starts_with(name)),
+                "logout must clear {name}, got: {cleared:?}"
+            );
+        }
+    }
+
+    async fn admin_update_user(
+        app: &axum::Router,
+        caller_token: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                json_post("/v1/users/update")
+                    .header("authorization", format!("Bearer {caller_token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn admin_password_reset_revokes_the_target_session() {
+        // H2: the standard compromise response is an admin password reset.
+        // It must bump token_version so a stolen session dies immediately.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        seed_user(
+            &state.pool,
+            "u-admin-reset",
+            "reseter",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        seed_user(
+            &state.pool,
+            "u-target-reset",
+            "target",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+
+        let caller = admin_token_for(&state, "u-admin-reset", false);
+        let target = admin_token_for(&state, "u-target-reset", false);
+
+        // Target token works before the reset.
+        let (status, _) = overview_status(&app, Some(&target)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = admin_update_user(
+            &app,
+            &caller,
+            serde_json::json!({
+                "user_id": "u-target-reset",
+                "password": "brand-new-password-12",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin reset failed: {body}");
+
+        let (status, body) = overview_status(&app, Some(&target)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the target's pre-reset session must be revoked"
+        );
+        assert_eq!(body["code"], "SESSION_REVOKED");
+    }
+
+    #[tokio::test]
+    async fn admin_role_demotion_revokes_the_target_session() {
+        // H2: a demoted account must not keep an admin-scoped token.
+        use axum::http::StatusCode;
+
+        let state = build_test_state().await;
+        seed_user(
+            &state.pool,
+            "u-admin-demote",
+            "demoter",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        seed_user(
+            &state.pool,
+            "u-target-demote",
+            "demotee",
+            "irrelevant12",
+            false,
+        )
+        .await;
+        let app = crate::bff_router(state.clone()).with_state(state.clone());
+
+        let caller = admin_token_for(&state, "u-admin-demote", false);
+        let target = admin_token_for(&state, "u-target-demote", false);
+
+        let (status, _) = overview_status(&app, Some(&target)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = admin_update_user(
+            &app,
+            &caller,
+            serde_json::json!({
+                "user_id": "u-target-demote",
+                "role": "viewer",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "role update failed: {body}");
+        assert_eq!(body["role"], "viewer");
+
+        let (status, body) = overview_status(&app, Some(&target)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the demoted user's prior session must be revoked"
+        );
+        assert_eq!(body["code"], "SESSION_REVOKED");
     }
 }

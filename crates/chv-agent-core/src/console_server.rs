@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    extract::{Path, State, WebSocketUpgrade},
+    http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -26,11 +26,6 @@ pub struct ConsoleServer {
 }
 
 #[derive(serde::Deserialize)]
-struct ConsoleParams {
-    token: String,
-}
-
-#[derive(serde::Deserialize)]
 struct ResizeMsg {
     #[serde(rename = "type")]
     msg_type: String,
@@ -38,11 +33,18 @@ struct ResizeMsg {
     rows: u16,
 }
 
+/// Audience bound into every console ticket by the BFF. The console server
+/// rejects session tokens (or any other JWT) that do not carry exactly this
+/// audience, so a stolen short-lived console token cannot be replayed
+/// against the session API and a full session JWT cannot open a console.
+const CONSOLE_AUDIENCE: &str = "chv:console";
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct Claims {
     sub: String,
     username: String,
+    aud: String,
     exp: u64,
 }
 
@@ -139,22 +141,39 @@ impl ConsoleServer {
     async fn ws_handler(
         State(state): State<ConsoleServer>,
         Path(vm_id): Path<String>,
-        Query(params): Query<ConsoleParams>,
+        headers: HeaderMap,
         ws: WebSocketUpgrade,
     ) -> Response {
         const MAX_TOKEN_LEN: usize = 8192;
         const MAX_VM_ID_LEN: usize = 256;
 
-        if params.token.len() > MAX_TOKEN_LEN {
-            tracing::warn!(token_len = params.token.len(), "console token too long");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
         if vm_id.len() > MAX_VM_ID_LEN {
             tracing::warn!(vm_id_len = vm_id.len(), "vm_id too long");
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        let claims = match validate_console_token(&params.token, &state.jwt_secret) {
+        // #660: the console ticket arrives as a WebSocket subprotocol, never
+        // in the URL. Query strings leak through access logs, proxy logs, and
+        // browser history, so `?token=` is ignored entirely — a request with
+        // no subprotocol ticket is unauthenticated even if the query carries
+        // one.
+        let token = match console_token_from_headers(&headers) {
+            Some(token) => token,
+            None => {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    "console token missing from Sec-WebSocket-Protocol"
+                );
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        };
+
+        if token.len() > MAX_TOKEN_LEN {
+            tracing::warn!(token_len = token.len(), "console token too long");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        let claims = match validate_console_token(&token, &state.jwt_secret) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "console token validation failed");
@@ -171,13 +190,18 @@ impl ConsoleServer {
             return response;
         }
 
-        if let Some(response) = Self::check_replay(&params.token, &state.consumed_tokens).await {
+        if let Some(response) = Self::check_replay(&token, &state.consumed_tokens).await {
             tracing::warn!(vm_id = %vm_id, "console token replay detected");
             return response;
         }
 
         let vm_runtime = state.vm_runtime.clone();
-        ws.max_message_size(64 * 1024)
+        // Echo the accepted ticket as the negotiated subprotocol. Browsers
+        // only deliver a 101 to the page when the server selects one of the
+        // offered protocols, so this both completes the handshake and keeps
+        // the credential out of the URL.
+        ws.protocols([token])
+            .max_message_size(64 * 1024)
             .max_frame_size(64 * 1024)
             .on_upgrade(move |socket| Self::handle_socket(socket, vm_id, vm_runtime))
     }
@@ -372,15 +396,40 @@ fn set_pty_size(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> Result<(), nix:
     unsafe { set_winsize(fd, &ws).map(|_| ()) }
 }
 
-/// Validate a JWT token against the given secret using HS256.
-/// Returns Ok(Claims) if the token is valid and not expired, Err otherwise.
+/// Extract the console ticket from the `Sec-WebSocket-Protocol` request
+/// header (#660).
+///
+/// Browsers cannot set arbitrary headers on a WebSocket handshake, so the
+/// conventional channel for a bearer credential is the subprotocol list:
+/// the UI calls `new WebSocket(url, [token])`. A handshake may offer several
+/// protocols (comma-separated); the first JWT-shaped candidate is returned.
+/// Non-JWT protocol names (e.g. `graphql-ws`) are skipped so a client that
+/// offers both still authenticates. The candidate is fully validated by
+/// [`validate_console_token`] afterwards, including the `chv:console`
+/// audience.
+fn console_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
+    raw.split(',')
+        .map(str::trim)
+        .find(|candidate| candidate.matches('.').count() == 2)
+        .map(str::to_string)
+}
+
+/// Validate a console ticket against the given secret using HS256.
+///
+/// The token must carry exactly the `chv:console` audience (#660): a normal
+/// session JWT (no `aud`) or an API token is rejected, so a stolen console
+/// ticket cannot be replayed against the session API and a full session
+/// credential cannot open a console. Returns Ok(Claims) if the token is
+/// valid and not expired, Err otherwise.
 fn validate_console_token(
     token: &str,
     secret: &str,
 ) -> Result<Claims, jsonwebtoken::errors::Error> {
     let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.validate_aud = false;
+    validation.set_audience(&[CONSOLE_AUDIENCE]);
+    validation.set_required_spec_claims(&["exp", "aud", "sub"]);
     jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation).map(|d| d.claims)
 }
 
@@ -399,9 +448,20 @@ mod tests {
     }
 
     fn encode_claims(sub: &str, username: &str, exp: u64, secret: &str) -> String {
+        encode_claims_with_aud(sub, username, CONSOLE_AUDIENCE, exp, secret)
+    }
+
+    fn encode_claims_with_aud(
+        sub: &str,
+        username: &str,
+        aud: &str,
+        exp: u64,
+        secret: &str,
+    ) -> String {
         let claims = Claims {
             sub: sub.to_string(),
             username: username.to_string(),
+            aud: aud.to_string(),
             exp,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -462,6 +522,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_console_audience_is_rejected() {
+        // A session JWT carries a different audience (or none); only console
+        // tickets are accepted.
+        let token = encode_claims_with_aud(
+            "user-1",
+            "admin",
+            "chv:session",
+            future_exp(),
+            &test_secret(),
+        );
+        let result = validate_console_token(&token, &test_secret());
+        assert!(
+            result.is_err(),
+            "token with the wrong audience must be rejected"
+        );
+    }
+
+    #[test]
+    fn missing_audience_is_rejected() {
+        // No `aud` claim at all must also fail (set_required_spec_claims).
+        let claims = serde_json::json!({
+            "sub": "user-1",
+            "username": "admin",
+            "exp": future_exp(),
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(test_secret().as_bytes()),
+        )
+        .unwrap();
+        assert!(validate_console_token(&token, &test_secret()).is_err());
+    }
+
+    #[test]
+    fn console_audience_is_accepted() {
+        let token = encode_claims_with_aud(
+            "user-1",
+            "admin",
+            CONSOLE_AUDIENCE,
+            future_exp(),
+            &test_secret(),
+        );
+        let claims =
+            validate_console_token(&token, &test_secret()).expect("console audience valid");
+        assert_eq!(claims.aud, CONSOLE_AUDIENCE);
+    }
+
+    #[test]
+    fn console_token_is_read_from_subprotocol_header() {
+        let token = encode_claims("user-1", "admin", future_exp(), &test_secret());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            format!("graphql-ws, {token}").parse().unwrap(),
+        );
+        assert_eq!(console_token_from_headers(&headers), Some(token));
+    }
+
+    #[test]
+    fn query_string_tokens_are_not_read() {
+        // Request headers without a subprotocol never yield a token, no
+        // matter what the (ignored) query string says.
+        let headers = HeaderMap::new();
+        assert_eq!(console_token_from_headers(&headers), None);
+    }
+
     #[tokio::test]
     async fn try_bind_fails_when_port_in_use() {
         // Bind a temporary listener to occupy the port
@@ -490,26 +618,79 @@ mod tests {
         ConsoleServer::new(vm_runtime, test_secret())
     }
 
-    fn ws_upgrade_request(uri: &str) -> axum::http::Request<axum::body::Body> {
-        axum::http::Request::get(uri)
-            .header("upgrade", "websocket")
-            .header("connection", "upgrade")
-            .header("sec-websocket-version", "13")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .body(axum::body::Body::empty())
-            .unwrap()
+    /// A raw HTTP/1.1 WebSocket upgrade request. Needed for assertions that
+    /// run *after* the `WebSocketUpgrade` extractor, because `oneshot` has no
+    /// `OnUpgrade` extension (it answers 426 before the handler runs). The
+    /// duplex harness below carries a real hyper upgrade.
+    fn raw_ws_request(path: &str, protocols: Option<&str>) -> String {
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n"
+        );
+        if let Some(protocol) = protocols {
+            request.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+        }
+        request.push_str("\r\n");
+        request
+    }
+
+    /// Serve one raw request through a real upgrade-capable hyper connection
+    /// and return the HTTP status code.
+    async fn status_over_duplex(request: String) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let app = test_console_server().router();
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(
+                        hyper_util::rt::TokioIo::new(server_io),
+                        hyper_util::service::TowerToHyperService::new(app),
+                    )
+                    .await;
+        });
+
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write raw request");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while client.read_exact(&mut byte).await.is_ok() {
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&head);
+        head.lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
     }
 
     #[tokio::test]
-    async fn missing_token_returns_bad_request() {
-        use tower::ServiceExt;
-        let app = test_console_server().router();
-        let response = app
-            .oneshot(ws_upgrade_request("/vms/test-vm/console"))
-            .await
-            .unwrap();
-        // Axum's Query<ConsoleParams> fails to deserialize when token is missing
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    async fn missing_token_returns_unauthorized() {
+        let status = status_over_duplex(raw_ws_request("/vms/test-vm/console", None)).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn query_string_token_is_ignored() {
+        let token = encode_claims("test-vm", "admin", future_exp(), &test_secret());
+        // #660: the query channel was removed; only the subprotocol is read.
+        let status = status_over_duplex(raw_ws_request(
+            &format!("/vms/test-vm/console?token={token}"),
+            None,
+        ))
+        .await;
+        assert_eq!(status, 401);
     }
 
     #[tokio::test]
@@ -517,14 +698,11 @@ mod tests {
         use tower::ServiceExt;
         let app = test_console_server().router();
         let token = encode_claims("test-vm", "admin", future_exp(), &test_secret());
-        let response = app
-            .oneshot(
-                axum::http::Request::get(format!("/vms/test-vm/console?token={}", token))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
+        let request = axum::http::Request::get("/vms/test-vm/console")
+            .header("sec-websocket-protocol", token)
+            .body(axum::body::Body::empty())
             .unwrap();
+        let response = app.oneshot(request).await.unwrap();
         // WebSocketUpgrade extractor requires upgrade headers
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
@@ -972,12 +1150,13 @@ mod tests {
 
         let token = encode_claims(vm_id, "admin", future_exp(), &test_secret());
         let request = format!(
-            "GET /vms/{vm_id}/console?token={token} HTTP/1.1\r\n\
+            "GET /vms/{vm_id}/console HTTP/1.1\r\n\
              Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Protocol: {token}\r\n\
              \r\n"
         );
         client

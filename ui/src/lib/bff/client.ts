@@ -89,6 +89,7 @@ export async function bffFetch<T>(
 		response = await fetch(`${baseUrl}${path}`, {
 			...init,
 			headers,
+			credentials: 'include',
 			signal: controller.signal
 		});
 	} catch (networkError) {

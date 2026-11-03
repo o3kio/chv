@@ -1,9 +1,15 @@
 import type { Page } from '@playwright/test';
 
+/**
+ * Seed the non-credential UX hint cookies the SPA reads (#660). The browser
+ * session itself is the HttpOnly `chv_session` cookie, which these tests
+ * cannot forge; API calls are mocked so no real credential is needed.
+ */
 export async function loginAsAdmin(page: Page) {
-	await page.addInitScript(() => {
-		localStorage.setItem('chv-api-token', 'fake-jwt-token');
-	});
+	await page.context().addCookies([
+		{ name: 'chv_logged_in', value: '1', domain: 'localhost', path: '/', sameSite: 'Strict' },
+		{ name: 'chv_role', value: 'admin', domain: 'localhost', path: '/', sameSite: 'Strict' }
+	]);
 }
 
 export async function mockApiResponse(

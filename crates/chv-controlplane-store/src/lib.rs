@@ -25,6 +25,7 @@ mod nodes;
 mod notification_outbox;
 mod observed_state;
 mod operations;
+mod users;
 mod vtep;
 
 pub use alert_rules::{
@@ -100,6 +101,7 @@ pub use observed_state::{
     VmObservedStateInput, VolumeObservedStateInput,
 };
 pub use operations::{OperationCreateInput, OperationRepository, OperationStatusUpdateInput};
+pub use users::UserRepository;
 pub use vtep::{FabricPeerRecord, VtepEntry, VtepRepository};
 
 #[cfg(any(test, feature = "test-util"))]

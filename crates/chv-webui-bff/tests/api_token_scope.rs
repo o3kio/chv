@@ -7,8 +7,10 @@
 //!
 //! - `scope = "full"`     -> token keeps the user's role.
 //! - `scope = "readonly"` -> token is demoted to the viewer role.
-//! - any other value      -> fail-safe treated as "full" (see
-//!   `effective_role_for_scope`), so legacy rows never lock out.
+//! - any other value      -> the token is REJECTED with 403
+//!   `INVALID_TOKEN_SCOPE` (fail closed, #660). There is no fallback to the
+//!   user's role: an unrecognized scope must never inherit mutation
+//!   authority.
 //!
 //! These tests boot the real `bff_router` and assert the role middleware
 //! behavior end-to-end: a readonly token is rejected (403) on a mutating
@@ -266,7 +268,7 @@ async fn readonly_scope_token_works_on_read_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
-// full scope (and the fail-safe unknown-scope fallback)
+// full scope and fail-closed unknown scopes (#660)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -292,14 +294,15 @@ async fn full_scope_token_keeps_the_users_role() {
 }
 
 #[tokio::test]
-async fn unknown_scope_falls_back_to_full_without_lockout() {
+async fn unknown_scope_is_rejected_with_invalid_token_scope() {
     let state = build_state().await;
     let token = seed_api_token(&state, "u-svc", "svc", "operator", "banana").await;
 
-    // Legacy/unknown scope values are treated as "full" (fail-safe), so the
-    // token keeps the operator role and reaches the handler (404), not 403.
+    // #660 hardening: an unrecognized scope is a hard 403, never a fallback
+    // to the user's role. The token must not reach the handler (which would
+    // answer 404 for the unknown id) and must not inherit operator authority.
     let status = post_with_token(
-        state,
+        state.clone(),
         "/v1/architectures/plan",
         &token,
         r#"{"id":"arch-x"}"#,
@@ -307,7 +310,28 @@ async fn unknown_scope_falls_back_to_full_without_lockout() {
     .await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "unknown scope must fail safe to full"
+        StatusCode::FORBIDDEN,
+        "unknown scope must fail closed"
     );
+
+    // Even a read-only route rejects it: the credential itself is invalid.
+    let status = post_with_token(state, "/v1/overview", &token, "{}").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn empty_scope_is_rejected() {
+    let state = build_state().await;
+    let token = seed_api_token(&state, "u-svc", "svc", "admin", "").await;
+    let status = post_with_token(state, "/v1/overview", &token, "{}").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn mixed_case_scope_is_rejected() {
+    // Scope matching is exact: "READONLY" is not "readonly".
+    let state = build_state().await;
+    let token = seed_api_token(&state, "u-svc", "svc", "operator", "READONLY").await;
+    let status = post_with_token(state, "/v1/overview", &token, "{}").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

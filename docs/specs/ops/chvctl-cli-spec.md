@@ -17,7 +17,7 @@ the previous revision documented commands that never existed and
 spellings the binary never accepted.
 
 ### Authentication
-- `chvctl login --username <username> --password <password>` — authenticate against the backend-for-frontend (BFF) and store the token locally
+- `chvctl login --username <username> --password <password>` — authenticate against the control-plane API-only token endpoint (`POST /api/v1/auth/login`) and store the token locally. The browser login (`POST /v1/auth/login`) deliberately returns no token (#660): it sets an HttpOnly session cookie instead, so `chvctl` must use the `/api/v1` surface.
 
 ### Virtual Machines
 - `chvctl vm list` — List all VMs

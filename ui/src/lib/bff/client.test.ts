@@ -58,6 +58,22 @@ describe('bffFetch', () => {
 		expect(headers.get('Content-Type')).toBe('application/json');
 	});
 
+	it('sends cookies for browser sessions when no token is provided', async () => {
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 200,
+			headers: jsonHeaders(),
+			json: async () => ({ data: 'ok' })
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		await bffFetch('/v1/test', { method: 'POST' });
+
+		const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+		expect(init.credentials).toBe('include');
+		expect((init.headers as Headers).get('Authorization')).toBeNull();
+	});
+
 	it('throws BFFError on 401 with server payload', async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: false,

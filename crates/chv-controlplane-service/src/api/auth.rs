@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, response::Json, Json as AxumJson};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    Json as AxumJson,
+};
 use chv_webui_bff::auth::Claims;
 use chv_webui_bff::AppState;
 use serde_json::Value;
@@ -61,6 +66,13 @@ async fn check_rate_limit(username: &str) -> Result<(), chv_webui_bff::BffError>
     Ok(())
 }
 
+/// Direct control-plane login (`POST /api/v1/auth/login`).
+///
+/// This is the **API-only** token path. Unlike the browser login
+/// (`POST /v1/auth/login`, which never returns the JWT), callers here are
+/// non-browser clients such as `chvctl` that legitimately hold a bearer
+/// token. The browser flow must not be pointed at this endpoint: the UI
+/// authenticates exclusively through the BFF's HttpOnly cookie.
 pub async fn login_handler(
     State(state): State<AppState>,
     AxumJson(payload): AxumJson<Value>,
@@ -87,7 +99,8 @@ pub async fn login_handler(
 
     // Look up user by username
     let row = sqlx::query_as::<_, UserRow>(
-        "SELECT user_id, password_hash, role, must_change_password FROM users WHERE username = $1",
+        "SELECT user_id, password_hash, role, must_change_password, token_version \
+         FROM users WHERE username = $1",
     )
     .bind(username)
     .fetch_optional(&state.pool)
@@ -126,13 +139,16 @@ pub async fn login_handler(
         + 24 * 60 * 60; // 24 hours
 
     let must_change_password = row.must_change_password != 0;
+    let token_version = row.token_version.max(0) as u64;
 
     let claims = Claims {
         sub: row.user_id.clone(),
         username: username.to_string(),
         role: row.role.clone(),
         exp,
+        aud: Some(chv_webui_bff::auth::SESSION_AUDIENCE.to_string()),
         must_change_password,
+        token_version: Some(token_version),
     };
 
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -174,24 +190,77 @@ pub async fn me_handler(
     )
 }
 
-/// Logout terminates the cookie session: the `chv_session` cookie minted
-/// by `/api/v1/auth/login` (and the BFF's `/v1/auth/login`) is cleared with
+/// Logout terminates the browser session: the HttpOnly `chv_session`
+/// cookie minted by the **BFF's** `/v1/auth/login` is cleared with
 /// `Max-Age=0` and the same attributes it was set with (`Path=/`,
-/// `HttpOnly`, `SameSite=Strict`), so the browser stops sending the JWT on
-/// subsequent requests. JWTs are stateless and cannot be revoked
-/// server-side; expiring the cookie is the termination this surface owns.
-pub async fn logout_handler() -> impl axum::response::IntoResponse {
+/// `HttpOnly`, `SameSite=Strict`), and the two non-credential UX hint
+/// cookies are cleared too. (`/api/v1/auth/login` is the API-only token
+/// path and never sets a cookie.)
+///
+/// Server-side revocation (#660): when the request presents a valid
+/// session JWT (cookie or `Authorization: Bearer`), the user's
+/// `token_version` is incremented, so a copied token dies immediately
+/// instead of surviving until `exp`. The route remains unauthenticated so
+/// clearing the cookie works even for an already-expired session.
+pub async fn logout_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl axum::response::IntoResponse {
+    if let Some(token) = chv_webui_bff::auth::request_token(&headers) {
+        if let Ok(claims) = chv_webui_bff::auth::validate_token(&token, &state.jwt_secret) {
+            match chv_controlplane_store::UserRepository::new(state.pool.clone())
+                .bump_token_version(&claims.sub)
+                .await
+            {
+                Ok(_) => {}
+                // The account is already gone: nothing left to revoke, so
+                // logout succeeds and still clears every cookie (M2).
+                Err(chv_controlplane_store::StoreError::NotFound { .. }) => {
+                    tracing::debug!(
+                        sub = %claims.sub,
+                        "logout for deleted user: nothing to revoke, clearing cookies"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "logout failed to bump token_version");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "message": "failed to revoke session",
+                            "code": "INTERNAL"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    let mut response_headers = axum::http::HeaderMap::new();
+    for cookie in [
+        format!(
+            "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
+            chv_webui_bff::auth::SESSION_COOKIE_NAME
+        ),
+        format!(
+            "{}=; Max-Age=0; Path=/; SameSite=Strict",
+            chv_webui_bff::auth::ROLE_COOKIE_NAME
+        ),
+        format!(
+            "{}=; Max-Age=0; Path=/; SameSite=Strict",
+            chv_webui_bff::auth::AUTH_HINT_COOKIE_NAME
+        ),
+    ] {
+        if let Ok(value) = cookie.parse::<axum::http::HeaderValue>() {
+            response_headers.append(axum::http::header::SET_COOKIE, value);
+        }
+    }
     (
         StatusCode::OK,
-        [(
-            axum::http::header::SET_COOKIE,
-            format!(
-                "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
-                chv_webui_bff::auth::SESSION_COOKIE_NAME
-            ),
-        )],
+        response_headers,
         Json(serde_json::json!({"ok": true})),
     )
+        .into_response()
 }
 
 #[derive(sqlx::FromRow)]
@@ -204,4 +273,6 @@ struct UserRow {
     /// sets it to 1 on the seeded admin row so the operator is forced to
     /// rotate the credential on first login.
     must_change_password: i64,
+    /// Session revocation counter (#660, migration 0066).
+    token_version: i64,
 }

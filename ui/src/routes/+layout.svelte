@@ -1,7 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { getStoredToken } from '#lib/api/client.ts';
-	import { syncAuthCookieFromLocalStorage } from '#lib/bff/auth-cookie.ts';
+	import { isLoggedIn } from '#lib/api/client.ts';
 	import KeyboardShortcutsHelp from '#lib/components/shared/KeyboardShortcutsHelp.svelte';
 	import QuickActions from '#lib/components/shared/QuickActions.svelte';
 	import SearchModal from '#lib/components/shell/SearchModal.svelte';
@@ -41,11 +40,9 @@
 	});
 
 	onMount(() => {
-		const token = getStoredToken();
-		syncAuthCookieFromLocalStorage();
 		theme.init();
 
-		if (!isPublicRoute && !getStoredToken()) {
+		if (!isPublicRoute && !isLoggedIn()) {
 			goto('/login');
 		}
 

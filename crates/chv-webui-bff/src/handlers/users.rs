@@ -201,8 +201,11 @@ pub async fn update_user(
     };
 
     if let Some(ref hash) = resolved_password_hash {
+        // Admin password reset revokes every prior session (#660): a stolen
+        // cookie must not survive the standard compromise response.
         sqlx::query(
-            "UPDATE users SET role = ?, display_name = ?, email = ?, password_hash = ? WHERE user_id = ?",
+            "UPDATE users SET role = ?, display_name = ?, email = ?, password_hash = ?, \
+             token_version = token_version + 1 WHERE user_id = ?",
         )
         .bind(&resolved_role)
         .bind(&resolved_display_name)
@@ -216,17 +219,27 @@ pub async fn update_user(
             BffError::Internal("failed to update user".into())
         })?;
     } else {
-        sqlx::query("UPDATE users SET role = ?, display_name = ?, email = ? WHERE user_id = ?")
-            .bind(&resolved_role)
-            .bind(&resolved_display_name)
-            .bind(&resolved_email)
-            .bind(&user_id)
-            .execute(&state.pool)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "update_user db update failed");
-                BffError::Internal("failed to update user".into())
-            })?;
+        // A role change (including demotion) revokes prior sessions so a
+        // reduced-privilege account cannot keep an old admin-scoped token.
+        // Cosmetic edits (display name/email) do not, matching the
+        // documented behavior in docs/OPERATIONS.md; logging the target out
+        // of an unrelated tab would otherwise be a surprise.
+        let bump_token_version = i64::from(resolved_role != row.role);
+        sqlx::query(
+            "UPDATE users SET role = ?, display_name = ?, email = ?, \
+             token_version = token_version + ? WHERE user_id = ?",
+        )
+        .bind(&resolved_role)
+        .bind(&resolved_display_name)
+        .bind(&resolved_email)
+        .bind(bump_token_version)
+        .bind(&user_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "update_user db update failed");
+            BffError::Internal("failed to update user".into())
+        })?;
     }
     state.cache.invalidate("overview").await;
 

@@ -28,8 +28,12 @@ The BFF returns a full `ws://` or `wss://` URL. The browser connects directly to
 
 The BFF returns a relative path including `node_id`:
 ```
-/ws/vms/{node_id}/{vm_id}/console?token=...
+/ws/vms/{node_id}/{vm_id}/console
 ```
+
+The console ticket is delivered separately and sent in the
+`Sec-WebSocket-Protocol` header (#660), so it does not appear in the URL,
+access logs, or browser history. nginx forwards the header by default.
 
 nginx routes to the correct backend using a `map` block. Edit the `map $request_uri $ws_backend` section in `chv-ui.conf` and add one entry per node:
 

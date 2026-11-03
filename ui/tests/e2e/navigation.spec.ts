@@ -24,10 +24,15 @@ test.describe('Navigation & Auth', () => {
 		await expect(page.locator('.fixed.inset-0')).toBeVisible();
 	});
 
-	test('logout clears token and redirects to login', async ({ page }) => {
+	test('logout clears the session hint and redirects to login', async ({ page }) => {
 		await page.getByRole('button', { name: /sign out/i }).click();
 		await expect(page).toHaveURL('/login');
+		// #660: no credential is ever stored client-side, and the UX hint is
+		// cleared so a reload does not bounce back into the app.
 		expect(await page.evaluate(() => localStorage.getItem('chv-api-token'))).toBeNull();
+		const cookies = await page.context().cookies();
+		expect(cookies.find((c) => c.name === 'chv_logged_in')).toBeUndefined();
+		expect(cookies.find((c) => c.name === 'chv_role')).toBeUndefined();
 	});
 
 	test('unauthenticated user is redirected to login from protected route', async ({ browser }) => {

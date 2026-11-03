@@ -1,5 +1,5 @@
 import { browser } from '$app/env';
-import { getStoredToken } from '#lib/api/client.ts';
+import { isLoggedIn } from '#lib/api/client.ts';
 
 export interface TaskUpdate {
 	task_id: string;
@@ -36,13 +36,12 @@ export class TaskStreamStore {
 		this.stopPollingFallback();
 		this.pollTimer = setInterval(async () => {
 			try {
-				const token = getStoredToken();
-				if (!token) return;
+				if (!isLoggedIn()) return;
 				const res = await fetch('/v1/tasks', {
 					method: 'POST',
+					credentials: 'include',
 					headers: {
 						'Content-Type': 'application/json',
-						Authorization: `Bearer ${token}`,
 					},
 					body: JSON.stringify({ page: 1, page_size: 50 }),
 				});
@@ -95,8 +94,7 @@ export class TaskStreamStore {
 	async connect(resourceKinds?: string[]) {
 		if (!browser) return;
 		this.disconnect();
-		const token = getStoredToken();
-		if (!token) {
+		if (!isLoggedIn()) {
 			this.startPollingFallback();
 			return;
 		}
@@ -111,9 +109,9 @@ export class TaskStreamStore {
 
 		try {
 			const res = await fetch(url.toString(), {
+				credentials: 'include',
 				headers: {
 					Accept: 'text/event-stream',
-					Authorization: `Bearer ${token}`,
 				},
 				signal: this.abortCtrl.signal,
 			});

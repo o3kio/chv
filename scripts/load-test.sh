@@ -22,7 +22,7 @@ echo "Duration: $DURATION, Connections: $CONNECTIONS, RPS: $RPS"
 echo ""
 
 # Verify BFF is reachable
-if ! curl -sf -o /dev/null "$BFF_URL" && ! curl -sf -o /dev/null "$BFF_URL/v1/auth/login"; then
+if ! curl -sf -o /dev/null "$BFF_URL" && ! curl -sf -o /dev/null "$BFF_URL/api/v1/auth/login"; then
     echo "ERROR: BFF is not reachable at $BFF_URL"
     echo "Make sure the CHV services are running (e.g., docker-compose up)."
     exit 1
@@ -30,7 +30,7 @@ fi
 
 # 1. Get JWT token
 echo "[1/2] Authenticating..."
-TOKEN_RESPONSE=$(curl -s -X POST "$BFF_URL/v1/auth/login" \
+TOKEN_RESPONSE=$(curl -s -X POST "$BFF_URL/api/v1/auth/login" \
   -H "Content-Type: application/json" \
   -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")
 

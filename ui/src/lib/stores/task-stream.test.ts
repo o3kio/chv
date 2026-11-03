@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// task-stream now imports getStoredToken from #lib/api/client, which transitively
+// task-stream now imports isLoggedIn from #lib/api/client, which transitively
 // pulls in SvelteKit's $app/env/public and $app/navigation. Mock both so this
 // suite can run under jsdom without a SvelteKit runtime.
 vi.mock('$app/env/public', () => ({
@@ -42,17 +42,19 @@ function mockFetchWithStream(chunks: Uint8Array[], status = 200, hang = false) {
 	return reader;
 }
 
+function setLoggedIn(loggedIn: boolean): void {
+	document.cookie = loggedIn
+		? 'chv_logged_in=1; Path=/'
+		: 'chv_logged_in=; Max-Age=0; Path=/';
+}
+
 describe('TaskStreamStore', () => {
 	beforeEach(() => {
 		vi.restoreAllMocks();
-		vi.stubGlobal('localStorage', {
-			getItem: vi.fn(() => 'test-token'),
-			setItem: vi.fn(),
-			removeItem: vi.fn(),
-		});
+		setLoggedIn(true);
 	});
 
-	it('connects to SSE endpoint with resource_kinds filter', async () => {
+	it('connects to SSE endpoint with the session cookie and resource_kinds filter', async () => {
 		const reader = mockFetchWithStream([], 200, true);
 		const store = new TaskStreamStore();
 		store.connect(['vm', 'node']);
@@ -60,12 +62,14 @@ describe('TaskStreamStore', () => {
 		expect(globalThis.fetch).toHaveBeenCalledWith(
 			expect.stringContaining('/v1/tasks/stream?resource_kinds=vm%2Cnode'),
 			expect.objectContaining({
-				headers: expect.objectContaining({
-					Authorization: 'Bearer test-token',
-				}),
+				credentials: 'include',
 				signal: expect.any(AbortSignal),
 			})
 		);
+		// #660: no bearer token is assembled in the browser.
+		const init = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+			.calls[0][1] as RequestInit;
+		expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
 		expect(store.status).toBe('connecting');
 
 		// Wait for async connect
@@ -74,12 +78,8 @@ describe('TaskStreamStore', () => {
 		store.disconnect();
 	});
 
-	it('falls back to polling when no token is available', () => {
-		vi.stubGlobal('localStorage', {
-			getItem: vi.fn(() => null),
-			setItem: vi.fn(),
-			removeItem: vi.fn(),
-		});
+	it('falls back to polling when no session hint is present', () => {
+		setLoggedIn(false);
 
 		const store = new TaskStreamStore();
 		const pollSpy = vi.spyOn(store, 'startPollingFallback');

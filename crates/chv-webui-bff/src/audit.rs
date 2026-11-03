@@ -138,6 +138,8 @@ pub async fn record_privileged_mutation(
                 role: AUDIT_ANONYMOUS_ROLE.to_string(),
                 exp: 0,
                 must_change_password: false,
+                aud: None,
+                token_version: None,
             },
             AuthSource::Anonymous,
         ),

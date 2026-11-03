@@ -1509,11 +1509,10 @@ pub async fn get_vm_console_url(
         .unwrap_or(false);
     let ws_scheme = if is_tls { "wss" } else { "ws" };
 
-    // Return a full WS URL when the node has an agent_ws_address configured
-    // and the client did not explicitly request proxied mode;
-    // otherwise fall back to the relative path for proxy setups.
-    // In proxied mode the path includes node_id so nginx can route to the
-    // correct hypervisor without requiring dynamic-upstream modules.
+    // #660: the console ticket is returned separately and never embedded in
+    // the URL. The UI passes it as the WebSocket subprotocol
+    // (`new WebSocket(url, [token])`), keeping it out of browser history,
+    // Referer headers, and proxy access logs.
     let console_url = match agent_ws_address {
         Some(addr) if !addr.is_empty() && query.proxied != Some(true) => {
             if !is_tls {
@@ -1523,12 +1522,9 @@ pub async fn get_vm_console_url(
                     "console WebSocket URL uses plaintext ws:// — configure TLS and X-Forwarded-Proto for production"
                 );
             }
-            format!(
-                "{}://{}/vms/{}/console?token={}",
-                ws_scheme, addr, vm_id, token
-            )
+            format!("{}://{}/vms/{}/console", ws_scheme, addr, vm_id)
         }
-        Some(_) => format!("/ws/vms/{}/{}/console?token={}", node_id, vm_id, token),
+        Some(_) => format!("/ws/vms/{}/{}/console", node_id, vm_id),
         None => return Err(BffError::NotFound("node not found".into())),
     };
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
@@ -1537,6 +1533,7 @@ pub async fn get_vm_console_url(
         "vm_id": vm_id,
         "node_id": node_id,
         "url": console_url,
+        "token": token,
         "expires_at": expires_at.to_rfc3339(),
     })))
 }

@@ -1,0 +1,13 @@
+-- Server-side session revocation (#660).
+--
+-- Session JWTs are stateless: expiring the cookie at logout stops the
+-- browser from replaying it, but a copied/leaked token would stay valid
+-- until `exp`. `token_version` is embedded in every newly issued session
+-- JWT; the auth extractor compares it with this column on every request,
+-- and logout, password change, an admin password reset, and a role change
+-- increment it so all older tokens die immediately.
+--
+-- Default 0 keeps pre-#660 rows (and pre-#660 tokens, which carry no
+-- `token_version` claim) at their current version. See the rollout notes
+-- in `docs/OPERATIONS.md`.
+ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0;

@@ -78,7 +78,13 @@
 		return currentPath.startsWith(href);
 	}
 
-	function handleLogout() {
+	async function handleLogout() {
+		try {
+			const { createAPIClient } = await import('#lib/api/client.ts');
+			await createAPIClient().logout();
+		} catch {
+			// Best-effort: clear the client hints regardless.
+		}
 		clearToken();
 		goto('/login');
 		closeMenu();

@@ -22,49 +22,71 @@ import type {
 } from '#lib/api/types.ts';
 
 const DEFAULT_BASE_URL = PUBLIC_CHV_API_BASE_URL || ''; // Empty string means same origin
-const TOKEN_STORAGE_KEY = 'chv-api-token';
 
-function canUseStorage(): boolean {
-  return typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function';
-}
+/** Non-credential UX hint cookie set by the BFF at login. Grants nothing. */
+const AUTH_HINT_COOKIE = 'chv_logged_in';
+/** Non-credential role hint cookie set by the BFF at login. Grants nothing. */
+const ROLE_COOKIE = 'chv_role';
 
-export function getStoredToken(): string | null {
-  if (!canUseStorage()) {
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined' || typeof document.cookie !== 'string') {
     return null;
   }
-  return localStorage.getItem(TOKEN_STORAGE_KEY);
+  const prefix = `${name}=`;
+  for (const pair of document.cookie.split(';')) {
+    const trimmed = pair.trim();
+    if (trimmed.startsWith(prefix)) {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    }
+  }
+  return null;
 }
 
-export function storeToken(token: string): void {
-  if (canUseStorage() && typeof localStorage.setItem === 'function') {
-    localStorage.setItem(TOKEN_STORAGE_KEY, token);
-  }
-}
-
-export function clearToken(): void {
-  if (canUseStorage() && typeof localStorage.removeItem === 'function') {
-    localStorage.removeItem(TOKEN_STORAGE_KEY);
-  }
+function deleteCookie(name: string): void {
+  if (typeof document === 'undefined') return;
+  document.cookie = `${name}=; Max-Age=0; Path=/; SameSite=Strict`;
 }
 
 /**
- * Decode the JWT role claim from the stored token.
- * Handles base64url encoding (RFC 7515) by normalising before decoding.
- * Returns the role string or null if the token is absent / malformed.
+ * HTTP-only cookie sessions mean there is no bearer token for scripts to
+ * read. This remains as a compatibility shim for callers that used to pass
+ * a token through; the BFF client sends cookies automatically.
+ */
+export function getStoredToken(): string | null {
+  return null;
+}
+
+/**
+ * No-op retained for API compatibility. Browser sessions are established by
+ * the server's HttpOnly `chv_session` cookie during `/v1/auth/login`; a token
+ * must never be written to localStorage or sessionStorage (#660).
+ */
+export function storeToken(_token: string): void {
+  // Intentionally empty: the browser has no access to the session credential.
+}
+
+/**
+ * Clear the non-credential UX hint cookies. The HttpOnly session credential
+ * cannot be read or cleared by script: callers logging out should also call
+ * the server's `/v1/auth/logout` (the nav does this) so the JWT is revoked
+ * and the cookie is expired.
+ */
+export function clearToken(): void {
+  deleteCookie(AUTH_HINT_COOKIE);
+  deleteCookie(ROLE_COOKIE);
+}
+
+/** True when the server has set the authenticated-session hint cookie. */
+export function isLoggedIn(): boolean {
+  return readCookie(AUTH_HINT_COOKIE) === '1';
+}
+
+/**
+ * Role hint from the non-credential `chv_role` cookie. Used only to hide
+ * controls the server already gates; never an authorization decision.
  */
 export function getStoredRole(): string | null {
-  try {
-    const token = getStoredToken();
-    if (!token) return null;
-    const parts = token.split('.');
-    if (parts.length < 3) return null;
-    const segment = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const padded = segment.padEnd(Math.ceil(segment.length / 4) * 4, '=');
-    const payload = JSON.parse(atob(padded));
-    return payload.role ?? null;
-  } catch {
-    return null;
-  }
+  return readCookie(ROLE_COOKIE);
 }
 
 /**
@@ -167,7 +189,10 @@ async function parseJSONResponse<T>(response: Response, path: string): Promise<T
 
 export function createAPIClient(options?: { baseUrl?: string; token?: string }) {
   const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL;
-  let token = options?.token ?? getStoredToken() ?? '';
+  // `token` is only for non-browser API clients that explicitly hold a bearer
+  // credential (e.g. an integration harness). The browser never supplies one:
+  // the HttpOnly session cookie is sent automatically.
+  let token = options?.token ?? '';
 
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const headers = new Headers(init?.headers ?? {});
@@ -181,6 +206,7 @@ export function createAPIClient(options?: { baseUrl?: string; token?: string }) 
     try {
       response = await fetch(`${baseUrl}${path}`, {
         ...init,
+        credentials: 'include',
         headers
       });
     } catch (fetchError) {
@@ -282,9 +308,12 @@ export function createAPIClient(options?: { baseUrl?: string; token?: string }) 
 
 
   return {
+    /**
+     * Set an in-memory bearer token for a non-browser client. Never persists
+     * to storage; browser auth uses the HttpOnly cookie instead.
+     */
     setToken(next: string) {
       token = next;
-      storeToken(next);
     },
     clearToken() {
       token = '';
@@ -312,7 +341,7 @@ export function createAPIClient(options?: { baseUrl?: string; token?: string }) 
       return request<Event[]>(`/api/v1/events${query}`);
     },
     logout() {
-      return request<void>('/api/v1/auth/logout', { method: 'POST' });
+      return request<void>('/v1/auth/logout', { method: 'POST' });
     },
     listNodes() {
       return request<NodeWithResources[]>('/api/v1/nodes');

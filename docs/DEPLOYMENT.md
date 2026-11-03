@@ -728,8 +728,14 @@ sudo systemctl start chv-controlplane
 When `agent_ws_address` is empty (or the client passes `?proxied=true`), the BFF returns a relative path that includes the `node_id`:
 
 ```
-/ws/vms/{node_id}/{vm_id}/console?token=...
+/ws/vms/{node_id}/{vm_id}/console
 ```
+
+The short-lived console ticket is **not** in the URL. The UI passes it as
+the WebSocket subprotocol (`new WebSocket(url, [ticket])`), which travels in
+the `Sec-WebSocket-Protocol` request header (#660) and therefore never lands
+in access logs, proxy logs, or browser history. nginx forwards that header
+by default; no special configuration is required.
 
 nginx strips the `/ws/vms/{node_id}` prefix and forwards the request to the correct agent backend using a static `map`.  This works when nodes are on private networks or the UI is behind a firewall.
 
@@ -849,12 +855,14 @@ edge (TLS termination, gzip, the `/ws/` console proxy) in front.
 ### Serial console requires the `/ws/` proxy
 
 In proxied mode the BFF returns console URLs of the form
-`/ws/vms/{node_id}/{vm_id}/console?token=...`. These URLs work only
-through an edge that proxies `/ws/` to the agent on `127.0.0.1:8444`:
-**the control plane binary does not proxy `/ws/`** (the #447 decision —
-documented, not implemented; maintainer-ratified 2026-10-07; see the
-issue). The example configuration includes this proxy. Do not remove
-it; the VM serial console stops working without it.
+`/ws/vms/{node_id}/{vm_id}/console`. The short-lived ticket is delivered
+separately and carried in the `Sec-WebSocket-Protocol` header (#660), not
+the query string. These URLs work only through an edge that proxies `/ws/`
+to the agent on `127.0.0.1:8444`: **the control plane binary does not proxy
+`/ws/`** (the #447 decision — documented, not implemented;
+maintainer-ratified 2026-10-07; see the issue). The example configuration
+includes this proxy. Do not remove it; the VM serial console stops working
+without it.
 
 ### Notes
 

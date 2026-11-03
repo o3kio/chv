@@ -92,10 +92,25 @@ fn test_app_state(pool: StorePool) -> chv_webui_bff::AppState {
 }
 
 fn test_admin_token() -> String {
-    test_token_for_role("admin")
+    test_token_claims("test-admin-id", "admin", "admin")
 }
 
 fn test_token_for_role(role: &str) -> String {
+    if role == "admin" {
+        return test_admin_token();
+    }
+    // Use the seeded synthetic users (`u-viewer`, `u-operator`): #660
+    // rejects legacy tokens whose `sub` has no user row.
+    test_token_claims(&format!("u-{role}"), role, role)
+}
+
+/// Token with an explicit `sub` and admin role, for tests that need a
+/// synthetic user id (e.g. deleted-user revocation paths, #660).
+fn test_token_for(sub: &str) -> String {
+    test_token_claims(sub, "admin", "admin")
+}
+
+fn test_token_claims(sub: &str, username: &str, role: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,11 +118,13 @@ fn test_token_for_role(role: &str) -> String {
         .as_secs()
         + 3600;
     let claims = chv_webui_bff::auth::Claims {
-        sub: format!("test-{role}-id"),
-        username: role.to_string(),
+        sub: sub.to_string(),
+        username: username.to_string(),
         role: role.to_string(),
         exp,
         must_change_password: false,
+        aud: None,
+        token_version: None,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     jsonwebtoken::encode(
@@ -4473,7 +4490,9 @@ async fn test_logout_clears_session_cookie() {
     );
 
     // Logout must terminate the cookie session: clear chv_session with
-    // Max-Age=0 and the same attributes the login path sets.
+    // Max-Age=0 and the same attributes the login path sets. The two
+    // non-credential UX hint cookies (`chv_role`, `chv_logged_in`) are
+    // cleared as well (#660).
     let response = app
         .oneshot(
             axum::http::Request::post("/api/v1/auth/logout")
@@ -4483,22 +4502,118 @@ async fn test_logout_clears_session_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let set_cookie = response
+    let set_cookies: Vec<&str> = response
         .headers()
-        .get(axum::http::header::SET_COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .expect("logout must clear the session cookie");
-    assert!(set_cookie.starts_with("chv_session=;"), "got: {set_cookie}");
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(set_cookies.len(), 3, "got: {set_cookies:?}");
+
+    let set_cookie = set_cookies
+        .iter()
+        .find(|c| c.starts_with("chv_session=;"))
+        .unwrap_or_else(|| panic!("logout must clear the session cookie: {set_cookies:?}"));
     assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
     assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
     assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
     assert!(set_cookie.contains("SameSite=Strict"), "got: {set_cookie}");
+
+    for hint in ["chv_role=;", "chv_logged_in=;"] {
+        let cookie = set_cookies
+            .iter()
+            .find(|c| c.starts_with(hint))
+            .unwrap_or_else(|| panic!("logout must clear {hint}: {set_cookies:?}"));
+        assert!(cookie.contains("Max-Age=0"), "got: {cookie}");
+        assert!(cookie.contains("Path=/"), "got: {cookie}");
+    }
+}
+
+#[tokio::test]
+async fn test_logout_for_deleted_user_still_clears_cookies() {
+    // M2: the presented account no longer exists, so bump_token_version
+    // returns NotFound. Logout must be idempotent — 200 plus every cookie
+    // cleared — rather than 500 with the browser stuck on a stale session.
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let app = crate::api::router::admin_router(
+        test_app_state(test_db.pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+
+    let orphan = test_token_for("test-user-deleted");
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/api/v1/auth/logout")
+                .header("authorization", format!("Bearer {orphan}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookies: Vec<&str> = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(set_cookies.len(), 3, "got: {set_cookies:?}");
+    for name in ["chv_session=;", "chv_role=;", "chv_logged_in=;"] {
+        assert!(
+            set_cookies.iter().any(|c| c.starts_with(name)),
+            "logout must clear {name}, got: {set_cookies:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_login_mints_session_audience_and_token_version() {
+    // N4: both mint sites must bind `aud=chv:session` and the user's
+    // `token_version`; without this, session/console separation could
+    // silently regress to the legacy no-audience path.
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let hash = bcrypt::hash("correctpassword", 4).expect("hash");
+    sqlx::query(
+        "INSERT INTO users (user_id, username, password_hash, role, token_version) \
+         VALUES ('u-cp-aud', 'cp-aud', ?, 'operator', 3)",
+    )
+    .bind(&hash)
+    .execute(&test_db.pool)
+    .await
+    .expect("seed user");
+
+    let response = crate::api::auth::login_handler(
+        axum::extract::State(test_app_state(test_db.pool.clone())),
+        axum::Json(serde_json::json!({
+            "username": "cp-aud",
+            "password": "correctpassword"
+        })),
+    )
+    .await
+    .expect("login should succeed");
+
+    let token = response
+        .0
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("API login returns a token");
+    let claims = chv_webui_bff::auth::validate_token(token, "test-secret").expect("decode token");
+    assert_eq!(
+        claims.aud.as_deref(),
+        Some(chv_webui_bff::auth::SESSION_AUDIENCE),
+        "control-plane API logins must mint the session audience"
+    );
+    assert_eq!(claims.token_version, Some(3));
 }
 
 // ---------------------------------------------------------------------------
 // resolve_inspect_required_operation relay (operator egress to the agent)
 // ---------------------------------------------------------------------------
-
 async fn resolve_relay_service() -> (LifecycleServiceImplementation, proto::RequestMeta) {
     let test_db = chv_controlplane_store::test_util::TestDb::new().await;
     let pool = test_db.pool.clone();

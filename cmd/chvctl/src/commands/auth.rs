@@ -21,7 +21,11 @@ pub async fn execute(client: &BffClient, args: LoginArgs) -> Result<(), CliError
         "password": args.password,
     });
 
-    let resp = client.post("/v1/auth/login", &body).await?;
+    // API-only login: /v1/auth/login is the browser flow and no longer
+    // returns a token (#660). chvctl is a non-browser client and uses the
+    // control-plane token endpoint, which is merged onto the same admin
+    // router under /api/v1.
+    let resp = client.post("/api/v1/auth/login", &body).await?;
 
     let token = resp
         .get("token")

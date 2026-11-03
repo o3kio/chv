@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { getStoredToken, clearToken } from '#lib/api/client.ts';
+  import { isLoggedIn, clearToken } from '#lib/api/client.ts';
   import { toast } from '#lib/stores/toast.svelte.ts';
 
   let currentPassword = '';
@@ -12,9 +12,9 @@
 
   const MIN_PASSWORD_LENGTH = 12;
 
-  // Redirect to login if no token is present
+  // Redirect to login if the server has not established a session.
   onMount(() => {
-    if (!getStoredToken()) {
+    if (!isLoggedIn()) {
       goto('/login', { replace: true });
     }
   });
@@ -37,22 +37,15 @@
       return;
     }
 
-    const token = getStoredToken();
-    if (!token) {
-      error = 'Session expired. Please log in again.';
-      goto('/login', { replace: true });
-      return;
-    }
-
     loading = true;
 
     try {
+      // Auth travels in the HttpOnly session cookie; there is no token for
+      // this script to read (#660).
       const response = await fetch('/v1/auth/change-password', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           current_password: currentPassword,
           new_password: newPassword
@@ -75,7 +68,8 @@
 
       toast.success('Password updated successfully. Please log in again.');
 
-      // Clear the old token and redirect to login so the user gets a fresh JWT
+      // The password change increments token_version, revoking every prior
+      // session. Clear the hint cookies, revoke server-side, and re-login.
       clearToken();
 
       await goto('/login', {
