@@ -711,6 +711,9 @@ pub async fn build_service(
         token_repo.clone(),
         cert_issuer,
         vtep_repo.clone(),
+    )
+    .with_certificate_revocations(
+        chv_controlplane_store::CertificateRevocationRepository::new(pool.clone()),
     );
     let inventory_service =
         InventoryServiceImplementation::new(node_repo.clone(), vtep_repo.clone());

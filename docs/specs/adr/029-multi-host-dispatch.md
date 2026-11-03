@@ -188,11 +188,28 @@ Certificate content rules:
    `localhost`/`127.0.0.1`-only certificate is insufficient for multi-host.
 4. EKUs are explicit. `keyUsage` is `digitalSignature` (+ `keyEncipherment`
    for RSA).
-5. Serial numbers are recorded in `nodes.certificate_serial` (already present)
-   and checked against a denylist on every new connection (the denylist is
-   new work in P1; it does not exist today). There is no CRL/OCSP
-   infrastructure in v1; short lifetimes plus the denylist are the
-   revocation story.
+5. Serial numbers are recorded in `nodes.certificate_serial` and checked against
+   the `node_certificate_revocations` denylist by the gRPC peer-identity
+   interceptor on every steady-state production mTLS request (#661); the
+   token-authenticated `EnrollNode` recovery path is excepted. The table is the source
+   of truth; a startup-loaded, atomically refreshed in-memory snapshot keeps the
+   synchronous interceptor off the database hot path. Production startup fails
+   closed if the snapshot cannot be loaded. There is no CRL/OCSP infrastructure
+   in v1; **bounded certificate lifetimes** (not-before = now − 5 min,
+   not-after = now + 90 days) plus the denylist are the revocation story.
+   Revoking a serial also burns rotation for it — the store's compare-and-swap
+   refuses to exchange a revoked serial for a new certificate — so the node must
+   re-enroll. The enrollment service uses an identity-only interceptor so a
+   revoked node can present a one-time bootstrap token to `EnrollNode` (the
+   token is the authentication factor); `RotateNodeCertificate` re-checks the
+   denylist and every steady-state service keeps full enforcement.
+   Residual risk: serials are 32-bit `gen_short_id()` values and
+   `nodes.certificate_serial` is not UNIQUE, so a fresh serial can collide with
+   another node's active serial; minting retries only on collisions with
+   *revoked* serials. A uniqueness constraint or wider serials is a follow-up.
+   Operators revoke through the admin-only `POST /v1/nodes/revoke-certificate`
+   route (`chvctl node revoke-certificate`); see
+   [`docs/runbooks/node-certificate-compromise.md`](../../runbooks/node-certificate-compromise.md).
 
 The CP MUST verify that the agent's server certificate chains to the node CA,
 carries `serverAuth`, and has `CN == expected node_id` for the endpoint being

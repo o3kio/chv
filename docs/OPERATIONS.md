@@ -260,6 +260,39 @@ sudo systemctl start chv-controlplane
 sudo tar czf /backup/chv-certs-$(date +%Y%m%d).tar.gz /etc/chv/certs/
 ```
 
+### Node Certificate Revocation
+
+A stolen or host-compromised node certificate stays cryptographically valid
+until expiry. Revoke it — do not wait for expiry:
+
+```bash
+chvctl node revoke-certificate <NODE_ID> \
+  --reason "suspected host compromise: incident INC-1234"
+```
+
+The serial is added to the durable `node_certificate_revocations` denylist and
+rejected with `UNAUTHENTICATED` by the gRPC peer-identity interceptor on every
+steady-state node-facing RPC. Revocation also **burns rotation** for that
+serial: it cannot be exchanged for a fresh certificate, so the node must
+re-enroll with a new one-time bootstrap token. Enrollment deliberately remains
+reachable with the revoked certificate (the token is the authentication factor);
+enrollment rotation is still rejected. The endpoint is admin-only and
+idempotent, and writes an audit event.
+
+Use the canonical 8-character lowercase hex value from
+`nodes.certificate_serial` when passing `--certificate-serial`;
+`openssl x509 -serial` prints a different HEX encoding and is rejected.
+
+- Propagation to authentication is bounded by the snapshot refresh interval
+  (`CHV_REVOCATION_REFRESH_SECS`, default 5 s); rotation is database-immediate.
+- Production startup fails closed if the denylist cannot be loaded.
+- After a database restore, diff the denylist against incident records and
+  re-revoke any missing serials.
+- `CHV_ALLOW_INSECURE=1` (dev-feature builds only) bypasses revocation.
+
+Full procedure (verify, rotation recovery, re-enrollment, rollback, failure
+modes): [Node Certificate Compromise](runbooks/node-certificate-compromise.md).
+
 ### Disaster Recovery Runbooks
 
 For detailed step-by-step procedures covering VM snapshot restore, volume snapshot restore, backup artifact restore, control plane DR, and full site recovery, see the runbooks in [`docs/runbooks/`](runbooks/).
@@ -271,6 +304,7 @@ For detailed step-by-step procedures covering VM snapshot restore, volume snapsh
 | [Backup Artifact Restore](runbooks/backup-artifact-restore.md) | Restore a VM from an externally produced S3/NFS disk artifact (manual; CHV creates none) |
 | [Control Plane DR](runbooks/control-plane-dr.md) | Recover the control plane after host failure or DB corruption |
 | [Full Site Recovery](runbooks/full-site-recovery.md) | Rebuild the entire infrastructure from backups |
+| [Node Certificate Compromise](runbooks/node-certificate-compromise.md) | Revoke a node certificate, verify rejection, recover rotation, re-enroll |
 
 ---
 

@@ -92,6 +92,10 @@ fn test_app_state(pool: StorePool) -> chv_webui_bff::AppState {
 }
 
 fn test_admin_token() -> String {
+    test_token_for_role("admin")
+}
+
+fn test_token_for_role(role: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -99,9 +103,9 @@ fn test_admin_token() -> String {
         .as_secs()
         + 3600;
     let claims = chv_webui_bff::auth::Claims {
-        sub: "test-admin-id".to_string(),
-        username: "admin".to_string(),
-        role: "admin".to_string(),
+        sub: format!("test-{role}-id"),
+        username: role.to_string(),
+        role: role.to_string(),
         exp,
         must_change_password: false,
     };
@@ -158,6 +162,206 @@ async fn test_ready_endpoint() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `POST /v1/nodes/revoke-certificate` (#661): admin-only, idempotent, and
+/// durable. A viewer must be rejected before the handler; the first admin
+/// call inserts the denylist row, the second reports `already_revoked`.
+#[tokio::test]
+async fn revoke_certificate_endpoint_is_admin_only_and_idempotent() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let node_id = NodeId::new("node-revoke").unwrap();
+    NodeRepository::new(pool.clone())
+        .upsert_node(&NodeUpsertInput {
+            node_id: node_id.clone(),
+            hostname: "host-revoke".into(),
+            display_name: "node-revoke".into(),
+            certificate_serial: Some("0a3f7b2c".into()),
+            agent_version: None,
+            control_plane_version: None,
+            enrolled_unix_ms: 1_000,
+            last_seen_unix_ms: 1_000,
+        })
+        .await
+        .unwrap();
+
+    let app = crate::api::router::admin_router(
+        test_app_state(pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+
+    let body = serde_json::json!({
+        "node_id": "node-revoke",
+        "reason": "host compromise"
+    })
+    .to_string();
+
+    // Viewer is forbidden at the router's admin middleware.
+    let viewer_response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/nodes/revoke-certificate")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", test_token_for_role("viewer")),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_response.status(), StatusCode::FORBIDDEN);
+
+    // First admin call revokes the node's active serial.
+    let first = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/nodes/revoke-certificate")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["certificate_serial"], "0a3f7b2c");
+    assert_eq!(parsed["already_revoked"], false);
+
+    // Repeat: same serial, 200, flagged idempotent.
+    let second = app
+        .oneshot(
+            axum::http::Request::post("/v1/nodes/revoke-certificate")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["already_revoked"], true);
+
+    let repo = chv_controlplane_store::CertificateRevocationRepository::new(pool);
+    let rows = repo.list_for_node("node-revoke").await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "idempotent revocation must not duplicate rows"
+    );
+    assert_eq!(rows[0].certificate_serial, "0a3f7b2c");
+    assert_eq!(rows[0].revoked_by.as_deref(), Some("admin"));
+}
+
+/// H2 (#661 review): explicit serial input must be the canonical DB value.
+/// Operators copying `openssl x509 -serial` (HEX DER bytes, 16+ chars) used to
+/// get a 200 and a denylist row that matched no certificate. Uppercase input is
+/// normalized; malformed/openssl-shaped input is a clear 400.
+#[tokio::test]
+async fn revoke_certificate_serial_shape_is_validated() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let node_id = NodeId::new("node-serial-shape").unwrap();
+    NodeRepository::new(pool.clone())
+        .upsert_node(&NodeUpsertInput {
+            node_id,
+            hostname: "host-serial-shape".into(),
+            display_name: "node-serial-shape".into(),
+            certificate_serial: Some("0a3f7b2c".into()),
+            agent_version: None,
+            control_plane_version: None,
+            enrolled_unix_ms: 1_000,
+            last_seen_unix_ms: 1_000,
+        })
+        .await
+        .unwrap();
+
+    let app = crate::api::router::admin_router(
+        test_app_state(pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+
+    let post = |body: serde_json::Value| {
+        axum::http::Request::post("/v1/nodes/revoke-certificate")
+            .header("authorization", format!("Bearer {}", test_admin_token()))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    for bad in [
+        "0a3f7b2c2f9e1b4d6a", // openssl -serial HEX DER rendering
+        "0a3f7b2",            // too short
+        "0a3f7b2cg",          // not hex
+        "node-serial-shape",  // pasted node id
+    ] {
+        let response = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "node_id": "node-serial-shape",
+                "certificate_serial": bad,
+                "reason": "shape test",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "serial {bad:?} must be rejected"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let message = parsed["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("canonical CHV serial"),
+            "400 must explain the canonical serial; got: {message}"
+        );
+    }
+
+    // Uppercase is normalized to the stored lowercase form.
+    let response = app
+        .oneshot(post(serde_json::json!({
+            "node_id": "node-serial-shape",
+            "certificate_serial": "0A3F7B2C",
+            "reason": "uppercase shape",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["certificate_serial"], "0a3f7b2c");
+
+    let repo = chv_controlplane_store::CertificateRevocationRepository::new(pool);
+    assert!(repo.get("0a3f7b2c").await.unwrap().is_some());
+    assert!(
+        repo.get("0A3F7B2C").await.unwrap().is_none(),
+        "only the normalized lowercase serial is stored"
+    );
 }
 
 /// Regression (CI webui container smoke, G3 round 1): the guest-agent
@@ -1412,6 +1616,48 @@ async fn test_ca_backed_issuer_issuance() {
     // Verify signature
     leaf.verify_signature(Some(ca.public_key()))
         .expect("Certificate signature verification failed");
+}
+
+#[tokio::test]
+async fn test_ca_backed_issuer_bounds_certificate_lifetime() {
+    // H3 (#661 review): `CertificateParams::default()` yields 1975→4096.
+    // Issued node certs must be short-lived so the denylist story is true.
+    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    let mut ca_params = CertificateParams::default();
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Test CA");
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key_pair = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
+    let issuer = CaBackedCertificateIssuer::new(&ca_cert.pem(), &ca_key_pair.serialize_pem())
+        .expect("create issuer");
+
+    let issued = issuer
+        .issue_node_certificate(&NodeId::new("node-lifetime").unwrap())
+        .await
+        .expect("issue cert");
+
+    use x509_parser::prelude::*;
+    let (_, leaf_pem) = parse_x509_pem(&issued.certificate_pem).expect("parse leaf PEM");
+    let (_, leaf) = X509Certificate::from_der(&leaf_pem.contents).expect("parse leaf DER");
+    let validity = leaf.validity();
+    let lifetime = validity.not_after.timestamp() - validity.not_before.timestamp();
+
+    assert!(
+        (89..=91).contains(&(lifetime / 86_400)),
+        "lifetime must be bounded to ~90 days, got {lifetime}s"
+    );
+    let now = ::time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!(
+        (validity.not_before.timestamp() - now).abs() < 15 * 60,
+        "not_before must allow only a small clock-skew window"
+    );
+    assert!(
+        validity.not_after.timestamp() > now,
+        "issued certificate must not already be expired"
+    );
 }
 
 #[tokio::test]

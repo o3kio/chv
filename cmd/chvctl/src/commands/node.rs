@@ -26,6 +26,20 @@ pub enum NodeCommands {
         #[arg(long)]
         enable: bool,
     },
+    /// Revoke a node certificate (admin; denylist checked per-RPC by the gRPC interceptor)
+    RevokeCertificate {
+        /// Node identifier
+        node_id: String,
+        /// Certificate serial to revoke (defaults to the node's active serial)
+        #[arg(long)]
+        certificate_serial: Option<String>,
+        /// Why the certificate is being revoked (recorded in the audit trail)
+        #[arg(long)]
+        reason: String,
+        /// Optional RFC 3339 timestamp for pruning this denylist row later
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
 }
 
 pub async fn execute(
@@ -70,6 +84,38 @@ pub async fn execute(
                 println!("Node {node_id} entering maintenance mode.");
             } else {
                 println!("Node {node_id} exiting maintenance mode.");
+            }
+        }
+        NodeCommands::RevokeCertificate {
+            node_id,
+            certificate_serial,
+            reason,
+            expires_at,
+        } => {
+            let mut body = json!({ "node_id": node_id, "reason": reason });
+            if let Some(serial) = certificate_serial {
+                body["certificate_serial"] = json!(serial);
+            }
+            if let Some(expires_at) = expires_at {
+                body["expires_at"] = json!(expires_at);
+            }
+            let resp = client.post("/v1/nodes/revoke-certificate", &body).await?;
+            let serial = resp
+                .get("certificate_serial")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<unknown>");
+            let already = resp
+                .get("already_revoked")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if already {
+                println!("Certificate serial {serial} for node {node_id} was already revoked.");
+            } else {
+                println!(
+                    "Revoked certificate serial {serial} for node {node_id}. \
+                     The node must re-enroll with a fresh bootstrap token before it can \
+                     authenticate or rotate again."
+                );
             }
         }
     }

@@ -46,6 +46,46 @@ pub struct IssuedCertificate {
     pub serial: String,
 }
 
+/// Bounded attempts to mint a serial that is not already denied.
+///
+/// CHV serials are 32-bit (`gen_short_id`), so a collision with an existing
+/// denylist row is unlikely but possible. Handing out a certificate whose
+/// serial is already revoked would make a freshly issued credential unusable
+/// (and, worse, indistinguishable from the revoked one in audit logs).
+pub(crate) const MAX_CERTIFICATE_ISSUE_ATTEMPTS: usize = 8;
+
+/// Issue a node certificate, regenerating on a denylist collision.
+///
+/// The revocation table is authoritative for rotation; this closes the residual
+/// case where a freshly minted 32-bit serial happens to equal a previously
+/// revoked serial. Bounded by [`MAX_CERTIFICATE_ISSUE_ATTEMPTS`] so a broken
+/// random source fails instead of spinning.
+pub(crate) async fn issue_unrevoked_node_certificate(
+    issuer: &dyn CertificateIssuer,
+    node_id: &NodeId,
+    revocation_repo: Option<&chv_controlplane_store::CertificateRevocationRepository>,
+) -> Result<IssuedCertificate, ControlPlaneServiceError> {
+    for attempt in 0..MAX_CERTIFICATE_ISSUE_ATTEMPTS {
+        let cert = issuer.issue_node_certificate(node_id).await?;
+        match revocation_repo {
+            Some(repo) if repo.is_revoked(&cert.serial).await? => {
+                tracing::warn!(
+                    node_id = %node_id,
+                    certificate_serial = %cert.serial,
+                    attempt,
+                    "freshly minted certificate serial is revoked; regenerating"
+                );
+            }
+            _ => return Ok(cert),
+        }
+    }
+
+    Err(ControlPlaneServiceError::Internal(format!(
+        "failed to mint a certificate with an unrevoked serial for node {node_id} \
+         after {MAX_CERTIFICATE_ISSUE_ATTEMPTS} attempts"
+    )))
+}
+
 #[async_trait]
 pub trait EnrollmentService: Send + Sync {
     /// `peer_addr` is the transport-level remote address of the gRPC call
@@ -89,6 +129,10 @@ pub struct EnrollmentServiceImplementation {
     token_repo: BootstrapTokenRepository,
     cert_issuer: Option<Arc<dyn CertificateIssuer>>,
     vtep_repo: VtepRepository,
+    /// Durable certificate denylist (#661). The store-level compare-and-swap
+    /// always rejects revoked serials; wiring this in adds a pre-mint check
+    /// with an operator-actionable error instead of a "lost race" conflict.
+    revocation_repo: Option<chv_controlplane_store::CertificateRevocationRepository>,
 }
 
 impl EnrollmentServiceImplementation {
@@ -103,7 +147,18 @@ impl EnrollmentServiceImplementation {
             token_repo,
             cert_issuer,
             vtep_repo,
+            revocation_repo: None,
         }
+    }
+
+    /// Attach the certificate denylist so rotation fails fast (with the
+    /// revocation reason class) before minting key material.
+    pub fn with_certificate_revocations(
+        mut self,
+        revocation_repo: chv_controlplane_store::CertificateRevocationRepository,
+    ) -> Self {
+        self.revocation_repo = Some(revocation_repo);
+        self
     }
 
     fn now_ms(&self) -> i64 {
@@ -168,7 +223,12 @@ impl EnrollmentService for EnrollmentServiceImplementation {
             .cert_issuer
             .as_ref()
             .ok_or_else(|| ControlPlaneServiceError::Internal("CA not configured".into()))?;
-        let cert = cert_issuer.issue_node_certificate(&node_id).await?;
+        let cert = issue_unrevoked_node_certificate(
+            cert_issuer.as_ref(),
+            &node_id,
+            self.revocation_repo.as_ref(),
+        )
+        .await?;
 
         let now = self.now_ms();
 
@@ -376,6 +436,26 @@ impl EnrollmentService for EnrollmentServiceImplementation {
                         .into(),
                 ));
             }
+
+            // A revoked serial must never be exchangeable for a fresh
+            // certificate: otherwise a thief holding the stolen certificate
+            // could rotate to a new, unrevoked one. This pre-check gives a
+            // clear error; the store's compare-and-swap independently refuses
+            // the same serial, closing the check-to-commit race.
+            if let Some(repo) = &self.revocation_repo {
+                if repo.is_revoked(expected).await? {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        certificate_serial = %expected,
+                        "rejecting certificate rotation: presented certificate is revoked"
+                    );
+                    return Err(ControlPlaneServiceError::PermissionDenied(
+                        "the presented certificate has been revoked; re-enroll the node with a \
+                         fresh bootstrap token"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         // Only now, after the proof-of-possession check, mint the new cert.
@@ -383,7 +463,12 @@ impl EnrollmentService for EnrollmentServiceImplementation {
             .cert_issuer
             .as_ref()
             .ok_or_else(|| ControlPlaneServiceError::Internal("CA not configured".into()))?;
-        let cert = cert_issuer.issue_node_certificate(&node_id).await?;
+        let cert = issue_unrevoked_node_certificate(
+            cert_issuer.as_ref(),
+            &node_id,
+            self.revocation_repo.as_ref(),
+        )
+        .await?;
 
         // Commit with a compare-and-swap against the serial we validated. If a
         // concurrent rotation won the race, do not hand out this key material.
@@ -505,6 +590,17 @@ impl CertificateIssuer for CaBackedCertificateIssuer {
             .distinguished_name
             .push(DnType::CommonName, node_id.as_str());
 
+        // `CertificateParams::default()` leaves the validity unbounded in
+        // practice (1975→4096), which makes the "short-lived certificate plus
+        // denylist" revocation story untrue (#661 review H3). Issued node
+        // certs are intentionally bounded: five minutes of clock skew on the
+        // not-before side, 90 days of life. Agents rotate every 12 hours, so
+        // this is a safety bound, not the normal renewal mechanism. Existing
+        // certificates are unaffected.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::minutes(5);
+        params.not_after = now + time::Duration::days(90);
+
         let dns_name = Ia5String::try_from(node_id.as_str()).map_err(|e| {
             ControlPlaneServiceError::Internal(format!("invalid node_id for DNS: {}", e))
         })?;
@@ -526,5 +622,121 @@ impl CertificateIssuer for CaBackedCertificateIssuer {
             ca_pem: self.ca_pem.as_bytes().to_vec(),
             serial,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chv_controlplane_store::{
+        test_util::TestDb, CertificateRevocationRepository, RevokeCertificateInput,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Issuer stub that returns a scripted sequence of serials.
+    struct SequenceIssuer {
+        serials: Mutex<VecDeque<String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SequenceIssuer {
+        fn new(serials: &[&str]) -> Self {
+            Self {
+                serials: Mutex::new(serials.iter().map(|s| (*s).to_string()).collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CertificateIssuer for SequenceIssuer {
+        async fn issue_node_certificate(
+            &self,
+            _node_id: &NodeId,
+        ) -> Result<IssuedCertificate, ControlPlaneServiceError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let serial = self
+                .serials
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "00000000".into());
+            Ok(IssuedCertificate {
+                certificate_pem: vec![],
+                private_key_pem: vec![],
+                ca_pem: vec![],
+                serial,
+            })
+        }
+    }
+
+    async fn revoked_repo(serials: &[&str]) -> (TestDb, CertificateRevocationRepository) {
+        let db = TestDb::new().await;
+        let repo = CertificateRevocationRepository::new(db.pool.clone());
+        for serial in serials {
+            repo.revoke(&RevokeCertificateInput {
+                certificate_serial: serial,
+                node_id: "node-m4",
+                reason: "test",
+                revoked_by: None,
+                revoked_at: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        }
+        (db, repo)
+    }
+
+    #[tokio::test]
+    async fn minted_serial_colliding_with_denylist_is_regenerated() {
+        let (_db, repo) = revoked_repo(&["aaaaaaaa"]).await;
+        let issuer = SequenceIssuer::new(&["aaaaaaaa", "bbbbbbbb"]);
+        let node_id = NodeId::new("node-m4").unwrap();
+
+        let issued = issue_unrevoked_node_certificate(&issuer, &node_id, Some(&repo))
+            .await
+            .expect("second serial is not revoked");
+
+        assert_eq!(issued.serial, "bbbbbbbb");
+        assert_eq!(
+            issuer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a revoked collision must be discarded and re-minted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn minted_serial_exhaustion_fails_closed() {
+        let (_db, repo) = revoked_repo(&["aaaaaaaa"]).await;
+        // Every attempt collides.
+        let serials = vec!["aaaaaaaa"; MAX_CERTIFICATE_ISSUE_ATTEMPTS];
+        let issuer = SequenceIssuer::new(&serials);
+        let node_id = NodeId::new("node-m4").unwrap();
+
+        let error = match issue_unrevoked_node_certificate(&issuer, &node_id, Some(&repo)).await {
+            Ok(_) => panic!("must fail instead of issuing a revoked serial"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ControlPlaneServiceError::Internal(_)));
+        assert_eq!(
+            issuer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CERTIFICATE_ISSUE_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn no_denylist_configured_accepts_first_serial() {
+        let issuer = SequenceIssuer::new(&["cccccccc"]);
+        let node_id = NodeId::new("node-m4").unwrap();
+
+        let issued = issue_unrevoked_node_certificate(&issuer, &node_id, None)
+            .await
+            .expect("no denylist means no collision check");
+
+        assert_eq!(issued.serial, "cccccccc");
+        assert_eq!(issuer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -681,6 +681,10 @@ pub fn bff_router(state: AppState) -> Router<AppState> {
             post(crate::handlers::nodes::enroll_node),
         )
         .route(
+            "/v1/nodes/revoke-certificate",
+            post(crate::handlers::nodes::revoke_node_certificate),
+        )
+        .route(
             "/v1/settings/hypervisor",
             patch(crate::handlers::hypervisor_settings::update_settings),
         )

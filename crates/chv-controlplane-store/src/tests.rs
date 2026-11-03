@@ -249,6 +249,123 @@ async fn test_rotate_certificate_serial_is_compare_and_swap() {
 }
 
 #[tokio::test]
+async fn test_revoke_certificate_is_idempotent_and_preserves_first_record() {
+    let test_db = TestDb::new().await;
+    let repo = CertificateRevocationRepository::new(test_db.pool.clone());
+
+    let first = repo
+        .revoke(&RevokeCertificateInput {
+            certificate_serial: "serial-revoked",
+            node_id: "node-a",
+            reason: "host compromise",
+            revoked_by: Some("admin"),
+            revoked_at: Some("2026-01-01T00:00:00Z"),
+            expires_at: Some("2027-01-01T00:00:00Z"),
+        })
+        .await
+        .expect("first revocation");
+    assert!(!first.already_revoked);
+    assert_eq!(first.revocation.certificate_serial, "serial-revoked");
+    assert_eq!(first.revocation.node_id, "node-a");
+    assert_eq!(first.revocation.reason, "host compromise");
+    assert_eq!(first.revocation.revoked_at, "2026-01-01T00:00:00Z");
+
+    let second = repo
+        .revoke(&RevokeCertificateInput {
+            certificate_serial: "serial-revoked",
+            node_id: "node-a",
+            reason: "a later, different reason",
+            revoked_by: Some("another-admin"),
+            revoked_at: Some("2026-02-02T00:00:00Z"),
+            expires_at: None,
+        })
+        .await
+        .expect("repeat revocation is idempotent");
+    assert!(second.already_revoked);
+    assert_eq!(
+        second.revocation.reason, "host compromise",
+        "first revocation stays authoritative"
+    );
+    assert_eq!(second.revocation.revoked_by.as_deref(), Some("admin"));
+    assert_eq!(second.revocation.revoked_at, "2026-01-01T00:00:00Z");
+
+    assert_eq!(repo.list_all().await.unwrap().len(), 1);
+    assert!(repo.is_revoked("serial-revoked").await.unwrap());
+    assert!(!repo.is_revoked("serial-other").await.unwrap());
+    assert_eq!(repo.list_for_node("node-a").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_revoke_certificate_rejects_serial_attributed_to_another_node() {
+    let test_db = TestDb::new().await;
+    let repo = CertificateRevocationRepository::new(test_db.pool.clone());
+
+    repo.revoke(&RevokeCertificateInput {
+        certificate_serial: "serial-shared",
+        node_id: "node-a",
+        reason: "compromise",
+        revoked_by: None,
+        revoked_at: None,
+        expires_at: None,
+    })
+    .await
+    .unwrap();
+
+    let result = repo
+        .revoke(&RevokeCertificateInput {
+            certificate_serial: "serial-shared",
+            node_id: "node-b",
+            reason: "typo",
+            revoked_by: None,
+            revoked_at: None,
+            expires_at: None,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Conflict { entity, .. }) if entity == "node_certificate_revocation"),
+        "a serial cannot be silently re-attributed to another node: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_certificate_serial_refuses_revoked_serial() {
+    let test_db = TestDb::new().await;
+    let node_repo = NodeRepository::new(test_db.pool.clone());
+    let revocation_repo = CertificateRevocationRepository::new(test_db.pool.clone());
+    let node_id = NodeId::new("node-serial-revoked").unwrap();
+    seed_node_for_serial_test(&node_repo, &node_id, Some("serial-a")).await;
+
+    revocation_repo
+        .revoke(&RevokeCertificateInput {
+            certificate_serial: "serial-a",
+            node_id: node_id.as_str(),
+            reason: "stolen",
+            revoked_by: Some("admin"),
+            revoked_at: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        !node_repo
+            .rotate_certificate_serial(&node_id, "serial-a", "serial-b")
+            .await
+            .unwrap(),
+        "a revoked serial must never be exchangeable for fresh key material"
+    );
+    assert_eq!(
+        node_repo
+            .get_certificate_serial(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("serial-a"),
+        "the revoked serial remains recorded so operators can see what was burned"
+    );
+}
+
+#[tokio::test]
 async fn test_telemetry_missing_parent_node() {
     let test_db = TestDb::new().await;
     let pool = test_db.pool.clone();

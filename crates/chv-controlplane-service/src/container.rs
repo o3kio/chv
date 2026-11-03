@@ -5,8 +5,9 @@ use crate::lifecycle::LifecycleServiceImplementation;
 use crate::monitoring_ingest::MonitoringIngestImplementation;
 use crate::peer_identity::PeerIdentityInterceptor;
 use crate::reconcile::ReconcileServiceImplementation;
+use crate::revocation::run_refresh_loop;
 use crate::telemetry::TelemetryServiceImplementation;
-use chv_controlplane_store::StorePool;
+use chv_controlplane_store::{CertificateRevocationRepository, StorePool};
 use control_plane_node_api::control_plane_node_api as proto;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -192,12 +193,59 @@ impl ControlPlaneService {
         let addr = self.runtime.bind_addr();
 
         // Peer-identity interceptor: pins the wire-asserted node_id to the
-        // peer's mTLS leaf certificate (closes C1/H1 cross-node trust gap).
+        // peer's mTLS leaf certificate (closes C1/H1 cross-node trust gap)
+        // and rejects serials present in the certificate denylist (#661).
         // In CHV_ALLOW_INSECURE=1 mode this is a no-op; in production it
         // rejects requests without a parseable peer cert. Constructing it is
         // fallible: requesting insecure mode without the `dev` feature returns
         // a typed startup error (issue #233) instead of panicking.
-        let interceptor = PeerIdentityInterceptor::new(self.runtime.allow_insecure())?;
+        //
+        // The revocation snapshot is loaded BEFORE the listener starts. In
+        // production mode a failed load is fatal: serving with unknown
+        // revocation state would silently re-enable revoked certificates.
+        let revocation_repo =
+            CertificateRevocationRepository::new(self.components.store_pool.clone());
+        let revocation = crate::revocation::load_startup_snapshot(
+            &revocation_repo,
+            self.runtime.allow_insecure(),
+        )
+        .await
+        .map_err(|error| {
+            ControlPlaneServiceError::Internal(format!(
+                "refusing to start: cannot load node certificate revocation snapshot \
+                         from node_certificate_revocations: {error}. Fix the store or rebuild the \
+                         database; never start production with unknown revocation state."
+            ))
+        })?;
+        metrics::gauge!("chv_node_certificate_revocations_active").set(revocation.len() as f64);
+
+        let interceptor =
+            PeerIdentityInterceptor::new(self.runtime.allow_insecure(), revocation.clone())?;
+
+        // Enrollment is the controlled recovery path: a node whose certificate
+        // was revoked must still be able to present a fresh one-time bootstrap
+        // token. This interceptor extracts/binds the peer identity but skips
+        // the denylist; rotation is re-checked in EnrollmentServer. Every other
+        // service keeps full revocation enforcement.
+        let enrollment_interceptor = PeerIdentityInterceptor::for_enrollment(
+            self.runtime.allow_insecure(),
+            revocation.clone(),
+        )?;
+
+        // Refresh the denylist in the background. In dev mode revocation is
+        // bypassed entirely, so no reload task is needed.
+        let refresh_handle = if self.runtime.allow_insecure() {
+            None
+        } else {
+            let refresh_shutdown = self.runtime.shutdown_rx.clone();
+            Some(tokio::spawn(run_refresh_loop(
+                revocation_repo,
+                revocation.clone(),
+                crate::revocation::refresh_interval_from_env(),
+                refresh_shutdown,
+            )))
+        };
+
         let make_intercept = || {
             let interceptor = interceptor.clone();
             #[allow(clippy::result_large_err)]
@@ -205,12 +253,19 @@ impl ControlPlaneService {
             move |req: tonic::Request<()>| interceptor.intercept(req)
         };
 
+        let make_enrollment_intercept = || {
+            let interceptor = enrollment_interceptor.clone();
+            #[allow(clippy::result_large_err)]
+            move |req: tonic::Request<()>| interceptor.intercept(req)
+        };
+
         let enrollment_server =
             proto::enrollment_service_server::EnrollmentServiceServer::with_interceptor(
                 crate::server::EnrollmentServer::new(Arc::new(
                     self.components.enrollment_service.clone(),
-                )),
-                make_intercept(),
+                ))
+                .with_revocation(revocation.clone()),
+                make_enrollment_intercept(),
             );
 
         let inventory_server =
@@ -306,6 +361,10 @@ impl ControlPlaneService {
             error!("gRPC server error: {}", e);
             ControlPlaneServiceError::Internal(e.to_string())
         })?;
+
+        if let Some(handle) = refresh_handle {
+            handle.abort();
+        }
 
         Ok(())
     }

@@ -204,3 +204,69 @@ groups:
             state. Check agent logs and network connectivity to the affected
             hypervisor host.
           runbook: "docs/runbooks/full-site-recovery.md"
+
+  # ---------------------------------------------------------------------------
+  # Certificate revocation integrity (#661)
+  # ---------------------------------------------------------------------------
+  - name: chv.slo.revocation
+    interval: 30s
+    rules:
+      - alert: RevocationSnapshotReloadFailing
+        expr: |
+          sum(increase(chv_revocation_snapshot_reload_total{result!="ok"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: revocation-freshness
+          team: chv
+        annotations:
+          summary: "Certificate revocation snapshot reloads are failing"
+          description: >
+            The control plane has failed to reload node_certificate_revocations
+            for 5 minutes. The last-known-good snapshot remains enforced, but
+            any revocation made after that snapshot is not yet effective for
+            authentication (rotation stays database-enforced). Investigate the
+            control-plane store/DB immediately.
+          runbook: "docs/runbooks/node-certificate-compromise.md#23-observe-telemetry"
+
+      - alert: RevocationSnapshotShrunk
+        expr: |
+          (
+            delta(chv_node_certificate_revocations_active[15m]) < 0
+              and chv_node_certificate_revocations_active > 0
+          )
+          or (increase(chv_revocation_snapshot_shrink_total[15m]) > 0)
+        for: 1m
+        labels:
+          severity: critical
+          slo: revocation-integrity
+          team: chv
+        annotations:
+          summary: "Certificate revocation snapshot shrank"
+          description: >
+            The denylist lost entries, which can resurrect revoked certificates
+            (database restore or manual deletion). The `> 0` guard on the delta
+            suppresses the transient zero gauge during a process restart; the
+            shrink-counter branch catches a shrink all the way to zero. Diff
+            node_certificate_revocations against incident records and re-revoke
+            every missing serial.
+          runbook: "docs/runbooks/node-certificate-compromise.md#6-rollback-and-failure-modes"
+
+      - alert: RevokedPeerAdmittedForEnrollment
+        expr: |
+          increase(chv_enrollment_revoked_peer_admitted_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          slo: revocation-recovery
+          team: chv
+        annotations:
+          summary: "A revoked certificate reached the enrollment service"
+          description: >
+            This is expected during a documented re-enrollment: the enrollment
+            service skips the denylist because a one-time bootstrap token is the
+            authentication factor. Verify the token was admin-issued and
+            one-time, and that the caller is the node being recovered. Repeated
+            events outside an incident may be a stale revoked credential probing
+            enrollment.
+          runbook: "docs/runbooks/node-certificate-compromise.md#4-re-enroll-a-compromised-node"
