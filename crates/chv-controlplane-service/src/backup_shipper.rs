@@ -92,6 +92,12 @@ impl S3Shipper {
             .with_disable_bulk_delete(true);
 
         if let Some(endpoint) = &endpoint {
+            // Validate at the construction boundary, not only at the
+            // `shipper_from_destination` call site: object_store 0.14.2
+            // panics inside its URI parser when a malformed endpoint is
+            // first used, so every path that constructs an S3 client must
+            // reject it here (#677).
+            validate_s3_endpoint(endpoint)?;
             // Preserve the previous `Region::Custom` behavior: plain-http
             // endpoints (e.g. a local MinIO) are allowed.
             if endpoint.starts_with("http://") {
@@ -230,9 +236,11 @@ pub fn shipper_from_destination(
         }
 
         if let Some(endpoint) = endpoint.as_deref() {
-            // Validate before object_store sees the value: malformed
-            // endpoints (including an empty value) panic in 0.14.2 instead
-            // of returning an error (#677).
+            // `S3Shipper::new` validates the endpoint before object_store
+            // sees it (malformed endpoints, including an empty value, panic
+            // in 0.14.2 instead of returning an error — #677). Kept here as
+            // an explicit fail-fast so the error is attributed to the
+            // destination before bucket/credential parsing.
             validate_s3_endpoint(endpoint)?;
         }
 
@@ -341,6 +349,25 @@ mod tests {
                     other.map(|_| "Ok(shipper)")
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn test_s3_shipper_new_validates_endpoint_at_construction_boundary() {
+        // Defense in depth for #677: validation inside the constructor, not
+        // only in `shipper_from_destination`, so a future in-crate caller
+        // cannot hand object_store a panicking endpoint.
+        let result = S3Shipper::new(
+            "bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("not a url".to_string()),
+            None,
+            None,
+        );
+        match result {
+            Err(ChvError::InvalidArgument { field, .. }) => assert_eq!(field, "destination"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("malformed endpoint must be rejected"),
         }
     }
 
