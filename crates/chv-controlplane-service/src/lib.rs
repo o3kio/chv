@@ -59,8 +59,9 @@ pub use node_client_pool::NodeClientPool;
 pub use orchestrator::Orchestrator;
 pub use overlay::OverlayManager;
 pub use peer_identity::{
-    extract_peer_node_id_from_extensions, parse_node_id_from_der, validate_security_mode,
-    verify_peer_matches, InsecurePeer, PeerIdentityError, PeerIdentityInterceptor, PeerNodeId,
+    extract_peer_certificate_serial_from_extensions, extract_peer_node_id_from_extensions,
+    parse_node_id_from_der, parse_serial_from_der, validate_security_mode, verify_peer_matches,
+    InsecurePeer, PeerCertificateSerial, PeerIdentityError, PeerIdentityInterceptor, PeerNodeId,
 };
 pub use reconcile::{ReconcileService, ReconcileServiceImplementation};
 pub use server::{

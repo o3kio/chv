@@ -48,6 +48,20 @@ impl PeerNodeId {
     }
 }
 
+/// Certificate serial of the peer's mTLS leaf certificate.
+///
+/// Inserted into request extensions by [`PeerIdentityInterceptor`] alongside
+/// [`PeerNodeId`]. The value is the same textual serial that
+/// `CaBackedCertificateIssuer` stores in `nodes.certificate_serial`; rotation
+/// handlers use it as proof that the caller actually possesses the currently
+/// trusted certificate rather than merely knowing the node id (#661).
+///
+/// `None` means the certificate carried a serial that could not be represented
+/// in the issuer's textual form. Handlers MUST fail closed in production mode
+/// when this is absent or when no extension was inserted at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCertificateSerial(pub Option<String>);
+
 /// Marker inserted by the interceptor when the request arrived over an
 /// insecure (non-TLS, dev-mode) channel. Handlers MUST treat this as
 /// "no peer identity available" and accept any wire-asserted node_id —
@@ -116,7 +130,22 @@ impl PeerIdentityInterceptor {
             }
         };
 
+        let peer_serial = match extract_peer_certificate_serial_from_extensions(
+            request.extensions(),
+        ) {
+            Ok(serial) => serial,
+            Err(err) => {
+                tracing::warn!(error = %err, "rejecting request: peer certificate serial extraction failed");
+                return Err(tonic::Status::unauthenticated(
+                    "peer mTLS certificate required",
+                ));
+            }
+        };
+
         request.extensions_mut().insert(PeerNodeId(peer_node_id));
+        request
+            .extensions_mut()
+            .insert(PeerCertificateSerial(peer_serial));
         Ok(request)
     }
 }
@@ -192,6 +221,79 @@ pub fn extract_peer_node_id_from_extensions(
         .ok_or(PeerIdentityError::NoClientCertificate)?;
 
     parse_node_id_from_der(leaf.as_ref())
+}
+
+/// Extract the peer's leaf certificate serial from the request's
+/// [`TlsConnectInfo`] extension.
+///
+/// Exposed for completeness; production code normally consumes the
+/// [`PeerCertificateSerial`] extension inserted by [`PeerIdentityInterceptor`].
+pub fn extract_peer_certificate_serial_from_extensions(
+    extensions: &tonic::Extensions,
+) -> Result<Option<String>, PeerIdentityError> {
+    use tonic::transport::server::TcpConnectInfo;
+
+    let tls_info: &TlsConnectInfo<TcpConnectInfo> = extensions
+        .get::<TlsConnectInfo<TcpConnectInfo>>()
+        .ok_or(PeerIdentityError::MissingTlsInfo)?;
+
+    let certs: Arc<Vec<_>> = tls_info
+        .peer_certs()
+        .ok_or(PeerIdentityError::NoClientCertificate)?;
+
+    let leaf = certs
+        .first()
+        .ok_or(PeerIdentityError::NoClientCertificate)?;
+
+    parse_serial_from_der(leaf.as_ref())
+}
+
+/// Parse a DER-encoded X.509 certificate and return its serial in the same
+/// textual form `CaBackedCertificateIssuer` records in
+/// `nodes.certificate_serial`.
+///
+/// `CaBackedCertificateIssuer` stores `chv_common::gen_short_id()` (an
+/// 8-character lowercase-ASCII hex string) as the DER INTEGER's big-endian
+/// bytes. `x509_parser`'s `cert.raw_serial()` returns those DER content
+/// octets, not a decimal/hex display string, so for CHV-issued certs it is
+/// byte-for-byte the original ASCII serial.
+///
+/// Two DER normalization rules must be undone explicitly:
+/// - A positive INTEGER whose high bit is set is encoded with one `0x00` sign
+///   byte. That padding is not part of the serial and is stripped here.
+/// - `yasna` (via `rcgen`) strips leading `0x00` bytes before encoding, so an
+///   original serial with leading zero bytes cannot be recovered — for CHV
+///   ASCII serials this is irrelevant because ASCII `'0'` is `0x30`, not
+///   `0x00`. A serial of only zero bytes therefore yields [`None`].
+///
+/// A certificate carrying a non-ASCII/binary serial cannot be compared to the
+/// stored textual serial; it is rendered as lowercase hex so handlers still
+/// see a deterministic value and fail closed on the mismatch.
+pub fn parse_serial_from_der(der: &[u8]) -> Result<Option<String>, PeerIdentityError> {
+    use x509_parser::prelude::*;
+
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| PeerIdentityError::InvalidCertificate(e.to_string()))?;
+
+    let raw = cert.raw_serial();
+    // Strip exactly one DER sign-padding byte. Any other leading zero was
+    // already removed by the issuer's DER encoder before the cert was minted.
+    let unsigned = match raw {
+        [0x00, rest @ ..] if !rest.is_empty() => rest,
+        _ => raw,
+    };
+
+    if unsigned.is_empty() || unsigned.iter().all(|b| *b == 0) {
+        return Ok(None);
+    }
+
+    // CHV serials are printable ASCII; decode those exactly so equality with
+    // the stored `certificate_serial` is byte-for-byte. Anything else is
+    // canonicalized to lowercase hex rather than lossy-decoded.
+    Ok(Some(match std::str::from_utf8(unsigned) {
+        Ok(text) if text.bytes().all(|b| b.is_ascii_graphic()) => text.to_string(),
+        _ => unsigned.iter().map(|b| format!("{b:02x}")).collect(),
+    }))
 }
 
 /// Parse a DER-encoded X.509 certificate and return its asserted node_id.
@@ -297,6 +399,12 @@ mod tests {
     /// Build a self-signed leaf certificate whose CN and DNS SAN both equal
     /// `node_id`. Returns the DER bytes.
     fn fake_leaf_der(node_id: &str) -> Vec<u8> {
+        fake_leaf_der_with_serial(node_id, None)
+    }
+
+    /// Build a self-signed leaf certificate with an explicit DER serial.
+    /// `None` leaves rcgen's default (a random u64 serial).
+    fn fake_leaf_der_with_serial(node_id: &str, serial: Option<Vec<u8>>) -> Vec<u8> {
         use rcgen::string::Ia5String;
         use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType};
 
@@ -306,6 +414,9 @@ mod tests {
         let dns = Ia5String::try_from(node_id.to_string()).unwrap();
         params.subject_alt_names.push(SanType::DnsName(dns));
         params.is_ca = IsCa::NoCa;
+        if let Some(serial) = serial {
+            params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        }
 
         let key = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
@@ -317,6 +428,46 @@ mod tests {
         let der = fake_leaf_der("node-alpha");
         let got = parse_node_id_from_der(&der).expect("parse");
         assert_eq!(got.as_str(), "node-alpha");
+    }
+
+    #[test]
+    fn parses_ascii_serial_issued_form() {
+        // This is the shape CaBackedCertificateIssuer mints: an 8-char
+        // lowercase hex string stored as the DER INTEGER's ASCII bytes.
+        let serial = "0a3f7b2c";
+        let der = fake_leaf_der_with_serial("node-alpha", Some(serial.as_bytes().to_vec()));
+        let got = parse_serial_from_der(&der).expect("parse");
+        assert_eq!(
+            got.as_deref(),
+            Some(serial),
+            "ASCII serial must round-trip byte-for-byte, including a leading '0'"
+        );
+    }
+
+    #[test]
+    fn serial_sign_padding_is_not_part_of_the_value() {
+        // DER encodes a positive INTEGER whose high bit is set with a 0x00
+        // sign-padding byte. It must not become a leading NUL in the parsed
+        // serial (which would make every such serial look foreign).
+        let der = fake_leaf_der_with_serial("node-alpha", Some(vec![0x80, 0x01]));
+        let got = parse_serial_from_der(&der).expect("parse");
+        assert_eq!(got.as_deref(), Some("8001"));
+    }
+
+    #[test]
+    fn serial_leading_zero_bytes_are_normalized_by_der() {
+        // yasna strips leading 0x00 bytes before encoding, so the serial is
+        // the remaining bytes. ASCII '0' (0x30) is unaffected; this test
+        // documents the one lossy case for binary serials.
+        let der = fake_leaf_der_with_serial("node-alpha", Some(vec![0x00, 0x41]));
+        let got = parse_serial_from_der(&der).expect("parse");
+        assert_eq!(got.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn rejects_garbage_der_when_parsing_serial() {
+        let err = parse_serial_from_der(b"not a certificate").unwrap_err();
+        assert!(matches!(err, PeerIdentityError::InvalidCertificate(_)));
     }
 
     #[test]

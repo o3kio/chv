@@ -167,6 +167,19 @@ UPDATE nodes SET
 WHERE node_id = $1
 "#;
 
+/// Compare-and-swap certificate rotation: only update when the caller still
+/// holds the serial that is currently recorded for the node. This is the
+/// store-level half of certificate-rotation proof-of-possession (#661): the
+/// service checks the presented peer certificate serial before minting a new
+/// cert, and this conditional write closes the remaining race between that
+/// check and the commit.
+const ROTATE_NODE_CERTIFICATE_SQL: &str = r#"
+UPDATE nodes SET
+    certificate_serial = $3,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+WHERE node_id = $1 AND certificate_serial = $2
+"#;
+
 const UPSERT_BOOTSTRAP_RESULT_SQL: &str = r#"
 INSERT INTO node_bootstrap_results (
     node_id,
@@ -508,6 +521,55 @@ impl NodeRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Read the certificate serial currently recorded for a node.
+    ///
+    /// A missing node row is a [`StoreError::NotFound`]; an existing legacy
+    /// row whose `certificate_serial` is `NULL` is `Ok(None)` so callers can
+    /// fail closed with an operator-actionable message instead of guessing a
+    /// serial or silently bootstrapping one (#661).
+    pub async fn get_certificate_serial(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<String>, StoreError> {
+        let serial = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT certificate_serial FROM nodes WHERE node_id = ?",
+        )
+        .bind(node_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match serial {
+            Some(serial) => Ok(serial),
+            None => Err(StoreError::NotFound {
+                entity: "node",
+                id: node_id.to_string(),
+            }),
+        }
+    }
+
+    /// Atomically rotate a node's certificate serial from `expected` to `new`.
+    ///
+    /// Returns `Ok(true)` when the conditional update matched (exactly one
+    /// row changed), `Ok(false)` when the stored serial no longer equals
+    /// `expected` (a concurrent rotation won the race) or the node row no
+    /// longer exists. Callers MUST treat `Ok(false)` as "do not hand out the
+    /// newly issued certificate" — see `EnrollmentServiceImplementation`.
+    pub async fn rotate_certificate_serial(
+        &self,
+        node_id: &NodeId,
+        expected: &str,
+        new: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(ROTATE_NODE_CERTIFICATE_SQL)
+            .bind(node_id.as_str())
+            .bind(expected)
+            .bind(new)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn update_certificate_serial(

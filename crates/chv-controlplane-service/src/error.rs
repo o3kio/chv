@@ -27,6 +27,13 @@ pub enum ControlPlaneServiceError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// The request was well-formed and authenticated but the server cannot
+    /// satisfy it until an operator repairs node state (for example a legacy
+    /// node with no recorded certificate serial must be re-enrolled before
+    /// rotation; #661). Maps to gRPC `FAILED_PRECONDITION`.
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
+
     /// A node agent backend could not be reached (socket down, call timeout,
     /// circuit breaker open). Distinct from [`Self::Internal`]: the request
     /// was valid and the control plane itself is healthy — the documented
@@ -87,6 +94,7 @@ impl From<ControlPlaneServiceError> for tonic::Status {
             ControlPlaneServiceError::Unauthorized(msg) => Status::unauthenticated(msg),
             ControlPlaneServiceError::PermissionDenied(msg) => Status::permission_denied(msg),
             ControlPlaneServiceError::Conflict(msg) => Status::already_exists(msg),
+            ControlPlaneServiceError::FailedPrecondition(msg) => Status::failed_precondition(msg),
             ControlPlaneServiceError::StaleGeneration { expected, received } => {
                 Status::failed_precondition(format!(
                     "stale generation: expected {expected}, received {received}"
