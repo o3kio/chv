@@ -218,7 +218,10 @@ async fn build_state() -> AppState {
         image_repo: ImageRepository::new(pool.clone()),
         apply_runs: Arc::new(ApplyRunRepository::new(pool.clone())),
         drift_reports: Arc::new(DriftReportRepository::new(pool.clone())),
-        netbox_config: Arc::new(NetboxProjectionConfigRepository::new(pool.clone())),
+        netbox_config: Arc::new(NetboxProjectionConfigRepository::with_crypto(
+            pool.clone(),
+            chv_controlplane_store::test_util::test_credential_encryption(),
+        )),
         netbox_runs: Arc::new(NetboxProjectionRunRepository::new(pool.clone())),
         mutations: Arc::new(NoopMutations),
         jwt_secret: "test-secret".to_string(),

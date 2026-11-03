@@ -4,6 +4,12 @@ mod architectures;
 mod backups;
 mod bootstrap_tokens;
 mod credential_crypto;
+
+/// Test-support access to the credential cipher so repository tests can
+/// inject a deterministic key (or no key) without mutating process-global
+/// environment variables.
+#[cfg(any(test, feature = "test-util"))]
+pub use credential_crypto::{CredentialEncryption, EncryptError};
 mod db;
 mod desired_state;
 mod events;

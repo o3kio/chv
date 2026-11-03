@@ -34,9 +34,50 @@ pub enum DecryptError {
     KeyUnavailable,
 }
 
+/// Errors returned by [`CredentialEncryption::encrypt`].
+///
+/// Encrypt fails closed: callers MUST handle these errors and MUST NOT write
+/// the credential. The previous contract returned the plaintext on every
+/// failure path (no key, bad nonce, cipher error), silently defeating
+/// encryption-at-rest.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum EncryptError {
+    /// No usable key is configured. Writing the credential would store it in
+    /// plaintext at rest, so the write is rejected.
+    #[error(
+        "no credential encryption key is configured: refusing to store the \
+         credential in plaintext. Set CHV_ENCRYPTION_KEY (or the legacy \
+         CHV_JWT_SECRET fallback) and retry"
+    )]
+    KeyUnavailable,
+    /// The generated nonce was not a valid AES-GCM nonce length. This should
+    /// be impossible (the nonce is a fixed 12-byte array); treat it as a
+    /// cryptographic configuration failure rather than downgrading to
+    /// plaintext.
+    #[error(
+        "invalid AES-256-GCM nonce: refusing to store the credential in \
+         plaintext; check the credential encryption configuration and retry"
+    )]
+    InvalidNonce,
+    /// AES-256-GCM encryption failed. The credential is not persisted.
+    #[error(
+        "credential encryption failed ({0}): refusing to store the credential \
+         in plaintext; retry, and contact the operator if the failure persists"
+    )]
+    EncryptionFailed(String),
+}
+
 #[derive(Clone)]
 pub struct CredentialEncryption {
     cipher: Option<Aes256Gcm>,
+}
+
+impl Default for CredentialEncryption {
+    /// Equivalent to [`CredentialEncryption::new`]: reads the process
+    /// environment for the configured key.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CredentialEncryption {
@@ -64,8 +105,11 @@ impl CredentialEncryption {
         // trust them.
         if key_str.is_empty() {
             warn!(
-                "CHV_ENCRYPTION_KEY is unset or empty; \
-                 S3 credentials will be stored in plaintext"
+                "CHV_ENCRYPTION_KEY is unset or empty; credential writes \
+                 (backup S3 credentials, NetBox API tokens) will be rejected \
+                 (fail-closed) until a key is configured. Existing plaintext \
+                 rows remain readable, and previously encrypted rows require \
+                 the original key."
             );
             return Self { cipher: None };
         }
@@ -89,15 +133,23 @@ impl CredentialEncryption {
             );
         }
 
-        let mut hasher = Sha256::new();
-        hasher.update(key_str.as_bytes());
-        let key_bytes = hasher.finalize();
-
         // SHA-256 always produces 32 bytes, which is the exact key size for
         // AES-256-GCM, so this constructor cannot fail in practice. We still
         // avoid `.expect()` in production code (ADR-008): on the impossible
         // failure path we fall back to a no-cipher state and log a clear
-        // operator-visible warning instead of crashing the process.
+        // operator-visible warning instead of crashing the process. The
+        // no-cipher state rejects credential writes (fail-closed).
+        Self::from_secret(&key_str)
+    }
+
+    /// Builds a cipher from an explicit key secret, bypassing environment
+    /// lookup. Used by [`Self::new`] after key selection and by the
+    /// test-support constructors.
+    fn from_secret(key_str: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(key_str.as_bytes());
+        let key_bytes = hasher.finalize();
+
         match Aes256Gcm::new_from_slice(&key_bytes) {
             Ok(cipher) => Self {
                 cipher: Some(cipher),
@@ -105,32 +157,65 @@ impl CredentialEncryption {
             Err(e) => {
                 warn!(
                     error = %e,
-                    "failed to construct AES-256-GCM cipher from key; \
-                     credentials will be stored in plaintext"
+                    "failed to construct AES-256-GCM cipher from key; credential \
+                     writes will be rejected (fail-closed) until this is fixed"
                 );
                 Self { cipher: None }
             }
         }
     }
 
-    pub fn encrypt(&self, plaintext: &str) -> String {
+    /// Test-support constructor: a no-cipher instance that exercises the
+    /// fail-closed write path without mutating process-global environment.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn without_key() -> Self {
+        Self { cipher: None }
+    }
+
+    /// Test-support constructor: a cipher keyed from an explicit secret,
+    /// without mutating process-global environment.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_key(key: &str) -> Self {
+        Self::from_secret(key)
+    }
+
+    /// Encrypts a credential for storage.
+    ///
+    /// Fail-closed contract: any failure (no key, invalid nonce, cipher error)
+    /// returns an [`EncryptError`]. The plaintext is never returned as a
+    /// successful result, so a caller that propagates the error cannot
+    /// persist the credential in the clear.
+    pub fn encrypt(&self, plaintext: &str) -> Result<String, EncryptError> {
         let Some(cipher) = &self.cipher else {
-            return plaintext.to_string();
+            metrics::counter!(
+                "chv_credential_encrypt_total",
+                "outcome" => "err_key_unavailable"
+            )
+            .increment(1);
+            return Err(EncryptError::KeyUnavailable);
         };
 
         let nonce_bytes: [u8; 12] = rand::random();
         let nonce = match Nonce::try_from(nonce_bytes.as_slice()) {
             Ok(nonce) => nonce,
             Err(_) => {
-                tracing::warn!("invalid AES-256-GCM nonce length; storing plaintext");
-                return plaintext.to_string();
+                metrics::counter!(
+                    "chv_credential_encrypt_total",
+                    "outcome" => "err_invalid_nonce"
+                )
+                .increment(1);
+                return Err(EncryptError::InvalidNonce);
             }
         };
         let ciphertext = match cipher.encrypt(&nonce, plaintext.as_bytes()) {
             Ok(ct) => ct,
             Err(e) => {
-                tracing::warn!(error = %e, "AES-256-GCM encryption failed; storing plaintext");
-                return plaintext.to_string();
+                metrics::counter!(
+                    "chv_credential_encrypt_total",
+                    "outcome" => "err_encrypt"
+                )
+                .increment(1);
+                return Err(EncryptError::EncryptionFailed(e.to_string()));
             }
         };
 
@@ -138,7 +223,8 @@ impl CredentialEncryption {
         combined.extend_from_slice(&nonce_bytes);
         combined.extend_from_slice(&ciphertext);
 
-        format!("enc:{}", hex::encode(combined))
+        metrics::counter!("chv_credential_encrypt_total", "outcome" => "ok").increment(1);
+        Ok(format!("enc:{}", hex::encode(combined)))
     }
 
     /// Decrypts an `enc:`-prefixed credential.
@@ -337,7 +423,7 @@ mod tests {
         let crypto = CredentialEncryption::new();
         let plaintext = "my-super-secret-key";
 
-        let encrypted = crypto.encrypt(plaintext);
+        let encrypted = crypto.encrypt(plaintext).expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
         assert_ne!(encrypted, plaintext);
 
@@ -373,7 +459,9 @@ mod tests {
 
         // The key-source logging is observability only: the cipher still
         // round-trips exactly as before.
-        let encrypted = crypto.encrypt("dedicated-key-plaintext");
+        let encrypted = crypto
+            .encrypt("dedicated-key-plaintext")
+            .expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
         assert_eq!(
             crypto.decrypt(&encrypted).expect("roundtrip succeeds"),
@@ -424,7 +512,9 @@ mod tests {
 
         // Behavior is unchanged: the fallback key still encrypts and
         // decrypts round-trip exactly as before.
-        let encrypted = crypto.encrypt("jwt-fallback-plaintext");
+        let encrypted = crypto
+            .encrypt("jwt-fallback-plaintext")
+            .expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
         assert_eq!(
             crypto.decrypt(&encrypted).expect("roundtrip succeeds"),
@@ -448,8 +538,12 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
+    /// Fail-closed (#655): with no key, `encrypt` MUST return
+    /// `KeyUnavailable` and MUST NOT return the input as a successful
+    /// ciphertext. The previous contract returned the plaintext verbatim,
+    /// silently defeating encryption at rest.
     #[test]
-    fn test_no_key_stores_plaintext() {
+    fn test_no_key_encrypt_fails_closed() {
         let _g = EnvGuard::lock();
         std::env::remove_var("CHV_ENCRYPTION_KEY");
         std::env::remove_var("CHV_JWT_SECRET");
@@ -457,21 +551,60 @@ mod tests {
         let crypto = CredentialEncryption::new();
         let plaintext = "no-encryption-active";
 
-        let encrypted = crypto.encrypt(plaintext);
-        assert_eq!(encrypted, plaintext);
+        let result = crypto.encrypt(plaintext);
+        assert!(
+            matches!(result, Err(EncryptError::KeyUnavailable)),
+            "expected KeyUnavailable with no key, got {:?}",
+            result
+        );
+        assert_ne!(result, Ok(plaintext.to_string()));
 
-        let decrypted = crypto
-            .decrypt(&encrypted)
-            .expect("no-key plaintext passthrough succeeds");
-        assert_eq!(decrypted, plaintext);
+        // Compatibility: legacy plaintext rows remain readable without a key.
+        assert_eq!(
+            crypto
+                .decrypt(plaintext)
+                .expect("plaintext passthrough still works"),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn test_without_key_constructor_encrypt_fails_closed() {
+        let crypto = CredentialEncryption::without_key();
+        let plaintext = "injected-no-key";
+
+        let result = crypto.encrypt(plaintext);
+        assert!(
+            matches!(result, Err(EncryptError::KeyUnavailable)),
+            "expected KeyUnavailable, got {:?}",
+            result
+        );
+        assert_ne!(result, Ok(plaintext.to_string()));
+    }
+
+    /// The no-key error must tell the operator exactly which setting to fix.
+    #[test]
+    fn encrypt_error_message_names_encryption_key() {
+        let err = CredentialEncryption::without_key()
+            .encrypt("secret")
+            .expect_err("no-key encryption must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("CHV_ENCRYPTION_KEY"),
+            "operator-facing error must name CHV_ENCRYPTION_KEY: {message}"
+        );
+        assert!(
+            message.contains("plaintext"),
+            "operator-facing error must state the plaintext hazard: {message}"
+        );
     }
 
     /// A present-but-empty CHV_ENCRYPTION_KEY (e.g. a truncated
     /// /etc/chv/encryption.env) must behave exactly like no key — and, as
     /// of #335 round 4, emit the same startup warning instead of silently
-    /// disabling encryption.
+    /// disabling encryption. Writes are now rejected (#655).
     #[test]
-    fn test_empty_key_stores_plaintext() {
+    fn test_empty_key_encrypt_fails_closed() {
         let _g = EnvGuard::lock();
         std::env::set_var("CHV_ENCRYPTION_KEY", "");
         std::env::remove_var("CHV_JWT_SECRET");
@@ -479,13 +612,13 @@ mod tests {
         let crypto = CredentialEncryption::new();
         let plaintext = "empty-key-no-encryption";
 
-        let encrypted = crypto.encrypt(plaintext);
-        assert_eq!(encrypted, plaintext);
-
-        let decrypted = crypto
-            .decrypt(&encrypted)
-            .expect("empty-key plaintext passthrough succeeds");
-        assert_eq!(decrypted, plaintext);
+        let result = crypto.encrypt(plaintext);
+        assert!(
+            matches!(result, Err(EncryptError::KeyUnavailable)),
+            "expected KeyUnavailable with an empty key, got {:?}",
+            result
+        );
+        assert_ne!(result, Ok(plaintext.to_string()));
     }
 
     /// Fail-closed: tampered ciphertext MUST surface AuthFailed, not be
@@ -499,7 +632,7 @@ mod tests {
 
         let crypto = CredentialEncryption::new();
         let plaintext = "sensitive-credential";
-        let encrypted = crypto.encrypt(plaintext);
+        let encrypted = crypto.encrypt(plaintext).expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
 
         // Flip one byte near the tail (auth tag region).
@@ -529,7 +662,7 @@ mod tests {
         std::env::set_var("CHV_ENCRYPTION_KEY", "key-A-for-encryption");
         let crypto_a = CredentialEncryption::new();
         let plaintext = "secret-under-key-A";
-        let encrypted = crypto_a.encrypt(plaintext);
+        let encrypted = crypto_a.encrypt(plaintext).expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
 
         // Decrypt with key B.
@@ -599,7 +732,9 @@ mod tests {
         // Encrypt under a key…
         std::env::set_var("CHV_ENCRYPTION_KEY", "key-that-will-be-removed");
         let crypto_with_key = CredentialEncryption::new();
-        let encrypted = crypto_with_key.encrypt("plaintext-under-key");
+        let encrypted = crypto_with_key
+            .encrypt("plaintext-under-key")
+            .expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
 
         // …then drop the key (operator misconfig / rotation gap).
@@ -623,7 +758,7 @@ mod tests {
         let crypto = CredentialEncryption::new();
         let plaintext = "hello 🌍 — naïve café 日本語 🚀";
 
-        let encrypted = crypto.encrypt(plaintext);
+        let encrypted = crypto.encrypt(plaintext).expect("encryption succeeds");
         assert!(encrypted.starts_with("enc:"));
 
         let decrypted = crypto.decrypt(&encrypted).expect("unicode roundtrip");
