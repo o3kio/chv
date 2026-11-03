@@ -107,6 +107,13 @@ pub struct AuditLogFilter {
     pub to_ms: Option<i64>,
 }
 
+/// Rows deleted per retention/prune statement. Bounded so a sweep of
+/// a huge backlog commits in increments instead of one giant
+/// transaction that holds the SQLite write lock — which would time
+/// out audit inserts on the request path and turn successful
+/// mutations into 500 `AUDIT_LOG_WRITE_FAILED` (#658 review M4).
+const DELETE_BATCH_ROWS: i64 = 5_000;
+
 #[derive(Clone)]
 pub struct AuditLogRepository {
     pool: StorePool,
@@ -121,11 +128,15 @@ impl AuditLogRepository {
         &self.pool
     }
 
-    /// Append exactly one audit row. The id is server-minted; a PRIMARY
-    /// KEY collision is a loud store error (never silently overwritten).
+    /// Append exactly one audit row. The id is server-minted (128
+    /// random bits — collision-safe for an append-only evidence table
+    /// at any realistic volume); a PRIMARY KEY collision is a loud
+    /// store error (never silently overwritten).
     pub async fn insert(&self, input: &AuditLogInsert) -> Result<String, StoreError> {
         let audit_id = format!(
-            "{}{}",
+            "{}{}{}{}",
+            chv_common::gen_short_id(),
+            chv_common::gen_short_id(),
             chv_common::gen_short_id(),
             chv_common::gen_short_id()
         );
@@ -217,12 +228,86 @@ impl AuditLogRepository {
 
     /// Retention sweep: delete rows strictly older than the cutoff.
     /// Returns the number of deleted rows. The cutoff is exclusive so a
-    /// row exactly at the boundary is retained.
+    /// row exactly at the boundary is retained. Deletion runs in
+    /// bounded batches (see [`DELETE_BATCH_ROWS`]) so a large backlog
+    /// cannot hold the write lock in one transaction.
     pub async fn delete_older_than(&self, cutoff_ms: i64) -> Result<u64, StoreError> {
-        let result = sqlx::query("DELETE FROM audit_log WHERE occurred_at_ms < $1")
-            .bind(cutoff_ms)
-            .execute(&self.pool)
-            .await?;
+        let mut deleted = 0u64;
+        loop {
+            let n = self
+                .delete_older_than_limited(cutoff_ms, DELETE_BATCH_ROWS)
+                .await?;
+            deleted += n;
+            if n < DELETE_BATCH_ROWS as u64 {
+                break;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// One bounded retention step: delete the `limit` oldest rows
+    /// strictly older than the cutoff. Private building block for
+    /// [`Self::delete_older_than`]; the tests exercise it directly to
+    /// pin the batching semantics.
+    async fn delete_older_than_limited(
+        &self,
+        cutoff_ms: i64,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM audit_log WHERE audit_id IN (\
+             SELECT audit_id FROM audit_log WHERE occurred_at_ms < $1 \
+             ORDER BY occurred_at_ms ASC, audit_id ASC LIMIT $2)",
+        )
+        .bind(cutoff_ms)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Row-count ceiling: prune the table down to its `max_rows`
+    /// NEWEST rows, deleting the oldest first, in bounded batches.
+    ///
+    /// Age retention alone cannot bound the table when rows arrive
+    /// faster than they age out (e.g. an anonymous-denial flood hitting
+    /// the always-record denials contract) — this cap bounds the
+    /// SQLite database regardless (#658 review M2). Returns the number
+    /// of deleted rows. `max_rows <= 0` is a no-op (defensive; the
+    /// config validator enforces a sane floor).
+    pub async fn prune_to_max_rows(&self, max_rows: i64) -> Result<u64, StoreError> {
+        if max_rows <= 0 {
+            return Ok(0);
+        }
+        let mut deleted = 0u64;
+        loop {
+            let n = self.prune_limited(max_rows, DELETE_BATCH_ROWS).await?;
+            deleted += n;
+            if n < DELETE_BATCH_ROWS as u64 {
+                break;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// One bounded prune step: delete up to `limit` of the oldest rows
+    /// that fall beyond the newest `max_rows`. Private building block
+    /// for [`Self::prune_to_max_rows`]. The inner subquery ranks the
+    /// table newest-first and skips the newest `max_rows`; the outer
+    /// one walks that overflow oldest-first, so an interrupted prune
+    /// has always removed the oldest evidence first.
+    async fn prune_limited(&self, max_rows: i64, limit: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM audit_log WHERE audit_id IN (\
+             SELECT audit_id FROM (\
+             SELECT audit_id, occurred_at_ms FROM audit_log \
+             ORDER BY occurred_at_ms DESC, audit_id DESC LIMIT -1 OFFSET $1\
+             ) ORDER BY occurred_at_ms ASC, audit_id ASC LIMIT $2)",
+        )
+        .bind(max_rows)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 }
@@ -426,5 +511,76 @@ mod tests {
         assert!(rows
             .iter()
             .all(|row| row.resource_id.as_deref() != Some("vm-1000")));
+    }
+
+    #[tokio::test]
+    async fn retention_deletion_is_batched_oldest_first_and_complete() {
+        let test_db = TestDb::new().await;
+        let repo = AuditLogRepository::new(test_db.pool.clone());
+        // More rows than one small batch; timestamps make oldest-first
+        // observable.
+        for i in 0..12 {
+            repo.insert(&entry(
+                (i + 1) * 1_000,
+                "alice",
+                "vm.create",
+                "vm",
+                &format!("vm-{i}"),
+                AUDIT_OUTCOME_SUCCESS,
+            ))
+            .await
+            .unwrap();
+        }
+
+        // One bounded step deletes only its batch, oldest first.
+        let deleted = repo.delete_older_than_limited(100_000, 5).await.unwrap();
+        assert_eq!(deleted, 5);
+        let (rows, total) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(rows[rows.len() - 1].occurred_at_ms, 6_000, "oldest 5 gone");
+
+        // The public sweep loops the batches to completion.
+        let deleted = repo.delete_older_than(100_000).await.unwrap();
+        assert_eq!(deleted, 7);
+        let (_, total) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_to_max_rows_keeps_the_newest_rows() {
+        let test_db = TestDb::new().await;
+        let repo = AuditLogRepository::new(test_db.pool.clone());
+        for i in 0..10 {
+            repo.insert(&entry(
+                (i + 1) * 1_000,
+                "alice",
+                "vm.create",
+                "vm",
+                &format!("vm-{i}"),
+                AUDIT_OUTCOME_SUCCESS,
+            ))
+            .await
+            .unwrap();
+        }
+
+        // One bounded prune step deletes at most its batch, oldest
+        // first.
+        let deleted = repo.prune_limited(3, 2).await.unwrap();
+        assert_eq!(deleted, 2);
+        let (rows, total) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
+        assert_eq!(total, 8);
+        assert_eq!(rows[rows.len() - 1].occurred_at_ms, 3_000, "oldest 2 gone");
+
+        // The public prune loops down to the cap, keeping the newest.
+        let deleted = repo.prune_to_max_rows(3).await.unwrap();
+        assert_eq!(deleted, 5);
+        let (rows, total) = repo.query(&AuditLogFilter::default(), 50, 0).await.unwrap();
+        assert_eq!(total, 3);
+        let remaining: Vec<i64> = rows.iter().map(|r| r.occurred_at_ms).collect();
+        assert_eq!(remaining, vec![10_000, 9_000, 8_000]);
+
+        // Under the cap: no-op.
+        assert_eq!(repo.prune_to_max_rows(3).await.unwrap(), 0);
+        assert_eq!(repo.prune_to_max_rows(0).await.unwrap(), 0);
     }
 }

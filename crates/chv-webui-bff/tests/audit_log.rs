@@ -607,3 +607,179 @@ async fn retention_removes_only_expired_rows_through_repository() {
     assert_eq!(total, 1);
     assert_eq!(rows[0].occurred_at_ms, 2_000);
 }
+
+#[tokio::test]
+async fn security_relevant_auth_routes_are_audited_but_login_is_not() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // Logout severs a session: a session thief's seizure step. Audited.
+    let response = send(
+        &state,
+        post_json("/v1/auth/logout", Some(&admin), serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = rows_for_path(&state, "/v1/auth/logout").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "auth.logout");
+    assert_eq!(rows[0].resource_kind.as_deref(), Some("user"));
+    assert_eq!(rows[0].actor_id, "u-admin");
+    assert_eq!(rows[0].outcome, "success");
+    assert_eq!(rows[0].status_code, 200);
+
+    // change-password with a body that passes policy but an unknown
+    // actor: 401 from the handler, still recorded with the real
+    // (token-verified) actor and never the body.
+    let response = send(
+        &state,
+        post_json(
+            "/v1/auth/change-password",
+            Some(&admin),
+            serde_json::json!({
+                "current_password": "WrongButWellFormed1!",
+                "new_password": "AnotherWellFormed1!"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let rows = rows_for_path(&state, "/v1/auth/change-password").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "auth.change_password");
+    assert_eq!(rows[0].actor_id, "u-admin");
+    assert_eq!(rows[0].outcome, "denied");
+    assert_eq!(rows[0].status_code, 401);
+    // The passwords never reach the durable row.
+    let dump = format!("{:?}", rows[0]);
+    assert!(!dump.contains("WrongButWellFormed1"));
+    assert!(!dump.contains("AnotherWellFormed1"));
+
+    // Login is credential entry (anonymous by definition, password in
+    // the body, brute-force volume accounted by rate limiting): NO row.
+    let response = send(
+        &state,
+        post_json(
+            "/v1/auth/login",
+            None,
+            serde_json::json!({ "username": "nobody", "password": "guess" }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        rows_for_path(&state, "/v1/auth/login").await.is_empty(),
+        "login must not be audited"
+    );
+    assert_eq!(all_rows(&state).await.len(), 2);
+}
+
+#[tokio::test]
+async fn csrf_rejected_mutation_is_recorded() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // A form-native content type is rejected by the CSRF middleware
+    // with 415 before any handler runs. The audit layer wraps the CSRF
+    // layer, so the rejected attempt is still recorded — attribution
+    // comes from the decoded credential, not the request shape.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/vms/delete")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+        .body(Body::from("vm_id=vm-1"))
+        .expect("build request");
+    let response = send(&state, request).await;
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let rows = rows_for_path(&state, "/v1/vms/delete").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "vm.delete");
+    assert_eq!(rows[0].status_code, 415);
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].actor_id, "u-admin");
+}
+
+#[tokio::test]
+async fn client_supplied_identifiers_are_capped() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // A hostile or buggy client sends a megabyte-scale identifier. The
+    // stored operation_id and correlation_id must be capped (review L2)
+    // so a row cannot be ballooned by header content.
+    let huge = "x".repeat(5_000);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/users/create")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+        .header("x-operation-id", huge.clone())
+        .body(Body::from(
+            serde_json::json!({
+                "username": "capped-id-user",
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            })
+            .to_string(),
+        ))
+        .expect("build request");
+    let response = send(&state, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].operation_id.as_deref().map(str::len),
+        Some(128),
+        "operation_id must be capped at 128 chars"
+    );
+    assert_eq!(
+        rows[0].correlation_id.as_deref().map(str::len),
+        Some(128),
+        "correlation_id must be capped at 128 chars"
+    );
+    assert_eq!(rows[0].operation_id, rows[0].correlation_id);
+}
+
+#[tokio::test]
+async fn audit_write_failure_fails_closed_with_correlation_handle() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // Break the audit store AFTER startup (an operator could drop the
+    // table, or the volume could fill): the mutation itself succeeds,
+    // but the response must not claim success without its durable
+    // record. The 500 replacement carries the correlation id so the
+    // operator can find what the mutation actually did (review M3).
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&state.pool)
+        .await
+        .expect("drop audit table");
+
+    let response = send(
+        &state,
+        post_json(
+            "/v1/users/create",
+            Some(&admin),
+            serde_json::json!({
+                "username": "unrecorded-user",
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let correlation = response
+        .headers()
+        .get("x-correlation-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("correlation id header")
+        .to_string();
+    let body = body_json(&body_bytes(response).await);
+    assert_eq!(body["code"], "AUDIT_LOG_WRITE_FAILED");
+    assert_eq!(body["request_id"], correlation.as_str());
+    assert!(!correlation.is_empty());
+}

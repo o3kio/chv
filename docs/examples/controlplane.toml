@@ -182,6 +182,14 @@ dir = "/usr/share/chv/ui"
 # periodic worker deletes only rows strictly older than the cutoff.
 # sweep_interval_secs is floored at 60. Set retention_days lower only
 # after checking your compliance/incident-review requirements.
+#
+# max_rows is a hard ceiling on the audit table: after every age sweep
+# the worker prunes down to the newest max_rows rows (oldest deleted
+# first, in bounded batches). It bounds the database even when rows
+# arrive faster than they age out — e.g. an anonymous-denial flood,
+# which is always recorded. Hitting the cap logs a warning: evidence
+# is being discarded ahead of schedule.
 [audit]
 retention_days = 365
 sweep_interval_secs = 86400
+max_rows = 1000000

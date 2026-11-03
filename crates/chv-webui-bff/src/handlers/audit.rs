@@ -51,7 +51,7 @@ pub async fn query_audit_log(
     State(state): State<AppState>,
     BearerToken(claims): BearerToken,
     Json(request): Json<AuditQueryRequest>,
-) -> Result<Json<Value>, BffError> {
+) -> Result<Response, BffError> {
     // Defense in depth: the route is mounted under admin_middleware, but
     // the handler repeats the role check so a future routing mistake
     // cannot expose the trail to a non-admin.
@@ -68,13 +68,23 @@ pub async fn query_audit_log(
     })?;
 
     let items: Vec<Value> = rows.iter().map(row_json).collect();
-    Ok(Json(json!({
-        "items": items,
-        "count": items.len(),
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    })))
+    let mut response = (
+        StatusCode::OK,
+        Json(json!({
+            "items": items,
+            "count": items.len(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })),
+    )
+        .into_response();
+    // The trail carries actor identities and source addresses: never
+    // let a shared browser or intermediary cache it (#658 review L7).
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 pub async fn export_audit_log(
@@ -141,6 +151,10 @@ pub async fn export_audit_log(
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    // Never cache an audit export (#658 review L7).
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).map_err(|e| {
@@ -258,17 +272,21 @@ fn csv_row(row: &AuditLogRow) -> String {
 }
 
 /// RFC 4180 quoting plus spreadsheet-formula neutralization: a field
-/// beginning with `=`, `+`, `-`, `@`, tab, or CR is prefixed with a
+/// whose first non-whitespace character is a formula trigger (`=`,
+/// `+`, `-`, `@`) or that begins with a tab/CR is prefixed with a
 /// single quote so opening an audit export in a spreadsheet cannot
-/// execute attacker-controlled text (for example a username).
+/// execute attacker-controlled text (for example a username). The
+/// leading-whitespace check covers importers that trim a field before
+/// evaluating it (#658 review L7).
 fn csv_field(value: &str) -> String {
-    let neutralized = if value.starts_with('=')
-        || value.starts_with('+')
-        || value.starts_with('-')
-        || value.starts_with('@')
+    let trimmed = value.trim_start();
+    let is_formula = trimmed.starts_with('=')
+        || trimmed.starts_with('+')
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('@')
         || value.starts_with('\t')
-        || value.starts_with('\r')
-    {
+        || value.starts_with('\r');
+    let neutralized = if is_formula {
         format!("'{value}")
     } else {
         value.to_string()
@@ -301,6 +319,14 @@ mod tests {
         assert_eq!(csv_field("@evil"), "'@evil");
         assert_eq!(csv_field("+1"), "'+1");
         assert_eq!(csv_field("-1"), "'-1");
+        // Leading whitespace before a trigger is neutralized too —
+        // some spreadsheet importers trim the field first.
+        assert_eq!(csv_field(" =cmd"), "' =cmd");
+        assert_eq!(csv_field("  +1"), "'  +1");
+        assert_eq!(csv_field("\t=cmd"), "'\t=cmd");
+        assert_eq!(csv_field(" \t@x"), "' \t@x");
+        // Plain leading whitespace without a trigger stays untouched.
+        assert_eq!(csv_field("  plain"), "  plain");
     }
 
     #[test]

@@ -192,7 +192,13 @@ pub fn admin_router_with_guest_agents(
     agent_browser: Option<(Router<AppState>, Router<AppState>)>,
     agent_ingest: Option<Router<AppState>>,
 ) -> Router {
-    let bff_router = chv_webui_bff::bff_router(bff_state.clone());
+    // The BFF's /v1 surface WITHOUT its own audit/metrics/correlation
+    // wrappers: this router applies them at the very end so they wrap
+    // every route below AND the fallback — the extra privileged
+    // surfaces (admin, legacy /api/v1, /internal, guest-agent browser
+    // routes) and unmatched non-safe paths included — exactly once
+    // (#658 review H1/H2).
+    let bff_router = chv_webui_bff::bff_router_unaudited(bff_state.clone());
 
     // Legacy cookie-authenticated backup routes. Mounted on the outer
     // router (not the BFF's /v1 surface) for the stage-1 UI, they accept
@@ -379,6 +385,32 @@ pub fn admin_router_with_guest_agents(
 
     router
         .layer(Extension(convergence_metrics))
+        // Audit wraps EVERY route and the fallback (registered above):
+        // the BFF's /v1 surface, the guest-agent browser routes, the
+        // CP admin routes, the legacy /api/v1 backup surface,
+        // /internal, and unmatched non-safe paths all pass through the
+        // same audit middleware, so no privileged mutation can bypass
+        // the trail (#658 review H1/H2). bff_router_unaudited supplies
+        // the /v1 routes without their own wrapper, so nothing is
+        // audited twice.
+        .layer(middleware::from_fn_with_state(
+            bff_state.clone(),
+            chv_webui_bff::audit::record_privileged_mutation,
+        ))
+        // Metrics sits outside the audit layer so the status it counts
+        // is the final one on the wire — including the 500
+        // AUDIT_LOG_WRITE_FAILED replacement (#658 review M3). It only
+        // records API-shaped paths (see is_recorded_path), so the
+        // static tree and health probes stay out of the label set.
+        .layer(middleware::from_fn(
+            chv_webui_bff::metrics_middleware::track_metrics,
+        ))
         .layer(middleware::from_fn(security_headers))
+        // Correlation outermost: the id is in request extensions by the
+        // time the audit row is built, and every response (including
+        // audit's 500 replacement) carries x-correlation-id.
+        .layer(middleware::from_fn(
+            chv_webui_bff::correlation_middleware::extract_correlation_id,
+        ))
         .with_state(bff_state)
 }

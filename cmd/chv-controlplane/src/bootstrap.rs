@@ -1022,6 +1022,11 @@ pub async fn build_service(
     // logged but never block startup or the request path.
     let audit_retention_repo = AuditLogRepository::new(pool.clone());
     let audit_retention_ms = (config.audit.retention_days as i64).saturating_mul(86_400_000);
+    // Row-count ceiling (#658 review M2): bounds the table even when
+    // rows arrive faster than they age out (anonymous-denial floods).
+    // Clamped into i64 range defensively; the config validator already
+    // rejects absurd values.
+    let audit_max_rows = config.audit.max_rows.min(i64::MAX as u64) as i64;
     let audit_sweep_interval =
         std::time::Duration::from_secs(config.audit.sweep_interval_secs.max(60));
     let mut audit_shutdown = shutdown_rx.clone();
@@ -1043,6 +1048,28 @@ pub async fn build_service(
                         target: "audit",
                         error = %error,
                         "audit log retention sweep failed; previous rows remain"
+                    );
+                }
+            }
+            // Cap the table at max_rows newest rows. A warn, not an
+            // info: hitting the ceiling means evidence is being
+            // discarded ahead of schedule and the operator should
+            // investigate the row flood (or raise the cap).
+            match audit_retention_repo.prune_to_max_rows(audit_max_rows).await {
+                Ok(pruned) if pruned > 0 => {
+                    tracing::warn!(
+                        target: "audit",
+                        pruned,
+                        max_rows = audit_max_rows,
+                        "audit log row cap pruned oldest rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        target: "audit",
+                        error = %error,
+                        "audit log row-cap prune failed; previous rows remain"
                     );
                 }
             }

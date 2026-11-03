@@ -121,7 +121,20 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
 }
 
-pub fn bff_router(state: AppState) -> Router<AppState> {
+/// The BFF's `/v1` surface WITHOUT the audit, metrics, and correlation
+/// wrappers.
+///
+/// doc-hidden on purpose: the only legitimate caller is the control
+/// plane's `admin_router_with_guest_agents`, which mounts this inside
+/// the full production router and then applies correlation + metrics +
+/// audit around **everything** — its own extra privileged surfaces
+/// (`/admin/*`, `/api/v1/*`, `/internal/*`, the guest-agent browser
+/// routes) and the router fallback — so no privileged mutation can
+/// bypass the trail and nothing is audited twice (#658 review H1/H2).
+/// Every other caller (tests, embedders) must use [`bff_router`],
+/// which adds the same wrappers in the same order.
+#[doc(hidden)]
+pub fn bff_router_unaudited(state: AppState) -> Router<AppState> {
     // Unauthenticated
     let login = Router::new()
         .route("/v1/auth/login", post(crate::handlers::auth::login))
@@ -727,17 +740,28 @@ pub fn bff_router(state: AppState) -> Router<AppState> {
         .merge(operator)
         .merge(admin)
         .layer(axum::middleware::from_fn(
-            crate::metrics_middleware::track_metrics,
-        ))
-        .layer(axum::middleware::from_fn(
             crate::csrf_middleware::csrf_protection,
         ))
+}
+
+/// The standalone BFF router: [`bff_router_unaudited`] plus the
+/// correlation → metrics → audit wrappers (outermost first).
+///
+/// Metrics deliberately sits **outside** the audit layer so the status
+/// it counts is the final one on the wire — including the 500
+/// `AUDIT_LOG_WRITE_FAILED` replacement (#658 review M3). Correlation
+/// runs outside audit so the id is already in request extensions when
+/// the audit row is built.
+pub fn bff_router(state: AppState) -> Router<AppState> {
+    bff_router_unaudited(state.clone())
         // Wraps the role middlewares (and CSRF) so denied and failed
-        // privileged mutations are recorded too. Correlation runs
-        // outside this layer and is therefore available in extensions.
+        // privileged mutations are recorded too.
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            state,
             crate::audit::record_privileged_mutation,
+        ))
+        .layer(axum::middleware::from_fn(
+            crate::metrics_middleware::track_metrics,
         ))
         .layer(axum::middleware::from_fn(
             crate::correlation_middleware::extract_correlation_id,

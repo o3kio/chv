@@ -248,6 +248,188 @@ async fn admin_router_builds_with_guest_agent_pair_in_both_arms() {
     );
 }
 
+/// #658 review H1/H2 regression: the audit layer must wrap the FULL
+/// production router — the guest-agent browser routes, the CP admin
+/// and `/internal` surfaces, the legacy `/api/v1` backup surface, and
+/// the outer fallback — not just the BFF's `/v1` routes. Before the
+/// fix the audit middleware lived only inside `bff_router`, so every
+/// privileged mutation outside `/v1` (and every unmatched non-safe
+/// path, which the outer `.fallback` handled outside the BFF's own
+/// layered fallback) bypassed the trail entirely. The fix mounts
+/// `bff_router_unaudited` inside `admin_router_with_guest_agents` and
+/// applies audit at the outermost layer, after fallback registration;
+/// this test pins that contract end-to-end against the real router.
+#[tokio::test]
+async fn production_router_audits_all_privileged_surfaces_exactly_once() {
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+
+    async fn rows_for(pool: &chv_controlplane_store::StorePool, path: &str) -> Vec<AuditLogRow> {
+        sqlx::query_as::<_, AuditLogRow>(
+            "SELECT * FROM audit_log WHERE path = ? ORDER BY occurred_at_ms DESC, audit_id DESC",
+        )
+        .bind(path)
+        .fetch_all(pool)
+        .await
+        .expect("query audit rows")
+    }
+
+    // The full production shape: guest-agent browser pair mounted
+    // (disabled arm → typed 503s), webui off so the fallback is the
+    // JSON 404 handler — the same fallback that used to sit outside
+    // the audit layer.
+    let (viewer, operator) = crate::api::agent_admin::agent_admin_disabled_routers();
+    let app = crate::api::router::admin_router_with_guest_agents(
+        test_app_state(pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+        Some((viewer, operator)),
+        None,
+    );
+    let token = test_admin_token();
+
+    // (a) Unknown non-safe /v1 path: unrouted, so it is answered by the
+    // PRODUCTION fallback — this exact request wrote zero rows before
+    // the fix. Fail-closed classification must record it (anonymous
+    // probing leaves a trace).
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/future-privileged-write")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let rows = rows_for(&pool, "/v1/future-privileged-write").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "unknown non-safe /v1 POST through the production fallback must write a row"
+    );
+    assert_eq!(rows[0].action, "future-privileged-write.post");
+    assert_eq!(rows[0].status_code, 404);
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].actor_id, "anonymous");
+
+    // (b) CP admin surface: a routed mutation outside the BFF router.
+    // "m-1" does not exist → 404 from the handler, and the attempt is
+    // still recorded with the real actor.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/admin/migrations/m-1/cancel")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let rows = rows_for(&pool, "/admin/migrations/m-1/cancel").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "migration.cancel");
+    assert_eq!(rows[0].resource_kind.as_deref(), Some("migration"));
+    assert_eq!(rows[0].resource_id.as_deref(), Some("m-1"));
+    assert_eq!(rows[0].actor_id, "test-admin-id");
+    assert_eq!(rows[0].actor_role, "admin");
+
+    // (b) /internal surface: the bootstrap-token seed only accepts
+    // loopback ConnectInfo; the request injects it the same way the
+    // TLS PeerInjectService now does (see tls.rs, review M1).
+    let mut request = axum::http::Request::post("/internal/bootstrap-token")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            r#"{"token":"regression-test-token"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:54321".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = rows_for(&pool, "/internal/bootstrap-token").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "bootstrap_token.seed");
+    assert_eq!(rows[0].status_code, 200);
+
+    // (b) Guest-agent browser surface (operator tier, disabled arm):
+    // the 503 is typed, and the attempt is recorded.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/monitoring/agents/revoke")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let rows = rows_for(&pool, "/v1/monitoring/agents/revoke").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "agent.revoke");
+    assert_eq!(rows[0].resource_kind.as_deref(), Some("monitoring_agent"));
+    assert_eq!(rows[0].status_code, 503);
+
+    // (c) A routed BFF mutation: audited EXACTLY once — the outer layer
+    // must not double-count what the /v1 surface already records.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/users/create")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "username": "prod-audit-user",
+                        "password": "Sup3rSecretPassw0rd!",
+                        "role": "viewer"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = rows_for(&pool, "/v1/users/create").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "routed BFF mutation must be audited exactly once — no double audit"
+    );
+    assert_eq!(rows[0].action, "user.create");
+    assert_eq!(rows[0].actor_id, "test-admin-id");
+    assert_eq!(rows[0].outcome, "success");
+    assert_eq!(rows[0].status_code, 200);
+
+    // Reads stay out of the trail, and the five mutations above are the
+    // COMPLETE table contents — nothing extra, nothing duplicated.
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 5, "exactly the five audited attempts above");
+    assert!(rows_for(&pool, "/health").await.is_empty());
+}
+
 #[tokio::test]
 async fn test_deep_health_endpoint() {
     use axum::http::StatusCode;

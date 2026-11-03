@@ -18,7 +18,7 @@ use crate::BffError;
 /// access.
 pub const SESSION_COOKIE_NAME: &str = "chv_session";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
     pub username: String,
@@ -265,10 +265,26 @@ impl AuthSource {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AuthFailure {
     pub message: &'static str,
 }
+
+/// The credential decode the audit middleware already performed,
+/// shared with the `BearerToken` extractor through request extensions
+/// (#658 review L6).
+///
+/// Inserted only by the audit middleware (server-side code — a client
+/// cannot forge request extensions). When present, the extractor
+/// reuses it verbatim, so the audit row's actor and the authorizer's
+/// identity are guaranteed to agree and an API-token credential is
+/// decoded (and its `last_used_at` touched) exactly once per mutating
+/// request instead of twice. Absent on requests that did not pass
+/// through the audit middleware (GETs, read-shaped POSTs, routers
+/// built from `bff_router_unaudited` without the outer layer), where
+/// the extractor decodes for itself exactly as before.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedAuth(pub Result<(Claims, AuthSource), AuthFailure>);
 
 /// Decode the same credential the `BearerToken` extractor accepts,
 /// without consuming request parts. The audit middleware uses this so a
@@ -421,6 +437,17 @@ impl FromRequestParts<crate::router::AppState> for BearerToken {
                 Json(serde_json::json!({ "message": msg, "code": "UNAUTHORIZED" })),
             )
         };
+        // Reuse the audit middleware's decode when it ran: one decode
+        // per mutating request, and attribution that cannot drift from
+        // authorization (see `VerifiedAuth`). Extensions are only
+        // writable by server-side middleware, never by the client.
+        if let Some(shared) = parts.extensions.get::<VerifiedAuth>() {
+            return shared
+                .0
+                .clone()
+                .map(|(claims, _source)| BearerToken(claims))
+                .map_err(|failure| reject(failure.message));
+        }
         let (claims, _source) = authenticate_headers(&parts.headers, state)
             .await
             .map_err(|failure| reject(failure.message))?;

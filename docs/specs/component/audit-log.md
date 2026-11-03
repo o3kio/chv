@@ -2,20 +2,63 @@
 
 The BFF keeps a durable, append-only record of every privileged
 mutation. Emission is centralized in middleware wrapped around the
-`/v1` BFF surface; handlers do not call an audit function.
+whole HTTP surface that carries privileged mutations; handlers do not
+call an audit function.
 
 ## Scope
 
-Recorded: every non-safe HTTP method under `/v1` that is not an
-explicitly read-shaped POST. This includes operator/admin mutations,
-the hard-fenced backup routes (which currently answer 501), and
-unknown future non-safe `/v1` paths (the classifier fails closed).
-Authentication routes under `/v1/auth/*` are excluded because they are
-self-service credential operations and their bodies contain secrets.
+Recorded: every non-safe HTTP method on an audited surface that is not
+an explicitly read-shaped POST. Audited surfaces:
 
-Reads are never recorded, including filter POSTs such as
-`POST /v1/vms`, `/v1/tasks`, `/v1/audit-log`, and
-`/v1/audit-log/export`.
+- `/v1/*` — the BFF surface, including the guest-agent browser routes
+  (`/v1/monitoring/agents/*`, mounted by the control plane outside the
+  BFF router) and the security-relevant self-service auth actions
+  `/v1/auth/change-password` and `/v1/auth/logout` (a session thief's
+  seizure step is evidence);
+- `/admin/*` — control-plane admin mutations;
+- `/api/v1/*` — the legacy cookie-authenticated surface (the hard-fenced
+  backup routes, which currently answer 501);
+- `/internal/*` — control-plane internal management.
+
+Unknown future non-safe paths on any audited surface fail closed into a
+row: probing an unrouted write path leaves a trace.
+
+Excluded:
+
+- `POST /v1/auth/login` and `POST /api/v1/auth/login` — credential
+  entry: the body carries the password, the caller is anonymous by
+  definition, and brute-force volume is accounted for by auth rate
+  limiting, not by this trail;
+- `/monitoring/v1/*` — the machine-to-machine guest ingest transport
+  (TLS-certificate authenticated, high frequency, not a privileged
+  human mutation);
+- reads, including filter POSTs such as `POST /v1/vms`, `/v1/tasks`,
+  `/v1/audit-log`, `/v1/audit-log/export`, and the guest-agent
+  inventory list `POST /v1/monitoring/agents`.
+
+## Mounting
+
+Standalone callers (tests, embedders) get the audited surface from
+`chv_webui_bff::bff_router`, which wraps its routes with
+correlation → metrics → audit (outermost first). The production
+control plane instead mounts the doc-hidden
+`chv_webui_bff::bff_router_unaudited` (routes, role middleware, and
+CSRF only) inside `admin_router_with_guest_agents` and applies the
+same three layers **at the outermost production router, after fallback
+registration**, so they also wrap the CP's extra privileged surfaces
+and the router fallback — exactly once, never twice.
+
+Layer order (outermost first) and why:
+
+1. **correlation** — the id is already in request extensions when the
+   audit row is built, and every response (including audit's 500
+   replacement) carries `x-correlation-id`;
+2. **metrics** — outside the audit layer so the status it counts is the
+   final one on the wire, including the 500 `AUDIT_LOG_WRITE_FAILED`
+   replacement. Only API-shaped paths (`/v1/`, `/api/`, `/admin/`,
+   `/internal/`) are recorded so the static tree, health probes, and
+   arbitrary 404 paths cannot balloon histogram cardinality;
+3. **audit** — wraps every route and the fallback.
 
 ## Row contract
 
@@ -23,7 +66,7 @@ Reads are never recorded, including filter POSTs such as
 
 | Column | Meaning |
 |---|---|
-| `audit_id` | Server-minted id (primary key). |
+| `audit_id` | Server-minted 128-bit id (primary key). |
 | `occurred_at_ms` | Epoch-millisecond completion timestamp. |
 | `actor_id`, `actor_username`, `actor_role` | Verified claims, or the explicit anonymous marker. |
 | `action` | Stable dotted action derived from method/path, e.g. `vm.create`. |
@@ -31,10 +74,30 @@ Reads are never recorded, including filter POSTs such as
 | `resource_kind`, `resource_id` | Best-effort path-derived resource. Body ids are intentionally not read. |
 | `outcome` | `success` (2xx/3xx), `denied` (401/403), `failed` (other 4xx/5xx). |
 | `status_code` | Final HTTP status. |
-| `correlation_id` | Correlation id assigned by the correlation middleware. |
-| `operation_id` | Inbound `x-operation-id` when supplied. |
-| `source_ip` | Transport peer address, or a validated forwarding hop. |
+| `correlation_id` | Correlation id assigned by the correlation middleware, capped at 128 chars. |
+| `operation_id` | Inbound `x-operation-id` when supplied, capped at 128 chars. |
+| `source_ip` | Transport peer address (see below), or a validated forwarding hop. |
 | `metadata` | Allowlisted redacted JSON object; currently only `auth_source`. |
+
+Client-controlled identifier strings (`operation_id`,
+`correlation_id`) are capped at 128 characters so a hostile or buggy
+client cannot balloon row size with megabyte header values.
+
+`source_ip` prefers the transport peer address when the server
+provides connect info — both serve paths (plain HTTP via
+`into_make_service_with_connect_info`, TLS via the peer-inject
+service) inject `ConnectInfo`. Only when connect info is absent does
+the row fall back to the first valid `x-forwarded-for` / `x-real-ip`
+hop, a value only a **trusted reverse proxy** can be expected to set
+correctly; deployments not behind such a proxy must treat `source_ip`
+as unverified. Invalid values are dropped.
+
+The audit middleware decodes the credential once and shares the result
+with the `BearerToken` extractor through request extensions
+(server-side only — a client cannot forge extensions), so the audit
+row's actor and the authorizer's identity cannot drift and an API
+token is decoded (and its `last_used_at` touched) once per mutating
+request instead of twice.
 
 There is no foreign key to `users`: an audit row must outlive the
 account it names, otherwise deleting a user would erase evidence of
@@ -48,11 +111,15 @@ per mutating request, including failed and denied attempts.
 
 The insert happens **after** the handler returns. If the insert fails:
 
+- the `chv_bff_audit_write_failures_total` counter is incremented — a
+  systemic audit-store outage is visible on dashboards, not only in
+  logs;
 - the failure is logged loudly at `error` level with target `audit`
   and the action/path/status;
 - if the mutation response was 2xx/3xx, the BFF replaces it with HTTP
-  500 `AUDIT_LOG_WRITE_FAILED` rather than claiming success without a
-  trail;
+  500 `AUDIT_LOG_WRITE_FAILED` (including the correlation id as
+  `request_id`, so the operator can find what the mutation actually
+  did) rather than claiming success without a trail;
 - if the response was already a 4xx/5xx (including 401/403), the
   original response is preserved and the missing row is logged.
 
@@ -123,7 +190,13 @@ stable `(occurred_at_ms DESC, audit_id DESC)` order.
 `{ items, count, total, truncated }`; CSV sends
 `x-audit-export-total` and, when bounded, `x-audit-export-truncated:
 true`. CSV fields are RFC 4180 quoted and spreadsheet-formula
-neutralized.
+neutralized (a field whose first non-whitespace character is a formula
+trigger `=`/`+`/`-`/`@`, or that begins with a tab/CR, is prefixed with
+a single quote — covering importers that trim the field before
+evaluating it). Both query and export responses carry
+`Cache-Control: no-store`: the trail holds actor identities and source
+addresses and must never be cached by a shared browser or
+intermediary.
 
 ## Retention
 
@@ -134,5 +207,22 @@ strictly older than `now - retention_days` are deleted; a row exactly
 at the cutoff is retained. Sweep failures are logged and leave the
 previous rows in place — retention never blocks startup or requests.
 
-Configuration validation rejects `retention_days = 0` and
-`sweep_interval_secs < 60`.
+Deletion is **batched**: each statement removes at most 5,000 rows
+(oldest first) and the sweep loops to completion, so a large backlog
+cannot hold the SQLite write lock in one transaction and turn
+successful mutations into 500 `AUDIT_LOG_WRITE_FAILED` responses.
+
+`[audit] max_rows` (default **1,000,000**) is a hard ceiling on table
+size: after every age sweep the worker prunes the table down to its
+`max_rows` newest rows, oldest first, in the same bounded batches.
+Age retention alone cannot bound the table when rows arrive faster
+than they age out — an anonymous-denial flood, for example, is always
+recorded (denials are evidence) and could otherwise grow the database
+without limit. Hitting the cap logs a `warn`: evidence is being
+discarded ahead of schedule and the operator should investigate the
+flood or raise the cap.
+
+Configuration validation rejects `retention_days = 0`,
+`retention_days > 36500` (overflow guard on the millisecond cutoff),
+`sweep_interval_secs < 60`, `max_rows < 1000`, and
+`max_rows > 1000000000000`.

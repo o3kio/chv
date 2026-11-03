@@ -1,12 +1,43 @@
 //! Durable audit trail for privileged BFF mutations (#658).
 //!
-//! Emission is centralized here, in middleware wrapped around the whole
-//! `/v1` BFF surface. Individual handlers do NOT remember to call an
-//! audit function: the middleware classifies the request by method and
-//! path, runs it, and writes exactly one row with the final HTTP status.
-//! Because it wraps the role middlewares too, a 401/403 denial is
-//! recorded with the credential's real actor (or the explicit anonymous
-//! marker when no credential validated).
+//! Emission is centralized here, in middleware wrapped around the
+//! whole HTTP surface that carries privileged mutations. Individual
+//! handlers do NOT remember to call an audit function: the middleware
+//! classifies the request by method and path, runs it, and writes
+//! exactly one row with the final HTTP status. Because it wraps the
+//! role middlewares too, a 401/403 denial is recorded with the
+//! credential's real actor (or the explicit anonymous marker when no
+//! credential validated).
+//!
+//! # Audited surfaces
+//!
+//! The classifier covers every non-safe method under:
+//!
+//! - `/v1/*` — the BFF surface, including the guest-agent browser
+//!   routes (`/v1/monitoring/agents/*`, mounted by the control plane
+//!   outside the BFF router) and `/v1/auth/change-password` /
+//!   `/v1/auth/logout` (self-service but security-relevant);
+//! - `/admin/*` — control-plane admin mutations;
+//! - `/api/v1/*` — the legacy cookie-authenticated surface;
+//! - `/internal/*` — control-plane internal management.
+//!
+//! Excluded: `POST /v1/auth/login` and `POST /api/v1/auth/login`
+//! (credential entry — the body carries the password, the caller is
+//! anonymous by definition, and brute-force volume is accounted for by
+//! auth rate limiting, not by this trail) and the machine-to-machine
+//! guest ingest transport `/monitoring/v1/*` (TLS-certificate
+//! authenticated, high frequency, not a privileged human mutation).
+//! Unknown non-safe paths on an audited surface fail closed into a
+//! row (probing leaves a trace).
+//!
+//! # Mounting
+//!
+//! Standalone callers get all of this from
+//! [`crate::router::bff_router`]. The production control plane mounts
+//! [`crate::router::bff_router_unaudited`] inside
+//! `admin_router_with_guest_agents` and applies this middleware at the
+//! outermost layer there, so the extra privileged surfaces and the
+//! router fallback are covered too — and nothing is audited twice.
 //!
 //! Redaction contract: the BFF never reads a request body, query string,
 //! Authorization header, Cookie header, password, token, or S3 key into
@@ -47,8 +78,19 @@ pub fn log_mutation(user: &str, action: &str, resource_kind: &str, resource_id: 
     );
 }
 
+/// Maximum stored length for client-supplied identifier strings
+/// (`x-operation-id`, the correlation id). Identifiers are telemetry,
+/// not data; capping them bounds row size against hostile or buggy
+/// clients that send megabyte header values.
+const MAX_CLIENT_ID_LEN: usize = 128;
+
+fn capped_client_id(value: String) -> String {
+    value.chars().take(MAX_CLIENT_ID_LEN).collect()
+}
+
 /// Middleware: append exactly one durable audit row for every mutating
-/// `/v1` request, then return the handler/role-middleware response.
+/// request on an audited surface, then return the handler/role-middleware
+/// response.
 pub async fn record_privileged_mutation(
     State(state): State<AppState>,
     req: Request,
@@ -65,15 +107,19 @@ pub async fn record_privileged_mutation(
         .extensions()
         .get::<Option<String>>()
         .and_then(|id| id.clone())
-        .or_else(|| header_value(&req, "x-correlation-id"));
-    let operation_id = header_value(&req, "x-operation-id");
+        .or_else(|| header_value(&req, "x-correlation-id"))
+        .map(capped_client_id);
+    let operation_id = header_value(&req, "x-operation-id").map(capped_client_id);
     let source_ip = extract_source_ip(&req);
 
     // Decode the same credential the authorization layer uses. On any
     // failure the actor is explicitly anonymous — never inferred from an
-    // unverified header or body field.
-    let (actor, auth_source) = match authenticate_headers(req.headers(), &state).await {
-        Ok((claims, source)) => (claims, source),
+    // unverified header or body field. The decoded result is also shared
+    // with the `BearerToken` extractor via extensions so authorization
+    // and audit attribution cannot drift (#658 review L6).
+    let decoded = authenticate_headers(req.headers(), &state).await;
+    let (actor, auth_source) = match &decoded {
+        Ok((claims, source)) => (claims.clone(), *source),
         Err(_) => (
             crate::auth::Claims {
                 sub: AUDIT_ANONYMOUS_ACTOR_ID.to_string(),
@@ -85,6 +131,10 @@ pub async fn record_privileged_mutation(
             AuthSource::Anonymous,
         ),
     };
+
+    let mut req = req;
+    req.extensions_mut()
+        .insert(crate::auth::VerifiedAuth(decoded));
 
     let response = next.run(req).await;
     let status = response.status();
@@ -130,6 +180,10 @@ pub async fn record_privileged_mutation(
         Err(error) => {
             // Loud, structured, and never silent: an audit write failure
             // after a mutation succeeded must not be reported as success.
+            // The dedicated counter makes a systemic audit-store outage
+            // visible on dashboards even though the metrics middleware
+            // records the final status on its own (#658 review M3).
+            metrics::counter!("chv_bff_audit_write_failures_total").increment(1);
             tracing::error!(
                 target: "audit",
                 error = %error,
@@ -141,14 +195,17 @@ pub async fn record_privileged_mutation(
                 "AUDIT LOG WRITE FAILED — privileged mutation may not be durably recorded"
             );
             if status.is_success() || status.is_redirection() {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "message": "privileged mutation completed but its audit record could not be persisted",
-                        "code": "AUDIT_LOG_WRITE_FAILED"
-                    })),
-                )
-                    .into_response()
+                let mut body = json!({
+                    "message": "privileged mutation completed but its audit record could not be persisted",
+                    "code": "AUDIT_LOG_WRITE_FAILED"
+                });
+                // Explicit correlation handle so the operator can find
+                // what the mutation actually did (#658 review M3). The
+                // outer correlation middleware re-inserts the same id.
+                if let Some(id) = &entry.correlation_id {
+                    body["request_id"] = json!(id);
+                }
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
             } else {
                 // Preserve the original denial/failure: replacing it could
                 // hide the real error from the caller, and the loud log
@@ -179,9 +236,14 @@ fn header_value(req: &Request, name: &str) -> Option<String> {
 }
 
 /// Source IP is advisory telemetry, not an authorization input. Prefer
-/// the transport peer address when the server provides connect info;
-/// otherwise accept the first valid `x-forwarded-for` / `x-real-ip`
-/// hop. Invalid values are dropped rather than stored verbatim.
+/// the transport peer address when the server provides connect info
+/// (both the plain-HTTP and TLS serve paths inject it); otherwise
+/// accept the first valid `x-forwarded-for` / `x-real-ip` hop — a
+/// value only a **trusted reverse proxy** can be expected to set
+/// correctly. Without ConnectInfo, a direct client can spoof these
+/// headers; deployments that do not sit behind such a proxy must treat
+/// `source_ip` as unverified. Invalid values are dropped rather than
+/// stored verbatim.
 fn extract_source_ip(req: &Request) -> Option<String> {
     if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
         return Some(addr.ip().to_string());
@@ -205,17 +267,43 @@ struct MutationClassification {
     resource_id: Option<String>,
 }
 
-/// Method/path classifier. Any non-safe method under `/v1` is audited
-/// unless it is explicitly a read-shaped POST. Authentication routes
-/// (`/v1/auth/*`) are excluded: they carry credentials in their bodies
-/// and are self-service, not privileged mutations. The fallback treats
-/// an unknown non-safe `/v1` path as a mutation (fail-closed: a new
-/// write route is audited by default, never silently omitted).
+/// Method/path classifier. Any non-safe method on an audited surface
+/// is audited unless it is explicitly a read-shaped POST. Audited
+/// surfaces: `/v1/*` (including the guest-agent browser routes and
+/// the self-service `change-password`/`logout`), `/admin/*`,
+/// `/api/v1/*` (legacy), and `/internal/*`. Excluded: the login
+/// credential-entry endpoints (bodies carry passwords; anonymous
+/// brute-force volume belongs to auth rate limiting, not this trail)
+/// and the machine-to-machine guest ingest transport
+/// `/monitoring/v1/*`. The fallback treats an unknown non-safe path
+/// on an audited surface as a mutation (fail-closed: a new write
+/// route — or mere probing of an unrouted one — is audited by
+/// default, never silently omitted).
 fn classify_mutation(method: &Method, path: &str) -> Option<MutationClassification> {
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         return None;
     }
-    if !path.starts_with("/v1/") || path.starts_with("/v1/auth/") {
+    // Machine-to-machine guest ingest transport: TLS-certificate
+    // authenticated, high frequency, not a privileged human mutation.
+    if path.starts_with("/monitoring/v1/") {
+        return None;
+    }
+    // The legacy /api/v1 surface shares the /v1 classification table;
+    // the row still stores the original request path.
+    let normalized;
+    let path = if let Some(rest) = path.strip_prefix("/api/v1") {
+        normalized = format!("/v1{rest}");
+        normalized.as_str()
+    } else {
+        path
+    };
+    if !path.starts_with("/v1/") && !path.starts_with("/admin/") && !path.starts_with("/internal/")
+    {
+        return None;
+    }
+    // Credential entry: unauthenticated by definition, password in the
+    // body, and brute-force volume — noise for this trail.
+    if path == "/v1/auth/login" {
         return None;
     }
     if is_read_shaped_post(method, path) {
@@ -258,6 +346,7 @@ fn is_read_shaped_post(method: &Method, path: &str) -> bool {
             | "/v1/monitoring/alerts/detail"
             | "/v1/monitoring/alert-rules"
             | "/v1/monitoring/notifications/deliveries"
+            | "/v1/monitoring/agents"
             | "/v1/nodes"
             | "/v1/nodes/get"
             | "/v1/vms"
@@ -302,6 +391,8 @@ fn is_read_shaped_post(method: &Method, path: &str) -> bool {
 
 fn action_and_kind(method: &Method, path: &str) -> (String, &'static str) {
     let (action, kind) = match path {
+        "/v1/auth/change-password" => ("auth.change_password", "user"),
+        "/v1/auth/logout" => ("auth.logout", "user"),
         "/v1/nodes/mutate" => ("node.mutate", "node"),
         "/v1/nodes/enroll" => ("node.enroll", "node"),
         "/v1/monitoring/alert-rules/create" => ("alert_rule.create", "alert_rule"),
@@ -310,6 +401,13 @@ fn action_and_kind(method: &Method, path: &str) -> (String, &'static str) {
         "/v1/monitoring/alerts/acknowledge" => ("alert.acknowledge", "incident"),
         "/v1/monitoring/alerts/silence" => ("alert.silence", "incident"),
         "/v1/monitoring/notifications/test" => ("notification.test", "notification"),
+        // Guest-agent browser surface (operator tier, mounted by the
+        // control plane outside the BFF router — audited since the
+        // review-round restructure).
+        "/v1/monitoring/agents/claim" => ("agent.issue_claim", "monitoring_agent"),
+        "/v1/monitoring/agents/revoke" => ("agent.revoke", "monitoring_agent"),
+        "/v1/monitoring/agents/rotate" => ("agent.rotate", "monitoring_agent"),
+        "/v1/monitoring/agents/reset" => ("agent.reset", "monitoring_agent"),
         "/v1/vms/create" => ("vm.create", "vm"),
         "/v1/vms/delete" => ("vm.delete", "vm"),
         "/v1/vms/resize" => ("vm.resize", "vm"),
@@ -365,6 +463,31 @@ fn action_and_kind(method: &Method, path: &str) -> (String, &'static str) {
                 if rest.ends_with("/export") {
                     return ("vm.export".to_string(), "vm");
                 }
+            }
+            // Legacy cookie-authenticated backup surface (reached via
+            // the /api/v1 → /v1 normalization): run/toggle/delete a
+            // fenced job by path id.
+            if let Some(rest) = path.strip_prefix("/v1/backup-jobs/") {
+                let segments: Vec<&str> = rest.split('/').collect();
+                if segments.len() == 2 && segments[1] == "run" {
+                    return ("backup.run".to_string(), "backup");
+                }
+                if segments.len() == 2 && segments[1] == "toggle" {
+                    return ("backup.toggle".to_string(), "backup");
+                }
+                if *method == Method::DELETE {
+                    return ("backup.delete".to_string(), "backup");
+                }
+            }
+            // Control-plane admin mutations.
+            if let Some(rest) = path.strip_prefix("/admin/migrations/") {
+                if rest.ends_with("/cancel") {
+                    return ("migration.cancel".to_string(), "migration");
+                }
+            }
+            // Control-plane internal management.
+            if path == "/internal/bootstrap-token" {
+                return ("bootstrap_token.seed".to_string(), "bootstrap_token");
             }
             if path.starts_with("/v1/vm-templates/") {
                 if path.ends_with("/clone") {
@@ -577,6 +700,8 @@ mod tests {
         assert!(classify_mutation(&Method::POST, "/v1/audit-log").is_none());
         assert!(classify_mutation(&Method::POST, "/v1/users").is_none());
         assert!(classify_mutation(&Method::POST, "/v1/quotas/u-1/usage").is_none());
+        // Guest-agent inventory list (viewer tier) is a read.
+        assert!(classify_mutation(&Method::POST, "/v1/monitoring/agents").is_none());
     }
 
     #[test]
@@ -601,9 +726,79 @@ mod tests {
     }
 
     #[test]
-    fn auth_routes_are_excluded() {
+    fn login_is_excluded_but_security_relevant_auth_routes_are_audited() {
+        // Login is credential entry: password in the body, anonymous
+        // caller, brute-force volume — deliberately outside the trail.
         assert!(classify_mutation(&Method::POST, "/v1/auth/login").is_none());
-        assert!(classify_mutation(&Method::POST, "/v1/auth/change-password").is_none());
+        assert!(classify_mutation(&Method::POST, "/api/v1/auth/login").is_none());
+        // change-password and logout are security-relevant self-service
+        // actions (a session thief's seizure step) and ARE recorded —
+        // with actor/action only, never the body.
+        let class = classify_mutation(&Method::POST, "/v1/auth/change-password").expect("mutation");
+        assert_eq!(class.action, "auth.change_password");
+        assert_eq!(class.resource_kind.as_deref(), Some("user"));
+        let class = classify_mutation(&Method::POST, "/v1/auth/logout").expect("mutation");
+        assert_eq!(class.action, "auth.logout");
+        // The legacy /api/v1 logout is classified identically.
+        let class = classify_mutation(&Method::POST, "/api/v1/auth/logout").expect("mutation");
+        assert_eq!(class.action, "auth.logout");
+    }
+
+    #[test]
+    fn control_plane_admin_internal_and_legacy_surfaces_are_audited() {
+        let class =
+            classify_mutation(&Method::POST, "/admin/migrations/m-1/cancel").expect("mutation");
+        assert_eq!(class.action, "migration.cancel");
+        assert_eq!(class.resource_kind.as_deref(), Some("migration"));
+        assert_eq!(class.resource_id.as_deref(), Some("m-1"));
+
+        let class =
+            classify_mutation(&Method::POST, "/internal/bootstrap-token").expect("mutation");
+        assert_eq!(class.action, "bootstrap_token.seed");
+        assert_eq!(class.resource_kind.as_deref(), Some("bootstrap_token"));
+
+        // Legacy /api/v1 backup surface (normalized onto /v1).
+        let class =
+            classify_mutation(&Method::POST, "/api/v1/backup-jobs/j-9/run").expect("mutation");
+        assert_eq!(class.action, "backup.run");
+        assert_eq!(class.resource_id.as_deref(), Some("j-9"));
+        let class =
+            classify_mutation(&Method::DELETE, "/api/v1/backup-jobs/j-9").expect("mutation");
+        assert_eq!(class.action, "backup.delete");
+        assert_eq!(class.resource_id.as_deref(), Some("j-9"));
+
+        // Unknown non-safe paths on every audited surface fail closed.
+        assert!(classify_mutation(&Method::POST, "/admin/future").is_some());
+        assert!(classify_mutation(&Method::POST, "/internal/future").is_some());
+        assert!(classify_mutation(&Method::POST, "/api/v1/future").is_some());
+    }
+
+    #[test]
+    fn guest_agent_browser_mutations_are_audited_but_ingest_is_not() {
+        for path in [
+            "/v1/monitoring/agents/claim",
+            "/v1/monitoring/agents/revoke",
+            "/v1/monitoring/agents/rotate",
+            "/v1/monitoring/agents/reset",
+        ] {
+            let class = classify_mutation(&Method::POST, path).expect("mutation");
+            assert_eq!(class.resource_kind.as_deref(), Some("monitoring_agent"));
+        }
+        // The certificate-authenticated machine ingest transport is
+        // excluded: high frequency, not a privileged human mutation.
+        assert!(classify_mutation(&Method::POST, "/monitoring/v1/enroll").is_none());
+        assert!(classify_mutation(&Method::POST, "/monitoring/v1/ingest").is_none());
+        assert!(classify_mutation(&Method::POST, "/monitoring/v1/rotate").is_none());
+        // Non-audited surfaces stay excluded.
+        assert!(classify_mutation(&Method::POST, "/some/static/path").is_none());
+        assert!(classify_mutation(&Method::POST, "/health").is_none());
+    }
+
+    #[test]
+    fn client_identifiers_are_capped() {
+        let long = "x".repeat(5_000);
+        assert_eq!(capped_client_id(long.clone()).len(), MAX_CLIENT_ID_LEN);
+        assert_eq!(capped_client_id("short".to_string()), "short");
     }
 
     #[test]
