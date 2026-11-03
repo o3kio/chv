@@ -1051,8 +1051,13 @@ mod tests {
             .await
             .expect("query pending resumes");
         assert_eq!(after.len(), 1);
+        // `julianday('now')` and the second-granularity `updated_at` text do
+        // not round identically, so the integer-cast delta can come out one
+        // second short of the nominal 45 s (observed 114 instead of 115).
+        // The clamp is conservative (it can only under-report silence), so
+        // assert growth with a small tolerance instead of exact arithmetic.
         assert!(
-            after[0].stalled_secs >= frozen + 45,
+            after[0].stalled_secs > before[0].stalled_secs && after[0].stalled_secs >= frozen + 43,
             "effective silence must grow with time since the reap ({} -> {}, frozen {frozen})",
             before[0].stalled_secs,
             after[0].stalled_secs
