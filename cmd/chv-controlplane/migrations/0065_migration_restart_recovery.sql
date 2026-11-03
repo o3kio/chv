@@ -1,0 +1,24 @@
+-- Restart-recovery bookkeeping for tracked migrations (#656).
+--
+-- The `migrations` table is the durable task record; the migration state
+-- machine itself is an in-process future. When the control plane exits while
+-- a migration is in flight, the future is gone but the row is still
+-- non-terminal. At the next startup the registry reconciles those rows so an
+-- operator can tell exactly what was interrupted and why.
+--
+-- `interrupted_from_phase` preserves the phase the row was in when the restart
+-- was observed (the terminal `phase` overwrites it during reconciliation).
+-- `interrupted_at` is the reconciliation/observation timestamp. It can also be
+-- non-NULL on a still-non-terminal row when recovery saw the row but could not
+-- safely terminalize it because progress kept racing the scan. Both columns are
+-- audit markers and are never cleared: a marked row later driven to `Completed`
+-- by the agent keeps them, so treat them as "restart observed", not "recovery
+-- pending".
+--
+-- Both columns are additive and nullable: rows written by older control
+-- planes, and terminal rows that were never interrupted, keep NULL. The schema
+-- change is backward-compatible (an older binary ignores the columns), but
+-- rolling the binary back is still blocked by sqlx's applied-migration
+-- validation, exactly like every other migration in this directory.
+ALTER TABLE migrations ADD COLUMN interrupted_from_phase TEXT;
+ALTER TABLE migrations ADD COLUMN interrupted_at TEXT;

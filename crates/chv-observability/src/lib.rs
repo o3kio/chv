@@ -44,6 +44,12 @@ pub const CHV_MIGRATION_PHASE: &str = "chv_migration_phase";
 pub const CHV_MIGRATION_BYTES_TRANSFERRED: &str = "chv_migration_bytes_transferred";
 pub const CHV_MIGRATION_DURATION_SECONDS: &str = "chv_migration_duration_seconds";
 pub const CHV_MIGRATION_DIRTY_BLOCKS: &str = "chv_migration_dirty_blocks";
+/// Counter of non-terminal rows reconciled by restart recovery.
+/// Label: `recovered_phase` (`RolledBack` or `Failed`).
+pub const CHV_MIGRATION_RESTART_RECONCILED_TOTAL: &str = "chv_migration_restart_reconciled_total";
+/// Counter of dropped progress reports for already-terminal migrations.
+/// Labels: `stored_phase`, `reported_phase`.
+pub const CHV_MIGRATION_PROGRESS_DROPPED_TOTAL: &str = "chv_migration_progress_dropped_total";
 
 // Overlay metrics
 pub const CHV_VXLAN_FDB_ENTRIES: &str = "chv_vxlan_fdb_entries";

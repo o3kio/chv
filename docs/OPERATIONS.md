@@ -538,6 +538,71 @@ sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
    WHERE phase NOT IN ('Completed', 'Failed', 'RolledBack');"
 ```
 
+### Migration Interrupted by a Control-Plane Restart
+
+The control-plane migration state machine is an in-process task; it does not
+survive a control-plane restart. The agent-side migration task may still be
+running. Before any worker (including the reaper) starts, the control plane
+reconciles every `migrations` row that is still non-terminal. The row is made
+terminal and keeps the interrupted phase in `interrupted_from_phase`, the
+recovery time in `interrupted_at`, and an operator-readable reason in
+`error_message`. The parent operation is failed with
+`error_code = MIGRATION_INTERRUPTED`. Terminal rows are never changed.
+
+Recovery treats the source as *presumed* authoritative for `Pending`,
+`PreCopyDisk`, and `ConvergingDisk`; this is an inference, not proof that the
+agent-side task stopped. Restart recovery never queues an automatic source-VM
+resume. Once the row is terminal, late progress reports from a still-running
+agent task are dropped, so the reaper's "sender has been silent" evidence would
+be self-fulfilling. Every recovered row is therefore operator-only
+(`reaper_resume_state` is cleared). Note that the pause-first gate normally
+pauses the source for the entire migration, so "the VM is on the source" does
+not mean it is running: resuming it is an explicit operator step.
+
+**Inspect interrupted migrations:**
+```bash
+sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
+  "SELECT migration_id, vm_id, phase, interrupted_from_phase, interrupted_at, \
+          error_message \
+   FROM migrations WHERE interrupted_at IS NOT NULL \
+   ORDER BY interrupted_at DESC;"
+```
+
+The interruption fields (`interrupted_from_phase`, `interrupted_at`,
+`error_message`) are also returned by `chvctl migrate status <MIGRATION_ID>` and
+`GET /v1/migrations/<MIGRATION_ID>`.
+
+| Recovered `phase` | Interrupted `interrupted_from_phase` | Automatic action | Operator action |
+|-------------------|--------------------------------------|------------------|-----------------|
+| `RolledBack` | `Pending`, `PreCopyDisk`, `ConvergingDisk` | None — no source resume is queued | The source is presumed authoritative. Confirm the VM's actual state on both nodes and check that no agent-side migration task is still writing. Under pause-first the source is normally paused; resume it explicitly if you decide to abandon the migration on the source. The migration is not retried automatically |
+| `Failed` | `MemoryMigration`, `Paused`, or an unrecognized phase | None — recovery does not guess a rollback | Inspect `vm_desired_state.target_node_id` and the VM's actual state on both nodes. Resume on the source only if the source still owns the VM state; otherwise finish/clean the destination. Partial destination volumes are not deleted automatically |
+| — | `Completed`, `Failed`, `RolledBack` | None | No action; terminal rows are left exactly as found |
+
+Do **not** mark an interrupted row `Completed` to make it disappear: `Completed`
+means the destination owns the VM and placement was atomically updated.
+Interrupted migrations are not retried automatically; start a new migration only
+after confirming placement and cleaning up any partial destination volume.
+A cancel request for an interrupted row returns `already_terminal` because the
+migration task no longer exists; cancel only affects a live task.
+
+The startup log line `migration restart recovery completed` reports
+`reconciled`, `already_terminal`, and `unresolved` counts; reconciliation also
+increments `chv_migration_restart_reconciled_total{recovered_phase=...}`.
+`unresolved` rows kept changing during startup (a late progress report raced the
+scan). They are left non-terminal but marked with `interrupted_at` and
+`interrupted_from_phase` when the observation still matches. The normal reaper
+later fails them; if either the marked phase (`interrupted_from_phase`) or the
+phase scanned at reap time is `MemoryMigration` or `Paused`, the reaper records
+`reaper_resume_state = 'blocked'` and does not resume the source. A row that
+changed too fast to mark (or that never carried `interrupted_at`) falls back to
+ordinary reaper semantics, so inspect it manually.
+
+`interrupted_at` and `interrupted_from_phase` are **audit markers** and are
+never cleared by this recovery path. If a marked, still-non-terminal row is
+later driven to `Completed` by the agent's own progress reports, the marker
+remains. Treat it as "a restart observed this migration", not as "recovery is
+still pending"; only the current `phase` and placement tell you what happened.
+
 **Verify mTLS configuration:**
 ```bash
 # Check cert files exist and are readable
@@ -741,6 +806,9 @@ counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`)
 | `chv_migration_bytes_transferred` | Counter | Total bytes copied so far |
 | `chv_migration_duration_seconds` | Histogram | End-to-end migration time by outcome |
 | `chv_migration_dirty_blocks` | Gauge | Remaining dirty blocks during convergence |
+| `chv_migration_restart_reconciled_total` | Counter | Rows reconciled at startup, labelled by `recovered_phase`; nonzero means a restart interrupted migrations |
+| `chv_migration_progress_dropped_total` | Counter | Late progress reports dropped after a terminal transition, labelled by `stored_phase` and `reported_phase`; `reported_phase="Completed"` after recovery is especially important |
+| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
 
 **Expected phase durations** (100GB disk, 16GB RAM):
 

@@ -43,6 +43,8 @@ struct MigrationRow {
     completed_at: Option<String>,
     error_message: Option<String>,
     cancel_requested_at: Option<String>,
+    interrupted_from_phase: Option<String>,
+    interrupted_at: Option<String>,
 }
 
 impl MigrationRow {
@@ -63,6 +65,8 @@ impl MigrationRow {
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
             "error_message": self.error_message,
+            "interrupted_from_phase": self.interrupted_from_phase,
+            "interrupted_at": self.interrupted_at,
         })
     }
 }
@@ -79,7 +83,7 @@ pub async fn list_migrations(
         SELECT migration_id, operation_id, vm_id, source_node_id, destination_node_id,
                phase, bytes_transferred, total_bytes, convergence_round,
                dirty_blocks_remaining, started_at, updated_at, completed_at,
-               error_message, cancel_requested_at
+               error_message, cancel_requested_at, interrupted_from_phase, interrupted_at
         FROM migrations
         ORDER BY started_at DESC
         LIMIT 1000
@@ -111,7 +115,7 @@ pub async fn get_migration(
         SELECT migration_id, operation_id, vm_id, source_node_id, destination_node_id,
                phase, bytes_transferred, total_bytes, convergence_round,
                dirty_blocks_remaining, started_at, updated_at, completed_at,
-               error_message, cancel_requested_at
+               error_message, cancel_requested_at, interrupted_from_phase, interrupted_at
         FROM migrations
         WHERE migration_id = ?
         "#,
