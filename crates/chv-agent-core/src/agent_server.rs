@@ -3960,6 +3960,55 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
+    /// Minimal per-thread WARN counter: enough to prove the token-rejection
+    /// warning is rate-limited without duplicating the full field-capture
+    /// subscriber used by the console/supervisor tests.
+    #[derive(Clone, Default)]
+    struct WarnCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn agent_token_rejections_warn_at_most_once_per_interval() {
+        let counter = WarnCounter::default();
+        let _guard = tracing::subscriber::set_default(counter.clone());
+        let mut auth = AgentAuth::new(TEST_AGENT_TOKEN, false, Vec::new());
+
+        for _ in 0..3 {
+            let err = tonic::service::Interceptor::call(&mut auth, Request::new(()))
+                .expect_err("missing token must be rejected");
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        }
+
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first rejection in the interval may warn"
+        );
+    }
+
     #[test]
     fn agent_peer_uid_gate_defaults_to_own_euid() {
         let auth = AgentAuth::new(TEST_AGENT_TOKEN, false, Vec::new());

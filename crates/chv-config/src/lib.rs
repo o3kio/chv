@@ -187,7 +187,7 @@ fn secret_is_weak(secret: &str) -> bool {
 /// legacy `jwt_secret` is expanded with domain separation (see
 /// [`derive_domain_secret`]). Fields that are present must be strong and
 /// must not duplicate another purpose (validation fails closed).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct SecretsConfig {
     /// Signing key for end-user session JWTs (BFF/control-plane login).
     #[serde(default)]
@@ -209,6 +209,31 @@ pub struct SecretsConfig {
     /// NetBox API tokens). Takes precedence over `CHV_ENCRYPTION_KEY`.
     #[serde(default)]
     pub credential_encryption: Option<String>,
+}
+
+// `AgentConfig` and `ControlPlaneConfig` derive `Debug` and embed this
+// struct, so a plain derive here would print every secret through `{:?}`.
+// Report only whether a purpose is configured, never the value or length.
+impl std::fmt::Debug for SecretsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn presence(value: &Option<String>) -> &'static str {
+            if value.is_some() {
+                "<redacted>"
+            } else {
+                "<unset>"
+            }
+        }
+
+        f.debug_struct("SecretsConfig")
+            .field("user_jwt", &presence(&self.user_jwt))
+            .field("console_jwt", &presence(&self.console_jwt))
+            .field("agent_auth_token", &presence(&self.agent_auth_token))
+            .field(
+                "credential_encryption",
+                &presence(&self.credential_encryption),
+            )
+            .finish()
+    }
 }
 
 /// Deployment-security switches shared by the control plane and agent.
@@ -278,13 +303,13 @@ impl SecretsConfig {
             })
     }
 
-    fn validate_explicit(&self, include_credential_encryption: bool) -> Result<(), ConfigError> {
+    fn validate_explicit(&self, include_control_plane_only: bool) -> Result<(), ConfigError> {
         let mut fields = vec![
-            ("secrets.user_jwt", &self.user_jwt),
             ("secrets.console_jwt", &self.console_jwt),
             ("secrets.agent_auth_token", &self.agent_auth_token),
         ];
-        if include_credential_encryption {
+        if include_control_plane_only {
+            fields.push(("secrets.user_jwt", &self.user_jwt));
             fields.push(("secrets.credential_encryption", &self.credential_encryption));
         }
         for (name, value) in fields {
@@ -892,8 +917,9 @@ impl AgentConfig {
     /// programmatically constructed config.
     pub fn validate_secrets(&self) -> Result<(), ConfigError> {
         validate_security_mode(&self.security)?;
-        // The agent never uses `credential_encryption`; skip validating a
-        // control-plane-only key it would not consume.
+        // The agent never uses `user_jwt` or `credential_encryption`; skip
+        // validating control-plane-only keys it would not consume, so a
+        // weak value in agent.toml cannot block startup confusingly.
         self.secrets.validate_explicit(false)?;
         if self.security.allow_insecure_agent_auth {
             return Ok(());
@@ -3061,12 +3087,44 @@ nonsense = true
     }
 
     #[test]
-    fn agent_ignores_control_plane_only_credential_encryption() {
-        // The agent never consumes `credential_encryption`; a value that is
-        // invalid for the control plane must not block agent startup.
+    fn secrets_config_is_debug_redacted() {
+        let cfg = SecretsConfig {
+            user_jwt: Some("user-secret-value-never-in-logs".into()),
+            console_jwt: Some("console-secret-value-never-in-logs".into()),
+            agent_auth_token: Some("agent-secret-value-never-in-logs".into()),
+            credential_encryption: Some("credential-secret-value-never-in-logs".into()),
+        };
+        let rendered = format!("{cfg:?}");
+        for secret in [
+            "user-secret-value-never-in-logs",
+            "console-secret-value-never-in-logs",
+            "agent-secret-value-never-in-logs",
+            "credential-secret-value-never-in-logs",
+        ] {
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("user_jwt"));
+        assert!(rendered.contains("credential_encryption"));
+
+        let rendered = format!("{:?}", SecretsConfig::default());
+        assert!(rendered.contains("<unset>"));
+        assert!(!rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn agent_ignores_control_plane_only_secrets() {
+        // The agent never consumes `user_jwt` or `credential_encryption`;
+        // values that are invalid for the control plane must not block
+        // agent startup.
         let mut agent = agent_with_master(TEST_MASTER);
+        agent.secrets.user_jwt = Some("short".into());
         agent.secrets.credential_encryption = Some("short".into());
         assert!(agent.validate_secrets().is_ok());
+
+        let mut control_plane = control_plane_with_master(TEST_MASTER);
+        control_plane.secrets.user_jwt = Some("short".into());
+        assert!(control_plane.validate_secrets().is_err());
 
         let mut control_plane = control_plane_with_master(TEST_MASTER);
         control_plane.secrets.credential_encryption = Some("short".into());

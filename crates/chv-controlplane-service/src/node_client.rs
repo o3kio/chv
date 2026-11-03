@@ -184,7 +184,8 @@ pub struct NodeClient {
     reconcile: proto::reconcile_service_client::ReconcileServiceClient<Channel>,
     lifecycle: proto::lifecycle_service_client::LifecycleServiceClient<Channel>,
     circuit_breaker: Arc<CircuitBreaker>,
-    /// Per-daemon bearer token attached to every RPC (#662). `None` is
+    /// Control-plane agent bearer token attached to every RPC (#662). One
+    /// value is shared by every agent this control plane serves. `None` is
     /// only used by transport-health probes and tests that do not issue
     /// RPCs; a real dispatch client always carries the configured token.
     auth_token: Option<Arc<str>>,
@@ -1828,7 +1829,7 @@ mod tests {
     use std::sync::Arc;
 
     /// #662: every dispatch request carries both the operation id and the
-    /// per-daemon agent token, so no RPC can be sent unauthenticated once
+    /// control-plane agent token, so no RPC can be sent unauthenticated once
     /// the pool is configured.
     #[test]
     fn dispatch_metadata_carries_operation_id_and_agent_token() {

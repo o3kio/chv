@@ -93,10 +93,14 @@ it. What is missing is the transport, not the model.
   (`DEPLOYMENT-ARCHITECTURE.md` §3.1) and its install-time certificate has
   SANs `localhost`/`127.0.0.1` only (`scripts/install.sh`). A remote agent
   cannot enroll against it even if a listener were opened.
-- Every CHV service shares one symmetric `jwt_secret`
-  (`crates/chv-config/src/lib.rs` `resolve_jwt_secret`; `scripts/install.sh`
-  writes the same value into the control-plane and agent configs). In a
-  fleet, any node can mint a console token accepted by any other node.
+- **Historically**, every CHV service shared one symmetric `jwt_secret`
+  (`crates/chv-config/src/lib.rs`; `scripts/install.sh` wrote the same value
+  into the control-plane and agent configs). #662 replaced that with separate
+  `[secrets]` keys for user sessions, console tokens, the agent token, and
+  credential encryption, derived from the legacy master only when omitted. A
+  fleet still shares the console key across the control plane and its agents,
+  so any node holding it can mint a console token accepted by another node
+  until §6's per-node audience and asymmetric signing land.
 
 ### 4. Why now
 
