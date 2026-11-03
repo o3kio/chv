@@ -207,6 +207,19 @@ where
 
     fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
         req.extensions_mut().insert(self.peer.clone());
+        // The real transport peer for anything that reads
+        // `ConnectInfo<SocketAddr>` — most importantly the BFF audit
+        // middleware's `source_ip` (#658 review M1). Without this, the
+        // TLS path carries no ConnectInfo and the audit row would fall
+        // back to the client-supplied `X-Forwarded-For`, i.e. a
+        // spoofable attribution field. axum's
+        // `into_make_service_with_connect_info` works exactly this
+        // way: the extractor reads itself from request extensions, so
+        // a manual insertion is equivalent.
+        if let Some(remote_addr) = self.peer.remote_addr {
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote_addr));
+        }
         self.inner.call(req)
     }
 }

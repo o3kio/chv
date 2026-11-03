@@ -22,6 +22,7 @@ Provide browser-safe, session-aware, view-model-oriented APIs for the WebUI.
 - events
 - maintenance
 - settings/access
+- audit log (admin-only query/export; see [`component/audit-log.md`](../component/audit-log.md))
 
 ## Response style
 - stable resource IDs

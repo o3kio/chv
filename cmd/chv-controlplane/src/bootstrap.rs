@@ -13,10 +13,10 @@ use chv_controlplane_service::{
     ReconcileServiceImplementation, TelemetryServiceImplementation,
 };
 use chv_controlplane_store::{
-    connect_pool, run_migrations, AlertRepository, AlertRuleRepository, BackupRepository,
-    BootstrapTokenRepository, ControlPlaneStoreConfig, DesiredStateRepository, EventRepository,
-    NodeRepository, NotificationOutboxRepository, ObservedStateRepository, OperationRepository,
-    VtepRepository,
+    connect_pool, run_migrations, AlertRepository, AlertRuleRepository, AuditLogRepository,
+    BackupRepository, BootstrapTokenRepository, ControlPlaneStoreConfig, DesiredStateRepository,
+    EventRepository, NodeRepository, NotificationOutboxRepository, ObservedStateRepository,
+    OperationRepository, VtepRepository,
 };
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -1096,6 +1096,70 @@ pub async fn build_service(
             ),
         }
     }
+    // Audit-log retention (#658): bounded periodic sweep, plus an
+    // immediate pass on startup so an upgraded host does not wait a
+    // whole interval to enforce the configured retention. Failures are
+    // logged but never block startup or the request path.
+    let audit_retention_repo = AuditLogRepository::new(pool.clone());
+    let audit_retention_ms = (config.audit.retention_days as i64).saturating_mul(86_400_000);
+    // Row-count ceiling (#658 review M2): bounds the table even when
+    // rows arrive faster than they age out (anonymous-denial floods).
+    // Clamped into i64 range defensively; the config validator already
+    // rejects absurd values.
+    let audit_max_rows = config.audit.max_rows.min(i64::MAX as u64) as i64;
+    let audit_sweep_interval =
+        std::time::Duration::from_secs(config.audit.sweep_interval_secs.max(60));
+    let mut audit_shutdown = shutdown_rx.clone();
+    let audit_retention_handle = tokio::spawn(async move {
+        loop {
+            let cutoff = chv_common::now_unix_ms().saturating_sub(audit_retention_ms);
+            match audit_retention_repo.delete_older_than(cutoff).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(
+                        target: "audit",
+                        deleted,
+                        retention_days = audit_retention_ms / 86_400_000,
+                        "audit log retention sweep removed expired rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        target: "audit",
+                        error = %error,
+                        "audit log retention sweep failed; previous rows remain"
+                    );
+                }
+            }
+            // Cap the table at max_rows newest rows. A warn, not an
+            // info: hitting the ceiling means evidence is being
+            // discarded ahead of schedule and the operator should
+            // investigate the row flood (or raise the cap).
+            match audit_retention_repo.prune_to_max_rows(audit_max_rows).await {
+                Ok(pruned) if pruned > 0 => {
+                    tracing::warn!(
+                        target: "audit",
+                        pruned,
+                        max_rows = audit_max_rows,
+                        "audit log row cap pruned oldest rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        target: "audit",
+                        error = %error,
+                        "audit log row-cap prune failed; previous rows remain"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(audit_sweep_interval) => {}
+                _ = audit_shutdown.changed() => break,
+            }
+        }
+    });
+
     let reaper_handle = tokio::spawn(migration_reaper.run(shutdown_rx));
 
     Ok(ControlPlaneService::new(
@@ -1119,6 +1183,7 @@ pub async fn build_service(
             alert_evaluator_handle,
             notification_dispatcher_handle,
             monitoring_exporter_handle,
+            audit_retention_handle,
         ],
     ))
 }

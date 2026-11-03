@@ -721,6 +721,78 @@ fn default_webui_dir() -> PathBuf {
     PathBuf::from(DEFAULT_CONTROLPLANE_WEBUI_DIR)
 }
 
+/// Durable privileged-mutation audit log retention (`[audit]`, #658).
+///
+/// The audit table lives in the control-plane database and is swept by
+/// a bounded periodic worker in the control plane. `retention_days`
+/// defaults to 365 days: conservative (long enough for incident review)
+/// but bounded. A retention value below one day is rejected by the
+/// config loader so a typo cannot silently erase a day's trail.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default = "default_audit_retention_days")]
+    pub retention_days: u64,
+    /// Sweep cadence. Floored at 60 seconds by the worker to keep a tiny
+    /// interval from turning retention into a busy loop.
+    #[serde(default = "default_audit_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+    /// Hard ceiling on `audit_log` rows. After every age sweep the
+    /// worker prunes the table down to its `max_rows` NEWEST rows, so
+    /// a row flood that ages out slower than it arrives (e.g. an
+    /// anonymous-denial flood — denials are always recorded) still
+    /// cannot grow the SQLite database without bound (#658 review M2).
+    #[serde(default = "default_audit_max_rows")]
+    pub max_rows: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_audit_retention_days(),
+            sweep_interval_secs: default_audit_sweep_interval_secs(),
+            max_rows: default_audit_max_rows(),
+        }
+    }
+}
+
+impl AuditConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.retention_days == 0 {
+            return Err("audit.retention_days must be at least 1".to_string());
+        }
+        // Upper bound (#658 review L5): `retention_days` is multiplied
+        // by 86_400_000 into an i64 millisecond cutoff — an absurd
+        // value could overflow the cast and land the cutoff in the
+        // future, which would delete everything. 36,500 days = 100
+        // years is far past any compliance horizon.
+        if self.retention_days > 36_500 {
+            return Err("audit.retention_days must not exceed 36500 (100 years)".to_string());
+        }
+        if self.sweep_interval_secs < 60 {
+            return Err("audit.sweep_interval_secs must be at least 60".to_string());
+        }
+        if self.max_rows < 1_000 {
+            return Err("audit.max_rows must be at least 1000".to_string());
+        }
+        if self.max_rows > 1_000_000_000_000 {
+            return Err("audit.max_rows must not exceed 1000000000000".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn default_audit_retention_days() -> u64 {
+    365
+}
+
+fn default_audit_sweep_interval_secs() -> u64 {
+    86_400
+}
+
+fn default_audit_max_rows() -> u64 {
+    1_000_000
+}
+
 /// Native monitoring history configuration (`[monitoring]`, ADR-027,
 /// campaign #602). Backs the isolated monitoring SQLite database; all
 /// knobs are advisory budgets enforced by `chv-monitoring-store` — the
@@ -1577,6 +1649,9 @@ pub struct ControlPlaneConfig {
     /// default — fail-closed.
     #[serde(default)]
     pub webui: WebUiConfig,
+    /// Durable privileged-mutation audit log retention (#658).
+    #[serde(default)]
+    pub audit: AuditConfig,
     /// Native monitoring history (ADR-027, campaign #602 PR-2). The
     /// monitoring store is disposable telemetry in a separate SQLite
     /// file with its own pool; a failure to connect degrades monitoring
@@ -1663,6 +1738,7 @@ impl Default for ControlPlaneConfig {
             firmware_path: default_firmware_path(),
             overlay: OverlayConfig::default(),
             webui: WebUiConfig::default(),
+            audit: AuditConfig::default(),
         }
     }
 }
@@ -1708,6 +1784,7 @@ pub fn load_controlplane_config(path: Option<&Path>) -> Result<ControlPlaneConfi
     if cfg.jwt_secret == "chv-dev-secret-change-in-production" || cfg.jwt_secret.len() < 32 {
         cfg.jwt_secret = resolve_jwt_secret(&cfg.jwt_secret, "controlplane");
     }
+    cfg.audit.validate().map_err(ConfigError::Invalid)?;
     Ok(cfg)
 }
 

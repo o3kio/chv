@@ -178,3 +178,24 @@ enabled = false
 # Default: where the .deb/.rpm installs the tree. scripts/install.sh
 # uses /opt/chv/ui and enables this section for its own tree.
 dir = "/usr/share/chv/ui"
+
+# Durable privileged-mutation audit log (#658). The BFF writes one row
+# per mutating request (success, failure, or role/auth denial) into the
+# control-plane database. Admin-only query/export endpoints live at
+# POST /v1/audit-log and POST /v1/audit-log/export.
+#
+# retention_days is deliberately conservative (365) but bounded: a
+# periodic worker deletes only rows strictly older than the cutoff.
+# sweep_interval_secs is floored at 60. Set retention_days lower only
+# after checking your compliance/incident-review requirements.
+#
+# max_rows is a hard ceiling on the audit table: after every age sweep
+# the worker prunes down to the newest max_rows rows (oldest deleted
+# first, in bounded batches). It bounds the database even when rows
+# arrive faster than they age out — e.g. an anonymous-denial flood,
+# which is always recorded. Hitting the cap logs a warning: evidence
+# is being discarded ahead of schedule.
+[audit]
+retention_days = 365
+sweep_interval_secs = 86400
+max_rows = 1000000
