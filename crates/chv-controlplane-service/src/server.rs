@@ -311,6 +311,11 @@ impl proto::telemetry_service_server::TelemetryService for TelemetryServer {
         request: Request<proto::MigrationProgress>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "report_migration_progress",
+        )?;
         let _span = tracing::info_span!("report_migration_progress", %op_id);
         let resp = self
             .service
@@ -342,6 +347,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::CreateVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "create_vm")?;
         let _span = tracing::info_span!("create_vm", %op_id);
         let resp = self
             .service
@@ -361,6 +367,11 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
     /// orchestrator dispatches to agents) is a different surface; this
     /// CP-side shim stays closed until/unless lifecycle journaling is
     /// ever adopted for the create.
+    ///
+    /// Authz note: this handler never reads the request or touches node
+    /// state — it always returns `Unimplemented` before `into_inner()`.
+    /// There is no authority to bind to a peer identity, so it is
+    /// intentionally exempt from `enforce_peer_node_id`.
     async fn create_volume(
         &self,
         _request: Request<proto::CreateVolumeRequest>,
@@ -377,6 +388,9 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
     /// BFF route (PR 2). The node RPC of the same name (the #522 PR 1
     /// dispatch carrier the orchestrator dispatches to agents) is a
     /// different surface; this CP-side shim stays closed.
+    ///
+    /// Authz note: unconditional `Unimplemented`, no request/state access;
+    /// exempt for the same reason as `create_volume`.
     async fn delete_volume(
         &self,
         _request: Request<proto::DeleteVolumeRequest>,
@@ -393,6 +407,9 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
     /// lifecycle RPC. The node RPC of the same name (the #355 dispatch
     /// carrier the orchestrator fans out to agents) is a different
     /// surface; this CP-side shim stays closed.
+    ///
+    /// Authz note: unconditional `Unimplemented`, no request/state access;
+    /// exempt for the same reason as `create_volume`.
     async fn apply_network_policy(
         &self,
         _request: Request<proto::ApplyNetworkPolicyRequest>,
@@ -408,6 +425,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::StartVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "start_vm")?;
         let _span = tracing::info_span!("start_vm", %op_id);
         let resp = self
             .service
@@ -423,6 +441,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::StopVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "stop_vm")?;
         let _span = tracing::info_span!("stop_vm", %op_id);
         let resp = self
             .service
@@ -438,6 +457,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::RebootVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "reboot_vm")?;
         let _span = tracing::info_span!("reboot_vm", %op_id);
         let resp = self
             .service
@@ -453,6 +473,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::DeleteVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "delete_vm")?;
         let _span = tracing::info_span!("delete_vm", %op_id);
         let resp = self
             .service
@@ -468,6 +489,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::ResizeVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "resize_vm")?;
         let _span = tracing::info_span!("resize_vm", %op_id);
         let resp = self
             .service
@@ -483,6 +505,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::AttachVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "attach_volume")?;
         let _span = tracing::info_span!("attach_volume", %op_id);
         let resp = self
             .service
@@ -498,6 +521,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::DetachVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "detach_volume")?;
         let _span = tracing::info_span!("detach_volume", %op_id);
         let resp = self
             .service
@@ -513,6 +537,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::ResizeVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "resize_volume")?;
         let _span = tracing::info_span!("resize_volume", %op_id);
         let resp = self
             .service
@@ -528,6 +553,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::SnapshotVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "snapshot_volume")?;
         let _span = tracing::info_span!("snapshot_volume", %op_id);
         let resp = self
             .service
@@ -543,6 +569,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::RestoreVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "restore_volume")?;
         let _span = tracing::info_span!("restore_volume", %op_id);
         let resp = self
             .service
@@ -558,6 +585,11 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::DeleteVolumeSnapshotRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "delete_volume_snapshot",
+        )?;
         let _span = tracing::info_span!("delete_volume_snapshot", %op_id);
         let resp = self
             .service
@@ -573,6 +605,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::CloneVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "clone_volume")?;
         let _span = tracing::info_span!("clone_volume", %op_id);
         let resp = self
             .service
@@ -588,6 +621,11 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::PauseNodeSchedulingRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "pause_node_scheduling",
+        )?;
         let _span = tracing::info_span!("pause_node_scheduling", %op_id);
         let resp = self
             .service
@@ -603,6 +641,11 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::ResumeNodeSchedulingRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "resume_node_scheduling",
+        )?;
         let _span = tracing::info_span!("resume_node_scheduling", %op_id);
         let resp = self
             .service
@@ -618,6 +661,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::DrainNodeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "drain_node")?;
         let _span = tracing::info_span!("drain_node", %op_id);
         let resp = self
             .service
@@ -633,6 +677,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::EnterMaintenanceRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "enter_maintenance")?;
         let _span = tracing::info_span!("enter_maintenance", %op_id);
         let resp = self
             .service
@@ -648,6 +693,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::ExitMaintenanceRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "exit_maintenance")?;
         let _span = tracing::info_span!("exit_maintenance", %op_id);
         let resp = self
             .service
@@ -663,6 +709,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::PauseVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "pause_vm")?;
         let _span = tracing::info_span!("pause_vm", %op_id);
         let resp = self
             .service
@@ -678,6 +725,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::ResumeVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "resume_vm")?;
         let _span = tracing::info_span!("resume_vm", %op_id);
         let resp = self
             .service
@@ -693,6 +741,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::PowerButtonVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "power_button_vm")?;
         let _span = tracing::info_span!("power_button_vm", %op_id);
         let resp = self
             .service
@@ -708,6 +757,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::AddDiskRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "add_disk")?;
         let _span = tracing::info_span!("add_disk", %op_id);
         let resp = self
             .service
@@ -723,6 +773,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::RemoveDeviceRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "remove_device")?;
         let _span = tracing::info_span!("remove_device", %op_id);
         let resp = self
             .service
@@ -738,6 +789,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::AddNetRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "add_net")?;
         let _span = tracing::info_span!("add_net", %op_id);
         let resp = self
             .service
@@ -753,6 +805,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::ResizeDiskRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "resize_disk")?;
         let _span = tracing::info_span!("resize_disk", %op_id);
         let resp = self
             .service
@@ -768,6 +821,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::SnapshotVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "snapshot_vm")?;
         let _span = tracing::info_span!("snapshot_vm", %op_id);
         let resp = self
             .service
@@ -783,6 +837,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::RestoreSnapshotRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "restore_snapshot")?;
         let _span = tracing::info_span!("restore_snapshot", %op_id);
         let resp = self
             .service
@@ -798,6 +853,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::CoredumpVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "coredump_vm")?;
         let _span = tracing::info_span!("coredump_vm", %op_id);
         let resp = self
             .service
@@ -813,6 +869,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::StartNetworkRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "start_network")?;
         let _span = tracing::info_span!("start_network", %op_id);
         let resp = self
             .service
@@ -828,6 +885,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::StopNetworkRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "stop_network")?;
         let _span = tracing::info_span!("stop_network", %op_id);
         let resp = self
             .service
@@ -843,6 +901,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::RestartNetworkRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "restart_network")?;
         let _span = tracing::info_span!("restart_network", %op_id);
         let resp = self
             .service
@@ -853,6 +912,9 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         Ok(Response::new(resp))
     }
 
+    /// Authz note: unconditional `Unimplemented` (the control plane does
+    /// not proxy `PingVmm`), no request/state access; exempt from
+    /// `enforce_peer_node_id`.
     async fn ping_vmm(
         &self,
         _request: Request<proto::PingVmmRequest>,
@@ -867,6 +929,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::MigrateVmRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "migrate_vm")?;
         let _span = tracing::info_span!("migrate_vm", %op_id);
         let resp = self
             .service
@@ -882,6 +945,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::UpdateOverlayRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "update_overlay")?;
         let _span = tracing::info_span!("update_overlay", %op_id);
         let resp = self
             .service
@@ -897,6 +961,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         request: Request<proto::SendGratuitousArpRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(&request, &request.get_ref().node_id, "send_gratuitous_arp")?;
         let _span = tracing::info_span!("send_gratuitous_arp", %op_id);
         let resp = self
             .service
@@ -907,6 +972,11 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         Ok(Response::new(resp))
     }
 
+    /// Authz note: not node-scoped on the wire. This is an operator egress
+    /// relay into a node; the request carries no `node_id` field and the
+    /// target is derived from `meta.target_node_id` (the operator/CP is the
+    /// authenticated caller, not the target node). It is therefore exempt
+    /// from `enforce_peer_node_id`.
     async fn resolve_inspect_required_operation(
         &self,
         request: Request<proto::ResolveInspectRequiredOperationRequest>,
@@ -940,6 +1010,11 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         request: Request<proto::ApplyNodeDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "apply_node_desired_state",
+        )?;
         let _span = tracing::info_span!("apply_node_desired_state", %op_id);
         let resp = self
             .service
@@ -955,6 +1030,11 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         request: Request<proto::ApplyVmDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "apply_vm_desired_state",
+        )?;
         let _span = tracing::info_span!("apply_vm_desired_state", %op_id);
         let resp = self
             .service
@@ -970,6 +1050,11 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         request: Request<proto::ApplyVolumeDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "apply_volume_desired_state",
+        )?;
         let _span = tracing::info_span!("apply_volume_desired_state", %op_id);
         let resp = self
             .service
@@ -985,6 +1070,11 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         request: Request<proto::ApplyNetworkDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let op_id = extract_op_id(&request).unwrap_or_default();
+        enforce_peer_node_id(
+            &request,
+            &request.get_ref().node_id,
+            "apply_network_desired_state",
+        )?;
         let _span = tracing::info_span!("apply_network_desired_state", %op_id);
         let resp = self
             .service

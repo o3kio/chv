@@ -742,6 +742,7 @@ mod tests {
                 convergence_round: 1,
                 dirty_blocks_remaining: 500,
                 progress_percent: 45.0,
+                node_id: "node-1".to_string(),
             },
         ));
         let cache = Arc::new(tokio::sync::Mutex::new(cache_inner));
@@ -854,6 +855,7 @@ mod tests {
                 convergence_round: 1,
                 dirty_blocks_remaining: 500,
                 progress_percent: 45.0,
+                node_id: "node-1".to_string(),
             },
         ));
         let cache = Arc::new(tokio::sync::Mutex::new(cache_inner));
@@ -931,6 +933,7 @@ mod tests {
                 convergence_round: 1,
                 dirty_blocks_remaining: 500,
                 progress_percent: 45.0,
+                node_id: "node-1".to_string(),
             },
         ));
         let cache = Arc::new(tokio::sync::Mutex::new(cache_inner));
@@ -1028,6 +1031,7 @@ mod tests {
                 convergence_round: 1,
                 dirty_blocks_remaining: 500,
                 progress_percent: 45.0,
+                node_id: "node-1".to_string(),
             })
         };
 

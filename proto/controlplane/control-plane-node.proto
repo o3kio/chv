@@ -712,6 +712,10 @@ message MigrationProgress {
   uint32 convergence_round = 6;
   uint64 dirty_blocks_remaining = 7;
   float progress_percent = 8;
+  // Identity of the agent reporting progress. Pinned to the mTLS peer
+  // certificate by the control plane so a compromised node cannot update
+  // another node's migration row.
+  string node_id = 9;
 }
 
 enum MigrationPhase {

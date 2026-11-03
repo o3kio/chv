@@ -3269,12 +3269,14 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                 let registry = self.migration_tasks.clone();
                 let op_id_for_task = operation_id.clone();
                 let op_id_for_log = operation_id.clone();
+                let node_id_for_task = my_node_id.clone();
                 let cancel_for_task = cancel_token.clone();
                 let handle = tokio::spawn(async move {
                     crate::migration::source_migration_with_disk_precopy(
                         vm_runtime,
                         vm_id,
                         op_id_for_task,
+                        node_id_for_task,
                         destination_url,
                         disk_config,
                         Some(progress_reporter),

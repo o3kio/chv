@@ -288,6 +288,7 @@ async fn run_disk_precopy_poll(
     cancel_token: &CancellationToken,
     pause_guard: &mut PausedVmGuard,
     progress_reporter: Option<&ProgressReporter>,
+    node_id: &str,
     vm_id: &str,
     operation_id: &str,
 ) -> Result<(), String> {
@@ -420,6 +421,7 @@ async fn run_disk_precopy_poll(
             };
 
             let progress = build_progress(
+                node_id,
                 vm_id,
                 operation_id,
                 proto_phase,
@@ -515,6 +517,7 @@ pub async fn source_migration_with_disk_precopy(
     vm_runtime: VmRuntime,
     vm_id: String,
     operation_id: String,
+    node_id: String,
     destination_url: String,
     disk_config: DiskPrecopyConfig,
     progress_reporter: Option<ProgressReporter>,
@@ -635,6 +638,7 @@ pub async fn source_migration_with_disk_precopy(
             &cancel_token,
             &mut pause_guard,
             progress_reporter.as_ref(),
+            &node_id,
             &vm_id,
             &operation_id,
         )
@@ -671,6 +675,7 @@ pub async fn source_migration_with_disk_precopy(
 
     if let Some(ref reporter) = progress_reporter {
         let progress = build_progress(
+            &node_id,
             &vm_id,
             &operation_id,
             proto::MigrationPhase::MemoryMigration,
@@ -691,6 +696,7 @@ pub async fn source_migration_with_disk_precopy(
         Ok(()) => {
             if let Some(ref reporter) = progress_reporter {
                 let progress = build_progress(
+                    &node_id,
                     &vm_id,
                     &operation_id,
                     proto::MigrationPhase::Completed,
@@ -729,6 +735,7 @@ pub async fn source_migration_with_disk_precopy(
 /// Build a MigrationProgress proto message.
 #[allow(clippy::too_many_arguments)]
 pub fn build_progress(
+    node_id: &str,
     vm_id: &str,
     operation_id: &str,
     phase: proto::MigrationPhase,
@@ -747,6 +754,7 @@ pub fn build_progress(
         convergence_round,
         dirty_blocks_remaining,
         progress_percent,
+        node_id: node_id.to_string(),
     }
 }
 
@@ -803,6 +811,7 @@ mod tests {
     #[test]
     fn build_progress_message() {
         let progress = build_progress(
+            "node-1",
             "vm-1",
             "op-1",
             proto::MigrationPhase::MemoryMigration,
@@ -814,6 +823,7 @@ mod tests {
         );
         assert_eq!(progress.vm_id, "vm-1");
         assert_eq!(progress.operation_id, "op-1");
+        assert_eq!(progress.node_id, "node-1");
         assert_eq!(
             progress.phase,
             proto::MigrationPhase::MemoryMigration as i32
@@ -877,6 +887,7 @@ mod tests {
     #[test]
     fn build_progress_with_zero_total_does_not_panic() {
         let progress = build_progress(
+            "node-1",
             "vm-1",
             "op-1",
             proto::MigrationPhase::Pending,
@@ -897,6 +908,7 @@ mod tests {
     #[test]
     fn build_progress_with_excess_bytes_preserves_values() {
         let progress = build_progress(
+            "node-1",
             "vm-1",
             "op-1",
             proto::MigrationPhase::ConvergingDisk,
@@ -1075,6 +1087,7 @@ mod tests {
             &cancel,
             &mut guard,
             None,
+            "node-1",
             "vm-1",
             "op-1",
         )
@@ -1122,6 +1135,7 @@ mod tests {
             &cancel,
             &mut guard,
             None,
+            "node-1",
             "vm-1",
             "op-1",
         )
@@ -1180,6 +1194,7 @@ mod tests {
             &cancel,
             &mut guard,
             Some(&reporter),
+            "node-1",
             "vm-1",
             "op-1",
         )
