@@ -51,6 +51,12 @@ pub async fn backup_fence() -> Result<Json<Value>, BffError> {
 ///   existing "resource has no owner" behavior;
 /// - the check runs before any write, so a denied request persists nothing.
 ///
+/// A job or schedule whose VM/volume has since been deleted is orphaned: the
+/// owner lookup finds no row, so operators cannot update or delete it and an
+/// admin must perform the cleanup. That is intentional — deleting a bound VM
+/// never silently discards backup history. Read/list/get visibility is out of
+/// scope for #655; this gate covers backup/restore writes only.
+///
 /// The backup hard-fence (#654) still runs at the router layer; this is
 /// defense-in-depth for the handler layer and for a future engine.
 async fn require_backup_resource_owner(

@@ -365,6 +365,112 @@ async fn create_restore(
     .await
 }
 
+async fn update_job(
+    state: &AppState,
+    claims: &Claims,
+    job_id: &str,
+    payload: Value,
+) -> Result<Json<Value>, BffError> {
+    backups::update_backup_job(
+        bearer(claims),
+        State(state.clone()),
+        axum::extract::Path(job_id.to_string()),
+        Json(payload),
+    )
+    .await
+}
+
+async fn delete_job(
+    state: &AppState,
+    claims: &Claims,
+    job_id: &str,
+) -> Result<Json<Value>, BffError> {
+    backups::delete_backup_job(
+        bearer(claims),
+        State(state.clone()),
+        axum::extract::Path(job_id.to_string()),
+    )
+    .await
+}
+
+async fn update_schedule(
+    state: &AppState,
+    claims: &Claims,
+    schedule_id: &str,
+    payload: Value,
+) -> Result<Json<Value>, BffError> {
+    backups::update_backup_schedule(
+        bearer(claims),
+        State(state.clone()),
+        axum::extract::Path(schedule_id.to_string()),
+        Json(payload),
+    )
+    .await
+}
+
+async fn delete_schedule(
+    state: &AppState,
+    claims: &Claims,
+    schedule_id: &str,
+) -> Result<Json<Value>, BffError> {
+    backups::delete_backup_schedule(
+        bearer(claims),
+        State(state.clone()),
+        axum::extract::Path(schedule_id.to_string()),
+    )
+    .await
+}
+
+async fn delete_job_api(
+    state: &AppState,
+    claims: &Claims,
+    job_id: &str,
+) -> Result<Json<Value>, BffError> {
+    backups::delete_backup_job_api(
+        bearer(claims),
+        State(state.clone()),
+        axum::extract::Path(job_id.to_string()),
+    )
+    .await
+}
+
+async fn toggle_job_api(
+    state: &AppState,
+    claims: &Claims,
+    job_id: &str,
+) -> Result<Json<Value>, BffError> {
+    backups::toggle_backup_job_api(
+        bearer(claims),
+        State(state.clone()),
+        axum::extract::Path(job_id.to_string()),
+    )
+    .await
+}
+
+async fn job_bindings(state: &AppState, job_id: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT vm_id, volume_id FROM backup_jobs WHERE job_id = ?")
+        .bind(job_id)
+        .fetch_one(&state.pool)
+        .await
+        .expect("read job bindings")
+}
+
+async fn schedule_bindings(state: &AppState, schedule_id: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT vm_id, volume_id FROM backup_schedules WHERE schedule_id = ?")
+        .bind(schedule_id)
+        .fetch_one(&state.pool)
+        .await
+        .expect("read schedule bindings")
+}
+
+async fn schedule_enabled(state: &AppState, schedule_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT enabled FROM backup_schedules WHERE schedule_id = ?")
+        .bind(schedule_id)
+        .fetch_one(&state.pool)
+        .await
+        .expect("read schedule enabled")
+}
+
 // ── Create job ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -603,6 +709,277 @@ async fn delete_job_denies_non_owner_and_keeps_the_row() {
     .expect_err("non-owner must not delete another user's job");
     assert_forbidden(err).await;
     assert_eq!(count(&state, "backup_jobs").await, 1);
+}
+
+// ── Update / delete / toggle ownership (double-rebind) ─────────────────────
+
+#[tokio::test]
+async fn update_job_denies_rebinding_to_foreign_volume_and_keeps_bindings() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_volume(&state, "vol-carol", "u-carol").await;
+    seed_job(&state, "job-1", "vm-alice", None).await;
+
+    let err = update_job(
+        &state,
+        &claims("u-alice", "operator"),
+        "job-1",
+        json!({ "volume_id": "vol-carol" }),
+    )
+    .await
+    .expect_err("the NEW volume binding must be owned by the caller");
+    assert_forbidden(err).await;
+    assert_eq!(
+        job_bindings(&state, "job-1").await,
+        ("vm-alice".to_string(), None),
+        "denied rebind must leave the original binding untouched"
+    );
+}
+
+#[tokio::test]
+async fn update_job_allows_rebinding_to_owned_volume() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_volume(&state, "vol-alice", "u-alice").await;
+    seed_job(&state, "job-1", "vm-alice", None).await;
+
+    expect_ok(
+        update_job(
+            &state,
+            &claims("u-alice", "operator"),
+            "job-1",
+            json!({ "volume_id": "vol-alice" }),
+        )
+        .await,
+    );
+    assert_eq!(
+        job_bindings(&state, "job-1").await,
+        ("vm-alice".to_string(), Some("vol-alice".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn update_job_denies_non_owner_rebinding_to_their_own_volume() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_volume(&state, "vol-bob", "u-bob").await;
+    seed_job(&state, "job-1", "vm-alice", None).await;
+
+    // Bob owns the new volume, so only the OLD binding (Alice's VM) can deny
+    // this. Dropping the existing-row check would let the update succeed.
+    let err = update_job(
+        &state,
+        &claims("u-bob", "operator"),
+        "job-1",
+        json!({ "volume_id": "vol-bob" }),
+    )
+    .await
+    .expect_err("a non-owner must not re-target a foreign job");
+    assert_forbidden(err).await;
+    assert_eq!(
+        job_bindings(&state, "job-1").await,
+        ("vm-alice".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn update_schedule_denies_rebinding_to_foreign_vm_and_keeps_bindings() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_vm(&state, "vm-carol", "u-carol").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+
+    let err = update_schedule(
+        &state,
+        &claims("u-alice", "operator"),
+        "sched-1",
+        json!({ "vm_id": "vm-carol" }),
+    )
+    .await
+    .expect_err("the NEW VM binding must be owned by the caller");
+    assert_forbidden(err).await;
+    assert_eq!(
+        schedule_bindings(&state, "sched-1").await,
+        ("vm-alice".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn update_schedule_denies_rebinding_to_foreign_volume_and_keeps_bindings() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_volume(&state, "vol-carol", "u-carol").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+
+    let err = update_schedule(
+        &state,
+        &claims("u-alice", "operator"),
+        "sched-1",
+        json!({ "vm_id": "vm-alice", "volume_id": "vol-carol" }),
+    )
+    .await
+    .expect_err("the NEW volume binding must be owned by the caller");
+    assert_forbidden(err).await;
+    assert_eq!(
+        schedule_bindings(&state, "sched-1").await,
+        ("vm-alice".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn update_schedule_denies_non_owner_rebinding_to_their_own_vm() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_vm(&state, "vm-bob", "u-bob").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+
+    // Bob owns the new VM, so only the OLD binding (Alice's VM) can deny it.
+    let err = update_schedule(
+        &state,
+        &claims("u-bob", "operator"),
+        "sched-1",
+        json!({ "vm_id": "vm-bob" }),
+    )
+    .await
+    .expect_err("a non-owner must not re-target a foreign schedule");
+    assert_forbidden(err).await;
+    assert_eq!(
+        schedule_bindings(&state, "sched-1").await,
+        ("vm-alice".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn update_schedule_allows_rebinding_to_owned_resources() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_vm(&state, "vm-alice2", "u-alice").await;
+    seed_volume(&state, "vol-alice", "u-alice").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+
+    expect_ok(
+        update_schedule(
+            &state,
+            &claims("u-alice", "operator"),
+            "sched-1",
+            json!({ "vm_id": "vm-alice2", "volume_id": "vol-alice" }),
+        )
+        .await,
+    );
+    assert_eq!(
+        schedule_bindings(&state, "sched-1").await,
+        ("vm-alice2".to_string(), Some("vol-alice".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn delete_schedule_denies_non_owner_and_keeps_the_row() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+
+    let err = delete_schedule(&state, &claims("u-bob", "operator"), "sched-1")
+        .await
+        .expect_err("non-owner must not delete another user's schedule");
+    assert_forbidden(err).await;
+    assert_eq!(count(&state, "backup_schedules").await, 1);
+    assert_eq!(
+        schedule_bindings(&state, "sched-1").await,
+        ("vm-alice".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn toggle_schedule_api_denies_non_owner_and_keeps_state() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+    assert_eq!(schedule_enabled(&state, "sched-1").await, 1);
+
+    let err = toggle_job_api(&state, &claims("u-bob", "operator"), "sched-1")
+        .await
+        .expect_err("non-owner must not toggle another user's schedule");
+    assert_forbidden(err).await;
+    assert_eq!(
+        schedule_enabled(&state, "sched-1").await,
+        1,
+        "a denied toggle must not flip enabled"
+    );
+}
+
+#[tokio::test]
+async fn legacy_delete_job_api_denies_non_owner_and_keeps_the_row() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+
+    let err = delete_job_api(&state, &claims("u-bob", "operator"), "sched-1")
+        .await
+        .expect_err("non-owner must not delete another user's legacy job");
+    assert_forbidden(err).await;
+    assert_eq!(count(&state, "backup_schedules").await, 1);
+}
+
+// ── Orphaned rows: admin-only cleanup ──────────────────────────────────────
+
+#[tokio::test]
+async fn orphaned_job_is_admin_only_for_cleanup() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_job(&state, "job-1", "vm-alice", None).await;
+    sqlx::query("DELETE FROM vms WHERE vm_id = 'vm-alice'")
+        .execute(&state.pool)
+        .await
+        .expect("delete vm to orphan the job");
+
+    let err = delete_job(&state, &claims("u-alice", "operator"), "job-1")
+        .await
+        .expect_err("the original owner cannot act on an orphaned job");
+    assert_forbidden(err).await;
+    assert_eq!(count(&state, "backup_jobs").await, 1);
+
+    expect_ok(delete_job(&state, &claims("u-root", "admin"), "job-1").await);
+    assert_eq!(
+        count(&state, "backup_jobs").await,
+        0,
+        "admin cleanup is the intended path for orphaned rows"
+    );
+}
+
+#[tokio::test]
+async fn orphaned_schedule_is_admin_only_for_cleanup() {
+    let state = build_state().await;
+    seed_node(&state).await;
+    seed_vm(&state, "vm-alice", "u-alice").await;
+    seed_schedule(&state, "sched-1", "vm-alice").await;
+    sqlx::query("DELETE FROM vms WHERE vm_id = 'vm-alice'")
+        .execute(&state.pool)
+        .await
+        .expect("delete vm to orphan the schedule");
+
+    let err = delete_schedule(&state, &claims("u-alice", "operator"), "sched-1")
+        .await
+        .expect_err("the original owner cannot act on an orphaned schedule");
+    assert_forbidden(err).await;
+    assert_eq!(count(&state, "backup_schedules").await, 1);
+
+    expect_ok(delete_schedule(&state, &claims("u-root", "admin"), "sched-1").await);
+    assert_eq!(
+        count(&state, "backup_schedules").await,
+        0,
+        "admin cleanup is the intended path for orphaned rows"
+    );
 }
 
 // ── Hard-fence unchanged ────────────────────────────────────────────────────
