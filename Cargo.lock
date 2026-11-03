@@ -859,9 +859,12 @@ version = "0.3.0"
 dependencies = [
  "chrono",
  "hex",
+ "hmac",
  "rand 0.10.3",
  "serde",
+ "serde_json",
  "sha2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

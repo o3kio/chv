@@ -37,6 +37,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub mod clock;
 pub mod firewall;
 pub mod hypervisor;
+pub mod migration_auth;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 

@@ -102,7 +102,139 @@ echo, so a skewed stord still serves them.
   - stord's **Unix socket** (plaintext, local-node only), shared with the control RPCs
 - The sender only ever dials `https://` with its client identity: an `http://` endpoint is force-upgraded to `https://` before dialing, and a missing TLS config is a hard precondition failure naming the config keys — there is **no plaintext fallback** (`crates/chv-stord-core/src/migration/sender.rs`)
 - Identity material is loaded and validated fail-closed at **startup**, not lazily: unreadable files, mismatched keypairs, empty/invalid CA bundles, and half-configured client or receiver field sets are startup errors (`crates/chv-stord-core/src/migration/tls_config.rs`)
+- mTLS authenticates a **node certificate**, not a migration: it does not prove the control plane requested this particular volume/destination/size. Every inbound stream therefore also carries a short-lived control-plane authorization (issue #663, below), verified **before** any receiving volume is created
 - Both serving paths accept messages up to **8 MiB** (`MAX_MIGRATION_MESSAGE_SIZE_BYTES`, `crates/chv-stord-core/src/migration/mod.rs`, applied in `crates/chv-stord-core/src/server.rs`): a `BlockChunk` carries a full 4 MiB block plus protobuf overhead and exceeds tonic's 4 MiB default decode limit
+
+## Migration authorization (issue #663)
+
+mTLS alone leaves a confused-deputy hole: any CA-certified peer could open
+`StreamBlocks` and make a destination `create_receiving_volume` with a
+peer-chosen id/size/format — i.e. arbitrary volume creation. The control plane
+is the only authority for *which* migration should happen, so it mints one
+short-lived, single-use token per attached volume and the source agent
+forwards it to the destination stord.
+
+### Token format and claims
+
+Wire form (printable ASCII, TOML/JSON-safe, no base64 dependency):
+
+```
+v1.<hex(canonical-JSON-claims)>.<hex(HMAC-SHA256)>
+```
+
+Claims:
+
+| Field | Meaning |
+|---|---|
+| `version` | token format version (`1`); unknown versions are rejected |
+| `source_node` | source node id the CP dispatched the migration from |
+| `destination_node` | destination node id; must equal the receiver's `migration.node_id` |
+| `volume_id` | exact volume id the destination may create/receive |
+| `size_bytes` | exact receiving-volume size |
+| `issued_at_unix_ms` | mint time; future skew > 60 s is rejected |
+| `expires_at_unix_ms` | expiry; an expired token is rejected |
+| `nonce` | 128-bit random, consumed exactly once by the receiver |
+
+The MAC is HMAC-SHA256 under a **dedicated migration-signing secret** — never
+the user/JWT, enrollment, webhook, or TLS key. The signing key is derived
+with a domain-separation label and the token is signed over a second
+domain-separation label, so the same configured bytes cannot be replayed as
+another protocol's MAC. Minimum secret length is 32 bytes. Verification uses
+the `hmac` crate's constant-time comparison.
+
+### Receiver policy and ordering
+
+`StorageMigrationServiceImpl` applies this order and never reaches
+`create_receiving_volume` unless every step passes:
+
+1. Validate the peer-supplied `volume_id`/receiving path (existing trust-boundary checks) and the 16 TiB size ceiling.
+2. Verify the token: structure/version, constant-time MAC, destination node, volume id, size, expiry, issue-time skew, and lifetime ≤ 15 minutes.
+3. Reserve one in-flight slot and `size_bytes` against the per-node admission limits.
+4. Consume the nonce in the replay cache (bounded by token expiry).
+
+The admission reservation is an RAII guard held for the whole stream
+lifetime and released on success, failure, and stream close. A replay is
+rejected even when capacity is free; a rejected admission does not consume
+the nonce (the token may be retried after capacity is released). Tokens are
+transient dispatch data and are never persisted in operations rows,
+migration records, or `correlation_id`.
+
+The replay cache is **memory-only** and bounded by token TTL: it is not
+persisted across a stord restart, and each entry is purged once its token
+expires (lazily on the next admission). A restart therefore loses replay
+history, but the 900 s maximum token lifetime bounds the exposure — a token
+can never be replayed after it expires regardless of cache state.
+
+A receiver that has authorized a peer but then sees no message closes the
+stream after a 300 s idle timeout (`RECEIVER_IDLE_TIMEOUT`), releasing its
+admission slot. The same idle bound covers the **pre-Init** first read: an
+authenticated peer that opens the stream and then never sends `InitMigration`
+cannot pin a connection (or leak a per-connection task) indefinitely.
+Without that bound a stalled authorized peer could pin a slot until TCP
+eventually gave up.
+
+`source_node` is signed but is **not** compared against the TLS peer
+certificate identity. It is defense-in-depth metadata only; the enforced
+authorization boundary is the signed destination node, volume, size, expiry,
+and single-use nonce. A stolen token is therefore usable by any
+CA-certified peer until it expires or is consumed.
+
+A receiver with no valid authorization material **fails closed**:
+`DenyAll` rejects every inbound stream. `DisabledInsecure` is reachable only
+with the explicit development-only `migration.allow_insecure_unauthenticated
+= true` and is loudly logged at startup. The control plane likewise refuses
+to dispatch a disk migration when attached volumes exist and no signing
+secret is configured, unless its own insecure flag is explicitly set; even
+then the source agent refuses the tokenless dispatch unless
+`allow_insecure_migration_dispatch = true` in its own config, and the
+destination stord must also be in insecure mode.
+
+**Residual mixed-config edge (diskless VMs):** the control plane sets the
+transient `allow_insecure_unauthenticated` dispatch marker whenever its own
+development flag is on and no volume tokens were minted. A diskless VM mints
+no tokens by construction (there is no destination volume to authorize), so
+the marker is still set even though the receiver never needs a token. If the
+source agent's `allow_insecure_migration_dispatch` is off — the production
+default — it refuses that `MigrateVm` with `FAILED_PRECONDITION` before any
+disk or memory work. This is a configuration edge, not a security bypass (no
+receiving volume is created), but operators who enable the control-plane
+development flag must also enable the agent gate on every source node, or
+must not combine that flag with diskless VMs.
+
+### Admission limits
+
+Each destination stord bounds inbound migrations independently of the token:
+
+- `migration.max_inflight_receiving` (default **16**)
+- `migration.max_inflight_receiving_bytes` (default **64 TiB**, i.e. 70,368,744,177,664 bytes)
+
+These are **per-destination-node aggregate** ceilings, not per-VM limits: the
+count covers every concurrent receiving stream on the node, and the byte
+budget is the sum of each stream's token-authorized `size_bytes`. The default
+16 admits a VM with up to 16 attached volumes; the 64 TiB byte budget keeps a
+single node from accepting more than 64 TiB of concurrently receiving volume
+storage. Both are checked before volume creation and must be non-zero (zero
+aborts startup rather than meaning "unlimited"). Over-limit streams get
+`RESOURCE_EXHAUSTED` and create nothing; the token is not consumed, so the
+source may retry after capacity is released.
+
+The source stord `TriggerDiskMigration` handler awaits this initial
+handshake for up to 10 s and returns the destination's status synchronously,
+which is what lets the source agent's bounded retry act on a capacity
+rejection. If the TLS/Init handshake or receiving-volume creation exceeds
+that bound, the trigger reports the migration as started and any later
+admission or authorization failure surfaces only through the asynchronous
+migration task — no automatic retry in that case.
+
+**Residual shape risk:** because the count is node-wide, one VM with 16
+attached volumes consumes the entire default stream budget, and two
+concurrent 8-volume VM migrations on the same destination exhaust it as
+well. A rejected source retries only a bounded number of times (four
+attempts); a long-lived backlog at the destination therefore fails the
+migration with an actionable `RESOURCE_EXHAUSTED` after the retry budget
+rather than waiting indefinitely. Size the two limits for the largest
+*simultaneous* set of receiving volumes the node should accept, not for a
+single VM.
 
 ## Protocol Phases
 
@@ -118,11 +250,12 @@ Source                          Destination
   │◄────────────────────────────────│
 ```
 
-- Source sends: `volume_id`, `size_bytes`, `block_size` (4 MiB), `format` (always `"raw"` today), `checksum_type` (always `"crc32"`) (`crates/chv-stord-core/src/migration/sender.rs`)
-- The sender sends `InitMigration` **before** awaiting the stream response: the tonic client future resolves only when the server sends response headers, and the server sends them only after it has read the first message and created the receiving volume (`crates/chv-stord-core/src/migration/sender.rs`)
+- Source sends: `volume_id`, `size_bytes`, `block_size` (4 MiB), `format` (always `"raw"` today), `checksum_type` (always `"crc32"`), and the per-volume control-plane `authorization` token (`crates/chv-stord-core/src/migration/sender.rs`). A missing token is an error at the agent before the trigger, except in the explicit development-only triple-gated insecure mode; stord then rejects the stream unless the destination is also in that mode.
+- The sender sends `InitMigration` **before** awaiting the stream response: the tonic client future resolves only when the server sends response headers, and the server sends them only after it has read the first message, authorized it, and created the receiving volume (`crates/chv-stord-core/src/migration/sender.rs`)
 - Dest validates before creating anything (`crates/chv-stord-core/src/migration/service.rs`):
   - `size_bytes` ≤ 16 TiB (`MAX_MIGRATION_SIZE_BYTES`)
   - `volume_id` is a safe id and the receiving path (`runtime_dir/{volume_id}.img`) stays inside `runtime_dir` — path-traversal defense at the trust boundary
+  - the control-plane authorization token is present, correctly signed, unexpired, unused, and names exactly this destination node, `volume_id`, and `size_bytes`; the stream fits the per-node in-flight count/byte limits (see *Migration authorization*)
 - Dest creates the receiving volume via `create_receiving_volume` — an existing file is a **hard refusal, never a truncate** (`crates/chv-stord-backends/src/trait.rs`)
 - Dest responds `MigrationReady{dest_volume_id}` (the same volume id), or the stream fails with an error
 
@@ -295,6 +428,10 @@ of the M4.6 qualification).
 | Live (`pause_first=false`) request at the user-facing API (BFF/chvctl/UI, #656) | `400 Bad Request` before dispatch (CLI fails locally) | — |
 | Finalize digest mismatch / unknown format / unreadable destination | `data_loss`, task Failed | `FinalizeAck{verified: false}` with a content-free error message |
 | Oversized InitMigration (> 16 TiB) or unsafe volume_id | Handshake fails | `invalid_argument` |
+| Missing migration authorization | Handshake fails before volume creation | `unauthenticated` |
+| Malformed/expired/not-yet-valid/bad-signature/wrong-destination/wrong-volume/wrong-size/replayed token | Handshake fails before volume creation | `permission_denied` |
+| Receiver has no authorization verifier configured (`DenyAll`) | Handshake fails before volume creation | `failed_precondition` |
+| In-flight count or byte limit exceeded | Handshake fails before volume creation | `resource_exhausted` |
 
 Note: `ACK_WRITE_ERROR` is defined in the proto but never emitted by the
 current receiver — destination write failures surface as stream errors
@@ -330,6 +467,7 @@ message InitMigration {
   uint32 block_size = 3;
   string format = 4;           // "raw" or "qcow2"
   string checksum_type = 5;    // "crc32"
+  string authorization = 6;    // short-lived CP migration token (issue #663)
 }
 
 message MigrationReady {
@@ -404,9 +542,10 @@ never emits `MigrationError` today — both peers handle it defensively.)
 
 The operator-facing config surface is the stord `[migration]` section
 (`StordMigrationConfig`, `crates/chv-config/src/lib.rs`), plus the stord-level
-`migration_dest_allowlist`. There are no per-protocol tuning knobs
-(`ack_interval`, `send_window`, timeouts, block size are constants — see
-below).
+`migration_dest_allowlist` and the control-plane `[migration]` section
+(`ControlPlaneMigrationConfig`). Authorization and admission are
+configurable; flow-control internals (`ack_interval`, `send_window`,
+timeouts, block size) remain constants — see below.
 
 ### `[migration]` (stord config, `crates/chv-config/src/lib.rs`)
 
@@ -426,14 +565,27 @@ TLS. All validation is fail-closed at startup
 | migration.server_cert_path | any receiver field set | PEM server certificate presented to migration peers |
 | migration.server_key_path | any receiver field set | PEM private key for the server certificate |
 | migration.client_ca_path | any receiver field set | PEM CA bundle used to authenticate peer client certificates on the receiver listener (client-cert auth is mandatory) |
+| migration.node_id | receiver enabled and authorization not explicitly disabled | This stord's node id; the token's `destination_node` claim must match it. Must equal the owning agent's node id |
+| migration.signing_secret | alternative to `signing_secret_file` | Dedicated migration HMAC secret (≥ 32 bytes). Prefer the file form; never the JWT/enrollment secret. Never logged |
+| migration.signing_secret_file | required for a receiver unless `signing_secret`/`CHV_MIGRATION_SIGNING_SECRET` is set | File containing the dedicated migration-signing secret (trimmed). Mutually exclusive with `signing_secret`; root:chv 0640 |
+| migration.allow_insecure_unauthenticated | development only | Explicit bypass: inbound streams need no token. Default false = fail closed. Requires the control plane's matching flag and the source agent's `allow_insecure_migration_dispatch`; logged loudly |
+| migration.max_inflight_receiving | no (default 16) | Per-destination-node aggregate maximum concurrent inbound receiving migrations. Zero aborts startup |
+| migration.max_inflight_receiving_bytes | no (default 64 TiB / 70,368,744,177,664 bytes) | Per-destination-node aggregate maximum total bytes reserved by concurrent inbound receiving migrations. Zero aborts startup |
 
-Fail-closed gating rules (issues #390, #395, #401):
+The `CHV_MIGRATION_SIGNING_SECRET` environment variable is the last-resort
+fallback when neither config key is set. It is shared with the control-plane
+process on nodes that run both, and must still be a dedicated secret.
 
-- `enabled = false` with **any** client identity field set → startup error
-- `enabled = false` with **any** receiver field set → startup error (an operator who believes migration is off must not get an inbound TCP listener)
+Fail-closed gating rules (issues #390, #395, #401, #663):
+
+- `enabled = false` with **any** client identity field (`client_cert_path`, `client_key_path`, `ca_cert_path`, `dest_server_name`) set → startup error
+- `enabled = false` with **any** receiver TLS field (`listen_addr`, `server_cert_path`, `server_key_path`, `client_ca_path`) set → startup error (an operator who believes migration is off must not get an inbound TCP listener). Authorization/admission keys (`node_id`, `signing_secret*`, `max_inflight_*`, `allow_insecure_unauthenticated`) are not TLS-listener fields: they never configure the listener and remain inert for it while `enabled = false`. They are still loaded and enforced by the always-present UDS migration service, so the authorization/admission policy applies to `StreamBlocks` on the local socket regardless of `enabled`
 - `enabled = true` with **no** client fields → destination-only stord: no client identity, outbound migration actions fail with a `failed_precondition` error (issue #401). The client half is all-or-nothing *when any client field is set*. The receiver half is all-or-nothing *when any receiver field is set*; `enabled = true` with **no** receiver fields is a legitimate source-only stord (no listener, logged at startup)
 - `enabled = true` with **neither** half configured → startup error (an enabled migration section that configures nothing is a misconfiguration)
 - Receiver files unreadable, keypair mismatch, empty/invalid CA bundle, or an unparseable `listen_addr` → startup error
+- A configured receiver with no signing secret/node id → startup error. The only bypass is the explicit `allow_insecure_unauthenticated = true`; there is no silent downgrade
+- A signing secret shorter than 32 bytes, empty, or configured through both `signing_secret` and `signing_secret_file` → startup error
+- Admission limits of zero → startup error (they are never interpreted as "unlimited")
 
 Stord additionally enforces `migration_dest_allowlist` (top-level stord key,
 not under `[migration]`): the destination endpoint host of every
@@ -452,6 +604,10 @@ not under `[migration]`): the destination endpoint host of every
 | Ack-wait timeout | 30 s | `crates/chv-stord-core/src/migration/flow_control.rs` |
 | Max gRPC message size (`MAX_MIGRATION_MESSAGE_SIZE_BYTES`) | 8 MiB (2 × block size; a `BlockChunk` carries a full 4 MiB block plus protobuf overhead, exceeding tonic's 4 MiB default) | `crates/chv-stord-core/src/migration/mod.rs` |
 | Max migrated volume size (`MAX_MIGRATION_SIZE_BYTES`) | 16 TiB | `crates/chv-stord-core/src/migration/service.rs` |
+| Default migration-token TTL (`DEFAULT_MIGRATION_TOKEN_TTL`) | 300 s (CP-configurable via `migration.token_ttl_seconds`) | `crates/chv-common/src/migration_auth.rs` |
+| Max accepted token lifetime (`MAX_MIGRATION_TOKEN_TTL`) | 900 s; longer tokens are rejected even with a valid MAC | `crates/chv-common/src/migration_auth.rs` |
+| Migration-token clock skew (`MIGRATION_TOKEN_CLOCK_SKEW`) | 60 s on `issued_at` | `crates/chv-common/src/migration_auth.rs` |
+| Minimum migration-signing secret (`MIN_MIGRATION_SIGNING_SECRET_BYTES`) | 32 bytes | `crates/chv-common/src/migration_auth.rs` |
 | Migration TLS handshake timeout (`MIGRATION_HANDSHAKE_TIMEOUT`) | 30 s (how long an accepted connection may take to complete its TLS handshake before the migration receiver gives up on it and closes it; guards only the ClientHello-never-arrives case — deliberately not a tunable) | `crates/chv-stord-core/src/server.rs` |
 
 ## Non-goals

@@ -172,6 +172,11 @@ message TriggerDiskMigrationRequest {
   // the cost of downtime equal to the transfer time. Default false keeps
   // the quiescent-assumed contract (write canary + finalize digest).
   bool pause_first = 5;
+  // Control-plane-issued migration authorization minted for this exact
+  // source node, destination node, volume, and size (issue #663). stord
+  // forwards it verbatim to the destination's InitMigration; the source
+  // does not verify it.
+  string migration_authorization = 6;
 }
 
 message TriggerDiskMigrationResponse {

@@ -40,6 +40,7 @@
 //! peer rejection), these cover the fail-closed contract of the disk
 //! migration protocol end to end.
 
+use chv_common::migration_auth::MigrationTokenCodec;
 use chv_common::types::{BackendLocator, DevicePolicy};
 use chv_stord_api::chv_stord_api::{
     migration_message,
@@ -48,6 +49,7 @@ use chv_stord_api::chv_stord_api::{
     Ack, AckStatus, BlockChunk, InitMigration, MigrationMessage, MigrationReady,
 };
 use chv_stord_backends::{LocalFileBackend, StorageBackend};
+use chv_stord_core::migration::auth::{MigrationLimits, MigrationReceiverAuthorization};
 use chv_stord_core::migration::sender::{MigrationSender, MigrationTlsConfig};
 use chv_stord_core::migration::service::StorageMigrationServiceImpl;
 use chv_stord_core::migration::task::{MigrationPhase, MigrationTask};
@@ -77,6 +79,27 @@ fn install_crypto_provider() {
 /// Migration block size (must match the backends' dirty-tracking block
 /// size so bitmap bits map 1:1 to migration chunks).
 const BLOCK: u64 = 4 * 1024 * 1024;
+
+/// Dedicated migration-signing secret shared by the in-test control-plane
+/// minter and the receiver (issue #663).
+const MIGRATION_SIGNING_SECRET: &[u8] = b"failclosed-migration-signing-secret-0123456789";
+
+/// Node id the receiver expects in the token's destination claim.
+const DESTINATION_NODE_ID: &str = "stord-receiver";
+
+/// Mint the control-plane authorization for a hand-crafted `InitMigration`.
+fn migration_token(volume_id: &str, size_bytes: u64) -> String {
+    MigrationTokenCodec::new(MIGRATION_SIGNING_SECRET)
+        .expect("test signing secret is long enough")
+        .mint(
+            "stord-sender",
+            DESTINATION_NODE_ID,
+            volume_id,
+            size_bytes,
+            Duration::from_secs(300),
+        )
+        .expect("token mint must succeed")
+}
 
 /// Overall guard so a protocol regression fails fast instead of hanging.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -167,7 +190,13 @@ async fn spawn_receiver(dest_dir: &Path) -> (SocketAddr, TestCa) {
         client_ca_pem: ca.cert_pem.clone(),
     };
     let backend = Arc::new(LocalFileBackend::new(dest_dir.to_path_buf()));
-    let service = StorageMigrationServiceImpl::new(backend, dest_dir.to_path_buf());
+    let service = StorageMigrationServiceImpl::new(
+        backend,
+        dest_dir.to_path_buf(),
+        MigrationReceiverAuthorization::required(MIGRATION_SIGNING_SECRET, DESTINATION_NODE_ID)
+            .expect("test authorization must construct"),
+        MigrationLimits::default(),
+    );
     tokio::spawn(async move {
         if let Err(e) = serve_migration_tls(listener, tls, service).await {
             panic!("migration TLS listener failed: {e:?}");
@@ -205,6 +234,7 @@ fn init_migration(volume_id: &str, size_bytes: u64) -> MigrationMessage {
             block_size: BLOCK as u32,
             format: "raw".to_string(),
             checksum_type: "crc32".to_string(),
+            authorization: migration_token(volume_id, size_bytes),
         })),
     }
 }

@@ -530,6 +530,11 @@ curl -X POST http://127.0.0.1:8080/v1/nodes/mutate \
 | `deadline_exceeded waiting for Ack` | Receiver not acknowledging | Check receiver node health; disk I/O saturation on destination |
 | Migration stalled (reaper will clean up) | `chv_migration_phase` gauge stuck and no progress reports | Wait for the reaper's no-progress timeout (default 7200 s, `CHV_MIGRATION_STALL_TIMEOUT_SECS`) or manually fail the row. The reaper resumes the source VM only when the sender is proven quiescent; otherwise the VM may stay paused for operator review |
 | Backpressure throttling | `slow_down_factor` in logs | Receiver is overwhelmed; reduce concurrent migrations or add I/O capacity |
+| `UNAUTHENTICATED: missing control-plane migration authorization token` | Token did not reach stord (agent/stord version skew, or a manual `TriggerDiskMigration` without `migration_authorization`) | Upgrade the agent and stord together; never hand-drive the stord migration API without a CP-minted token |
+| `PERMISSION_DENIED: migration authorization rejected: ...` | Signature/claim failure: wrong destination node id, wrong volume/size, expired, not-yet-valid, or replayed token | Ensure both sides use the *same* dedicated `[migration].signing_secret_file`; check `migration.node_id` matches the agent's node id; check clock skew (≤ 60 s) and that the token TTL is ≤ 900 s. A `size mismatch` line names both the token-authorized and receiver/backend sizes. A replay means the same token was used twice — inspect for a retried dispatch reusing the old token |
+| `FAILED_PRECONDITION: this stord has no migration authorization verifier configured` | Destination stord has no secret (`DenyAll`) | Set `migration.node_id` and `migration.signing_secret_file` (or `CHV_MIGRATION_SIGNING_SECRET`) on the destination and restart stord |
+| CP logs `disk migration requires a dedicated migration signing secret` | Control plane has attached volumes to migrate but no secret | Set `[migration].signing_secret_file` on the control plane (same secret as destination stords), or explicitly set the development-only `allow_insecure_unauthenticated` on the CP, the source agent (`allow_insecure_migration_dispatch = true`), and the destination stord |
+| `RESOURCE_EXHAUSTED: migration admission rejected: ...` | Destination hit its per-node aggregate `max_inflight_receiving` (default 16) or `max_inflight_receiving_bytes` (default 64 TiB) ceiling | Wait for active migrations to finish (capacity is released on stream close or after the 300 s receiver idle timeout), reduce migration concurrency, or raise the limits on the destination. Rejected attempts do not consume the token, so retry after capacity frees. The source agent retries this automatically a few times with exponential backoff before failing |
 
 **Check active migrations:**
 ```bash
@@ -614,6 +619,56 @@ openssl s_client -connect <PEER_IP>:8444 \
   -key /etc/chv/certs/node-key.pem \
   -CAfile /etc/chv/certs/ca.pem
 ```
+
+**Verify migration authorization (issue #663):**
+
+The control plane and every destination stord must load the *same* dedicated
+migration-signing secret. It is separate from the user JWT secret, the
+enrollment secret, and the TLS keys.
+
+```bash
+# Secret file: at least 32 bytes, root:chv 0640, no trailing content
+sudo install -d -m 0750 -o root -g chv /etc/chv/migration
+sudo sh -c 'openssl rand -hex 32 > /etc/chv/migration/signing-secret'
+sudo chown root:chv /etc/chv/migration/signing-secret
+sudo chmod 0640 /etc/chv/migration/signing-secret
+sudo test "$(tr -d '\r\n' < /etc/chv/migration/signing-secret | wc -c)" -ge 32 && echo ok
+
+# Destination stord config
+grep -A12 '^\[migration\]' /etc/chv/stord.toml | grep -E \
+  'node_id|signing_secret_file|max_inflight'
+
+# Startup log should say minting/verification is enabled, and must NOT contain
+# the insecure-bypass warning.
+journalctl -u chv-controlplane -u chv-stord | grep -i 'migration authorization\|allow_insecure'
+```
+
+Never set `allow_insecure_unauthenticated = true` in production on either the
+control plane or a destination stord, and never set
+`allow_insecure_migration_dispatch = true` on an agent; all three gates must
+agree before a tokenless CP-dispatched migration can run, and enabling them
+disables the control-plane binding so any CA-certified peer could create
+receiving volumes. Rotate the secret by updating the file on the control
+plane and all stords and restarting them; tokens minted with the old secret
+are rejected immediately (maximum exposure is the 900 s token lifetime).
+
+Admission defaults are per-destination-node aggregates: 16 concurrent
+receiving streams and 64 TiB (70,368,744,177,664 bytes) of summed
+token-authorized volume size — one 16-volume VM, or two 8-volume VM
+migrations, can exhaust the default stream budget. The replay cache is
+memory-only and bounded by token TTL, and `source_node` is signed but not
+matched to the TLS peer identity (defense-in-depth metadata only). An
+authenticated peer that never sends `InitMigration`, or stalls mid-stream, is
+closed after a 300 s idle timeout so it cannot pin a connection or admission
+slot forever.
+
+Development-only insecure mode has a diskless-VM edge: the control plane sets
+its transient tokenless marker when no tokens were minted, and a diskless VM
+mints none by construction. An agent whose
+`allow_insecure_migration_dispatch` is false therefore refuses that
+`MigrateVm` with `FAILED_PRECONDITION` even though no volume needed a token.
+Enable the agent gate on every source node, or do not combine the
+control-plane flag with diskless VMs.
 
 ### Stuck Operations After Agent Crash (InspectRequired)
 

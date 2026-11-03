@@ -82,6 +82,14 @@ stord_path_allowlist = ["/var/lib/chv/storage", "/var/lib/chv/agent"]
 # grant this via the chv-stord group: install.sh and the .deb postinst).
 stord_config_path = "/etc/chv/stord.toml"
 
+# Development-only gate for the control plane's explicit tokenless disk
+# migration marker (issue #663). Leave false in production: a volume with no
+# per-volume control-plane authorization is then refused before stord is
+# contacted. Enabling this requires the control plane's and destination
+# stord's matching insecure flags, and lets any CA-certified peer create
+# receiving volumes.
+# allow_insecure_migration_dispatch = true
+
 # nwd respawn config fidelity (#504). Same pass-through for the network
 # daemon: point this at the operator's nwd.toml and a supervisor
 # respawn execs chv-nwd with THAT file (validated: its socket_path must

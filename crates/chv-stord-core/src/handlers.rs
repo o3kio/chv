@@ -1,13 +1,28 @@
 use crate::migration::sender::{start_migration_to_peer, MigrationTlsConfig};
 use crate::migration::task::{MigrationPhase, MigrationTask, MigrationTaskTable};
 use crate::session::{Session, SessionTable};
+use chv_common::migration_auth::MigrationTokenCodec;
 use chv_common::types::{BackendLocator, DevicePolicy};
 use chv_errors::{ChvError, ErrorCode};
 use chv_observability::{operation_span, Metrics};
 use chv_stord_api::chv_stord_api as proto;
 use chv_stord_backends::StorageBackend;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
+
+/// Bound on the source stord trigger's wait for the destination's initial
+/// handshake/admission result (issue #663 follow-up).
+///
+/// The destination decides authorization and per-node admission *before* it
+/// creates the receiving volume and before it sends response headers, so a
+/// rejection (including `RESOURCE_EXHAUSTED`) normally arrives within one
+/// network round trip. Awaiting it here lets the agent's bounded retry act
+/// on a transient capacity rejection instead of seeing only an asynchronous
+/// task failure. The bound protects the trigger RPC from a slow or wedged
+/// destination: on timeout the migration is considered started (the
+/// pre-existing behavior) and continues in the background.
+const TRIGGER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) trait ChvErrorProtoExt {
     fn to_proto_result(&self) -> proto::Result;
@@ -101,6 +116,11 @@ pub struct StorageServiceImpl<B: StorageBackend> {
     migration_tasks: Arc<MigrationTaskTable>,
     migration_dest_allowlist: Vec<String>,
     migration_tls: Option<MigrationTlsConfig>,
+    /// Bound on awaiting the destination's initial handshake inside
+    /// `TriggerDiskMigration`. Production default is
+    /// [`TRIGGER_HANDSHAKE_TIMEOUT`]; tests can shorten it through
+    /// [`StorageServiceImpl::with_trigger_handshake_timeout`].
+    trigger_handshake_timeout: Duration,
 }
 
 impl<B: StorageBackend> StorageServiceImpl<B> {
@@ -128,7 +148,17 @@ impl<B: StorageBackend> StorageServiceImpl<B> {
             migration_tasks: Arc::new(MigrationTaskTable::new()),
             migration_dest_allowlist,
             migration_tls,
+            trigger_handshake_timeout: TRIGGER_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Override the bounded wait for the destination's initial
+    /// handshake/admission result. Tests use a short value so a deliberately
+    /// silent destination does not stall the trigger path; production keeps
+    /// [`TRIGGER_HANDSHAKE_TIMEOUT`].
+    pub fn with_trigger_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.trigger_handshake_timeout = timeout;
+        self
     }
 
     pub fn sessions(&self) -> Arc<SessionTable> {
@@ -1274,6 +1304,60 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
             state.total_bytes = volume_size;
         }
 
+        // Issue #663 MEDIUM-2: best-effort source-side cross-check. The
+        // destination is the authority (it verifies the HMAC), but decoding
+        // the already-minted token here catches a size mismatch before we
+        // open the peer stream and lets the operator see both numbers. The
+        // claims are NOT trusted — this is diagnostics only.
+        if !req.migration_authorization.is_empty() {
+            match MigrationTokenCodec::decode_claims_unverified(&req.migration_authorization) {
+                Ok(claims) if claims.size_bytes != volume_size => {
+                    return Ok(Response::new(proto::TriggerDiskMigrationResponse {
+                        result: Some(
+                            ChvError::InvalidArgument {
+                                field: "migration_authorization".to_string(),
+                                reason: format!(
+                                    "size mismatch for volume {}: token authorizes {} bytes, \
+                                     source backend reports {} bytes; refusing to start a \
+                                     migration the destination would reject",
+                                    req.volume_id, claims.size_bytes, volume_size
+                                ),
+                            }
+                            .to_proto_result(),
+                        ),
+                        migration_id: String::new(),
+                        pause_first: false,
+                    }));
+                }
+                Ok(claims) if claims.volume_id != req.volume_id => {
+                    return Ok(Response::new(proto::TriggerDiskMigrationResponse {
+                        result: Some(
+                            ChvError::InvalidArgument {
+                                field: "migration_authorization".to_string(),
+                                reason: format!(
+                                    "volume mismatch: token authorizes {:?}, trigger is for {:?}",
+                                    claims.volume_id, req.volume_id
+                                ),
+                            }
+                            .to_proto_result(),
+                        ),
+                        migration_id: String::new(),
+                        pause_first: false,
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Malformed/older tokens are left for the destination's
+                    // full verifier to reject with the authoritative error.
+                    tracing::warn!(
+                        volume_id = %req.volume_id,
+                        error = %error,
+                        "could not preflight-decode migration authorization; destination will verify"
+                    );
+                }
+            }
+        }
+
         // Ensure dirty tracking is enabled before the sender reads the
         // bitmap. This also covers sessions hydrated from the SQLite store
         // after a stord restart (their trackers are not recreated by open).
@@ -1298,11 +1382,17 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
         let endpoint = req.dest_endpoint.clone();
         let volume_id = req.volume_id.clone();
         let handle = req.attachment_handle.clone();
+        let migration_authorization = req.migration_authorization.clone();
         let tasks = self.migration_tasks.clone();
         let mig_id = migration_id.clone();
         // Issue #394 Option C: the opt-in stop-the-world mode threads from
         // the trigger request into the sender.
         let req_pause_first = req.pause_first;
+        // Surface the destination's initial handshake/admission result to
+        // the agent synchronously (issue #663 follow-up). A rejected
+        // admission never consumes the token, so the agent can retry the
+        // same trigger after capacity frees.
+        let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
             // Keep the pause channel open for this migration's lifetime
@@ -1327,7 +1417,9 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
                 backend,
                 tls_config,
                 Some(task_clone),
+                migration_authorization,
                 req_pause_first,
+                Some(handshake_tx),
                 // Default bound (30 s) for the FinalizeAck wait; operators
                 // can tune it in a later config PR.
                 None,
@@ -1354,6 +1446,56 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
             // A future enhancement could expire old entries.
             let _ = tasks;
         });
+
+        // Wait for the destination's initial handshake: either the
+        // receiving volume was authorized, admitted, and created
+        // (`MigrationReady`), or the destination rejected the stream. The
+        // rejection is returned as the gRPC status so the agent's
+        // `RESOURCE_EXHAUSTED` retry can fire. Anything after readiness
+        // remains asynchronous through the migration task, as before.
+        match tokio::time::timeout(self.trigger_handshake_timeout, handshake_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(status))) => {
+                tracing::warn!(
+                    migration_id = %migration_id,
+                    volume_id = %req.volume_id,
+                    code = ?status.code(),
+                    %status,
+                    "destination rejected the migration before readiness; returning the \
+                     status synchronously so the agent can retry when appropriate"
+                );
+                // The agent never saw this migration id; do not leave a
+                // phantom task behind for status queries.
+                self.migration_tasks.remove(&migration_id);
+                return Err(status);
+            }
+            Ok(Err(_)) => {
+                tracing::error!(
+                    migration_id = %migration_id,
+                    volume_id = %req.volume_id,
+                    "migration task ended before reporting the destination handshake result"
+                );
+                self.migration_tasks.remove(&migration_id);
+                return Err(Status::internal(
+                    "migration task ended before reporting the destination handshake result",
+                ));
+            }
+            Err(_) => {
+                // Bounded wait elapsed. The destination may still be
+                // creating a large receiving volume or the path may be
+                // slow. Preserve the prior semantics: report the migration
+                // as started and let the background task finish. A later
+                // admission failure then surfaces only as a failed task,
+                // not as a synchronous retryable status.
+                tracing::warn!(
+                    migration_id = %migration_id,
+                    volume_id = %req.volume_id,
+                    timeout_secs = self.trigger_handshake_timeout.as_secs_f64(),
+                    "destination handshake did not complete within the trigger bound; \
+                     returning success and leaving the migration in the background"
+                );
+            }
+        }
 
         Ok(Response::new(proto::TriggerDiskMigrationResponse {
             result: Some(Self::ok_result()),

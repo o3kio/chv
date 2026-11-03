@@ -29,6 +29,12 @@ message InitMigration {
   uint32 block_size = 3;
   string format = 4;           // "raw" or "qcow2"
   string checksum_type = 5;    // "crc32"
+  // Control-plane-issued, short-lived migration authorization (issue #663).
+  // HMAC-signed claims binding source node, destination node, volume_id,
+  // size_bytes, issue time, expiry, and a single-use nonce. The receiver
+  // verifies this BEFORE create_receiving_volume; an empty/malformed/
+  // expired/wrong-volume/size/destination/replayed token is rejected.
+  string authorization = 6;
 }
 
 message MigrationReady {

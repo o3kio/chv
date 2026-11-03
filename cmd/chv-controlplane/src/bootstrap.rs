@@ -818,6 +818,37 @@ pub async fn build_service(
         config.agent_socket_pattern.clone(),
     );
 
+    // Dedicated migration-signing secret (issue #663). Deliberately a
+    // separate key from jwt_secret: rotating user auth must not invalidate
+    // in-flight migration authorizations, and a leak of one domain must not
+    // compromise the other. Missing secret is allowed at startup so a
+    // deployment that never migrates still boots; a migration dispatch then
+    // fails closed before contacting the agent.
+    let migration_signing_secret = chv_config::resolve_migration_signing_secret(
+        config.migration.signing_secret.as_deref(),
+        config.migration.signing_secret_file.as_deref(),
+        "CHV_MIGRATION_SIGNING_SECRET",
+    )
+    .map_err(|e| {
+        ControlPlaneServiceError::InvalidArgument(format!(
+            "invalid migration signing-secret configuration: {e}"
+        ))
+    })?;
+    if migration_signing_secret.is_some() {
+        tracing::info!("migration authorization minting enabled (dedicated signing secret loaded)");
+    } else if config.migration.allow_insecure_unauthenticated {
+        tracing::warn!(
+            "SECURITY: migration.allow_insecure_unauthenticated = true — disk migrations will \
+             be dispatched without control-plane authorizations. Development-only; never run \
+             this in production"
+        );
+    } else {
+        tracing::warn!(
+            "no migration signing secret configured: disk migration dispatch will fail closed \
+             until [migration].signing_secret_file (or CHV_MIGRATION_SIGNING_SECRET) is set"
+        );
+    }
+
     let orchestrator = Orchestrator::new(
         pool.clone(),
         operation_repo.clone(),
@@ -827,7 +858,12 @@ pub async fn build_service(
         node_client_pool.clone(),
         convergence_metrics,
     )
-    .with_overlay_manager(overlay_manager);
+    .with_overlay_manager(overlay_manager)
+    .with_migration_authorization(
+        migration_signing_secret,
+        std::time::Duration::from_secs(config.migration.token_ttl_seconds),
+        config.migration.allow_insecure_unauthenticated,
+    );
     let orchestrator_handle = tokio::spawn(orchestrator.run(shutdown_rx.clone()));
 
     let backup_staging_dir = config.runtime_dir.join("backups");

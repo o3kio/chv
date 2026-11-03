@@ -1,4 +1,4 @@
-use chv_config::load_stord_config;
+use chv_config::{load_stord_config, resolve_migration_signing_secret, StordMigrationConfig};
 use chv_observability::init_logger;
 use chv_observability::metrics_server::{
     resolve_metrics_bind, start_metrics_server, DaemonMetricsInfo,
@@ -6,6 +6,7 @@ use chv_observability::metrics_server::{
 use chv_stord_backends::{
     CephRbdBackend, IscsiBackend, LVMBackend, LocalFileBackend, StorageBackend,
 };
+use chv_stord_core::migration::auth::{MigrationLimits, MigrationReceiverAuthorization};
 use chv_stord_core::migration::tls_config::{
     ensure_migration_half_configured, load_migration_server_tls, load_migration_tls,
 };
@@ -170,6 +171,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "storage migration receiver mTLS material validated (listener binds in server startup)"
         );
     }
+    let migration_authorization =
+        load_migration_authorization(&config.migration, migration_server_tls.is_some())?;
+    let migration_limits = load_migration_limits(&config.migration)?;
+    if matches!(
+        migration_authorization,
+        MigrationReceiverAuthorization::Required { .. }
+    ) {
+        info!(
+            "storage migration authorizations enabled (control-plane HMAC tokens required before \
+             receiving-volume creation)"
+        );
+    }
 
     let server = StorageServer::new(
         backend,
@@ -181,6 +194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.migration_dest_allowlist,
         migration_tls,
         migration_server_tls,
+        migration_authorization,
+        migration_limits,
         Some(store),
     );
 
@@ -333,7 +348,12 @@ fn load_migration_materials(
     )?;
     ensure_migration_half_configured(migration.enabled, client_tls.as_ref(), server_tls.as_ref())?;
     // Only reachable for a *clean* disabled section: `enabled = false`
-    // with any field set anywhere in the section already failed above.
+    // with any client/receiver *TLS* field set already failed above.
+    // Authorization/admission keys are not listener fields: they are inert
+    // for this TLS-material loader, but `load_migration_authorization` /
+    // `load_migration_limits` below still load and enforce them on the UDS
+    // migration service (the local socket serves `StreamBlocks` regardless
+    // of `enabled`).
     if !migration.enabled {
         info!(
             "storage migration is disabled (migration.enabled = false): migration actions will be unavailable"
@@ -342,13 +362,89 @@ fn load_migration_materials(
     Ok((client_tls, server_tls))
 }
 
+/// Build the receiver authorization policy (issue #663).
+///
+/// Fail-closed rules:
+/// * A receiver half with no signing secret, or no `node_id` to compare the
+///   token's destination claim against, aborts startup. An operator who
+///   exposed an inbound listener must not silently get an unauthenticated
+///   receiver.
+/// * `allow_insecure_unauthenticated = true` is the only bypass and logs a
+///   loud warning. It is never the default.
+/// * Without a receiver half the service still exists on the local Unix
+///   socket; absent auth material it uses `DenyAll` rather than accepting
+///   local streams without a token.
+fn load_migration_authorization(
+    migration: &StordMigrationConfig,
+    receiver_enabled: bool,
+) -> Result<MigrationReceiverAuthorization, String> {
+    if migration.allow_insecure_unauthenticated {
+        tracing::warn!(
+            "SECURITY: migration.allow_insecure_unauthenticated = true — inbound disk \
+             migrations are NOT authorized by the control plane. This is a development-only \
+             mode; never run it in production"
+        );
+        return Ok(MigrationReceiverAuthorization::DisabledInsecure);
+    }
+
+    let secret = resolve_migration_signing_secret(
+        migration.signing_secret.as_deref(),
+        migration.signing_secret_file.as_deref(),
+        "CHV_MIGRATION_SIGNING_SECRET",
+    )
+    .map_err(|e| e.to_string())?;
+
+    match secret {
+        Some(secret) => {
+            let node_id = migration
+                .node_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    "migration.signing_secret is configured but migration.node_id is missing; \
+                     stord needs its own node id to reject tokens minted for another destination"
+                        .to_string()
+                })?;
+            MigrationReceiverAuthorization::required(&secret, node_id)
+                .map_err(|e| format!("invalid migration authorization configuration: {e}"))
+        }
+        None if receiver_enabled => Err(
+            "migration receiver is enabled but no migration signing secret is configured; \
+             set migration.signing_secret_file (preferred) or CHV_MIGRATION_SIGNING_SECRET, \
+             or explicitly set migration.allow_insecure_unauthenticated = true for a \
+             development-only deployment"
+                .to_string(),
+        ),
+        None => Ok(MigrationReceiverAuthorization::DenyAll),
+    }
+}
+
+/// Per-node receiving-migration admission limits (issue #663). Zero is a
+/// startup error, not "unlimited": an accidental zero must never turn into
+/// an unbounded receiver.
+fn load_migration_limits(migration: &StordMigrationConfig) -> Result<MigrationLimits, String> {
+    let limits = MigrationLimits {
+        max_inflight: migration.max_inflight_receiving,
+        max_inflight_bytes: migration.max_inflight_receiving_bytes,
+    };
+    if limits.max_inflight == 0 || limits.max_inflight_bytes == 0 {
+        return Err(
+            "migration.max_inflight_receiving and migration.max_inflight_receiving_bytes \
+             must both be greater than zero"
+                .to_string(),
+        );
+    }
+    Ok(limits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        load_migration_materials, start_metrics_endpoint, validate_backend_type,
-        verify_volume_group, DEFAULT_METRICS_BIND,
+        load_migration_authorization, load_migration_limits, load_migration_materials,
+        start_metrics_endpoint, validate_backend_type, verify_volume_group, DEFAULT_METRICS_BIND,
     };
     use chv_config::StordMigrationConfig;
+    use chv_stord_core::migration::auth::MigrationReceiverAuthorization;
 
     /// Minimal `tracing` subscriber that records the message text of
     /// INFO- and WARN-level events, so tests can assert which startup log
@@ -604,6 +700,7 @@ mod tests {
             server_cert_path: Some(s_cert),
             server_key_path: Some(s_key),
             client_ca_path: Some(s_ca),
+            ..StordMigrationConfig::default()
         };
         let (client, server) =
             load_migration_materials(&config).expect("both-halves config must load");
@@ -701,5 +798,121 @@ mod tests {
             ),
             Ok(()) => panic!("a missing VG must fail the startup guard"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #663: migration authorization / admission startup wiring.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn migration_limits_reject_zero_and_accept_configured_values() {
+        let mut migration = StordMigrationConfig::default();
+        let defaults = load_migration_limits(&migration).expect("defaults must be valid");
+        assert_eq!(defaults.max_inflight, 16);
+        assert_eq!(defaults.max_inflight_bytes, 64 * 1024 * 1024 * 1024 * 1024);
+
+        migration.max_inflight_receiving = 0;
+        assert!(load_migration_limits(&migration)
+            .expect_err("zero concurrency must abort startup")
+            .contains("max_inflight_receiving"));
+
+        migration.max_inflight_receiving = 4;
+        migration.max_inflight_receiving_bytes = 0;
+        assert!(load_migration_limits(&migration)
+            .expect_err("zero bytes must abort startup")
+            .contains("max_inflight_receiving_bytes"));
+
+        migration.max_inflight_receiving_bytes = 8 * 1024 * 1024 * 1024;
+        let configured = load_migration_limits(&migration).unwrap();
+        assert_eq!(configured.max_inflight, 4);
+        assert_eq!(configured.max_inflight_bytes, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn migration_authorization_insecure_bypass_is_explicit_and_logged() {
+        let logs = log_capture::LogCollector::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let migration = StordMigrationConfig {
+            allow_insecure_unauthenticated: true,
+            ..StordMigrationConfig::default()
+        };
+        let authorization =
+            load_migration_authorization(&migration, true).expect("explicit bypass must construct");
+        assert!(matches!(
+            authorization,
+            MigrationReceiverAuthorization::DisabledInsecure
+        ));
+        assert!(
+            logs.messages_at(tracing::Level::WARN)
+                .iter()
+                .any(|m| m.contains("allow_insecure_unauthenticated")),
+            "the insecure bypass must be loudly logged"
+        );
+    }
+
+    #[test]
+    fn migration_authorization_receiver_without_secret_fails_closed() {
+        // Isolate the env fallback so a developer shell cannot change the
+        // outcome of this fail-closed assertion.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CHV_MIGRATION_SIGNING_SECRET");
+
+        let migration = StordMigrationConfig::default();
+        let error = load_migration_authorization(&migration, true)
+            .expect_err("an exposed receiver without a signing secret must abort startup");
+        assert!(
+            error.contains("no migration signing secret"),
+            "got: {error}"
+        );
+
+        // Without an exposed TCP receiver the service stays fail-closed
+        // instead of aborting the whole daemon.
+        assert!(matches!(
+            load_migration_authorization(&migration, false).unwrap(),
+            MigrationReceiverAuthorization::DenyAll
+        ));
+    }
+
+    #[test]
+    fn migration_authorization_requires_node_id_with_a_secret() {
+        let mut migration = StordMigrationConfig {
+            signing_secret: Some("dedicated-migration-signing-secret-0123456789abcdef".to_string()),
+            ..StordMigrationConfig::default()
+        };
+        let error = load_migration_authorization(&migration, true)
+            .expect_err("a secret without node_id must abort startup");
+        assert!(error.contains("node_id is missing"), "got: {error}");
+
+        migration.node_id = Some("node-a".to_string());
+        assert!(matches!(
+            load_migration_authorization(&migration, true).unwrap(),
+            MigrationReceiverAuthorization::Required { .. }
+        ));
+    }
+
+    #[test]
+    fn migration_authorization_rejects_short_or_ambiguous_secrets() {
+        let short = StordMigrationConfig {
+            node_id: Some("node-a".to_string()),
+            signing_secret: Some("too-short".to_string()),
+            ..StordMigrationConfig::default()
+        };
+        assert!(load_migration_authorization(&short, true)
+            .expect_err("short secret must abort")
+            .contains("shorter than 32 bytes"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("migration-secret");
+        std::fs::write(&file, b"file-migration-signing-secret-0123456789").unwrap();
+        let ambiguous = StordMigrationConfig {
+            node_id: Some("node-a".to_string()),
+            signing_secret: Some("inline-migration-signing-secret-0123456789".to_string()),
+            signing_secret_file: Some(file),
+            ..StordMigrationConfig::default()
+        };
+        assert!(load_migration_authorization(&ambiguous, true)
+            .expect_err("inline+file must abort")
+            .contains("mutually exclusive"));
     }
 }

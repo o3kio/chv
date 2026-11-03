@@ -26,10 +26,16 @@
 //!   client field set, all four identity inputs are required, files must be
 //!   readable, the certificate/key pair must match, and the CA bundle must
 //!   parse. Any problem is a **startup error** (fail-closed).
-//! - Receiver (server) fields are all-or-nothing: none set → `Ok(None)`
+//! - Receiver (server) TLS fields are all-or-nothing: none set → `Ok(None)`
 //!   (source-only stord, a legitimate deployment); *partially* set, an
 //!   unreadable file, a mismatched keypair, an invalid/empty client CA
-//!   bundle, or an unparseable `listen_addr` → **startup error**.
+//!   bundle, or an unparseable `listen_addr` → **startup error**. With
+//!   `enabled = false`, any receiver TLS field set is a startup error;
+//!   authorization/admission keys (`node_id`, `signing_secret*`,
+//!   `max_inflight_*`, `allow_insecure_unauthenticated`) are not listener
+//!   fields: they never configure the listener and stay inert for it in that
+//!   case. They are still loaded and enforced by the always-present UDS
+//!   migration service.
 //! - `enabled = true` with **neither** half configured → startup **error**
 //!   (see [`ensure_migration_half_configured`], issue #401): an enabled
 //!   migration section that configures nothing is a misconfiguration — the

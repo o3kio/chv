@@ -58,8 +58,14 @@
 //! a real, parseable checksum; the corruption test pins the other
 //! direction (garbage in the destination ⇒ Failed, never Completed).
 
+use chv_common::migration_auth::MigrationTokenCodec;
 use chv_common::types::{BackendLocator, DevicePolicy};
+use chv_stord_api::chv_stord_api::{
+    migration_message, storage_migration_service_client::StorageMigrationServiceClient,
+    InitMigration, MigrationMessage,
+};
 use chv_stord_backends::{LocalFileBackend, StorageBackend};
+use chv_stord_core::migration::auth::{MigrationLimits, MigrationReceiverAuthorization};
 use chv_stord_core::migration::sender::{MigrationSender, MigrationTlsConfig};
 use chv_stord_core::migration::service::StorageMigrationServiceImpl;
 use chv_stord_core::migration::task::{MigrationPhase, MigrationTask, MigrationTaskTable};
@@ -70,6 +76,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::Request;
 
 /// Install the rustls ring crypto provider (same as `cmd/chv-stord`
@@ -81,6 +90,28 @@ fn install_crypto_provider() {
 /// Migration block size (must match the backends' dirty-tracking block size
 /// so bitmap bits map 1:1 to migration chunks).
 const BLOCK: u64 = 4 * 1024 * 1024;
+
+/// Dedicated migration-signing secret shared by the in-test control-plane
+/// minter and the receiver (issue #663). Never reused for anything else.
+const MIGRATION_SIGNING_SECRET: &[u8] = b"e2e-migration-signing-secret-0123456789abcdef";
+
+/// Node id the receiver expects in the token's destination claim.
+const DESTINATION_NODE_ID: &str = "stord-receiver";
+
+/// Mint the control-plane authorization a real `MigrateVm` dispatch would
+/// attach to `InitMigration`.
+fn migration_token(volume_id: &str, size_bytes: u64) -> String {
+    MigrationTokenCodec::new(MIGRATION_SIGNING_SECRET)
+        .expect("test signing secret is long enough")
+        .mint(
+            "stord-sender",
+            DESTINATION_NODE_ID,
+            volume_id,
+            size_bytes,
+            Duration::from_secs(300),
+        )
+        .expect("token mint must succeed")
+}
 
 /// Overall guard so a protocol regression fails fast instead of hanging.
 const MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -157,6 +188,15 @@ fn issue_leaf(ca: &TestCa, cn: &str, server: bool) -> (Vec<u8>, Vec<u8>) {
 /// test CA (which also issued the receiver's server leaf, so the same CA
 /// can issue the sender's client identity).
 async fn spawn_receiver(dest_dir: &Path) -> (SocketAddr, TestCa) {
+    spawn_receiver_with_limits(dest_dir, MigrationLimits::default()).await
+}
+
+/// Same as [`spawn_receiver`] but with explicit per-node admission limits,
+/// so a test can drive the destination to capacity.
+async fn spawn_receiver_with_limits(
+    dest_dir: &Path,
+    limits: MigrationLimits,
+) -> (SocketAddr, TestCa) {
     let ca = test_ca("chv-migration-e2e-ca");
     let (server_cert, server_key) = issue_leaf(&ca, "stord-receiver", true);
 
@@ -170,7 +210,13 @@ async fn spawn_receiver(dest_dir: &Path) -> (SocketAddr, TestCa) {
         client_ca_pem: ca.cert_pem.clone(),
     };
     let backend = Arc::new(LocalFileBackend::new(dest_dir.to_path_buf()));
-    let service = StorageMigrationServiceImpl::new(backend, dest_dir.to_path_buf());
+    let service = StorageMigrationServiceImpl::new(
+        backend,
+        dest_dir.to_path_buf(),
+        MigrationReceiverAuthorization::required(MIGRATION_SIGNING_SECRET, DESTINATION_NODE_ID)
+            .expect("test authorization must construct"),
+        limits,
+    );
     tokio::spawn(async move {
         if let Err(e) = serve_migration_tls(listener, tls, service).await {
             panic!("migration TLS listener failed: {e:?}");
@@ -189,6 +235,65 @@ fn sender_tls(ca: &TestCa) -> MigrationTlsConfig {
         ca_pem: ca.cert_pem.clone(),
         dest_domain: "localhost".to_string(),
     }
+}
+
+/// Build a raw mTLS `StreamBlocks` client — used by the capacity test to
+/// occupy a destination admission slot without running a second sender.
+async fn tls_migration_client(
+    addr: SocketAddr,
+    ca: &TestCa,
+) -> StorageMigrationServiceClient<Channel> {
+    let (client_cert, client_key) = issue_leaf(ca, "stord-holder", false);
+    let tls = ClientTlsConfig::new()
+        .domain_name("localhost")
+        .identity(Identity::from_pem(client_cert, client_key))
+        .ca_certificate(Certificate::from_pem(&ca.cert_pem));
+    let channel = Channel::from_shared(format!("https://{addr}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap()
+        .connect()
+        .await
+        .expect("mTLS migration client must connect");
+    StorageMigrationServiceClient::new(channel)
+}
+
+fn init_message(volume_id: &str, size_bytes: u64, authorization: String) -> MigrationMessage {
+    MigrationMessage {
+        payload: Some(migration_message::Payload::Init(InitMigration {
+            volume_id: volume_id.to_string(),
+            size_bytes,
+            block_size: BLOCK as u32,
+            format: "raw".to_string(),
+            checksum_type: "crc32".to_string(),
+            authorization,
+        })),
+    }
+}
+
+/// Drive one `TriggerDiskMigration` through the production handler for the
+/// capacity test (a free function avoids a borrowing async closure).
+async fn trigger_capacity_migration(
+    svc: &chv_stord_core::handlers::StorageServiceImpl<LocalFileBackend>,
+    addr: SocketAddr,
+    handle: String,
+    token: String,
+) -> Result<
+    tonic::Response<chv_stord_api::chv_stord_api::TriggerDiskMigrationResponse>,
+    tonic::Status,
+> {
+    chv_stord_api::chv_stord_api::storage_service_server::StorageService::trigger_disk_migration(
+        svc,
+        Request::new(chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest {
+            meta: None,
+            volume_id: "vol-cap".to_string(),
+            attachment_handle: handle,
+            dest_endpoint: format!("https://{addr}"),
+            pause_first: false,
+            migration_authorization: token,
+        }),
+    )
+    .await
 }
 
 /// A non-zero fill byte that varies per 4 MiB block, so bulk-copy
@@ -309,6 +414,7 @@ async fn small_volume_completes_and_matches() {
     spawn_auto_pause(task.clone());
 
     let sender = MigrationSender::new(src_backend, "vol-e2e-small".to_string(), handle)
+        .with_migration_authorization(migration_token("vol-e2e-small", 2 * BLOCK))
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
 
@@ -386,7 +492,9 @@ async fn dirty_rounds_converge_preseeded_writes() {
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
     spawn_auto_pause(task.clone());
 
+    let authorization = migration_token(&volume_id, blocks * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -490,7 +598,9 @@ async fn concurrent_source_write_fails_fast() {
         }
     });
 
+    let authorization = migration_token(&volume_id, blocks * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -562,7 +672,9 @@ async fn source_write_during_pause_window_fails_at_finalize_digest() {
     let (task, mut pause_rx) =
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
 
+    let authorization = migration_token(&volume_id, 2 * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -676,7 +788,9 @@ async fn pause_handshake_releases_final_sync() {
     table.insert("mig-e2e-pause".to_string(), task.clone());
     let task = table.get("mig-e2e-pause").unwrap();
 
+    let authorization = migration_token(&volume_id, 2 * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");
@@ -785,7 +899,9 @@ async fn pause_first_pauses_before_bulk_copy() {
     table.insert("mig-e2e-pause-first".to_string(), task.clone());
     let task = table.get("mig-e2e-pause-first").unwrap();
 
+    let authorization = migration_token(&volume_id, 2 * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone())
         .with_pause_first();
@@ -897,6 +1013,185 @@ async fn pause_first_pauses_before_bulk_copy() {
     );
 }
 
+/// **Destination capacity rejection surfaces synchronously, then the same
+/// token succeeds after a slot frees.**
+///
+/// The source `TriggerDiskMigration` handler awaits the destination's
+/// initial handshake, so a `RESOURCE_EXHAUSTED` admission rejection is
+/// returned as the trigger status (not hidden in a background task). That
+/// is what lets the source agent's bounded retry act on transient
+/// capacity; rejection happens before nonce consumption, so the retry
+/// reuses the same authorization token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destination_capacity_rejection_is_synchronous_and_same_token_retry_succeeds() {
+    install_crypto_provider();
+
+    let src_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let expected = write_source_image(src_dir.path(), "vol-cap.img", 1);
+
+    // One admission slot, enough bytes for two volumes.
+    let (addr, ca) = spawn_receiver_with_limits(
+        dest_dir.path(),
+        MigrationLimits {
+            max_inflight: 1,
+            max_inflight_bytes: 8 * BLOCK,
+        },
+    )
+    .await;
+
+    // Occupy the only slot with a held, admitted receiving stream.
+    let mut holder = tls_migration_client(addr, &ca).await;
+    let (holder_tx, holder_rx) = mpsc::channel(8);
+    holder_tx
+        .send(init_message(
+            "vol-holder",
+            BLOCK,
+            migration_token("vol-holder", BLOCK),
+        ))
+        .await
+        .unwrap();
+    let mut holder_inbound = holder
+        .stream_blocks(ReceiverStream::new(holder_rx))
+        .await
+        .expect("holder stream must be admitted")
+        .into_inner();
+    match holder_inbound
+        .message()
+        .await
+        .expect("holder stream must stay healthy")
+        .expect("holder stream must send MigrationReady")
+        .payload
+    {
+        Some(migration_message::Payload::Ready(_)) => {}
+        other => panic!("expected MigrationReady for the holder, got {other:?}"),
+    }
+
+    let backend = Arc::new(LocalFileBackend::new(src_dir.path().to_path_buf()));
+    let svc = chv_stord_core::handlers::StorageServiceImpl::new(
+        backend.clone(),
+        Arc::new(chv_stord_core::session::SessionTable::new()),
+        Arc::new(chv_observability::Metrics::new()),
+        src_dir.path().to_path_buf(),
+        vec!["local".to_string()],
+        vec![],
+        vec![],
+        vec![], // migration_dest_allowlist: empty = allow all
+        Some(sender_tls(&ca)),
+    );
+
+    let handle = open_source_volume(&backend, "vol-cap", "vol-cap.img", BLOCK).await;
+    svc.sessions().upsert(chv_stord_core::session::Session {
+        volume_id: "vol-cap".to_string(),
+        vm_id: None,
+        attachment_handle: handle.clone(),
+        export_kind: "raw".to_string(),
+        export_path: src_dir
+            .path()
+            .join("vol-cap.img")
+            .to_string_lossy()
+            .to_string(),
+        runtime_status: "open".to_string(),
+    });
+
+    let token = migration_token("vol-cap", BLOCK);
+
+    let err = trigger_capacity_migration(&svc, addr, handle.clone(), token.clone())
+        .await
+        .expect_err("a destination at capacity must reject the trigger synchronously");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "the destination admission status must reach the trigger unchanged: {err}"
+    );
+
+    // Free the slot. The receiver releases its RAII reservation when the
+    // held stream ends; retry the same token until the destination admits
+    // it (the agent's bounded loop does the same after its backoff).
+    drop(holder_tx);
+    drop(holder_inbound);
+    drop(holder);
+
+    let deadline = tokio::time::Instant::now() + MIGRATION_TIMEOUT;
+    let resp = loop {
+        match trigger_capacity_migration(&svc, addr, handle.clone(), token.clone()).await {
+            Ok(resp) => break resp.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::ResourceExhausted
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(status) => panic!("retry after freeing capacity must succeed: {status}"),
+        }
+    };
+    assert_eq!(
+        resp.result.as_ref().map(|r| r.status.as_str()),
+        Some("OK"),
+        "the same-token retry must start the migration"
+    );
+    let migration_id = resp.migration_id;
+
+    // Drive the admitted migration to completion through the real handler.
+    let mut resumed = false;
+    let deadline = tokio::time::Instant::now() + MIGRATION_TIMEOUT;
+    loop {
+        let status = chv_stord_api::chv_stord_api::storage_service_server::StorageService::get_disk_migration_status(
+            &svc,
+            Request::new(chv_stord_api::chv_stord_api::GetDiskMigrationStatusRequest {
+                migration_id: migration_id.clone(),
+            }),
+        )
+        .await
+        .expect("status must be served")
+        .into_inner();
+        // Default (non-pause-first) mode pauses at final sync; release it
+        // exactly as the agent would.
+        if status.needs_vm_pause && !resumed {
+            let resume = chv_stord_api::chv_stord_api::storage_service_server::StorageService::resume_disk_migration(
+                &svc,
+                Request::new(chv_stord_api::chv_stord_api::ResumeDiskMigrationRequest {
+                    migration_id: migration_id.clone(),
+                    vm_paused: true,
+                }),
+            )
+            .await
+            .expect("resume must be served")
+            .into_inner();
+            assert_eq!(
+                resume.result.expect("resume result present").status,
+                "OK",
+                "the final-sync resume must be accepted"
+            );
+            resumed = true;
+        }
+        if status.phase
+            == chv_stord_api::chv_stord_api::get_disk_migration_status_response::Phase::Completed
+                as i32
+        {
+            break;
+        }
+        assert_ne!(
+            status.phase,
+            chv_stord_api::chv_stord_api::get_disk_migration_status_response::Phase::Failed as i32,
+            "migration failed: {}",
+            status.error_message
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "migration never completed (stuck at phase {})",
+            status.phase
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        std::fs::read(dest_dir.path().join("vol-cap.img")).unwrap(),
+        expected,
+        "the retried migration must transfer the source bytes exactly"
+    );
+}
+
 /// **Pause-signal latching for staggered senders** (issue #394 Option C
 /// review finding): the agent pauses and resumes ALL of a VM's volumes
 /// when the FIRST one requests the pause — a sibling whose sender has
@@ -952,7 +1247,10 @@ async fn pause_signal_latches_for_senders_not_yet_at_their_gate() {
         // The TLS identity is required by the sender but never validated
         // against the silent peer (the handshake never completes).
         Some(sender_tls(&test_ca("silent-dest"))),
-    );
+    )
+    // The silent destination never completes the handshake; do not make
+    // this test wait out the production 10 s trigger bound.
+    .with_trigger_handshake_timeout(Duration::from_millis(200));
 
     let handle = open_source_volume(&backend, "vol-latch", "vol-latch.img", 2 * BLOCK).await;
     svc.sessions().upsert(chv_stord_core::session::Session {
@@ -977,6 +1275,7 @@ async fn pause_signal_latches_for_senders_not_yet_at_their_gate() {
             attachment_handle: handle,
             dest_endpoint: format!("https://{silent_addr}"),
             pause_first: true,
+            migration_authorization: migration_token("vol-latch", 2 * BLOCK),
         }),
     )
     .await
@@ -1105,6 +1404,7 @@ async fn resume_after_completion_is_a_benign_noop() {
             attachment_handle: handle,
             dest_endpoint: format!("https://{addr}"),
             pause_first: true,
+            migration_authorization: migration_token("vol-resume", 2 * BLOCK),
         }),
     )
     .await
@@ -1242,7 +1542,9 @@ async fn corrupted_destination_fails_at_finalize() {
     let (task, _pause_rx) =
         MigrationTask::new(volume_id.clone(), handle.clone(), format!("https://{addr}"));
 
+    let authorization = migration_token(&volume_id, blocks * BLOCK);
     let sender = MigrationSender::new(src_backend, volume_id, handle)
+        .with_migration_authorization(authorization)
         .with_tls(sender_tls(&ca))
         .with_task(task.clone());
     let endpoint = format!("https://{addr}");

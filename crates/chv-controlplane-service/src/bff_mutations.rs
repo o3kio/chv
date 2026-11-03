@@ -263,6 +263,10 @@ impl MutationService for ControlPlaneMutationService {
                     block_size_bytes: 0,
                     total_timeout_seconds: 0,
                     pause_first,
+                    // Minted later by the orchestrator, immediately before
+                    // dispatching to the source agent (issue #663).
+                    volume_authorizations: Vec::new(),
+                    allow_insecure_unauthenticated: false,
                 }),
             })
             .await;

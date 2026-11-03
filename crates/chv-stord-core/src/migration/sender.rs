@@ -106,6 +106,56 @@ pub struct MigrationSender<B: StorageBackend> {
     /// Without it a destination that accepts the stream but never answers
     /// finalization leaves the sender (and the VM) paused forever.
     finalize_ack_timeout: Duration,
+    /// Control-plane-issued authorization for this migration (issue #663).
+    /// Forwarded verbatim in `InitMigration`; the destination verifies it
+    /// before creating the receiving volume. Empty means the destination
+    /// will reject the stream (unless it is explicitly in insecure mode).
+    migration_authorization: String,
+    /// Optional one-shot notifier resolved when the destination's *initial*
+    /// handshake finishes. `Ok(())` means `MigrationReady` arrived (the
+    /// destination authorized the token, reserved admission, and created
+    /// the receiving volume); `Err(status)` carries the destination's
+    /// rejection (including `RESOURCE_EXHAUSTED`). The source stord trigger
+    /// handler awaits this so admission errors reach the agent
+    /// synchronously and its bounded retry can act.
+    handshake_tx: Option<tokio::sync::oneshot::Sender<Result<(), tonic::Status>>>,
+}
+
+/// Fires the source-side handshake notifier exactly once.
+///
+/// `success()` after `MigrationReady`; `fail()` with the real transport or
+/// destination status on any earlier error. On drop without either (for
+/// example a `?` return on a path that did not explicitly notify), a
+/// generic error is sent so the trigger handler never has to wait for the
+/// full bounded timeout.
+struct HandshakeNotifier(Option<tokio::sync::oneshot::Sender<Result<(), tonic::Status>>>);
+
+impl HandshakeNotifier {
+    fn new(tx: Option<tokio::sync::oneshot::Sender<Result<(), tonic::Status>>>) -> Self {
+        Self(tx)
+    }
+
+    fn success(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+
+    fn fail(&mut self, status: &tonic::Status) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Err(status.clone()));
+        }
+    }
+}
+
+impl Drop for HandshakeNotifier {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Err(tonic::Status::internal(
+                "migration task ended before the destination handshake completed",
+            )));
+        }
+    }
 }
 
 impl<B: StorageBackend> MigrationSender<B> {
@@ -123,7 +173,31 @@ impl<B: StorageBackend> MigrationSender<B> {
             canary_baseline: None,
             pause_first: false,
             finalize_ack_timeout: DEFAULT_FINALIZE_ACK_TIMEOUT,
+            migration_authorization: String::new(),
+            handshake_tx: None,
         }
+    }
+
+    /// Attach the control-plane-issued migration authorization forwarded in
+    /// `InitMigration` (issue #663).
+    pub fn with_migration_authorization(mut self, authorization: String) -> Self {
+        self.migration_authorization = authorization;
+        self
+    }
+
+    /// Attach a one-shot notifier for the destination's initial handshake.
+    ///
+    /// The notifier resolves exactly once: `Ok(())` after `MigrationReady`
+    /// (the destination admitted the stream and created the receiving
+    /// volume), or `Err(status)` with the destination's rejection. The
+    /// source stord trigger handler awaits it to surface admission errors
+    /// such as `RESOURCE_EXHAUSTED` synchronously.
+    pub fn with_handshake_notifier(
+        mut self,
+        tx: tokio::sync::oneshot::Sender<Result<(), tonic::Status>>,
+    ) -> Self {
+        self.handshake_tx = Some(tx);
+        self
     }
 
     /// Attach a shared migration task for progress reporting and pause coordination.
@@ -176,6 +250,20 @@ impl<B: StorageBackend> MigrationSender<B> {
     /// This opens a bidirectional stream, sends InitMigration, waits for
     /// MigrationReady, then performs bulk copy followed by dirty sync rounds.
     pub async fn start_migration(mut self, endpoint: String) -> Result<(), tonic::Status> {
+        let mut handshake = HandshakeNotifier::new(self.handshake_tx.take());
+        let result = self.start_migration_inner(endpoint, &mut handshake).await;
+        match &result {
+            Ok(()) => handshake.success(),
+            Err(status) => handshake.fail(status),
+        }
+        result
+    }
+
+    async fn start_migration_inner(
+        &mut self,
+        endpoint: String,
+        handshake: &mut HandshakeNotifier,
+    ) -> Result<(), tonic::Status> {
         // Pause-first fail-closed check (issue #394, Option C): the mode
         // requires the task's pause coordination channel. Without a task
         // it cannot be honored — fail BEFORE connecting rather than
@@ -287,6 +375,7 @@ impl<B: StorageBackend> MigrationSender<B> {
                 block_size: self.block_size as u32,
                 format: "raw".to_string(),
                 checksum_type: "crc32".to_string(),
+                authorization: self.migration_authorization.clone(),
             })),
         };
         tx.send(init_msg)
@@ -329,6 +418,12 @@ impl<B: StorageBackend> MigrationSender<B> {
                 ));
             }
         }
+
+        // The destination has authorized the token, reserved admission, and
+        // created the receiving volume. Release the source stord trigger
+        // handler now: anything from here on is post-admission progress, and
+        // its failure is reported asynchronously through the migration task.
+        handshake.success();
 
         // Pause-first gate (issue #394, Option C): the opt-in
         // stop-the-world mode. The VM is paused BEFORE any source byte
@@ -1124,10 +1219,16 @@ pub async fn start_migration_to_peer<B: StorageBackend>(
     backend: Arc<B>,
     tls_config: Option<MigrationTlsConfig>,
     task: Option<Arc<MigrationTask>>,
+    migration_authorization: String,
     pause_first: bool,
+    handshake_tx: Option<tokio::sync::oneshot::Sender<Result<(), tonic::Status>>>,
     finalize_ack_timeout: Option<Duration>,
 ) -> Result<(), tonic::Status> {
-    let mut sender = MigrationSender::new(backend, volume_id, handle);
+    let mut sender = MigrationSender::new(backend, volume_id, handle)
+        .with_migration_authorization(migration_authorization);
+    if let Some(tx) = handshake_tx {
+        sender = sender.with_handshake_notifier(tx);
+    }
     if let Some(tls) = tls_config {
         sender = sender.with_tls(tls);
     }

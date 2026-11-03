@@ -8,6 +8,7 @@
 
 use crate::daemon_clients::StordClient;
 use crate::vm_runtime::VmRuntime;
+use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
 use std::net::TcpListener;
 use std::path::Path;
@@ -19,6 +20,16 @@ use tracing::{error, info, warn};
 /// Port range for migration receiver sockets.
 const MIGRATION_PORT_RANGE_START: u16 = 49152;
 const MIGRATION_PORT_RANGE_END: u16 = 49200;
+
+/// Bounded retry for the destination's transient admission rejection
+/// (`RESOURCE_EXHAUSTED`). The authorization token is deliberately NOT
+/// consumed by a rejected admission, so retrying the same trigger is safe.
+/// Four attempts with 250 ms/500 ms/1 s backoff ride out a short burst of
+/// competing migrations without hiding a genuinely full destination.
+const TRIGGER_ADMISSION_RETRY_ATTEMPTS: u32 = 4;
+const TRIGGER_ADMISSION_RETRY_BASE_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const TRIGGER_ADMISSION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The role this agent plays in a migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +161,19 @@ pub struct DiskPrecopyConfig {
     pub dest_stord_endpoint: String,
     /// Volumes to migrate.
     pub volumes: Vec<MigrationVolume>,
+    /// Control-plane-issued migration authorizations keyed by volume id
+    /// (issue #663). The agent forwards each token to stord's
+    /// TriggerDiskMigration; the destination verifies it before creating
+    /// the receiving volume. A volume with no matching token fails before
+    /// the trigger rather than attempting an unauthorized migration.
+    pub volume_authorizations: std::collections::HashMap<String, String>,
+    /// Explicit development-only tokenless dispatch marker. The control
+    /// plane sets this only when it has opted into
+    /// `allow_insecure_unauthenticated`; the agent honors it only when its
+    /// own `allow_insecure_migration_dispatch` gate is also enabled.
+    /// Production deployments leave both false, so a missing per-volume
+    /// token is always refused before the trigger.
+    pub allow_insecure_unauthenticated: bool,
     /// Issue #394 Option C: opt-in stop-the-world mode — the VM is paused
     /// before stord's bulk copy begins (the PAUSED_PRE_COPY handshake)
     /// instead of only at final sync. Downtime equals the full transfer;
@@ -499,6 +523,102 @@ async fn run_disk_precopy_poll(
     }
 }
 
+/// Bounded exponential backoff for the admission retry loop. Attempt 0
+/// fails over after 250 ms, then 500 ms, then 1 s; capped at 2 s.
+fn trigger_admission_retry_delay(attempt: u32) -> std::time::Duration {
+    let factor = 1u32 << attempt.min(4);
+    (TRIGGER_ADMISSION_RETRY_BASE_DELAY * factor).min(TRIGGER_ADMISSION_RETRY_MAX_DELAY)
+}
+
+/// Select the authorization token for one volume.
+///
+/// The empty-token fallback exists **only** for the explicit, double-gated
+/// development mode (control-plane marker + agent config gate). Otherwise a
+/// missing token is a hard refusal: the agent must never let stord fall back
+/// to an unauthenticated receiver because the control plane is old or buggy.
+fn migration_authorization_for_volume(
+    volume_id: &str,
+    authorizations: &std::collections::HashMap<String, String>,
+    allow_insecure_unauthenticated: bool,
+) -> Result<String, String> {
+    match authorizations.get(volume_id) {
+        Some(token) if !token.is_empty() => Ok(token.clone()),
+        _ if allow_insecure_unauthenticated => Ok(String::new()),
+        _ => Err(format!(
+            "disk pre-copy refused for volume {volume_id}: no control-plane migration \
+             authorization was supplied (the control plane must mint one per volume)"
+        )),
+    }
+}
+
+/// Trigger one volume's disk migration, retrying only the transient
+/// `RESOURCE_EXHAUSTED` admission rejection.
+///
+/// Safe by construction: destination admission runs before the nonce is
+/// consumed, so a rejected attempt leaves the token usable. Any other error
+/// (auth, transport, not-found) fails immediately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn trigger_disk_migration_with_admission_retry(
+    stord_client: &mut StordClient,
+    volume: &MigrationVolume,
+    dest_endpoint: &str,
+    migration_authorization: &str,
+    pause_first: bool,
+    operation_id: &str,
+    cancel_token: &CancellationToken,
+) -> Result<String, String> {
+    let mut attempt = 0u32;
+    loop {
+        match stord_client
+            .trigger_disk_migration(
+                &volume.volume_id,
+                &volume.attachment_handle,
+                dest_endpoint,
+                migration_authorization,
+                pause_first,
+                Some(operation_id),
+            )
+            .await
+        {
+            Ok(id) => return Ok(id),
+            Err(ChvError::ResourceExhausted { reason })
+                if attempt + 1 < TRIGGER_ADMISSION_RETRY_ATTEMPTS =>
+            {
+                let delay = trigger_admission_retry_delay(attempt);
+                warn!(
+                    volume_id = %volume.volume_id,
+                    attempt = attempt + 1,
+                    max_attempts = TRIGGER_ADMISSION_RETRY_ATTEMPTS,
+                    retry_in_ms = delay.as_millis() as u64,
+                    %reason,
+                    "source agent: destination migration admission is full; retrying"
+                );
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        return Err(format!(
+                            "disk pre-copy trigger for volume {} cancelled while waiting for \
+                             destination migration capacity",
+                            volume.volume_id
+                        ));
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                attempt += 1;
+            }
+            Err(ChvError::ResourceExhausted { reason }) => {
+                return Err(format!(
+                    "destination migration admission is exhausted after {} attempt(s) for volume \
+                     {}: {reason}. The destination node's max_inflight_receiving / \
+                     max_inflight_receiving_bytes ceiling is full; no authorization token was \
+                     consumed, so retry after capacity frees or raise the destination limits",
+                    TRIGGER_ADMISSION_RETRY_ATTEMPTS, volume.volume_id
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 /// Run a full source-side migration with disk pre-copy.
 ///
 /// This is the cancel-aware async core. The `cancel_token` is consulted at every **phase boundary**
@@ -582,6 +702,17 @@ pub async fn source_migration_with_disk_precopy(
             // Phase boundary 2: before each volume's pre-copy trigger.
             check_cancel!("pre-disk-trigger");
 
+            // Issue #663: never trigger an unauthorized migration. Missing
+            // authorization is a control-plane/version-skew error, not a
+            // reason to let stord fall back to the old unauthenticated path.
+            // The only exception is the explicit development-only marker,
+            // honored only after both the CP and agent gates are on.
+            let migration_authorization = migration_authorization_for_volume(
+                &volume.volume_id,
+                &disk_config.volume_authorizations,
+                disk_config.allow_insecure_unauthenticated,
+            )?;
+
             info!(
                 vm_id = %vm_id,
                 operation_id = %operation_id,
@@ -590,15 +721,16 @@ pub async fn source_migration_with_disk_precopy(
                 "source agent: triggering disk pre-copy for volume"
             );
 
-            let migration_id = match stord_client
-                .trigger_disk_migration(
-                    &volume.volume_id,
-                    &volume.attachment_handle,
-                    &disk_config.dest_stord_endpoint,
-                    disk_config.pause_first,
-                    Some(&operation_id),
-                )
-                .await
+            let migration_id = match trigger_disk_migration_with_admission_retry(
+                &mut stord_client,
+                volume,
+                &disk_config.dest_stord_endpoint,
+                &migration_authorization,
+                disk_config.pause_first,
+                &operation_id,
+                &cancel_token,
+            )
+            .await
             {
                 Ok(id) => id,
                 Err(e) => {
@@ -851,6 +983,8 @@ mod tests {
             stord_socket: std::path::PathBuf::from("/run/chv/stord.sock"),
             dest_stord_endpoint: "http://10.0.0.5:50052".to_string(),
             pause_first: false,
+            volume_authorizations: std::collections::HashMap::new(),
+            allow_insecure_unauthenticated: false,
             volumes: vec![
                 MigrationVolume {
                     volume_id: "vol-1".to_string(),
@@ -876,9 +1010,58 @@ mod tests {
             stord_socket: std::path::PathBuf::from("/run/chv/stord.sock"),
             dest_stord_endpoint: "http://10.0.0.5:50052".to_string(),
             pause_first: false,
+            volume_authorizations: std::collections::HashMap::new(),
+            allow_insecure_unauthenticated: false,
             volumes: vec![],
         };
         assert!(config.volumes.is_empty());
+    }
+
+    #[test]
+    fn volume_without_authorization_is_refused_in_production_mode() {
+        let authorizations = std::collections::HashMap::new();
+        let err = migration_authorization_for_volume("vol-1", &authorizations, false)
+            .expect_err("a tokenless volume must never reach stord outside the explicit dev mode");
+        assert!(err.contains("no control-plane migration authorization"));
+        assert!(err.contains("vol-1"));
+    }
+
+    #[test]
+    fn volume_authorization_is_returned_verbatim() {
+        let mut authorizations = std::collections::HashMap::new();
+        authorizations.insert("vol-1".to_string(), "v1.payload.signature".to_string());
+        assert_eq!(
+            migration_authorization_for_volume("vol-1", &authorizations, false).unwrap(),
+            "v1.payload.signature"
+        );
+        // Empty tokens count as absent: refused unless the explicit
+        // development-mode gate is on.
+        authorizations.insert("vol-2".to_string(), String::new());
+        assert!(migration_authorization_for_volume("vol-2", &authorizations, false).is_err());
+        assert_eq!(
+            migration_authorization_for_volume("vol-2", &authorizations, true).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn admission_retry_backoff_is_bounded_exponential() {
+        use std::time::Duration;
+        assert_eq!(trigger_admission_retry_delay(0), Duration::from_millis(250));
+        assert_eq!(trigger_admission_retry_delay(1), Duration::from_millis(500));
+        assert_eq!(
+            trigger_admission_retry_delay(2),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            trigger_admission_retry_delay(3),
+            Duration::from_millis(2000)
+        );
+        // Saturates instead of overflow/runaway for absurd attempt values.
+        assert_eq!(
+            trigger_admission_retry_delay(64),
+            Duration::from_millis(2000)
+        );
     }
 
     // Guard against a regression where caller passes total_bytes=0 and

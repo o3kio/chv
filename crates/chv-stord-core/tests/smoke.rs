@@ -6,6 +6,7 @@ use chv_stord_api::chv_stord_api::{
     SetDevicePolicyRequest, VolumeHealthRequest,
 };
 use chv_stord_backends::LocalFileBackend;
+use chv_stord_core::migration::auth::{MigrationLimits, MigrationReceiverAuthorization};
 use chv_stord_core::store::SessionStore;
 use chv_stord_core::StorageServer;
 use std::io::Write;
@@ -49,6 +50,8 @@ async fn setup_server() -> (
         vec![],
         None,
         None,
+        MigrationReceiverAuthorization::DenyAll,
+        MigrationLimits::default(),
         None,
     );
 
@@ -598,6 +601,8 @@ async fn sqlite_persistence_roundtrip() {
         vec![],
         None,
         None,
+        MigrationReceiverAuthorization::DenyAll,
+        MigrationLimits::default(),
         Some(store),
     );
     let socket_clone = socket.clone();

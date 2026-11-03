@@ -1,4 +1,8 @@
-use crate::migration::receiver::MigrationReceiver;
+use crate::migration::auth::{
+    MigrationAdmission, MigrationLimits, MigrationReceiverAuthorization, MigrationReplayCache,
+};
+use crate::migration::receiver::{MigrationReceiver, RECEIVER_IDLE_TIMEOUT};
+use chv_common::migration_auth::MigrationAuthError;
 use chv_stord_api::chv_stord_api::{
     migration_message, storage_migration_service_server::StorageMigrationService, MigrationMessage,
     MigrationReady,
@@ -10,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Maximum volume size accepted for a migration (16 TiB).
 const MAX_MIGRATION_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
@@ -23,14 +27,79 @@ const MAX_MIGRATION_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 pub struct StorageMigrationServiceImpl<B: StorageBackend> {
     backend: Arc<B>,
     runtime_dir: Option<std::path::PathBuf>,
+    /// Control-plane token verification policy (issue #663). Checked before
+    /// any backend call that can provision a volume.
+    authorization: MigrationReceiverAuthorization,
+    /// Per-node in-flight count/byte limits, shared by every accepted
+    /// stream (including both serving paths for the same service value).
+    admission: Arc<MigrationAdmission>,
+    /// Single-use token nonces, bounded by token expiry.
+    replay: Arc<MigrationReplayCache>,
 }
 
 impl<B: StorageBackend> StorageMigrationServiceImpl<B> {
-    pub fn new(backend: Arc<B>, runtime_dir: std::path::PathBuf) -> Self {
+    pub fn new(
+        backend: Arc<B>,
+        runtime_dir: std::path::PathBuf,
+        authorization: MigrationReceiverAuthorization,
+        limits: MigrationLimits,
+    ) -> Self {
+        let admission = MigrationAdmission::new(limits).unwrap_or_else(|error| {
+            warn!(
+                error = %error,
+                "invalid migration admission limits; all inbound migrations will be rejected"
+            );
+            MigrationAdmission::unavailable()
+        });
         Self {
             backend,
             runtime_dir: Some(runtime_dir),
+            authorization,
+            admission,
+            replay: MigrationReplayCache::new(),
         }
+    }
+
+    /// Verify the control-plane authorization before any volume creation.
+    ///
+    /// Ordering is deliberate: signature/claims first, then admission
+    /// reservation, then nonce consumption. A replay is rejected even while
+    /// capacity is free; a reservation failure never reaches the backend and
+    /// drops the slot immediately.
+    fn authorize_and_reserve(
+        &self,
+        init: &chv_stord_api::chv_stord_api::InitMigration,
+    ) -> Result<crate::migration::auth::MigrationReservation, Status> {
+        let claims = self
+            .authorization
+            .authorize(&init.authorization, &init.volume_id, init.size_bytes)
+            .map_err(migration_auth_status)?;
+
+        let reservation = self.admission.reserve(init.size_bytes).map_err(|error| {
+            warn!(
+                volume_id = %init.volume_id,
+                size_bytes = init.size_bytes,
+                error = %error,
+                "migration rejected by per-node admission limits"
+            );
+            Status::resource_exhausted(format!("migration admission rejected: {error}"))
+        })?;
+
+        self.replay
+            .consume(
+                &claims.nonce,
+                claims.expires_at_unix_ms,
+                chv_common::now_unix_ms(),
+            )
+            .map_err(|error| {
+                warn!(
+                    volume_id = %init.volume_id,
+                    "migration authorization replay rejected"
+                );
+                migration_auth_status(error)
+            })?;
+
+        Ok(reservation)
     }
 
     /// Defense in depth at the migration gRPC boundary.
@@ -93,6 +162,41 @@ impl<B: StorageBackend> Clone for StorageMigrationServiceImpl<B> {
         Self {
             backend: Arc::clone(&self.backend),
             runtime_dir: self.runtime_dir.clone(),
+            authorization: self.authorization.clone(),
+            admission: Arc::clone(&self.admission),
+            replay: Arc::clone(&self.replay),
+        }
+    }
+}
+
+/// Map a rejected authorization to a closed gRPC status. No variant ever
+/// permits the caller to proceed to volume creation.
+fn migration_auth_status(error: MigrationAuthError) -> Status {
+    match error {
+        MigrationAuthError::Missing => {
+            Status::unauthenticated("missing control-plane migration authorization token")
+        }
+        MigrationAuthError::NotConfigured => Status::failed_precondition(
+            "this stord has no migration authorization verifier configured; \
+             inbound migrations are rejected",
+        ),
+        MigrationAuthError::SecretTooShort => Status::failed_precondition(
+            "migration signing secret is misconfigured (shorter than 32 bytes)",
+        ),
+        MigrationAuthError::WrongDestination
+        | MigrationAuthError::WrongVolume
+        | MigrationAuthError::WrongSize { .. } => {
+            Status::permission_denied(format!("migration authorization rejected: {error}"))
+        }
+        MigrationAuthError::Malformed
+        | MigrationAuthError::UnsupportedVersion
+        | MigrationAuthError::BadSignature
+        | MigrationAuthError::Expired
+        | MigrationAuthError::NotYetValid
+        | MigrationAuthError::InvalidLifetime
+        | MigrationAuthError::Replay
+        | MigrationAuthError::InvalidClaims(_) => {
+            Status::permission_denied(format!("migration authorization rejected: {error}"))
         }
     }
 }
@@ -107,11 +211,25 @@ impl<B: StorageBackend> StorageMigrationService for StorageMigrationServiceImpl<
     ) -> Result<Response<Self::StreamBlocksStream>, Status> {
         let mut inbound = request.into_inner();
 
-        // Read the first message to determine role
-        let first_msg = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("stream closed without sending a message"))?;
+        // Read the first message to determine role. Bound the wait: an
+        // authenticated peer that opens the stream and then never sends
+        // `InitMigration` must not pin this connection (and its per-connection
+        // task) forever. Same idle budget as the post-handshake loop.
+        let first_msg = match tokio::time::timeout(RECEIVER_IDLE_TIMEOUT, inbound.message()).await {
+            Ok(result) => result?.ok_or_else(|| {
+                Status::invalid_argument("stream closed without sending a message")
+            })?,
+            Err(_) => {
+                warn!(
+                    idle_timeout_secs = RECEIVER_IDLE_TIMEOUT.as_secs(),
+                    "migration stream idle before InitMigration; closing connection"
+                );
+                return Err(Status::deadline_exceeded(format!(
+                    "migration receiver idle for {}s before InitMigration; closing connection",
+                    RECEIVER_IDLE_TIMEOUT.as_secs()
+                )));
+            }
+        };
 
         let init = match first_msg.payload {
             Some(migration_message::Payload::Init(init)) => init,
@@ -133,12 +251,17 @@ impl<B: StorageBackend> StorageMigrationService for StorageMigrationServiceImpl<
         // runtime directory when the backend constructs the receiving path.
         self.validate_receiving_volume_id(&init.volume_id)?;
 
+        // Issue #663: a CA-certified peer is not automatically authorized
+        // to create this volume. Verify the control-plane token and reserve
+        // capacity BEFORE the backend can provision anything.
+        let reservation = self.authorize_and_reserve(&init)?;
+
         info!(
             volume_id = %init.volume_id,
             size_bytes = init.size_bytes,
             block_size = init.block_size,
             format = %init.format,
-            "received InitMigration, starting receiver"
+            "received authorized InitMigration, starting receiver"
         );
 
         // Create the receiving volume
@@ -175,6 +298,9 @@ impl<B: StorageBackend> StorageMigrationService for StorageMigrationServiceImpl<
         let backend = self.backend.clone();
         let volume_id = dest_volume_id.clone();
         tokio::spawn(async move {
+            // Held for the entire stream lifetime and released on every exit
+            // path (success, failure, or peer closing the stream).
+            let _reservation = reservation;
             let receiver =
                 MigrationReceiver::new(backend, volume_id.clone(), handle, init.size_bytes);
             if let Err(e) = receiver.run(inbound, tx).await {
@@ -206,6 +332,8 @@ mod tests {
         StorageMigrationServiceImpl::new(
             Arc::new(LocalFileBackend::new(runtime_dir.clone())),
             runtime_dir,
+            MigrationReceiverAuthorization::DenyAll,
+            MigrationLimits::default(),
         )
     }
 

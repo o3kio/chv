@@ -152,7 +152,12 @@ async fn spawn_receiver(
     .expect("configured receiver must produce server TLS material");
 
     let backend = Arc::new(LocalFileBackend::new(dir.to_path_buf()));
-    let service = StorageMigrationServiceImpl::new(backend, dir.to_path_buf());
+    let service = StorageMigrationServiceImpl::new(
+        backend,
+        dir.to_path_buf(),
+        chv_stord_core::migration::auth::MigrationReceiverAuthorization::DenyAll,
+        chv_stord_core::migration::auth::MigrationLimits::default(),
+    );
     let handle = tokio::spawn(async move {
         if let Err(e) =
             serve_migration_tls_with_handshake_timeout(listener, tls, service, handshake_timeout)
