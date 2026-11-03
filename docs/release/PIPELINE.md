@@ -135,7 +135,7 @@ scripts/package/lifecycle-rpm.sh → same for RPM
 
 | Workflow | Trigger | What it does | Runner |
 |----------|---------|--------------|--------|
-| `ci.yml` | push/PR to `main`; `workflow_call` | fmt, check, clippy `--all-targets`, workspace tests, UI build/check, Vitest unit tests, Playwright e2e | `ubuntu-latest` |
+| `ci.yml` | push/PR to `main`; `workflow_call` | fmt, check, clippy `--all-targets`, workspace tests via nextest + doctests, non-blocking llvm-cov coverage baseline, UI build/check, Vitest unit tests, Playwright e2e | `ubuntu-latest` |
 | `package-pr.yml` | PR to `main`, push to other branches | build, package, smoke deb/rpm/webui | `ubuntu-22.04` (glibc 2.35 pin — oldest smoke target is debian:12/glibc 2.36) |
 | `package-nightly.yml` | push to `main`, dispatch | build, package, smoke, lifecycle, publish pre-release | `ubuntu-22.04` (build job; same glibc pin) |
 | `security.yml` | push/PR to `main`, daily schedule | `cargo audit`, `cargo deny` (advisories/bans/licenses/sources) | `ubuntu-22.04` |

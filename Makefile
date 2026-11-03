@@ -59,8 +59,12 @@ netbox-qualify:
 netbox-qualify-env:
 	./scripts/netbox-qualify.sh --print-env
 
+# CI parity: nextest runs unit/integration tests, then doctests run
+# separately because nextest does not support them. Install with
+# `cargo install cargo-nextest --locked` if needed.
 test:
-	cargo test --workspace
+	cargo nextest run --workspace --no-fail-fast
+	cargo test --workspace --doc
 
 fmt:
 	cargo fmt --all

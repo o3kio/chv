@@ -98,8 +98,25 @@ jobs:
         # installer's trust checks cannot silently rot.
         run: ./tests/scripts/install-signature-negative.sh
 
-      - name: cargo test
-        run: cargo test --workspace
+      - name: Install cargo-nextest
+        # Nextest runs each test in its own process, isolates hangs, and
+        # reports a per-test summary; it does not run doctests (see below).
+        # Pin the tool version: the action otherwise installs the latest
+        # release, which makes CI nondeterministic.
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+        with:
+          tool: cargo-nextest@0.9.151
+
+      - name: cargo nextest
+        # `cargo test` stopped at the first failing test binary. Keep
+        # --no-fail-fast so a red PR shows the full blast radius (all
+        # failures, not just the first) in one run.
+        run: cargo nextest run --workspace --no-fail-fast
+
+      - name: cargo test (doctests)
+        # cargo-nextest intentionally does not execute doctests. Keep them in
+        # CI instead of silently losing that coverage (#659).
+        run: cargo test --workspace --doc
 
       - name: Build chv-agent process smoke binary
         run: cargo build --package chv-agent
@@ -260,6 +277,75 @@ jobs:
             exit 1
           fi
           promtool check rules "${files[@]}"
+  coverage:
+    name: Rust coverage (non-blocking baseline)
+    runs-on: ubuntu-latest
+    # Non-blocking baseline for #659: publish a per-PR line-coverage report
+    # before any threshold exists. The follow-up ratchet turns this into a
+    # blocking check once the baseline is stable; until then a coverage
+    # tooling failure must not block a merge. Do not add this job to the
+    # required checks list until that ratchet lands.
+    continue-on-error: true
+    # Same hang guard as the rust job: a stuck apt/protoc install must fail
+    # fast rather than burn a runner until the 6-hour cap. Cold instrumented
+    # builds are slower than plain tests, hence the same 45-minute budget.
+    timeout-minutes: 45
+    # Only report on the normal PR/push triggers. release.yml calls this
+    # workflow (workflow_call) as its merge gate; a non-blocking baseline
+    # must not lengthen that path or appear in its required-job set.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (pinned 2026-09-30)
+
+      - name: Install protoc
+        # The workspace build scripts (tonic-prost-build) need protoc even
+        # when the generated sources are already checked in.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-llvm-cov
+        # Pinned for the same reproducibility reason as cargo-nextest above.
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: Install llvm-tools-preview
+        # cargo-llvm-cov needs the llvm-profdata/llvm-cov binaries shipped
+        # with this rustup component for the pinned toolchain.
+        run: rustup component add llvm-tools-preview
+
+      - name: Run coverage (lcov)
+        # No --no-report: the command builds, runs the suite, and writes the
+        # report. Its exit code reflects build/test failures (meaningful even
+        # while the job itself is continue-on-error).
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          {
+            echo "## Rust coverage (non-blocking baseline, #659)"
+            echo ""
+            echo "Full lcov report is attached to this run as \`rust-coverage-lcov\`."
+            echo ""
+            echo '```'
+            cargo llvm-cov report --summary-only \
+              || echo "coverage summary unavailable (the instrumented run produced no profiles)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
 
   ui:
     name: UI checks

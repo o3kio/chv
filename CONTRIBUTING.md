@@ -35,8 +35,10 @@ cd ui && npm run build && cd .. && cargo build --workspace --release
 ## Testing
 
 ```bash
-# Rust tests
-cargo test --workspace
+# Rust tests (unit + integration; CI uses nextest)
+cargo nextest run --workspace --no-fail-fast
+# Doctests are not run by nextest, so CI runs them separately
+cargo test --workspace --doc
 
 # Rust linting
 cargo clippy --workspace -- -D warnings
