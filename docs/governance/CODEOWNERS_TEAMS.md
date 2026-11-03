@@ -120,6 +120,13 @@ done
 Use `permission='admin'` for `chv-admins` only if its members need to manage
 repository settings. Do not grant admin to every team.
 
+GitHub team permissions are repository-wide, not path-scoped: any member of
+`chv-frontend`, `chv-ops`, or `chv-architecture` can push anywhere in the
+repository, including `crates/` and `.github/workflows/`. The path ownership
+table below controls review routing, not write access. Keep team membership
+restricted to the maintainers recorded in `MAINTAINERS.md`; a future reviewer
+or contributor must not be added to a team to express area ownership.
+
 ### 4. Add members
 
 Add only the active maintainers recorded in `MAINTAINERS.md`:

@@ -34,8 +34,8 @@ Rotating one does not rotate the other. The release signing job runs in the
 `rc` or `production` environment (currently without a required-reviewer
 protection rule; see [`docs/release/release-process.md`](../release/release-process.md)),
 and the package-repository job runs
-in `rc-repo` or `production-repo`. Store each secret in its protected
-environment according to the release process.
+in `rc-repo` or `production-repo`. Store each secret as an environment secret
+on the environment its job declares, not as a repository secret.
 
 The `sign` job has read-only `contents` permission. It receives only the
 checksum files, never the build artifacts. Do not add build or package
@@ -86,12 +86,14 @@ issues, pull requests, chat, and logs.
      Export the public key and an ASCII-armored private key.
    - Cosign: generate a key pair with `cosign generate-key-pair`. Keep the
      private key and password separate.
-3. Store the new private key and passphrase in the protected `rc` and
-   `production` environment secrets:
+3. Store the new private key and passphrase as `rc` and `production`
+   environment secrets (environment scoping, not a required-reviewer gate —
+   see the note above):
    - `CHV_RELEASE_GPG_KEY` and `CHV_RELEASE_GPG_PASSPHRASE`; or
    - `CHV_RELEASE_COSIGN_KEY` and `CHV_RELEASE_COSIGN_PASSWORD`.
-   Do not put key material in repository secrets that are visible to workflows
-   outside the protected environments.
+   Do not put key material in repository secrets: those are visible to every
+   workflow, while environment secrets are exposed only to jobs that declare
+   that environment.
 4. Keep the old key available for verification until the new key has produced a
    verified release. Do not delete the old public key immediately.
 5. Publish the new public key and fingerprint in
