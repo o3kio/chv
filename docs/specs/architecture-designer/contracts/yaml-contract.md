@@ -37,6 +37,31 @@ projects: []
 7. Platform users and instance OS users must remain separate.
 8. Every deployable resource must be plan-able before apply.
 
+## Scalar and structural semantics
+
+The validator parses YAML 1.2 scalars. It preserves the `serde_yaml` behavior
+this contract was written against for booleans, merge keys, non-finite floats,
+duplicate keys, and error shape; numeric resolution differs in the ways listed
+below. The following rules are pinned by tests in
+`crates/chv-architecture-validate/src/parse.rs`:
+
+- **Booleans**: only `true` and `false` (any case) are booleans. `yes`, `no`,
+  `on`, `off`, `y`, and `n` are strings — quote them when they are identifiers,
+  because `name: n` stays `"n"`, not `false`.
+- **Numbers**: `1_000` is accepted as the integer `1000`. A leading-zero
+  decimal such as `010` resolves to the number `10` (it is **not** octal and
+  **not** a string), so quote values with meaningful leading zeros. Integers
+  larger than `u64::MAX` resolve to a float.
+- **Non-finite floats**: `.inf`, `-.inf`, and `.nan` are accepted and become
+  `null` in the JSON view rather than failing the document.
+- **Merge keys**: `<<` is treated as an ordinary mapping key, matching the
+  previous parser. Merge expansion is **not** performed; write the keys out
+  explicitly if you need them merged.
+- **Duplicate keys** and multi-document streams are rejected.
+- **Anchors and aliases** are supported, including one anchor reused hundreds
+  of times (for example a shared `defaults: &d` template). Nesting depth is
+  bounded to reject pathological documents.
+
 ## Metadata
 
 ```yaml

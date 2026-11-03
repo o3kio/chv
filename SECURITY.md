@@ -8,8 +8,8 @@ CHV is in the early-to-MVP phase. Only the latest minor release line receives se
 
 | Version | Supported          | Notes                                |
 | ------- | ------------------ | ------------------------------------ |
-| 0.2.x   | :white_check_mark: | Current supported line               |
-| < 0.2   | :x:                | Pre-release; please upgrade to 0.2.x |
+| 0.3.x   | :white_check_mark: | Current supported line               |
+| < 0.3   | :x:                | Pre-release; please upgrade to 0.3.x |
 
 The single source of truth for the current release is the [`VERSION`](VERSION) file at the repository root.
 

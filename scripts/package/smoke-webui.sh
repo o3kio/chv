@@ -15,6 +15,8 @@
 #                                    #447 review rename)
 #   4. GET /v1/<missing>          -> JSON 404 (reserved prefix, never
 #                                    the SPA shell)
+#   4a. POST /internal/bootstrap-token -> 404 (internal management routes
+#                                    are never proxied through the edge)
 #   5. GET /metrics               -> 401 unauthenticated (admin-gated
 #                                    prometheus route, not shadowed)
 # 6. POST /api/v1/auth/login    -> 200 + JWT (login round-trip)
@@ -257,6 +259,15 @@ grep -qi '^HTTP/.* 404' "${TMP}/h" \
 grep -qi 'content-type: application/json' "${TMP}/h" \
     && pass "reserved-prefix miss is JSON" \
     || error "reserved-prefix miss is not JSON (the SPA shell must never shadow API 404s)"
+
+# 4a. Internal management routes are never exposed through the edge ----------
+do_request "http://127.0.0.1:80/internal/bootstrap-token" \
+    -H 'Content-Type: application/json' \
+    -X POST \
+    -d '{"token":"edge-must-not-reach-this"}'
+grep -qi '^HTTP/.* 404' "${TMP}/h" \
+    && pass "POST /internal/bootstrap-token -> 404 (not proxied)" \
+    || error "POST /internal/bootstrap-token was exposed through the edge (got: $(head -n1 "${TMP}/h"))"
 
 # 5. /metrics stays the admin-gated prometheus route --------------------------
 do_request "http://127.0.0.1:80/metrics"

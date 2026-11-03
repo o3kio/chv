@@ -55,8 +55,13 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh |
   bash -s
 ```
 
-### Installer behavior: VMM pin and firmware
+### Installer behavior: release artifact, VMM pin, and firmware
 
+- **Release tarball.** When downloading from GitHub, the installer fetches
+  `chv-<version>-linux-amd64.tar.gz` and its published `.sha256` sidecar, and
+  refuses to extract unless the digest matches. A release without a sidecar
+  (or with a mismatched one) aborts before anything is installed. The
+  dev-only `INSTALL_CHV_TARBALL_PATH` flow trusts the operator-supplied file.
 - **Cloud Hypervisor pin.** The installer requires major.minor **53.0** for
   both `cloud-hypervisor` and its version-coupled `ch-remote` client. A
   preinstalled binary at that pin is kept; any other version is replaced with

@@ -22,7 +22,8 @@ what to alert on, and how to investigate incidents.
 > their config structs is currently not read by any daemon — do not expect a
 > scrape target there.
 > **Never expose `metrics_bind` on a public interface**; the qualified and
-> packaged posture is loopback (`127.0.0.1:9901`). To scrape from another host,
+> packaged posture is loopback (qualification config `127.0.0.1:9100`;
+> packaged/installer default `127.0.0.1:9901`). To scrape from another host,
 > bind to a specific management address (for example
 > `metrics_bind = "192.0.2.10:9901"`), not to a wildcard address. The code
 > fallback `9100` is node_exporter's default port: on hosts running

@@ -20,10 +20,19 @@
 #   2. Generate a bootstrap token: openssl rand -hex 32 > bootstrap.token
 #   3. Set CHV_JWT_SECRET in your environment (or a .env file)
 #
-# Start:
+# Start (expected to fail closed):
 #   docker compose -f docker-compose.prod.yml up -d
 #
-# Health checks:
+#   Nothing here provisions TLS/mTLS material or a bootstrap token, and the
+#   control plane fails closed without them (CHV_ALLOW_INSECURE is rejected in
+#   non-dev builds). The control-plane container therefore exits at startup and
+#   `depends_on: service_healthy` never releases. Treat this file as a legacy
+#   reference, not a runnable deployment; supply the material yourself if you
+#   want to experiment. The agent's cert bootstrap also needs
+#   /etc/chv/certs to be writable by the `chv` user, which the image does not
+#   arrange.
+#
+# Health checks (only meaningful once you supply TLS material):
 #   docker compose -f docker-compose.prod.yml ps
 #   curl http://localhost:8080/health
 #

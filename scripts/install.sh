@@ -379,16 +379,34 @@ download_release() {
         return
     fi
 
-    local tarball_url="https://github.com/${GITHUB_REPO}/releases/download/v${INSTALL_CHV_VERSION}/chv-${INSTALL_CHV_VERSION}-linux-amd64.tar.gz"
+    local tarball_name="chv-${INSTALL_CHV_VERSION}-linux-amd64.tar.gz"
+    local tarball_url="https://github.com/${GITHUB_REPO}/releases/download/v${INSTALL_CHV_VERSION}/${tarball_name}"
     local tmpdir
     tmpdir=$(mktemp -d)
-    local tarball="$tmpdir/chv-release.tar.gz"
+    local tarball="$tmpdir/${tarball_name}"
+    local checksum="${tarball}.sha256"
     CLEANUP_TMPDIR="$tmpdir"
 
     info "Downloading release tarball..."
     if ! curl -fsSL "$tarball_url" -o "$tarball"; then
         print_tarball_download_diagnostics "$tarball_url"
         fatal "Failed to download release from $tarball_url"
+    fi
+
+    # The tarball carries root-installed binaries, units, UI assets, and
+    # migrations, so TLS alone is not enough. The release pipeline publishes a
+    # `.sha256` sidecar for every tarball; a missing or mismatched sidecar is
+    # fail-closed (the same discipline quick-install.sh applies).
+    info "Verifying release tarball checksum..."
+    local checksum_code
+    checksum_code=$(curl -sSL -o "$checksum" -w '%{http_code}' "${tarball_url}.sha256" 2>/dev/null) || checksum_code="000"
+    if [ "$checksum_code" = "404" ]; then
+        fatal "Release v${INSTALL_CHV_VERSION} has no published ${tarball_name}.sha256; refusing to install an unverified tarball."
+    elif [ "$checksum_code" != "200" ]; then
+        fatal "Failed to download ${tarball_name}.sha256 (HTTP ${checksum_code}); refusing to install an unverified tarball."
+    fi
+    if ! ( cd "$tmpdir" && sha256sum -c --strict "${tarball_name}.sha256" ); then
+        fatal "Checksum mismatch for ${tarball_name} against the release sidecar; aborting install."
     fi
 
     info "Extracting release tarball..."
@@ -727,7 +745,9 @@ download_firmware() {
         warn "Failed to download firmware from ${FIRMWARE_URL}"
         warn "No firmware will be present at ${FIRMWARE_PATH}: VMs that request"
         warn "firmware will fail to start with 'firmware not found: ${FIRMWARE_PATH}'."
-        warn "Retry manually with: curl -fSL --retry 3 '${FIRMWARE_URL}' -o '${FIRMWARE_PATH}'"
+        warn "Retry manually (download to a temp file, verify, then install):"
+        warn "  curl -fSL --retry 3 '${FIRMWARE_URL}' -o '${FIRMWARE_PATH}.tmp'"
+        warn "  echo '${FIRMWARE_SHA256}  ${FIRMWARE_PATH}.tmp' | sha256sum -c - && mv '${FIRMWARE_PATH}.tmp' '${FIRMWARE_PATH}'"
     fi
 }
 
@@ -1350,6 +1370,15 @@ EOF
 server {
     listen 80;
     server_name _;
+
+    # Internal control-plane management routes (for example
+    # /internal/bootstrap-token) are unauthenticated and protected only by a
+    # handler-side loopback check. Proxying them would make nginx the peer, so
+    # the loopback check would pass for any remote caller. Never expose them
+    # through the edge.
+    location ^~ /internal/ {
+        return 404;
+    }
 
     # Everything (UI + BFF/API) from the control plane binary.
     location / {

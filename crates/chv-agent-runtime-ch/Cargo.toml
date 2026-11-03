@@ -27,4 +27,4 @@ cellhv-core-operations = { version = "0.1.0", path = "../cellhv-core-operations"
 [dev-dependencies]
 tempfile = { workspace = true }
 metrics-util = "0.20"
-serde-saphyr = { version = "2.0", default-features = false, features = ["serialize", "deserialize"] }
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }

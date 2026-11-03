@@ -214,9 +214,9 @@ be made.
 |---|---|---|
 | CA | `/etc/chv/certs/ca.crt` + `ca.key`, held by the control plane | `docs/examples/controlplane.toml` `[tls]`; [m4.1](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.1-harness.md) |
 | Node certificates | Issued by the control plane at enrollment; subject `CN = <node_id>`; serial recorded in the nodes table | `crates/chv-controlplane-service/src/enrollment.rs`; `peer_identity.rs` |
-| Enrollment client cert | Pre-placed by the operator/installer at `/run/chv/agent/agent.crt` (+ key); used only for the EnrollNode handshake | `scripts/install.sh:968-981` (issued), `:1464-1467` (installed); m4.1 harness invariants |
+| Enrollment client cert | Pre-placed by the operator/installer at `/run/chv/agent/agent.crt` (+ key); used only for the EnrollNode handshake | `scripts/install.sh:1004-1019` (issued), `:1508-1513` (installed); m4.1 harness invariants |
 | Steady-state agent TLS | `/run/chv/agent/agent.crt`, `agent.key` (control-plane-issued material replaces the enrollment cert) | `docs/examples/agent.toml` |
-| Bootstrap token | One-time; minted/rotated over loopback `/internal/bootstrap-token` | `scripts/install.sh:1243` (mint), `:1401` (API seed); m4.1 asserts single consumption |
+| Bootstrap token | One-time; minted/rotated over loopback `/internal/bootstrap-token` | `scripts/install.sh:1283-1284` (mint), `:1447-1449` (API seed); m4.1 asserts single consumption |
 | Peer identity enforcement | stord↔stord migration peers authenticate by certificate identity; negative cases fail closed with zero bytes leaving the source | [m4.6](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.6-migration.md) |
 
 **Proposed (ADR-029, not implemented):** split node identities
@@ -232,7 +232,7 @@ runtime posture.
 
 | Path | Provisioning | Result |
 |---|---|---|
-| `scripts/install.sh` (all-in-one) | Generates CA + server/client certs, writes configs, mints the encryption key and bootstrap token, seeds the admin user (forced password change), base image, default network, and `dev-vm-1` (skippable with `INSTALL_CHV_NO_SEED=1`), installs and starts nginx + the four units. Root-only (`scripts/install.sh:162`). | Working single-host deployment. [QUALIFIED — KVM-VERIFIED] topology; the install path itself carries the m4.2 install-sh contract leg (clean container, ~30 assertions + 7 host-side checks, errors=0 warnings=0). |
+| `scripts/install.sh` (all-in-one) | Generates CA + server/client certs, writes configs, mints the encryption key and bootstrap token, seeds the admin user (forced password change), base image, default network, and `dev-vm-1` (skippable with `INSTALL_CHV_NO_SEED=1`), installs and starts nginx + the four units. Root-only (`scripts/install.sh:168`). | Working single-host deployment. [QUALIFIED — KVM-VERIFIED] topology; the install path itself carries the m4.2 install-sh contract leg (clean container, ~30 assertions + 7 host-side checks, errors=0 warnings=0). |
 | Packages on a clean host | Layout only. The control plane **fails closed** at startup without operator provisioning: CA + server/client certs, a real `jwt_secret`, and admin seeding (typed error, restart loop, no insecure fallback). | [QUALIFIED — KVM-VERIFIED] as the fail-closed boundary ([m4.2](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.2-clean-install.md) §3). |
 
 Additional provisioning facts:
@@ -251,7 +251,7 @@ Additional provisioning facts:
   managed by `chv-nwd` as `br-<net_id>`; the pre-created `chvbr0` is a dev
   convenience.
 - `--wipe` tears down the deployment **but preserves persistent agent
-  authority state by design** (`scripts/install.sh:1380-1422`).
+  authority state by design** (`scripts/install.sh:1651-1691`).
 
 ## 5. Deployment topologies and use cases
 
@@ -374,7 +374,7 @@ identity`, m4.1 §6). No multi-host fabric behavior is claimed.
 
 Escape hatches exist in `scripts/install.sh` — `INSTALL_CHV_TARBALL_PATH`
 (local tarball), `INSTALL_CHV_SKIP_DEPS=1`, `INSTALL_CHV_SKIP_CLOUD_HV=1`,
-and pre-staged base-image paths (`scripts/install.sh:404-428`) — but no
+and pre-staged base-image paths (`scripts/install.sh:634-640`) — but no
 documented offline recipe exists, and the installer's default flow downloads
 the tarball, Cloud Hypervisor, and the base image from the network. Whether
 to define and document an air-gap profile is decision **D4**.
@@ -582,7 +582,7 @@ deploy them; do not file evidence against them.
 
 | Surface | Status | Why fenced |
 |---|---|---|
-| `docker-compose.yml`, `docker-compose.prod.yml` | Legacy / DEV-ONLY (explicit in-repo banners) | **The image builds on amd64; the stacks remain unsupported.** Neither compose file provisions TLS/mTLS material or a bootstrap token, and the control plane fails closed without them by design, so the stacks do not run end-to-end as configured. Use the `.deb`/`.rpm` packages or `scripts/install.sh`. |
+| `docker-compose.yml`, `docker-compose.prod.yml` | `docker-compose.yml`: Legacy / DEV-ONLY; `docker-compose.prod.yml`: Legacy / UNMAINTAINED (both explicit in-repo banners) | **The image builds on amd64; the stacks remain unsupported.** Neither compose file provisions TLS/mTLS material or a bootstrap token, and the control plane fails closed without them by design, so the stacks do not run end-to-end as configured. Use the `.deb`/`.rpm` packages or `scripts/install.sh`. |
 | `Dockerfile`, `deploy/entrypoint.sh` | DEV / LAB convenience only (explicit in-repo banner) | The image builds on amd64 (Rust 1.98.1 pin, protoc/cmake, `VERSION`, digest-verified Cloud Hypervisor v53.0); non-amd64 builds fail fast because the pinned VMM assets are x86_64-only. It is useful for local iteration and image-build smoke checks, but it is not a supported deployment path. |
 | Legacy `chvbr0` host bridge/NAT bootstrap | Opt-out dev convenience (`INSTALL_CHV_NO_BRIDGE=1`) | Qualified networks are API-created and `chv-nwd`-managed (`br-<net_id>`). |
 | `authority_mode = "legacy"` | Compatibility adapter only | Explicit opt-in; the agent logs a warning. Qualified posture is core-managed everywhere. |
