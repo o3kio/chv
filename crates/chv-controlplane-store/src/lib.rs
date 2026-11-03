@@ -15,6 +15,7 @@ mod desired_state;
 mod events;
 mod hypervisor_settings;
 mod images;
+mod migrations;
 mod monitoring_agents;
 mod network_exposures;
 mod networks;
@@ -63,6 +64,10 @@ pub use desired_state::{
 pub use events::{EventAppendInput, EventRepository};
 pub use hypervisor_settings::{HypervisorSettingsRepository, HypervisorSettingsRow};
 pub use images::{ImageRepository, ImageRow};
+pub use migrations::{
+    is_terminal_phase, InterruptedMigrationOutcome, InterruptedMigrationUpdate, MigrationRecord,
+    MigrationRepository,
+};
 pub use monitoring_agents::{
     AgentAuthError, AgentCredential, AgentOsMetadata, ClaimConsumeError, ConsumedClaim,
     IssuedClaim, MonitoringAgentRepository, MonitoringAgentRow, RecordBatchOutcome,

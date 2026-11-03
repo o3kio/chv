@@ -781,6 +781,67 @@ mod tests {
         );
     }
 
+    /// Restart reconciliation must not hand any recovered row to the automatic
+    /// resume pass. The row is terminal as soon as it is reconciled, so late
+    /// progress reports are dropped and the reaper's "sender has been silent"
+    /// gate cannot prove the agent-side task stopped. Operator-only recovery is
+    /// the fail-safe choice for every interrupted phase.
+    #[tokio::test]
+    async fn restart_recovery_queues_no_automatic_source_resumes() {
+        let test_db = TestDb::new().await;
+        seed_migration(
+            &test_db.pool,
+            "restart-precopy",
+            "ConvergingDisk",
+            -10_800,
+            -10,
+        )
+        .await;
+        seed_migration(
+            &test_db.pool,
+            "restart-memory",
+            "MemoryMigration",
+            -10_800,
+            -10,
+        )
+        .await;
+
+        crate::migration::MigrationRegistry::new(test_db.pool.clone())
+            .recover_after_restart()
+            .await
+            .expect("restart recovery should succeed");
+
+        assert_eq!(
+            migration_phase(&test_db.pool, "restart-precopy").await,
+            "RolledBack"
+        );
+        assert_eq!(
+            migration_phase(&test_db.pool, "restart-memory").await,
+            "Failed"
+        );
+
+        for id in ["restart-precopy", "restart-memory"] {
+            let resume_state: Option<String> = sqlx::query_scalar(
+                "SELECT reaper_resume_state FROM migrations WHERE migration_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&test_db.pool)
+            .await
+            .expect("read resume state");
+            assert_eq!(resume_state, None, "{id} must stay operator-only");
+        }
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let pending = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes");
+        assert!(
+            pending.is_empty(),
+            "restart-recovered rows must never be auto-resumed"
+        );
+    }
+
     /// A resume whose frozen pre-reap gap is below the quiescence floor must
     /// not defer forever: the effective silence grows with the time elapsed
     /// since the reap, so a later retry tick can satisfy the floor.

@@ -4,7 +4,10 @@
 //! Handles rollback at each phase according to spec.
 
 use crate::node_client_pool::NodeClientPool;
-use chv_controlplane_store::StorePool;
+use chv_controlplane_store::{
+    InterruptedMigrationOutcome, InterruptedMigrationUpdate, MigrationRecord, MigrationRepository,
+    StorePool,
+};
 use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
 use std::path::PathBuf;
@@ -197,6 +200,228 @@ pub struct MigrationState {
     pub total_bytes: u64,
     pub convergence_round: u32,
     pub dirty_blocks_remaining: u64,
+}
+
+/// How many optimistic retries the startup recovery pass attempts when a
+/// progress report moves a row between the scan and the guarded update.
+const RESTART_RECOVERY_MAX_ATTEMPTS: usize = 3;
+
+/// One migration that a control-plane restart interrupted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredMigration {
+    pub migration_id: String,
+    pub operation_id: String,
+    pub vm_id: String,
+    /// The non-terminal phase observed on disk at startup.
+    pub interrupted_phase: String,
+    /// The terminal phase written by recovery.
+    pub recovered_phase: MigrationPhase,
+}
+
+/// Result of the startup reconciliation pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MigrationRecoveryReport {
+    /// Non-terminal rows reconciled to a terminal phase by this pass.
+    pub reconciled: Vec<RecoveredMigration>,
+    /// Rows that reached a terminal phase between the scan and the guarded
+    /// update (for example a late progress report that raced startup). They
+    /// were left exactly as found.
+    pub already_terminal: usize,
+    /// Rows that could not be reconciled after the retry budget (or
+    /// disappeared mid-pass). A row that still exists remains non-terminal for
+    /// the reaper/operator; the pass never guesses a terminal state.
+    pub unresolved: usize,
+}
+
+impl MigrationRecoveryReport {
+    pub fn is_empty(&self) -> bool {
+        self.reconciled.is_empty() && self.already_terminal == 0 && self.unresolved == 0
+    }
+}
+
+/// Durable, restart-scoped view of tracked migrations.
+///
+/// The `migrations` table — not an in-process map — is the source of truth.
+/// A fresh registry is constructed during control-plane startup; its
+/// [`Self::recover_after_restart`] pass converts rows left non-terminal by the
+/// previous process into an inspectable terminal state. Terminal rows are never
+/// touched (a `Completed` migration must never be resurrected).
+pub struct MigrationRegistry {
+    repository: MigrationRepository,
+}
+
+impl MigrationRegistry {
+    pub fn new(pool: StorePool) -> Self {
+        Self {
+            repository: MigrationRepository::new(pool),
+        }
+    }
+
+    /// Reconcile every migration row left non-terminal by a previous
+    /// control-plane process.
+    ///
+    /// Mapping is deterministic and conservative:
+    /// - `Pending`, `PreCopyDisk`, `ConvergingDisk` → `RolledBack`: the source
+    ///   VM is still authoritative, so the migration can be abandoned there.
+    /// - `MemoryMigration`, `Paused`, and any unrecognized non-terminal phase →
+    ///   `Failed`: VM state may already be on the destination, so an automatic
+    ///   rollback would be unsafe.
+    ///
+    /// No recovered row gets an automatic source-VM resume, in either mapping.
+    /// Once the row is terminal the progress path drops late reports, so the
+    /// reaper's "sender has been silent" evidence would be self-fulfilling
+    /// rather than proof that the agent-side task stopped. Operators inspect
+    /// the row and resume placement explicitly.
+    ///
+    /// The original phase is preserved in `interrupted_from_phase` and the
+    /// reason in `error_message`; the parent operation is failed with
+    /// `MIGRATION_INTERRUPTED`. Reconciliation is idempotent: a second pass
+    /// finds only terminal rows and changes nothing.
+    pub async fn recover_after_restart(&self) -> Result<MigrationRecoveryReport, ChvError> {
+        let mut report = MigrationRecoveryReport::default();
+        let rows = self
+            .repository
+            .list_non_terminal()
+            .await
+            .map_err(|e| ChvError::Internal {
+                reason: format!("failed to scan migrations for restart recovery: {e}"),
+            })?;
+
+        for row in rows {
+            match self.reconcile_row(row).await? {
+                ReconcileRowOutcome::Reconciled(recovered) => {
+                    metrics::counter!(
+                        "chv_migration_restart_reconciled_total",
+                        "recovered_phase" => recovered.recovered_phase.as_str()
+                    )
+                    .increment(1);
+                    warn!(
+                        migration_id = %recovered.migration_id,
+                        operation_id = %recovered.operation_id,
+                        vm_id = %recovered.vm_id,
+                        interrupted_phase = %recovered.interrupted_phase,
+                        recovered_phase = %recovered.recovered_phase.as_str(),
+                        "migration interrupted by control-plane restart; reconciled"
+                    );
+                    report.reconciled.push(recovered);
+                }
+                ReconcileRowOutcome::AlreadyTerminal => report.already_terminal += 1,
+                ReconcileRowOutcome::Unresolved => report.unresolved += 1,
+            }
+        }
+
+        Ok(report)
+    }
+
+    async fn reconcile_row(
+        &self,
+        mut row: MigrationRecord,
+    ) -> Result<ReconcileRowOutcome, ChvError> {
+        for _ in 0..RESTART_RECOVERY_MAX_ATTEMPTS {
+            let recovered_phase = recovery_phase(&row.phase);
+            let error_message = migration_interrupted_reason(&row.phase, recovered_phase);
+            let update = InterruptedMigrationUpdate {
+                migration_id: row.migration_id.clone(),
+                operation_id: row.operation_id.clone(),
+                observed_phase: row.phase.clone(),
+                observed_updated_at: row.updated_at.clone(),
+                terminal_phase: recovered_phase.as_str().to_string(),
+                error_message,
+            };
+
+            match self.repository.reconcile_interrupted(&update).await {
+                Ok(InterruptedMigrationOutcome::Reconciled) => {
+                    return Ok(ReconcileRowOutcome::Reconciled(RecoveredMigration {
+                        migration_id: row.migration_id,
+                        operation_id: row.operation_id,
+                        vm_id: row.vm_id,
+                        interrupted_phase: row.phase,
+                        recovered_phase,
+                    }));
+                }
+                Ok(InterruptedMigrationOutcome::AlreadyTerminal) => {
+                    return Ok(ReconcileRowOutcome::AlreadyTerminal);
+                }
+                Ok(InterruptedMigrationOutcome::Missing) => {
+                    warn!(
+                        migration_id = %row.migration_id,
+                        "migration disappeared during restart recovery; leaving it to the reaper"
+                    );
+                    return Ok(ReconcileRowOutcome::Unresolved);
+                }
+                Ok(InterruptedMigrationOutcome::PhaseChanged) => {
+                    // A progress report (or another phase transition) landed
+                    // while we were looking. Re-read and re-plan against the
+                    // fresh state rather than overwriting it.
+                    match self.repository.get(&row.migration_id).await.map_err(|e| {
+                        ChvError::Internal {
+                            reason: format!(
+                                "failed to re-read migration {} during restart recovery: {e}",
+                                row.migration_id
+                            ),
+                        }
+                    })? {
+                        Some(fresh) if !chv_controlplane_store::is_terminal_phase(&fresh.phase) => {
+                            row = fresh;
+                        }
+                        Some(_) => return Ok(ReconcileRowOutcome::AlreadyTerminal),
+                        None => return Ok(ReconcileRowOutcome::Unresolved),
+                    }
+                }
+                Err(e) => {
+                    return Err(ChvError::Internal {
+                        reason: format!(
+                            "failed to reconcile interrupted migration {}: {e}",
+                            row.migration_id
+                        ),
+                    });
+                }
+            }
+        }
+
+        warn!(
+            migration_id = %row.migration_id,
+            phase = %row.phase,
+            "migration kept changing during restart recovery; leaving it non-terminal for the reaper"
+        );
+        Ok(ReconcileRowOutcome::Unresolved)
+    }
+}
+
+enum ReconcileRowOutcome {
+    Reconciled(RecoveredMigration),
+    AlreadyTerminal,
+    Unresolved,
+}
+
+/// Deterministic terminal mapping for a non-terminal phase observed at
+/// startup. No mapping authorizes an automatic source-VM resume.
+fn recovery_phase(phase: &str) -> MigrationPhase {
+    match phase {
+        "Pending" | "PreCopyDisk" | "ConvergingDisk" => MigrationPhase::RolledBack,
+        // Memory transfer, final sync, and unknown/future phases are all
+        // ambiguous: VM state may already live on the destination. Fail closed
+        // and require an operator to inspect placement.
+        _ => MigrationPhase::Failed,
+    }
+}
+
+fn migration_interrupted_reason(observed_phase: &str, recovered_phase: MigrationPhase) -> String {
+    match recovered_phase {
+        MigrationPhase::RolledBack => format!(
+            "control-plane restarted while migration was in phase {observed_phase}; \
+             no migration task survived. Recovery marked it RolledBack because the source \
+             VM is still authoritative. No automatic resume is queued: confirm the VM \
+             state on the source and resume it manually if needed; the migration is not \
+             retried automatically."
+        ),
+        _ => format!(
+            "control-plane restarted while migration was in phase {observed_phase}; \
+             no migration task survived. VM state may already be on the destination, so \
+             recovery marked it Failed rather than guess a rollback. Inspect VM placement \
+             on both nodes before resuming or retrying; no automatic action is taken."
+        ),
+    }
 }
 
 /// Calculate phase timeouts based on VM resource sizes.
@@ -2150,6 +2375,292 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert migration");
+    }
+
+    /// Seed one migration row (plus its VM and parent operation) for the
+    /// restart-recovery tests. Returns `(migration_id, operation_id)`.
+    async fn seed_migration_row(
+        pool: &StorePool,
+        suffix: &str,
+        phase: &str,
+        updated_offset_secs: i64,
+    ) -> (String, String) {
+        let migration_id = format!("mig-{suffix}");
+        let operation_id = format!("op-{suffix}");
+        let vm_id = format!("vm-{suffix}");
+
+        sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES (?, ?)")
+            .bind(&vm_id)
+            .bind(&vm_id)
+            .execute(pool)
+            .await
+            .expect("insert vm");
+
+        sqlx::query(
+            r#"INSERT INTO operations
+                   (operation_id, idempotency_key, resource_kind, resource_id,
+                    operation_type, status, requested_at)
+               VALUES (?, ?, 'vm', ?, 'Migrate', 'Running',
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"#,
+        )
+        .bind(&operation_id)
+        .bind(format!("idem-{suffix}"))
+        .bind(&vm_id)
+        .execute(pool)
+        .await
+        .expect("insert operation");
+
+        sqlx::query(
+            r#"INSERT INTO migrations
+                   (migration_id, operation_id, vm_id, source_node_id,
+                    destination_node_id, phase, started_at, updated_at)
+               VALUES (?, ?, ?, 'node-a', 'node-b', ?,
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 seconds'),
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?))"#,
+        )
+        .bind(&migration_id)
+        .bind(&operation_id)
+        .bind(&vm_id)
+        .bind(phase)
+        .bind(format!("{updated_offset_secs} seconds"))
+        .execute(pool)
+        .await
+        .expect("insert migration");
+
+        (migration_id, operation_id)
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct RecoveredRow {
+        phase: String,
+        interrupted_from_phase: Option<String>,
+        interrupted_at: Option<String>,
+        completed_at: Option<String>,
+        error_message: Option<String>,
+        reaper_resume_state: Option<String>,
+    }
+
+    async fn recovered_row(pool: &StorePool, migration_id: &str) -> RecoveredRow {
+        sqlx::query_as(
+            r#"SELECT phase, interrupted_from_phase, interrupted_at, completed_at,
+                      error_message, reaper_resume_state
+               FROM migrations WHERE migration_id = ?"#,
+        )
+        .bind(migration_id)
+        .fetch_one(pool)
+        .await
+        .expect("read recovered migration")
+    }
+
+    /// Acceptance: a restart mid-migration leaves a recoverable, inspectable
+    /// terminal state, and a fresh registry against the same database observes
+    /// it deterministically instead of guessing `Completed`.
+    #[tokio::test]
+    async fn restart_recovery_reconciles_in_flight_migrations_deterministically() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+
+        let cases = [
+            ("pending", "Pending", "RolledBack"),
+            ("precopy", "PreCopyDisk", "RolledBack"),
+            ("converging", "ConvergingDisk", "RolledBack"),
+            // Ambiguous: VM state may already be on the destination. Fail
+            // closed and leave the resume decision to an operator.
+            ("memory", "MemoryMigration", "Failed"),
+            ("paused", "Paused", "Failed"),
+        ];
+        for (suffix, phase, _) in cases {
+            seed_migration_row(&test_db.pool, suffix, phase, -10).await;
+        }
+
+        let registry = MigrationRegistry::new(test_db.pool.clone());
+        let report = registry
+            .recover_after_restart()
+            .await
+            .expect("restart recovery should succeed");
+        assert_eq!(
+            report.reconciled.len(),
+            cases.len(),
+            "every in-flight row must be reconciled"
+        );
+        assert_eq!(report.already_terminal, 0);
+        assert_eq!(report.unresolved, 0);
+
+        // Simulate a second control-plane start: drop the old registry and
+        // construct a fresh one against the same database.
+        drop(registry);
+        let restarted = MigrationRegistry::new(test_db.pool.clone());
+        let second = restarted
+            .recover_after_restart()
+            .await
+            .expect("second recovery should succeed");
+        assert!(second.is_empty(), "recovery must be idempotent: {second:?}");
+
+        for (suffix, interrupted_phase, recovered_phase) in cases {
+            let migration_id = format!("mig-{suffix}");
+            let operation_id = format!("op-{suffix}");
+            let row = recovered_row(&test_db.pool, &migration_id).await;
+
+            assert_eq!(row.phase, recovered_phase, "unexpected phase for {suffix}");
+            assert_ne!(
+                row.phase, "Completed",
+                "an interrupted migration must never be marked Completed"
+            );
+            assert_eq!(
+                row.interrupted_from_phase.as_deref(),
+                Some(interrupted_phase),
+                "the interrupted phase must stay inspectable"
+            );
+            assert!(row.interrupted_at.is_some(), "interruption time missing");
+            assert!(row.completed_at.is_some(), "terminal time missing");
+            let message = row.error_message.expect("interruption reason");
+            assert!(
+                message.contains("control-plane restarted") && message.contains(interrupted_phase),
+                "reason must identify the restart and original phase: {message}"
+            );
+
+            assert_eq!(
+                row.reaper_resume_state, None,
+                "restart recovery must not queue an automatic source resume for {suffix}"
+            );
+
+            let (status, error_code): (String, Option<String>) =
+                sqlx::query_as("SELECT status, error_code FROM operations WHERE operation_id = ?")
+                    .bind(&operation_id)
+                    .fetch_one(&test_db.pool)
+                    .await
+                    .expect("read operation");
+            assert_eq!(
+                status, "Failed",
+                "operation {operation_id} must not stay Running"
+            );
+            assert_eq!(error_code.as_deref(), Some("MIGRATION_INTERRUPTED"));
+        }
+    }
+
+    /// Terminal rows are evidence, not work: a restart must not rewrite their
+    /// phase, reason, completion time, or resume bookkeeping.
+    #[tokio::test]
+    async fn restart_recovery_never_touches_or_resurrects_terminal_rows() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+
+        for (suffix, phase) in [
+            ("completed", "Completed"),
+            ("failed", "Failed"),
+            ("rolledback", "RolledBack"),
+        ] {
+            let (migration_id, _) = seed_migration_row(&test_db.pool, suffix, phase, -600).await;
+            sqlx::query(
+                r#"UPDATE migrations
+                   SET completed_at = '2026-01-01T00:00:00Z',
+                       error_message = ?,
+                       reaper_resume_state = 'resumed'
+                   WHERE migration_id = ?"#,
+            )
+            .bind(format!("preserved-{suffix}"))
+            .bind(&migration_id)
+            .execute(&test_db.pool)
+            .await
+            .expect("annotate terminal row");
+        }
+        seed_migration_row(&test_db.pool, "live", "ConvergingDisk", -10).await;
+
+        let report = MigrationRegistry::new(test_db.pool.clone())
+            .recover_after_restart()
+            .await
+            .expect("restart recovery should succeed");
+        assert_eq!(report.reconciled.len(), 1);
+        assert_eq!(report.reconciled[0].migration_id, "mig-live");
+
+        for (suffix, expected_phase) in [
+            ("completed", "Completed"),
+            ("failed", "Failed"),
+            ("rolledback", "RolledBack"),
+        ] {
+            let migration_id = format!("mig-{suffix}");
+            let row = recovered_row(&test_db.pool, &migration_id).await;
+            assert_eq!(row.phase, expected_phase);
+            assert_eq!(row.interrupted_from_phase, None);
+            assert_eq!(row.interrupted_at, None);
+            assert_eq!(row.completed_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+            let expected_message = format!("preserved-{suffix}");
+            assert_eq!(
+                row.error_message.as_deref(),
+                Some(expected_message.as_str())
+            );
+            assert_eq!(row.reaper_resume_state.as_deref(), Some("resumed"));
+        }
+    }
+
+    /// After recovery the row is terminal, so the existing RPC paths must
+    /// behave: cancel is a no-op and a late progress report is acknowledged
+    /// without resurrecting the migration.
+    #[tokio::test]
+    async fn cancel_and_progress_after_restart_cannot_resurrect_interrupted_migration() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "cancel", "ConvergingDisk", -10).await;
+
+        MigrationRegistry::new(test_db.pool.clone())
+            .recover_after_restart()
+            .await
+            .expect("restart recovery should succeed");
+
+        assert_eq!(
+            request_migration_cancel(&test_db.pool, "mig-cancel")
+                .await
+                .expect("cancel lookup"),
+            CancelMigrationOutcome::AlreadyTerminal,
+            "cancelling an interrupted (already terminal) migration is a no-op"
+        );
+
+        update_migration_progress(
+            &test_db.pool,
+            "node-a",
+            "vm-cancel",
+            "op-cancel",
+            proto::MigrationPhase::MemoryMigration as i32,
+            100,
+            200,
+            4,
+            7,
+        )
+        .await
+        .expect("late progress is acknowledged and dropped");
+
+        let (phase, round, bytes): (String, i32, i64) = sqlx::query_as(
+            "SELECT phase, convergence_round, bytes_transferred FROM migrations \
+             WHERE migration_id = 'mig-cancel'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "RolledBack");
+        assert_eq!(round, 0, "late progress must not mutate a terminal row");
+        assert_eq!(bytes, 0, "late progress must not mutate a terminal row");
+    }
+
+    /// Unknown or future non-terminal phases fail closed: `Failed`, original
+    /// phase preserved, no automatic source resume.
+    #[tokio::test]
+    async fn restart_recovery_fails_closed_on_unknown_non_terminal_phase() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "future", "SomeFuturePhase", -10).await;
+
+        let report = MigrationRegistry::new(test_db.pool.clone())
+            .recover_after_restart()
+            .await
+            .expect("restart recovery should succeed");
+        assert_eq!(report.reconciled.len(), 1);
+
+        let row = recovered_row(&test_db.pool, "mig-future").await;
+        assert_eq!(row.phase, "Failed");
+        assert_eq!(
+            row.interrupted_from_phase.as_deref(),
+            Some("SomeFuturePhase")
+        );
+        assert_eq!(
+            row.reaper_resume_state, None,
+            "an unrecognized phase must not trigger an automatic source resume"
+        );
     }
 
     #[tokio::test]

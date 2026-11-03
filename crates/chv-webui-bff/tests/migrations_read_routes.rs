@@ -18,6 +18,8 @@
 //! - a seeded migration row lists and gets with the `migrations`
 //!   table's own column names (plus the derived `cancel_requested`
 //!   flag), and a cancel-flagged row reports `cancel_requested: true`;
+//! - a restart-interrupted row exposes `interrupted_from_phase` and
+//!   `interrupted_at` (the recovery vocabulary from #656);
 //! - an unknown migration id is a 404.
 
 use std::sync::Arc;
@@ -376,6 +378,39 @@ async fn migrations_get_returns_the_single_row_at_viewer_tier() {
     assert_eq!(body["started_at"], "2026-01-01T00:00:00Z");
     assert!(body.get("completed_at").is_some());
     assert!(body.get("error_message").is_some());
+}
+
+#[tokio::test]
+async fn migrations_get_exposes_restart_interruption() {
+    let state = build_state().await;
+    let token = seed_jwt_as(&state, "viewer").await;
+    seed_migration(&state, "mig-1", false).await;
+    sqlx::query(
+        "UPDATE migrations \
+         SET phase = 'RolledBack', \
+             completed_at = '2026-01-01T00:05:00Z', \
+             interrupted_from_phase = 'ConvergingDisk', \
+             interrupted_at = '2026-01-01T00:05:00Z', \
+             error_message = 'control-plane restarted while migration was in phase ConvergingDisk' \
+         WHERE migration_id = 'mig-1'",
+    )
+    .execute(&state.pool)
+    .await
+    .expect("annotate interrupted migration");
+
+    let (status, body) = get_json(state, "/v1/migrations/mig-1", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["phase"], "RolledBack");
+    assert_eq!(body["interrupted_from_phase"], "ConvergingDisk");
+    assert_eq!(body["interrupted_at"], "2026-01-01T00:05:00Z");
+    assert_eq!(body["completed_at"], "2026-01-01T00:05:00Z");
+    assert!(
+        body["error_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("control-plane restarted"),
+        "operators must see the interruption reason: {body}"
+    );
 }
 
 #[tokio::test]

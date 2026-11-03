@@ -52,6 +52,7 @@ pub use error::ControlPlaneServiceError;
 pub use fabric_planner::{CompiledFabricPlan, FabricPlanner};
 pub use inventory::{InventoryService, InventoryServiceImplementation};
 pub use lifecycle::{LifecycleService, LifecycleServiceImplementation};
+pub use migration::{MigrationRecoveryReport, MigrationRegistry, RecoveredMigration};
 pub use migration_reaper::MigrationReaper;
 pub use netbox_projection_worker::NetboxProjectionWorker;
 pub use node_client::NodeClient;

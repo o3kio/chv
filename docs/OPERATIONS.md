@@ -504,6 +504,53 @@ sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
    WHERE phase NOT IN ('Completed', 'Failed', 'RolledBack');"
 ```
 
+### Migration Interrupted by a Control-Plane Restart
+
+The migration state machine is an in-process task; it does not survive a
+control-plane restart. Before any worker (including the reaper) starts, the
+control plane reconciles every `migrations` row that is still non-terminal. The
+row is made terminal and keeps the interrupted phase in
+`interrupted_from_phase`, the recovery time in `interrupted_at`, and an
+operator-readable reason in `error_message`. The parent operation is failed
+with `error_code = MIGRATION_INTERRUPTED`. Terminal rows are never changed.
+
+Restart recovery never queues an automatic source-VM resume. Once the row is
+terminal, late progress reports from a still-running agent task are dropped, so
+the reaper's "sender has been silent" evidence would be self-fulfilling rather
+than proof that the agent stopped. Every recovered row is therefore
+operator-only (`reaper_resume_state` is cleared).
+
+**Inspect interrupted migrations:**
+```bash
+sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
+  "SELECT migration_id, vm_id, phase, interrupted_from_phase, interrupted_at, \
+          error_message \
+   FROM migrations WHERE interrupted_at IS NOT NULL \
+   ORDER BY interrupted_at DESC;"
+```
+
+The interruption fields (`interrupted_from_phase`, `interrupted_at`,
+`error_message`) are also returned by `chvctl migrate status <MIGRATION_ID>` and
+`GET /v1/migrations/<MIGRATION_ID>`.
+
+| Recovered `phase` | Interrupted `interrupted_from_phase` | Automatic action | Operator action |
+|-------------------|--------------------------------------|------------------|-----------------|
+| `RolledBack` | `Pending`, `PreCopyDisk`, `ConvergingDisk` | None — no source resume is queued | Confirm the VM is running on the source. If it is paused, resume it explicitly after checking that no agent-side migration task is still writing; the migration is not retried automatically |
+| `Failed` | `MemoryMigration`, `Paused`, or an unrecognized phase | None — recovery does not guess a rollback | Inspect `vm_desired_state.target_node_id` and the VM's actual state on both nodes. Resume on the source only if the source still owns the VM state; otherwise finish/clean the destination. Partial destination volumes are not deleted automatically |
+| — | `Completed`, `Failed`, `RolledBack` | None | No action; terminal rows are left exactly as found |
+
+Do **not** mark an interrupted row `Completed` to make it disappear: `Completed`
+means the destination owns the VM and placement was atomically updated.
+Interrupted migrations are not retried automatically; start a new migration only
+after confirming placement and cleaning up any partial destination volume.
+A cancel request for an interrupted row returns `already_terminal` because the
+migration task no longer exists; cancel only affects a live task.
+
+The startup log line `migration restart recovery completed` reports
+`reconciled`, `already_terminal`, and `unresolved` counts. `unresolved` rows keep
+changing during startup (a late progress report raced the scan) and are left
+non-terminal for the normal reaper; the next restart will reconcile them.
+
 **Verify mTLS configuration:**
 ```bash
 # Check cert files exist and are readable

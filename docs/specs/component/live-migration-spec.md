@@ -315,6 +315,7 @@ constants above.
 | Phase 5: Completed / cleanup | migration.rs | DONE |
 | Rollback per phase | migration.rs | DONE |
 | Migration reaper (stale ops) | migration_reaper.rs | DONE |
+| Restart reconciliation | migration.rs `MigrationRegistry`, chv-controlplane-store `migrations.rs` | DONE — non-terminal rows become `RolledBack` (pre-memory) or `Failed` (memory/paused/unknown), operator-only; terminal rows untouched; migration `0064` records `interrupted_from_phase`/`interrupted_at` (#656) |
 | Phase timeouts | migration.rs `PhaseTimeouts` | DONE |
 | MigrationProgress proto | control-plane-node.proto | DONE |
 | Source stord: bulk copy | sender.rs `bulk_copy()` | DONE |
@@ -364,6 +365,29 @@ constants above.
 - Concurrent-write ("live") disk migration — not claimed; see *Claimed mode / not claimed* (issue #394)
 
 ## Recovery model
-- If CP crashes during migration: on restart, find in-progress migration operations, mark them Failed (cannot safely resume mid-migration)
+- If CP crashes during migration: on the next startup the control-plane
+  migration registry reconciles every row still in a non-terminal phase (the
+  in-process migration task did not survive the restart). The mapping is
+  deterministic and conservative:
+  - `Pending`, `PreCopyDisk`, `ConvergingDisk` → `RolledBack`: the source VM is
+    still authoritative. `interrupted_from_phase` and `interrupted_at` preserve
+    what was interrupted.
+  - `MemoryMigration`, `Paused`, or any unrecognized non-terminal phase →
+    `Failed`: VM state may already be on the destination, so recovery does not
+    guess a rollback.
+  - `Completed`, `Failed`, and `RolledBack` rows are never modified (a terminal
+    migration must never be resurrected).
+
+  No recovered row gets an automatic source-VM resume. The row becomes terminal
+  immediately, and the normal progress path drops late reports from a
+  still-running agent task; reaper "silence" would therefore not prove the
+  sender stopped. `reaper_resume_state` is cleared and an operator must inspect
+  placement and resume explicitly. The parent operation is failed with
+  `error_code = 'MIGRATION_INTERRUPTED'`.
+  Interrupted migrations are not retried automatically; a second startup is a
+  no-op because only terminal rows remain. Operators inspect the original phase
+  via `interrupted_from_phase` (also returned by `GET /v1/migrations[/:id]`)
+  and the reason via `error_message`, then follow the recovery steps in
+  `docs/OPERATIONS.md` ("Migration interrupted by a control-plane restart").
 - If source agent crashes during Phase 1-2: the reaper eventually marks the migration Failed and best-effort resumes the source VM; the partial destination volume is NOT deleted automatically (the receiver only releases its backend handle when the stream ends) — manual cleanup required
 - If dest agent crashes during Phase 3-4: mark Failed, source resumes VM (manual cleanup of dest)

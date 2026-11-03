@@ -290,6 +290,30 @@ pub async fn build_service(
     let pool = connect_pool(&store_config).await?;
     run_migrations(&pool, Some(&store_config)).await?;
 
+    // Restart reconciliation (#656): the migration state machine is an
+    // in-process future, so any non-terminal row at this point belongs to a
+    // previous control-plane process. Record those rows as interrupted before
+    // any worker (including the reaper) starts, so operators see an inspectable
+    // terminal state instead of a row that silently sits non-terminal for the
+    // stall timeout. Fail closed: a database error here aborts startup rather
+    // than leaving ambiguous migration state behind.
+    let recovery_report = chv_controlplane_service::MigrationRegistry::new(pool.clone())
+        .recover_after_restart()
+        .await
+        .map_err(|e| {
+            ControlPlaneServiceError::Internal(format!("migration restart recovery failed: {e}"))
+        })?;
+    if recovery_report.is_empty() {
+        tracing::info!("migration restart recovery: no interrupted migrations");
+    } else {
+        tracing::warn!(
+            reconciled = recovery_report.reconciled.len(),
+            already_terminal = recovery_report.already_terminal,
+            unresolved = recovery_report.unresolved,
+            "migration restart recovery completed"
+        );
+    }
+
     // Monitoring store (ADR-027, campaign #602 PR-2): disposable
     // telemetry in its own SQLite file and pool. A failure here —
     // missing directory, corrupt file, full disk — DEGRADES monitoring
