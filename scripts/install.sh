@@ -9,6 +9,23 @@
 # Environment variables:
 #   INSTALL_CHV_VERSION         - Version to install (default: latest)
 #   INSTALL_CHV_TARBALL_PATH    - Path to local release tarball (dev mode)
+#   INSTALL_CHV_TARBALL_SHA256  - Expected sha256 of INSTALL_CHV_TARBALL_PATH.
+#                                 Strongly recommended for local tarballs; when
+#                                 unset the installer warns that the file is
+#                                 unverified rather than calling it authentic.
+#   CHV_RELEASE_GPG_PUBKEY      - ASCII-armored release signing public key.
+#                                 When set (or INSTALL_CHV_GPG_PUBKEY_FILE),
+#                                 the release checksum signature is required
+#                                 and verified; missing/invalid signatures are
+#                                 fatal. When unset, checksum integrity is
+#                                 verified but the release is UNSIGNED and the
+#                                 installer warns accordingly.
+#   INSTALL_CHV_GPG_PUBKEY_FILE - Path to the ASCII-armored release signing
+#                                 public key (alternative to CHV_RELEASE_GPG_PUBKEY).
+#   INSTALL_CHV_BASE_IMAGE_SHA256 - Expected sha256 of the downloaded Ubuntu
+#                                 noble base image. When unset, the mutable
+#                                 noble/current image is fetched over TLS only
+#                                 and the installer warns about that trust gap.
 #   INSTALL_CHV_SKIP_DEPS       - Set to "1" to skip apt dependency installation
 #   INSTALL_CHV_SKIP_CLOUD_HV   - Set to "1" to skip cloud-hypervisor download
 #   INSTALL_CHV_ALLOW_VMM_MISMATCH - Set to "1" to keep host cloud-hypervisor /
@@ -35,6 +52,10 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 INSTALL_CHV_VERSION="${INSTALL_CHV_VERSION:-latest}"
 INSTALL_CHV_TARBALL_PATH="${INSTALL_CHV_TARBALL_PATH:-}"
+INSTALL_CHV_TARBALL_SHA256="${INSTALL_CHV_TARBALL_SHA256:-}"
+CHV_RELEASE_GPG_PUBKEY="${CHV_RELEASE_GPG_PUBKEY:-}"
+INSTALL_CHV_GPG_PUBKEY_FILE="${INSTALL_CHV_GPG_PUBKEY_FILE:-}"
+INSTALL_CHV_BASE_IMAGE_SHA256="${INSTALL_CHV_BASE_IMAGE_SHA256:-}"
 INSTALL_CHV_SKIP_DEPS="${INSTALL_CHV_SKIP_DEPS:-0}"
 INSTALL_CHV_SKIP_CLOUD_HV="${INSTALL_CHV_SKIP_CLOUD_HV:-0}"
 INSTALL_CHV_NO_SEED="${INSTALL_CHV_NO_SEED:-0}"
@@ -68,6 +89,7 @@ GITHUB_REPO="${GITHUB_REPO:-o3kio/chv}"
 # Populated later
 EXTRACT_DIR=""
 CLEANUP_TMPDIR=""
+RELEASE_GPG_HOME=""
 JWT_SECRET=""
 BOOTSTRAP_TOKEN=""
 CHV_NODE_ID=""
@@ -79,6 +101,35 @@ info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
 fatal() { echo "[ERROR] $*" >&2; exit 1; }
 cmd_exists() { command -v "$1" &>/dev/null; }
+
+# Run sqlite3 as the CHV service user for every write to the live WAL
+# database. The controlplane owns the database as ${CHV_USER}; a root-run
+# sqlite3 leaves root-owned -wal/-shm files behind and the service then fails
+# on them (issue #669). sudo -u is the historical idiom here; runuser covers
+# minimal hosts without sudo.
+chv_sqlite() {
+    if cmd_exists sudo; then
+        sudo -u "$CHV_USER" sqlite3 "$@"
+    else
+        runuser -u "$CHV_USER" -- sqlite3 "$@"
+    fi
+}
+
+# Repair and then verify ownership of the control-plane DB and its WAL
+# sidecars. Any root-owned sidecar left by an earlier tool is fixed here;
+# a file that still is not owned by the service user is a hard error, never a
+# silently accepted data-integrity risk.
+ensure_chv_db_ownership() {
+    local db_file owner
+    for db_file in "$CHV_DB_PATH" "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm"; do
+        [ -e "$db_file" ] || continue
+        chown "$CHV_USER:$CHV_USER" "$db_file" 2>/dev/null || true
+        owner="$(stat -c '%U' "$db_file" 2>/dev/null || echo unknown)"
+        if [ "$owner" != "$CHV_USER" ]; then
+            fatal "Database file ${db_file} is owned by '${owner}', not '${CHV_USER}'; refusing to continue with a root-owned SQLite WAL artifact."
+        fi
+    done
+}
 
 list_chv_processes() {
     ps -eo pid=,comm=,args= | awk '
@@ -165,20 +216,20 @@ get_local_ip() {
 # -----------------------------------------------------------------------------
 # Pre-flight checks
 # -----------------------------------------------------------------------------
-if [ "$(id -u)" -ne 0 ]; then
-    fatal "This installer must be run as root. Try: sudo ./scripts/install.sh"
-fi
-
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64)
         CHV_ARCH="amd64"
         ;;
     aarch64|arm64)
-        CHV_ARCH="arm64"
+        # Fail CLOSED before dependencies, downloads, or any install step
+        # (#647). The release pipeline publishes linux-amd64 assets only;
+        # constructing an amd64 URL on arm64 would download binaries that
+        # cannot execute.
+        fatal "arm64 is not supported: CHV release artifacts are published for x86_64 (linux-amd64) only. Use an x86_64 host."
         ;;
     *)
-        fatal "Unsupported architecture: $ARCH. Only x86_64 and arm64 are supported."
+        fatal "Unsupported architecture: $ARCH. CHV release artifacts are published for x86_64 (linux-amd64) only."
         ;;
 esac
 info "Detected architecture: $ARCH (image suffix: $CHV_ARCH)"
@@ -207,7 +258,7 @@ install_dependencies() {
     apt-get install -y -qq \
         nginx \
         qemu-kvm bridge-utils iproute2 iptables curl openssl \
-        dnsmasq coreutils tar gzip sqlite3 genisoimage apache2-utils
+        dnsmasq coreutils tar gzip sqlite3 genisoimage apache2-utils gnupg
 }
 
 # -----------------------------------------------------------------------------
@@ -361,13 +412,186 @@ print_tarball_download_diagnostics() {
     print_github_install_alternatives
 }
 
+# -----------------------------------------------------------------------------
+# Release signature verification (#646)
+#
+# Trust contract: integrity alone is not authenticity. The release pipeline
+# must publish a detached, ASCII-armored GnuPG signature of the tarball's
+# checksum sidecar:
+#   chv-<version>-linux-amd64.tar.gz.sha256.sig
+# over:
+#   chv-<version>-linux-amd64.tar.gz.sha256
+# Operators supply the signing public key out of band via
+# CHV_RELEASE_GPG_PUBKEY (armored text) or INSTALL_CHV_GPG_PUBKEY_FILE.
+# A SHA256SUMS.sig fallback is accepted ONLY when that same SHA256SUMS file
+# actually lists the tarball; today it lists packages only, so it is not a
+# substitute for signing the tarball sidecar.
+# -----------------------------------------------------------------------------
+release_signature_configured() {
+    [ -n "$CHV_RELEASE_GPG_PUBKEY" ] || [ -n "$INSTALL_CHV_GPG_PUBKEY_FILE" ]
+}
+
+release_gpg() {
+    GNUPGHOME="$RELEASE_GPG_HOME" gpg --batch --no-tty "$@"
+}
+
+setup_release_gpg() {
+    release_signature_configured || return 0
+
+    if [ -n "$CHV_RELEASE_GPG_PUBKEY" ] && [ -n "$INSTALL_CHV_GPG_PUBKEY_FILE" ]; then
+        fatal "Set only one of CHV_RELEASE_GPG_PUBKEY and INSTALL_CHV_GPG_PUBKEY_FILE, not both."
+    fi
+    if ! cmd_exists gpg; then
+        fatal "GPG signature verification is configured, but gpg is not installed. Install gnupg or unset CHV_RELEASE_GPG_PUBKEY / INSTALL_CHV_GPG_PUBKEY_FILE (which downgrades to checksum-only, unsigned verification)."
+    fi
+    if [ -n "$INSTALL_CHV_GPG_PUBKEY_FILE" ] && [ ! -r "$INSTALL_CHV_GPG_PUBKEY_FILE" ]; then
+        fatal "INSTALL_CHV_GPG_PUBKEY_FILE is not readable: $INSTALL_CHV_GPG_PUBKEY_FILE"
+    fi
+
+    RELEASE_GPG_HOME="$(mktemp -d)" || fatal "Failed to create a temporary GPG home."
+    chmod 700 "$RELEASE_GPG_HOME"
+
+    if [ -n "$INSTALL_CHV_GPG_PUBKEY_FILE" ]; then
+        release_gpg --import "$INSTALL_CHV_GPG_PUBKEY_FILE" >/dev/null 2>&1 \
+            || fatal "Failed to import the release GPG public key from $INSTALL_CHV_GPG_PUBKEY_FILE."
+    else
+        printf '%s\n' "$CHV_RELEASE_GPG_PUBKEY" | release_gpg --import >/dev/null 2>&1 \
+            || fatal "Failed to import CHV_RELEASE_GPG_PUBKEY (expected an ASCII-armored public key)."
+    fi
+
+    if ! release_gpg --list-keys --with-colons 2>/dev/null | grep -q '^pub:'; then
+        fatal "The configured release GPG keyring contains no public key; cannot verify the release signature."
+    fi
+    info "Release GPG public key imported; signatures are REQUIRED for this install."
+}
+
+# Non-fatal primitive used by the negative test and the download path.
+verify_detached_signature() {
+    local signature="$1"
+    local signed_file="$2"
+    [ -s "$signature" ] && [ -s "$signed_file" ] || return 1
+    release_gpg --verify "$signature" "$signed_file" >/dev/null 2>&1
+}
+
+tarball_sums_lists_asset() {
+    local sums="$1"
+    local asset="$2"
+    awk -v n="$asset" '$2 == n { found = 1 } END { exit(found ? 0 : 1) }' "$sums"
+}
+
+verify_local_tarball_digest() {
+    local tarball="$1"
+    if [ -z "$INSTALL_CHV_TARBALL_SHA256" ]; then
+        warn "INSTALL_CHV_TARBALL_SHA256 is not set: local tarball ${tarball}"
+        warn "is used as-is, with NO integrity or authenticity verification."
+        warn "Set INSTALL_CHV_TARBALL_SHA256=<64-hex-sha256> to verify it."
+        return 0
+    fi
+
+    local expected actual
+    expected="$(printf '%s' "$INSTALL_CHV_TARBALL_SHA256" | tr 'A-F' 'a-f')"
+    if [ "${#expected}" -ne 64 ] || [ -n "${expected//[0-9a-f]/}" ]; then
+        fatal "INSTALL_CHV_TARBALL_SHA256 must be exactly 64 hexadecimal characters."
+    fi
+    actual="$(sha256sum "$tarball" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        fatal "Local tarball checksum mismatch: expected ${expected}, got ${actual}. Refusing to install an unverified tarball."
+    fi
+    info "Verified local tarball sha256: ${actual}"
+}
+
+# Verify the downloaded tarball against its checksum sidecar AND (when a key
+# is configured) the sidecar's detached signature. Fail closed on every
+# missing/invalid signature once verification is configured.
+verify_release_tarball() {
+    local tarball_name="$1"
+    local tarball_url="$2"
+    local tmpdir="$3"
+    local sidecar="${tarball_name}.sha256"
+    local sidecar_path="${tmpdir}/${sidecar}"
+
+    if ! release_signature_configured; then
+        warn "Release signature verification is NOT configured (CHV_RELEASE_GPG_PUBKEY /"
+        warn "INSTALL_CHV_GPG_PUBKEY_FILE unset). This install verifies the tarball"
+        warn "CHECKSUM only; it does NOT establish release authenticity or prove who"
+        warn "built the artifact. Configure a release public key to fail closed on"
+        warn "missing or invalid signatures."
+        ( cd "$tmpdir" && sha256sum -c --strict "$sidecar" ) \
+            || fatal "Checksum mismatch for ${tarball_name} against the release sidecar; aborting install."
+        return 0
+    fi
+
+    local sig_name="${sidecar}.sig"
+    local sig_path="${tmpdir}/${sig_name}"
+    local sig_url="${tarball_url}.sha256.sig"
+    local code
+    code="$(curl -sSL -o "$sig_path" -w '%{http_code}' "$sig_url" 2>/dev/null)" || code="000"
+
+    if [ "$code" = "200" ]; then
+        if ! verify_detached_signature "$sig_path" "$sidecar_path"; then
+            fatal "GPG signature verification FAILED for ${sig_name} over ${sidecar}; the release may be tampered with. Aborting."
+        fi
+        info "Verified GPG signature ${sig_name} over ${sidecar}."
+        ( cd "$tmpdir" && sha256sum -c --strict "$sidecar" ) \
+            || fatal "Checksum mismatch for ${tarball_name} against the GPG-signed sidecar; aborting install."
+        return 0
+    fi
+
+    warn "Preferred signature asset ${sig_name} is unavailable (HTTP ${code})."
+    warn "Checking the SHA256SUMS.sig fallback; it is accepted only if the same"
+    warn "SHA256SUMS file lists ${tarball_name}."
+
+    local base_url="${tarball_url%/*}"
+    local sums_path="${tmpdir}/SHA256SUMS"
+    local sums_sig_path="${tmpdir}/SHA256SUMS.sig"
+    code="$(curl -sSL -o "$sums_path" -w '%{http_code}' "${base_url}/SHA256SUMS" 2>/dev/null)" || code="000"
+    if [ "$code" != "200" ]; then
+        fatal "GPG verification is configured, but release v${INSTALL_CHV_VERSION} has no ${sig_name} and SHA256SUMS is unavailable (HTTP ${code}). Refusing an unsigned tarball."
+    fi
+    if ! tarball_sums_lists_asset "$sums_path" "$tarball_name"; then
+        fatal "GPG verification is configured, but release v${INSTALL_CHV_VERSION} publishes no ${sig_name}, and SHA256SUMS.sig is NOT a usable fallback because SHA256SUMS does not list ${tarball_name}. The release pipeline must sign the tarball checksum sidecar (${sig_name})."
+    fi
+    code="$(curl -sSL -o "$sums_sig_path" -w '%{http_code}' "${base_url}/SHA256SUMS.sig" 2>/dev/null)" || code="000"
+    if [ "$code" != "200" ]; then
+        fatal "GPG verification is configured, but release v${INSTALL_CHV_VERSION} has neither ${sig_name} nor SHA256SUMS.sig (HTTP ${code}). Refusing an unsigned tarball."
+    fi
+    if ! verify_detached_signature "$sums_sig_path" "$sums_path"; then
+        fatal "GPG signature verification FAILED for SHA256SUMS.sig; the release may be tampered with. Aborting."
+    fi
+
+    local count
+    count="$(awk -v n="$tarball_name" '$2 == n' "$sums_path" | wc -l)"
+    if [ "$count" -ne 1 ]; then
+        fatal "SHA256SUMS.sig is valid but SHA256SUMS has ${count} entries for ${tarball_name}; refusing an ambiguous fallback."
+    fi
+    if ! ( cd "$tmpdir" \
+            && awk -v n="$tarball_name" '$2 == n' "$sums_path" > local-tarball-SHA256SUMS \
+            && sha256sum -c --strict local-tarball-SHA256SUMS ); then
+        fatal "Checksum mismatch for ${tarball_name} against the GPG-signed SHA256SUMS; aborting install."
+    fi
+    info "Verified ${tarball_name} through the GPG-signed SHA256SUMS fallback."
+}
+
 download_release() {
     if [ -n "$INSTALL_CHV_TARBALL_PATH" ]; then
         if [ -d "$INSTALL_CHV_TARBALL_PATH" ]; then
             info "Using local release directory: $INSTALL_CHV_TARBALL_PATH"
+            warn "Local release directory mode uses the files as-is; the installer"
+            warn "cannot establish their authenticity. Only use a directory you built"
+            warn "or verified yourself."
+            if release_signature_configured; then
+                warn "A release GPG key is configured, but local release directory mode"
+                warn "does not fetch or verify a release signature."
+            fi
             EXTRACT_DIR="$INSTALL_CHV_TARBALL_PATH"
         elif [ -f "$INSTALL_CHV_TARBALL_PATH" ]; then
             info "Using local release tarball: $INSTALL_CHV_TARBALL_PATH"
+            if release_signature_configured; then
+                warn "A release GPG key is configured, but local tarball mode does not"
+                warn "fetch the published signature. Verification here is limited to"
+                warn "INSTALL_CHV_TARBALL_SHA256."
+            fi
+            verify_local_tarball_digest "$INSTALL_CHV_TARBALL_PATH"
             local tmpdir
             tmpdir=$(mktemp -d)
             tar -xzf "$INSTALL_CHV_TARBALL_PATH" -C "$tmpdir"
@@ -378,6 +602,8 @@ download_release() {
         fi
         return
     fi
+
+    setup_release_gpg
 
     local tarball_name="chv-${INSTALL_CHV_VERSION}-linux-amd64.tar.gz"
     local tarball_url="https://github.com/${GITHUB_REPO}/releases/download/v${INSTALL_CHV_VERSION}/${tarball_name}"
@@ -396,8 +622,10 @@ download_release() {
     # The tarball carries root-installed binaries, units, UI assets, and
     # migrations, so TLS alone is not enough. The release pipeline publishes a
     # `.sha256` sidecar for every tarball; a missing or mismatched sidecar is
-    # fail-closed (the same discipline quick-install.sh applies).
-    info "Verifying release tarball checksum..."
+    # fail-closed (the same discipline quick-install.sh applies). When a GPG
+    # public key is configured, the sidecar's detached signature is required
+    # as well (#646).
+    info "Verifying release tarball checksum and signature policy..."
     local checksum_code
     checksum_code=$(curl -sSL -o "$checksum" -w '%{http_code}' "${tarball_url}.sha256" 2>/dev/null) || checksum_code="000"
     if [ "$checksum_code" = "404" ]; then
@@ -405,9 +633,7 @@ download_release() {
     elif [ "$checksum_code" != "200" ]; then
         fatal "Failed to download ${tarball_name}.sha256 (HTTP ${checksum_code}); refusing to install an unverified tarball."
     fi
-    if ! ( cd "$tmpdir" && sha256sum -c --strict "${tarball_name}.sha256" ); then
-        fatal "Checksum mismatch for ${tarball_name} against the release sidecar; aborting install."
-    fi
+    verify_release_tarball "$tarball_name" "$tarball_url" "$tmpdir"
 
     info "Extracting release tarball..."
     tar -xzf "$tarball" -C "$tmpdir"
@@ -610,7 +836,24 @@ download_base_image() {
     mkdir -p "${CHV_DATA_DIR}/images"
     chown "${CHV_USER}:${CHV_USER}" "${CHV_DATA_DIR}/images"
 
+    verify_base_image_digest() {
+        local image="$1"
+        [ -n "$INSTALL_CHV_BASE_IMAGE_SHA256" ] || return 0
+
+        local expected actual
+        expected="$(printf '%s' "$INSTALL_CHV_BASE_IMAGE_SHA256" | tr 'A-F' 'a-f')"
+        if [ "${#expected}" -ne 64 ] || [ -n "${expected//[0-9a-f]/}" ]; then
+            fatal "INSTALL_CHV_BASE_IMAGE_SHA256 must be exactly 64 hexadecimal characters."
+        fi
+        actual="$(sha256sum "$image" | awk '{print $1}')"
+        if [ "$actual" != "$expected" ]; then
+            fatal "Base image checksum mismatch for ${image}: expected ${expected}, got ${actual}. Refusing to use an unverified image."
+        fi
+        info "Verified base image sha256: ${actual}"
+    }
+
     if [ -f "$BASE_IMAGE_PATH" ]; then
+        verify_base_image_digest "$BASE_IMAGE_PATH"
         # Ensure existing image is raw (not qcow2)
         if cmd_exists qemu-img; then
             local img_fmt
@@ -631,13 +874,20 @@ download_base_image() {
         return
     fi
 
-    # Check common locations for a pre-downloaded image
+    # Check root-owned locations for a pre-downloaded image. `/tmp` was
+    # deliberately removed (#667): any local user can plant a file there and
+    # the installer runs as root. These `/root` candidates are only usable by
+    # root, and when INSTALL_CHV_BASE_IMAGE_SHA256 is set they are verified
+    # before use.
     for candidate in \
         "/root/noble-server-cloudimg-${CHV_ARCH}.img" \
-        "/root/ubuntu-noble-${CHV_ARCH}.img" \
-        "/tmp/noble-server-cloudimg-${CHV_ARCH}.img"; do
+        "/root/ubuntu-noble-${CHV_ARCH}.img"; do
         if [ -f "$candidate" ]; then
             info "Found pre-downloaded image at ${candidate}, copying..."
+            if [ -z "$INSTALL_CHV_BASE_IMAGE_SHA256" ]; then
+                warn "INSTALL_CHV_BASE_IMAGE_SHA256 is not set; trusting root-only pre-downloaded image ${candidate} without an out-of-band digest."
+            fi
+            verify_base_image_digest "$candidate"
             cp "$candidate" "$BASE_IMAGE_PATH"
             chown "${CHV_USER}:${CHV_USER}" "$BASE_IMAGE_PATH"
             chmod 644 "$BASE_IMAGE_PATH"
@@ -658,6 +908,13 @@ download_base_image() {
         fi
     done
 
+    if [ -z "$INSTALL_CHV_BASE_IMAGE_SHA256" ]; then
+        warn "INSTALL_CHV_BASE_IMAGE_SHA256 is not set: downloading the mutable"
+        warn "Ubuntu noble/current image over TLS without an out-of-band digest."
+        warn "That proves transport integrity to cloud-images.ubuntu.com, not that"
+        warn "the image is the one the operator intended. Pin a sha256 for production."
+    fi
+
     info "Downloading Ubuntu Noble base image for ${CHV_ARCH}..."
     info "URL: ${BASE_IMAGE_URL}"
 
@@ -665,6 +922,7 @@ download_base_image() {
     tmp_image="${BASE_IMAGE_PATH}.tmp"
 
     if curl -fsSL --retry 3 --retry-delay 5 "$BASE_IMAGE_URL" -o "$tmp_image"; then
+        verify_base_image_digest "$tmp_image"
         # Ubuntu cloud images are qcow2; convert to raw for CHV firmware boot
         if cmd_exists qemu-img; then
             local img_fmt
@@ -1467,7 +1725,7 @@ start_services() {
         if ! cmd_exists sqlite3; then
             fatal "sqlite3 is required to seed bootstrap tokens. Install sqlite3 or rerun without INSTALL_CHV_SKIP_DEPS=1."
         fi
-        sudo -u "${CHV_USER}" sqlite3 "${CHV_DB_PATH}" \
+        chv_sqlite "${CHV_DB_PATH}" \
             "INSERT OR REPLACE INTO bootstrap_tokens
              (token_hash, description, one_time_use, used_at, expires_at, created_at, updated_at)
              VALUES (?, 'All-in-one installer', 1, NULL,
@@ -1477,12 +1735,12 @@ start_services() {
             "${token_hash}" "${expires}"
 
         local seeded_tokens
-        seeded_tokens=$(sudo -u "${CHV_USER}" sqlite3 "${CHV_DB_PATH}" \
+        seeded_tokens=$(chv_sqlite "${CHV_DB_PATH}" \
             "SELECT COUNT(*) FROM bootstrap_tokens WHERE token_hash=?;" "${token_hash}" 2>/dev/null || echo "0")
         if [ "${seeded_tokens}" -lt 1 ] 2>/dev/null; then
             fatal "Failed to seed bootstrap token in ${CHV_DB_PATH}."
         fi
-        chown "${CHV_USER}:${CHV_USER}" "${CHV_DB_PATH}" "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" 2>/dev/null || true
+        ensure_chv_db_ownership
 
         # Restart controlplane after sqlite3 seeding
         info "Restarting control plane..."
@@ -1569,9 +1827,10 @@ seed_admin_user() {
 
     # Idempotency: if the admin user already exists, do nothing. We talk to the
     # SQLite DB directly because the API requires authentication (the very
-    # thing we're bootstrapping).
+    # thing we're bootstrapping). Both reads and writes run as the service
+    # user so SQLite never leaves root-owned WAL sidecars (#669).
     if [ -f "$db_path" ] && \
-       [ "$(sqlite3 "$db_path" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
+       [ "$(chv_sqlite "$db_path" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
         info "Admin user already exists — skipping seed."
         return 0
     fi
@@ -1612,7 +1871,7 @@ print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode("utf-8"))
     # ${admin_user_id} and ${hashed_pw}. The bcrypt hash contains '$' but those
     # are protected by the surrounding single quotes inside the SQL itself
     # (heredoc expands shell vars but the SQL parser sees the literal string).
-    if ! sqlite3 "$db_path" <<SQL
+    if ! chv_sqlite "$db_path" <<SQL
 INSERT INTO users (user_id, username, password_hash, role, display_name, must_change_password, created_at, updated_at)
 VALUES ('${admin_user_id}', 'admin', '${hashed_pw}', 'admin', 'Administrator', 1,
         strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -1621,6 +1880,7 @@ SQL
     then
         fatal "Failed to insert bootstrap admin row into ${db_path}."
     fi
+    ensure_chv_db_ownership
 
     # Atomically create the credential file with strict perms BEFORE writing
     # the plaintext, so there is no window where the file exists with permissive
@@ -1697,11 +1957,15 @@ wipe_deployment() {
 reset_must_change_password() {
     # Ensure the bootstrap admin is flagged for rotation on first login even
     # if we temporarily cleared it during install to allow API seeding.
+    # Run as the service user: this is a write to the live WAL database.
     if [ -f "${CHV_DB_PATH}" ] && cmd_exists sqlite3; then
-        if ! sqlite3 "${CHV_DB_PATH}" \
+        if ! chv_sqlite "${CHV_DB_PATH}" \
             "UPDATE users SET must_change_password = 1 WHERE username = 'admin';" 2>/dev/null; then
             warn "CRITICAL: Failed to reset must_change_password flag. Admin may not be forced to rotate password on first login."
         fi
+        # Subshell: a fatal ownership verdict must not change the cleanup
+        # exit status after a successful install.
+        ( ensure_chv_db_ownership ) 2>/dev/null || true
     fi
 }
 
@@ -1709,20 +1973,28 @@ cleanup() {
     if [ -n "${CLEANUP_TMPDIR:-}" ] && [ -d "$CLEANUP_TMPDIR" ]; then
         rm -rf "$CLEANUP_TMPDIR"
     fi
+    if [ -n "${RELEASE_GPG_HOME:-}" ] && [ -d "$RELEASE_GPG_HOME" ]; then
+        rm -rf "$RELEASE_GPG_HOME"
+    fi
     reset_must_change_password
 }
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-trap cleanup EXIT
+main() {
+    if [ "$(id -u)" -ne 0 ]; then
+        fatal "This installer must be run as root. Try: sudo ./scripts/install.sh"
+    fi
 
-if [ "$INSTALL_CHV_WIPE" = "1" ]; then
-    wipe_deployment
-fi
+    trap cleanup EXIT
 
-install_dependencies
-setup_user_and_dirs
+    if [ "$INSTALL_CHV_WIPE" = "1" ]; then
+        wipe_deployment
+    fi
+
+    install_dependencies
+    setup_user_and_dirs
 
 # Clean up previous installation artifacts
 #
@@ -1820,9 +2092,10 @@ seed_admin_user || fatal "Failed to seed bootstrap admin user."
 # middleware.  The flag is restored to 1 in cleanup() / reset_must_change_password()
 # so the operator is still forced to rotate on first UI login.
 info "Temporarily clearing must_change_password for install-time API seeding..."
-sqlite3 "${CHV_DB_PATH}" \
+chv_sqlite "${CHV_DB_PATH}" \
     "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
     || warn "Failed to clear must_change_password; API seeding may be blocked."
+ensure_chv_db_ownership
 
 import_base_image
 
@@ -1873,3 +2146,11 @@ Defaults:
   Bootstrap token valid for 1 hour from installation.
 
 EOF
+}
+
+# Allow sourcing for the signature negative test without running the installer.
+# stdin execution (curl | sudo bash -s) leaves BASH_SOURCE empty; a file
+# execution has BASH_SOURCE[0] == $0; a sourcing has BASH_SOURCE[0] != $0.
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
+    main "$@"
+fi

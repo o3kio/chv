@@ -93,6 +93,10 @@ CHV_RUN_DIR="${CHV_RUN_DIR:-/run/chv}"
 # path uses the package layout in BOTH legs so one config shape serves both.
 CHV_UI_DIR="${CHV_UI_DIR:-/usr/share/chv/ui}"
 CHV_MIGRATIONS_DIR="${CHV_MIGRATIONS_DIR:-/usr/share/chv/migrations}"
+# Package layout: the chv-controlplane .deb/.rpm ships the monitoring store
+# migrations at this path (packaging/nfpm/chv-controlplane.yaml). The tarball
+# leg copies its monitoring-migrations/ tree to the same location (#668).
+CHV_MONITORING_MIGRATIONS_DIR="${CHV_MONITORING_MIGRATIONS_DIR:-/usr/share/chv/monitoring-migrations}"
 CHV_DB_PATH="${CHV_DB_PATH:-${CHV_DATA_DIR}/controlplane.db}"
 
 # CLI flags (parsed in main)
@@ -105,6 +109,8 @@ ARG_TARBALL="0"
 
 # Populated during the run
 CHV_ARCH=""
+DEB_ARCH=""          # dpkg architecture (amd64/arm64)
+RPM_ARCH=""          # rpm architecture (x86_64/aarch64)
 PKG_KIND=""          # deb | rpm | tarball
 VERSION=""           # resolved version, no leading 'v' (e.g. 0.3.0, 0.4.0-rc.1)
 PKG_VERSION=""       # package version (RC maps -rc.N -> ~rc.N)
@@ -171,9 +177,13 @@ detect_arch() {
     case "$arch" in
         x86_64)
             CHV_ARCH="amd64"
+            DEB_ARCH="amd64"
+            RPM_ARCH="x86_64"
             ;;
         aarch64|arm64)
             CHV_ARCH="arm64"
+            DEB_ARCH="arm64"
+            RPM_ARCH="aarch64"
             ;;
         *)
             fatal "Unsupported architecture: ${arch}. Only x86_64 (amd64) and aarch64 (arm64) are supported."
@@ -329,16 +339,16 @@ expected_assets() {
     case "$PKG_KIND" in
         deb)
             printf '%s\n' \
-                "chv-controlplane_${PKG_VERSION}_amd64.deb" \
-                "chv-node_${PKG_VERSION}_amd64.deb" \
-                "chvctl_${PKG_VERSION}_amd64.deb" \
+                "chv-controlplane_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                "chv-node_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                "chvctl_${PKG_VERSION}_${DEB_ARCH}.deb" \
                 "SHA256SUMS"
             ;;
         rpm)
             printf '%s\n' \
-                "chv-controlplane-${PKG_VERSION}-1.x86_64.rpm" \
-                "chv-node-${PKG_VERSION}-1.x86_64.rpm" \
-                "chvctl-${PKG_VERSION}-1.x86_64.rpm" \
+                "chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                "chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                "chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
                 "SHA256SUMS"
             ;;
         tarball)
@@ -539,17 +549,17 @@ install_artifacts() {
         deb)
             info "Installing .deb packages (dpkg-owned upgrades)..."
             if ! (cd "$WORK_DIR" && apt-get install -y --allow-downgrades \
-                    "./chv-controlplane_${PKG_VERSION}_amd64.deb" \
-                    "./chv-node_${PKG_VERSION}_amd64.deb" \
-                    "./chvctl_${PKG_VERSION}_amd64.deb"); then
+                    "./chv-controlplane_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                    "./chv-node_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                    "./chvctl_${PKG_VERSION}_${DEB_ARCH}.deb"); then
                 # No usable apt (offline mirror, broken lists): plain dpkg.
                 # Dependency resolution (libssl3) is then the host's job;
                 # dpkg fails loudly if it is missing.
                 warn "apt-get local install failed; falling back to dpkg -i."
                 (cd "$WORK_DIR" && dpkg -i \
-                    "chv-controlplane_${PKG_VERSION}_amd64.deb" \
-                    "chv-node_${PKG_VERSION}_amd64.deb" \
-                    "chvctl_${PKG_VERSION}_amd64.deb")
+                    "chv-controlplane_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                    "chv-node_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                    "chvctl_${PKG_VERSION}_${DEB_ARCH}.deb")
             fi
             ;;
         rpm)
@@ -557,19 +567,19 @@ install_artifacts() {
             (cd "$WORK_DIR"
              if cmd_exists dnf; then
                  dnf install -y \
-                    "./chv-controlplane-${PKG_VERSION}-1.x86_64.rpm" \
-                    "./chv-node-${PKG_VERSION}-1.x86_64.rpm" \
-                    "./chvctl-${PKG_VERSION}-1.x86_64.rpm"
+                    "./chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm"
              elif cmd_exists yum; then
                  yum install -y \
-                    "./chv-controlplane-${PKG_VERSION}-1.x86_64.rpm" \
-                    "./chv-node-${PKG_VERSION}-1.x86_64.rpm" \
-                    "./chvctl-${PKG_VERSION}-1.x86_64.rpm"
+                    "./chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm"
              else
                  rpm -Uvh \
-                    "chv-controlplane-${PKG_VERSION}-1.x86_64.rpm" \
-                    "chv-node-${PKG_VERSION}-1.x86_64.rpm" \
-                    "chvctl-${PKG_VERSION}-1.x86_64.rpm"
+                    "chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm"
              fi)
             ;;
         tarball)
@@ -654,6 +664,18 @@ install_artifacts_tarball() {
     mkdir -p "$CHV_MIGRATIONS_DIR"
     cp -r "${extract_dir}/migrations/"* "$CHV_MIGRATIONS_DIR/"
     chown -R "$CHV_USER:$CHV_USER" "$CHV_MIGRATIONS_DIR"
+
+    # Monitoring store migrations (ADR-027, #602/#668). The packaged layout is
+    # /usr/share/chv/monitoring-migrations; the tarball carries the same tree
+    # as monitoring-migrations/. Older releases may not have it, which only
+    # degrades monitoring — never abort an otherwise good install.
+    mkdir -p "$CHV_MONITORING_MIGRATIONS_DIR"
+    if [ -d "${extract_dir}/monitoring-migrations" ]; then
+        cp -r "${extract_dir}/monitoring-migrations/"* "$CHV_MONITORING_MIGRATIONS_DIR/"
+        chown -R "$CHV_USER:$CHV_USER" "$CHV_MONITORING_MIGRATIONS_DIR"
+    else
+        warn "Release tarball carries no monitoring-migrations/; monitoring store stays degraded."
+    fi
 
     info "Installing systemd units (packaged units, verbatim)..."
     local unit
@@ -888,6 +910,15 @@ max_connections = 4
 min_connections = 1
 acquire_timeout_secs = 5
 
+# Native monitoring history (ADR-027). Disposable telemetry in a separate
+# SQLite database: a missing/corrupt store degrades monitoring only, never VM
+# lifecycle. Paths match the packaged layout on both the .deb/.rpm and tarball
+# legs (#668).
+[monitoring]
+enabled = true
+database_url = "sqlite://${CHV_DATA_DIR}/monitoring/monitoring.db"
+migrations_dir = "${CHV_MONITORING_MIGRATIONS_DIR}"
+
 [tls]
 ca_cert_path = "${CHV_CONFIG_DIR}/certs/ca.crt"
 ca_key_path = "${CHV_CONFIG_DIR}/certs/ca.key"
@@ -1008,6 +1039,21 @@ chv_sqlite() {
     fi
 }
 
+# Verify (and if necessary repair) ownership of the control-plane database and
+# its WAL/SHM sidecars. Root-owned sidecars make the service fail; never leave
+# them behind (#669).
+ensure_chv_db_ownership() {
+    local db_file owner
+    for db_file in "$CHV_DB_PATH" "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm"; do
+        [ -e "$db_file" ] || continue
+        chown "$CHV_USER:$CHV_USER" "$db_file" 2>/dev/null || true
+        owner="$(stat -c '%U' "$db_file" 2>/dev/null || echo unknown)"
+        if [ "$owner" != "$CHV_USER" ]; then
+            fatal "Database file ${db_file} is owned by '${owner}', not '${CHV_USER}'; refusing to continue with a root-owned SQLite WAL artifact."
+        fi
+    done
+}
+
 # -----------------------------------------------------------------------------
 # Bootstrap token (fresh installs only; the file is the agent's enrollment
 # secret, the control plane learns its hash via the loopback-only
@@ -1095,9 +1141,11 @@ seed_admin_user() {
         fatal "sqlite3 not available — cannot seed admin user. Install the sqlite3 package and re-run."
     fi
 
-    # Idempotency guard: if the admin user already exists, do nothing.
+    # Idempotency guard: if the admin user already exists, do nothing. Both
+    # the read and the write run as the service user so SQLite never leaves
+    # root-owned WAL sidecars (#669).
     if [ -f "${CHV_DB_PATH}" ] && \
-       [ "$(sqlite3 "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
+       [ "$(chv_sqlite "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
         info "Admin user already exists — skipping seed."
         return 0
     fi
@@ -1128,7 +1176,7 @@ print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode("utf-8"))
 
     local admin_user_id="00000000-0000-0000-0000-000000000001"
 
-    if ! sqlite3 "${CHV_DB_PATH}" <<SQL
+    if ! chv_sqlite "${CHV_DB_PATH}" <<SQL
 INSERT INTO users (user_id, username, password_hash, role, display_name, must_change_password, created_at, updated_at)
 VALUES ('${admin_user_id}', 'admin', '${hashed_pw}', 'admin', 'Administrator', 1,
         strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -1137,7 +1185,7 @@ SQL
     then
         fatal "Failed to insert bootstrap admin row into ${CHV_DB_PATH}."
     fi
-    chown "${CHV_USER}:${CHV_USER}" "${CHV_DB_PATH}" "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" 2>/dev/null || true
+    ensure_chv_db_ownership
 
     install -m 0600 -o root -g root /dev/null "$pw_file"
     printf '%s\n' "$plaintext_pw" > "$pw_file"
@@ -1178,6 +1226,11 @@ wait_for_controlplane_health() {
 
 start_services() {
     info "Enabling and starting CHV services..."
+
+    # Monitoring store parent (ADR-027): the control plane runs as ${CHV_USER}
+    # and must be able to create/write monitoring.db plus its WAL sidecars.
+    # This is required for both package and tarball legs (#668).
+    install -d -m 0750 -o "$CHV_USER" -g "$CHV_USER" "${CHV_DATA_DIR}/monitoring"
 
     systemctl enable chv-controlplane
     if [ "$FRESH_INSTALL" = "1" ]; then
@@ -1243,7 +1296,7 @@ wait_for_enrollment() {
     info "Waiting for the local agent to enroll (up to 90s)..."
     local attempt=1 enrolled
     while [ $attempt -le 90 ]; do
-        enrolled=$(sqlite3 "${CHV_DB_PATH}" \
+        enrolled=$(chv_sqlite "${CHV_DB_PATH}" \
             "SELECT COUNT(*) FROM nodes WHERE enrolled_at IS NOT NULL;" 2>/dev/null || echo "0")
         if [ "${enrolled}" -ge 1 ] 2>/dev/null; then
             info "Local agent enrolled."
