@@ -17,10 +17,12 @@ promtool check rules monitoring/rules/chv.yml
 promtool check rules monitoring/rules/recording.yml
 ```
 
-Both rules files must pass `promtool check rules` before merging. CI does
-**not** currently run `promtool`: the automated gate is tracked in the
-observability issue ([#657](https://github.com/o3kio/chv/issues/657)). Until it
-lands, the command above is a local review step, not an enforced check.
+Both rules files must pass `promtool check rules` before merging. CI enforces
+this in the `promtool` job of the [`CI` workflow](../.github/workflows/ci.yml),
+which runs on every pull request and push to `main`. That job downloads the
+pinned Prometheus v3.15.1 release, verifies its SHA256 checksum, and runs
+`promtool check rules monitoring/rules/*.yml`. It does not depend on the Rust
+build.
 
 ## Loading into Prometheus
 
