@@ -2077,22 +2077,9 @@ async fn get_vm_sizes(pool: &StorePool, vm_id: &str) -> Result<(u64, u64), ChvEr
 }
 
 fn migration_bridge_name(net_id: &str) -> String {
-    if net_id == "default" {
-        return "chvbr0".to_string();
-    }
-    let candidate = format!("br-{}", net_id);
-    if candidate.len() <= 15 {
-        return candidate;
-    }
-    let prefix: String = net_id.chars().take(8).collect();
-    let hash = {
-        let mut h: u32 = 0x811c9dc5;
-        for b in net_id.as_bytes() {
-            h = h.wrapping_mul(0x01000193) ^ (*b as u32);
-        }
-        format!("{:04x}", h & 0xffff)
-    };
-    format!("br-{}{}", prefix, hash)
+    // One definition for the agent runtime, legacy reconcile, nwd teardown,
+    // migration, and dnsmasq: truncate+hash ids that exceed IFNAMSIZ.
+    chv_common::bridge_name_for_network(net_id)
 }
 
 /// Atomically mark migration as Completed AND update VM placement.
