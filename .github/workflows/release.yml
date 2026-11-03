@@ -12,6 +12,10 @@ name: Release
 #
 # Safety:
 #   - Only tags create releases. Branch pushes do not trigger this workflow.
+#   - Publication requires the full CI quality gate (ci.yml via
+#     workflow_call) plus cargo audit/cargo deny preflight (#650).
+#   - Signing runs in a protected environment with a read-only token and
+#     only the checksum files, never build artifacts.
 #   - Publishing uses protected GitHub environments.
 #   - Package smoke tests must pass before any publishing.
 #   - Changelog entry is required for stable releases.
@@ -39,10 +43,75 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Quality gate: call the same CI workflow that gates merges (#650)
+  # ---------------------------------------------------------------------------
+  # Rust fmt/check/clippy --all-targets/test, UI build/check, Vitest
+  # (ui-unit), and Playwright e2e all run from ci.yml. Calling the workflow
+  # instead of copying its steps means the release gate cannot drift from the
+  # merge gate. A tag push does not match ci.yml's own push/PR triggers, so
+  # these checks run exactly once per release attempt.
+  quality:
+    name: Quality gate (CI)
+    uses: ./.github/workflows/ci.yml
+
+  # ---------------------------------------------------------------------------
+  # Supply-chain preflight: the same two gates security.yml enforces on PRs
+  # ---------------------------------------------------------------------------
+  # ci.yml does not own cargo-audit/cargo-deny (security.yml does), so the
+  # release gate runs them here rather than publishing on a stale advisory
+  # database. Audit and deny are separate jobs, so one failing cannot mask
+  # the other; deny runs the same policy as security.yml.
+  security-audit:
+    name: Security preflight (cargo audit)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # rustsec/audit-check publishes its result as a check run.
+      checks: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Run cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0 (pinned 2026-09-29)
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  security-deny:
+    name: Security preflight (cargo deny)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6 (pinned 2026-09-30)
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-deny-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deny-
+
+      - name: Run cargo deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (pinned 2026-09-29)
+        with:
+          # Same policy as security.yml: unmaintained advisories stay visible
+          # as warnings while issue #617 tracks the serde_yaml migration;
+          # vulnerabilities remain hard failures.
+          command: check --warn unmaintained
+          arguments: --all-features
+
+  # ---------------------------------------------------------------------------
   # Build release binaries and tarball
   # ---------------------------------------------------------------------------
   build:
     name: Build
+    needs: [quality, security-audit, security-deny]
     # Pin to ubuntu-22.04 (glibc 2.35) so dynamically-linked binaries run on
     # the oldest distro in our smoke matrix (debian:12 ships glibc 2.36).
     # ubuntu-latest currently maps to ubuntu-24.04 (glibc 2.39); binaries
@@ -202,6 +271,15 @@ jobs:
             dist/${{ env.TARBALL_NAME }}
             dist/${{ env.TARBALL_NAME }}.sha256
 
+      - name: Upload tarball checksum for signing
+        # Small artifact so the protected signing job downloads only the
+        # checksum sidecar, not the tarball/binaries/packages (#650).
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (pinned 2026-09-30)
+        with:
+          name: release-tarball-checksum
+          path: dist/${{ env.TARBALL_NAME }}.sha256
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # Build packages and run smoke tests
   # ---------------------------------------------------------------------------
@@ -333,15 +411,6 @@ jobs:
           sha256sum *.deb *.rpm > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Sign checksums
-        run: |
-          ./scripts/release/sign-checksums.sh dist/packages/SHA256SUMS
-        env:
-          CHV_RELEASE_GPG_KEY: ${{ secrets.CHV_RELEASE_GPG_KEY }}
-          CHV_RELEASE_GPG_PASSPHRASE: ${{ secrets.CHV_RELEASE_GPG_PASSPHRASE }}
-          CHV_RELEASE_COSIGN_KEY: ${{ secrets.CHV_RELEASE_COSIGN_KEY }}
-          CHV_RELEASE_COSIGN_PASSWORD: ${{ secrets.CHV_RELEASE_COSIGN_PASSWORD }}
-
       - name: Upload packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (pinned 2026-09-30)
         with:
@@ -349,7 +418,111 @@ jobs:
           path: |
             dist/packages/*.deb
             dist/packages/*.rpm
-            dist/packages/SHA256SUMS*
+            dist/packages/SHA256SUMS
+
+      - name: Upload package checksums for signing
+        # Signing runs in its own protected job (see `sign` below); hand it
+        # only SHA256SUMS instead of the whole package set (#650).
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (pinned 2026-09-30)
+        with:
+          name: release-package-checksums
+          path: dist/packages/SHA256SUMS
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Sign checksums in a protected environment
+  # ---------------------------------------------------------------------------
+  # Signing was previously a step inside the unprotected `package` job. It is
+  # now isolated: read-only token, only the two checksum files, and the same
+  # protected `rc`/`production` environments as the release job. No build
+  # binaries or packages are available to this job.
+  sign:
+    name: Sign artifacts
+    runs-on: ubuntu-latest
+    needs: [build, package]
+    if: needs.build.outputs.should_release == 'true'
+    environment: ${{ needs.build.outputs.is_prerelease == 'true' && 'rc' || 'production' }}
+    permissions:
+      contents: read
+    env:
+      TARBALL_NAME: ${{ needs.build.outputs.tarball_name }}
+      CHV_REQUIRE_SIGNING: ${{ vars.CHV_REQUIRE_SIGNING }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Download tarball checksum sidecar
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 (pinned 2026-09-30)
+        with:
+          name: release-tarball-checksum
+          path: dist/
+
+      - name: Download package checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 (pinned 2026-09-30)
+        with:
+          name: release-package-checksums
+          path: dist/packages/
+
+      - name: Verify checksum inputs
+        run: |
+          set -euo pipefail
+          test -s "dist/${TARBALL_NAME}.sha256" || {
+            echo "Missing dist/${TARBALL_NAME}.sha256 — refusing to sign" >&2
+            exit 1
+          }
+          test -s dist/packages/SHA256SUMS || {
+            echo "Missing dist/packages/SHA256SUMS — refusing to sign" >&2
+            exit 1
+          }
+
+      - name: Sign SHA256SUMS
+        run: ./scripts/release/sign-checksums.sh dist/packages/SHA256SUMS
+        env:
+          CHV_RELEASE_GPG_KEY: ${{ secrets.CHV_RELEASE_GPG_KEY }}
+          CHV_RELEASE_GPG_PASSPHRASE: ${{ secrets.CHV_RELEASE_GPG_PASSPHRASE }}
+          CHV_RELEASE_COSIGN_KEY: ${{ secrets.CHV_RELEASE_COSIGN_KEY }}
+          CHV_RELEASE_COSIGN_PASSWORD: ${{ secrets.CHV_RELEASE_COSIGN_PASSWORD }}
+          # Repository variable (not a secret): set to 1 to make missing/broken
+          # signing fail the release instead of degrading gracefully.
+          CHV_REQUIRE_SIGNING: ${{ vars.CHV_REQUIRE_SIGNING }}
+
+      - name: Sign tarball checksum sidecar
+        # scripts/install.sh verifies the tarball against
+        # chv-<version>-linux-amd64.tar.gz.sha256; installers that support
+        # signature verification look for the matching .sha256.sig. Signing
+        # the sidecar makes that exact published asset authentic (#650).
+        run: ./scripts/release/sign-checksums.sh "dist/${TARBALL_NAME}.sha256"
+        env:
+          CHV_RELEASE_GPG_KEY: ${{ secrets.CHV_RELEASE_GPG_KEY }}
+          CHV_RELEASE_GPG_PASSPHRASE: ${{ secrets.CHV_RELEASE_GPG_PASSPHRASE }}
+          CHV_RELEASE_COSIGN_KEY: ${{ secrets.CHV_RELEASE_COSIGN_KEY }}
+          CHV_RELEASE_COSIGN_PASSWORD: ${{ secrets.CHV_RELEASE_COSIGN_PASSWORD }}
+          CHV_REQUIRE_SIGNING: ${{ vars.CHV_REQUIRE_SIGNING }}
+
+      - name: Record signing status
+        # Guarantees the signature artifact exists even when signing is not
+        # configured, so the release job can download it unconditionally.
+        run: |
+          {
+            echo "channel=${{ needs.build.outputs.channel }}"
+            echo "require_signing=${{ vars.CHV_REQUIRE_SIGNING || '0' }}"
+            echo "signature files:"
+            find dist -name '*.sig' -type f -printf '%p\n' | sort || true
+          } > dist/SIGNING-STATUS.txt
+          cat dist/SIGNING-STATUS.txt
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (pinned 2026-09-30)
+        with:
+          name: release-signatures
+          path: |
+            dist/*.sha256.sig
+            dist/*.sha256.cosign.sig
+            dist/packages/SHA256SUMS.sig
+            dist/packages/SHA256SUMS.cosign.sig
+            dist/SIGNING-STATUS.txt
+          # Signature files are optional while no keys are configured; the
+          # status file always matches, so the artifact is always created.
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # Create GitHub Release and publish artifacts
@@ -357,7 +530,9 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [build, package]
+    # Publication depends on the full gate: CI (quality), supply-chain
+    # preflight, both build/package jobs, and the protected signing job.
+    needs: [quality, security-audit, security-deny, build, package, sign]
     if: needs.build.outputs.should_release == 'true'
     environment: ${{ needs.build.outputs.is_prerelease == 'true' && 'rc' || 'production' }}
     permissions:
@@ -378,6 +553,15 @@ jobs:
         with:
           name: release-packages
           path: dist/packages/
+
+      - name: Download signatures
+        # Artifact paths are rooted at dist/ in the sign job, so this restores
+        # dist/<tarball>.sha256.sig and dist/packages/SHA256SUMS*.sig. The
+        # artifact always exists (SIGNING-STATUS.txt), even unsigned.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8 (pinned 2026-09-30)
+        with:
+          name: release-signatures
+          path: dist/
 
       - name: Stage artifacts
         run: |
@@ -405,6 +589,7 @@ jobs:
         with:
           subject-path: |
             dist/chv-*.tar.gz
+            dist/chv-*.tar.gz.sha256
             dist/packages/*.deb
             dist/packages/*.rpm
 
@@ -475,9 +660,13 @@ jobs:
           files: |
             dist/${{ needs.build.outputs.tarball_name }}
             dist/${{ needs.build.outputs.tarball_name }}.sha256
+            dist/${{ needs.build.outputs.tarball_name }}.sha256.sig
+            dist/${{ needs.build.outputs.tarball_name }}.sha256.cosign.sig
             dist/packages/*.deb
             dist/packages/*.rpm
-            dist/packages/SHA256SUMS*
+            dist/packages/SHA256SUMS
+            dist/packages/SHA256SUMS.sig
+            dist/packages/SHA256SUMS.cosign.sig
             dist/sbom.spdx.json
             dist/sbom.cyclonedx.json
         env:
@@ -489,10 +678,15 @@ jobs:
   publish-repo:
     name: Publish to Package Repository
     runs-on: ubuntu-latest
-    needs: [build, package]
+    # Only after the GitHub Release and signing succeeded, and only for an
+    # explicit release ref/input on a known channel. The previous
+    # `channel != ''` condition was always true (channel is stable|rc).
+    needs: [build, package, sign, release]
     if: |
       needs.build.outputs.should_release == 'true' &&
-      needs.build.outputs.channel != ''
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' && inputs.version != '')) &&
+      (needs.build.outputs.channel == 'stable' || needs.build.outputs.channel == 'rc')
     environment: ${{ needs.build.outputs.is_prerelease == 'true' && 'rc-repo' || 'production-repo' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)

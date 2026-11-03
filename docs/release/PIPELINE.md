@@ -2,7 +2,7 @@
 
 **Purpose:** This is the single source of truth for the CHV release engineering pipeline. If you are an LLM agent working on releases, packaging, CI/CD, or versioning, **read this file first** before exploring the repository.
 
-**Last updated:** 2026-10-03  
+**Last updated:** 2026-11-03
 **Version:** 0.1.2  
 
 ---
@@ -135,41 +135,92 @@ scripts/package/lifecycle-rpm.sh → same for RPM
 
 | Workflow | Trigger | What it does | Runner |
 |----------|---------|--------------|--------|
-| `ci.yml` | push/PR to `main` | fmt, clippy, test, version check | `ubuntu-latest` |
+| `ci.yml` | push/PR to `main`; `workflow_call` | fmt, check, clippy `--all-targets`, workspace tests, UI build/check, Vitest unit tests, Playwright e2e | `ubuntu-latest` |
 | `package-pr.yml` | PR to `main`, push to other branches | build, package, smoke deb/rpm/webui | `ubuntu-22.04` (glibc 2.35 pin — oldest smoke target is debian:12/glibc 2.36) |
 | `package-nightly.yml` | push to `main`, dispatch | build, package, smoke, lifecycle, publish pre-release | `ubuntu-22.04` (build job; same glibc pin) |
-| `release.yml` | tag `v*`, dispatch | full pipeline + SBOM + signing + GitHub Release | build job `ubuntu-22.04` (glibc pin); package/release jobs `ubuntu-latest` (binaries only run in containers) |
+| `security.yml` | push/PR to `main`, daily schedule | `cargo audit`, `cargo deny` (advisories/bans/licenses/sources) | `ubuntu-22.04` |
+| `release.yml` | tag `v*`, dispatch | quality gate, supply-chain preflight, build, package, sign, GitHub Release, optional repo publish | quality/security `ubuntu-latest`/`ubuntu-22.04`; build `ubuntu-22.04` (glibc pin); package/sign/release jobs `ubuntu-latest` (binaries only run in containers) |
 | `integration-kvm.yml` | dispatch, PR label, push `main` | host diagnostics, KVM tests, package install | self-hosted `chv-kvm` |
+
+The `UI unit tests (Vitest)` job runs `npm ci` + `npm run test` in `ui/`.
+Making that check *required* for merges is a GitHub ruleset/branch-protection
+setting, not repository configuration.
 
 **Workflow dependencies:**
 ```
-ci.yml ──▶ (gates PRs)
+ci.yml ──▶ (gates PRs; also called by release.yml via workflow_call)
 package-pr.yml ──▶ produces artifacts (7 day retention)
-release.yml:build ──▶ release.yml:package ──▶ release.yml:release ──▶ release.yml:publish-repo
+release.yml:
+  quality (calls ci.yml) ─┐
+  security-audit ─────────┼──▶ build ──▶ package ──▶ sign ──▶ release ──▶ publish-repo
+  security-deny ──────────┘
 ```
+
+**release.yml job conditions (authoritative graph):**
+
+| Job | `needs` | `if` |
+|-----|---------|------|
+| `quality` | — (reusable `ci.yml`) | always on trigger |
+| `security-audit` | — | always on trigger |
+| `security-deny` | — | always on trigger |
+| `build` | `quality`, `security-audit`, `security-deny` | — |
+| `package` | `build` | — |
+| `sign` | `build`, `package` | `needs.build.outputs.should_release == 'true'` |
+| `release` | `quality`, `security-audit`, `security-deny`, `build`, `package`, `sign` | `needs.build.outputs.should_release == 'true'` |
+| `publish-repo` | `build`, `package`, `sign`, `release` | `should_release == 'true'` **and** (`refs/tags/v*` **or** dispatch `version` input) **and** `channel` is `stable` or `rc` |
+
+`sign` and `release` run in the protected `rc` / `production` environments;
+`publish-repo` runs in `rc-repo` / `production-repo`. A tag push cannot reach
+any publication job unless every quality/security/build/package/sign job
+succeeded.
 
 ### Signing and Trust Artifacts
 ```
-dist/packages/SHA256SUMS ──▶ scripts/release/sign-checksums.sh
-   ├── SHA256SUMS.sig       (GPG, if CHV_RELEASE_GPG_KEY secret set)
-   └── SHA256SUMS.cosign.sig (Cosign, if CHV_RELEASE_COSIGN_KEY secret set)
+dist/packages/SHA256SUMS ─────────────▶ release.yml:sign
+   ├── SHA256SUMS.sig          (GPG, if CHV_RELEASE_GPG_KEY is configured)
+   └── SHA256SUMS.cosign.sig   (Cosign, if CHV_RELEASE_COSIGN_KEY is configured)
 
+dist/chv-<version>-linux-amd64.tar.gz.sha256 ─▶ release.yml:sign
+   ├── chv-<version>-linux-amd64.tar.gz.sha256.sig         (GPG)
+   └── chv-<version>-linux-amd64.tar.gz.sha256.cosign.sig  (Cosign)
+```
+- Signing runs in its own `sign` job, **not** in `package`: protected `rc` /
+  `production` environment, `contents: read` only, and it downloads only the
+  two checksum files (small dedicated artifacts), never binaries or packages.
+- The tarball checksum sidecar signature matters because `scripts/install.sh`
+  verifies the tarball against `chv-<version>-linux-amd64.tar.gz.sha256`; the
+  `.sha256.sig` is the published authenticity asset for that exact file.
+- **Graceful default:** with no signing secrets, `sign` logs
+  `SIGNING NOT CONFIGURED`, still uploads `SIGNING-STATUS.txt`, and the release
+  proceeds unsigned.
+- **Fail closed:** set the repository variable `CHV_REQUIRE_SIGNING=1` to make
+  missing or failed signing fail the `sign` job (and therefore block
+  `release`/`publish-repo`). Enable it for stable releases once keys exist.
+- **Operational prerequisite (not configured in this repository):** the
+  maintainer must add `CHV_RELEASE_GPG_KEY` (and optional passphrase) or
+  `CHV_RELEASE_COSIGN_KEY` (and optional password) as secrets on the protected
+  `rc` / `production` environments, then set `CHV_REQUIRE_SIGNING=1` when the
+  keys are verified. No keys are committed or invented by the pipeline.
+
+```
 SBOM:
    ├── dist/sbom.spdx.json      (anchore/sbom-action)
    └── dist/sbom.cyclonedx.json (anchore/sbom-action)
 
 Provenance:
-   └── GitHub artifact attestation (actions/attest-build-provenance)
+   └── GitHub artifact attestation (actions/attest-build-provenance),
+       including the tarball `.sha256` sidecar
 ```
-- Signing gracefully degrades if secrets are missing
-- No signing keys are currently configured
+- Signature files are published as release assets when present
+- Without keys the release is unsigned, never falsely marked as signed
 
 ### Publishing
 ```
-GitHub Release (always):
+GitHub Release (if should_release == 'true'):
    └── Created by softprops/action-gh-release@v2
 
-Package Repository (optional, requires secrets):
+Package Repository (optional: explicit tag/dispatch input + stable/rc channel,
+                    protected rc-repo/production-repo environment):
    └── scripts/publish/publish-repo.sh
        ├── apt repository (dpkg-scanpackages + GPG-signed Release/InRelease)
        └── yum repository (createrepo_c + GPG-signed repomd.xml)
@@ -273,7 +324,8 @@ git push origin v<version>-rc.1
 | `rpm` command not found (on Debian) | Can't inspect RPM metadata locally | Use CI, or install `rpm` package |
 | `systemd-analyze verify` fails locally | Binaries not in `/usr/bin/` during build | Expected in build container; verified in smoke tests instead |
 | Release workflow fails at "Create GitHub Release" | Missing `contents: write` permission | Check workflow `permissions` block |
-| Signing step shows "SIGNING NOT CONFIGURED" | Secrets not set | Add `CHV_RELEASE_GPG_KEY` or `CHV_RELEASE_COSIGN_KEY` to repo secrets |
+| `Sign artifacts` job shows "SIGNING NOT CONFIGURED" | Secrets not set | Add `CHV_RELEASE_GPG_KEY` or `CHV_RELEASE_COSIGN_KEY` to the protected `rc`/`production` environment, then set repo variable `CHV_REQUIRE_SIGNING=1` for stable releases |
+| `sign` job fails with "CHV_REQUIRE_SIGNING=1" | Required signing enabled but no keys/valid signature | Configure the signing secrets or unset `CHV_REQUIRE_SIGNING`; do not bypass by publishing unsigned |
 | `local: can only be used in a function` | Bash `local` outside function | Fix: remove `local` keyword from top-level code |
 | Nightly/RC RPM sorts below the stable release | CI stamps the Debian-derived `~` pre-release string on both formats; `~` sorts before the base version in RPM too | Expected behavior — nightly → RC → stable is a forward upgrade on both formats (`version.sh --rpm` emits the same `~` strings as `--deb`; see versioning-policy §3.1) |
 
@@ -288,7 +340,7 @@ git push origin v<version>-rc.1
 - "Fix the install script" → edit `scripts/install.sh` (not the hosting scripts unless explicitly asked)
 - "Update version everywhere" → run `make bump-version BUMP_TYPE=<major|minor|patch>`
 - "Review release workflow" → read `.github/workflows/release.yml` and `docs/release/PIPELINE.md`
-- "Sign artifacts" → check if `CHV_RELEASE_GPG_KEY` or `CHV_RELEASE_COSIGN_KEY` secrets exist; if not, explain graceful degradation
+- "Sign artifacts" → check the protected `sign` job; if `CHV_RELEASE_GPG_KEY` / `CHV_RELEASE_COSIGN_KEY` are absent, explain graceful degradation and that `CHV_REQUIRE_SIGNING=1` makes it fail closed
 
 **Before modifying any packaging or release file:**
 1. Read this document (`docs/release/PIPELINE.md`)
