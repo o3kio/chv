@@ -81,8 +81,8 @@ jobs:
             echo "::error::Nightly KVM qualification requires /dev/kvm on the self-hosted chv-kvm runner; this run cannot pass."
             exit 1
           fi
-          if ! sudo -n true 2>/dev/null; then
-            echo "::error::Nightly KVM qualification requires passwordless sudo on the self-hosted chv-kvm runner."
+          if ! sudo -E -n true 2>/dev/null; then
+            echo "::error::Nightly KVM qualification requires passwordless sudo with env preservation (-E) on the self-hosted chv-kvm runner."
             exit 1
           fi
 
@@ -120,12 +120,13 @@ jobs:
             ./scripts/integration/qual/nightly-run.sh --scenarios "m4.7-faults"
 
       - name: Restore runner ownership after root staging
-        # Root compiled into the workspace target/ and the runner's cargo
-        # registries. Hand them back to the runner user so later caching and
-        # checkouts do not fail with permission errors.
+        # env-preflight.sh builds with an isolated --target-dir under
+        # CHV_QUAL_ROOT, so the ownership risk is not the workspace target/:
+        # it is root writing into the runner-owned CARGO_HOME/RUSTUP_HOME
+        # registries. Hand those back so later caching/checkouts do not fail.
         if: always()
         run: |
-          for path in target "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
+          for path in "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
             if [ -e "$path" ]; then
               sudo chown -R "$(id -u):$(id -g)" "$path"
             fi
@@ -171,8 +172,8 @@ jobs:
             echo "::error::Nightly KVM qualification requires /dev/kvm on the self-hosted chv-kvm runner; this run cannot pass."
             exit 1
           fi
-          if ! sudo -n true 2>/dev/null; then
-            echo "::error::Nightly KVM qualification requires passwordless sudo on the self-hosted chv-kvm runner."
+          if ! sudo -E -n true 2>/dev/null; then
+            echo "::error::Nightly KVM qualification requires passwordless sudo with env preservation (-E) on the self-hosted chv-kvm runner."
             exit 1
           fi
 
@@ -212,11 +213,12 @@ jobs:
               --scenarios "m4.3-lifecycle m4.4-network m4.5-storage m4.6-migration m4.7-faults m4.8-perf-soak"
 
       - name: Restore runner ownership after root staging
-        # Hand target/ and the runner cargo registries back to the runner user
+        # The build targets CHV_QUAL_ROOT/target (isolated), not the workspace
+        # target/. Return the runner-owned CARGO_HOME/RUSTUP_HOME registries
         # even when an early scenario failed.
         if: always()
         run: |
-          for path in target "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
+          for path in "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
             if [ -e "$path" ]; then
               sudo chown -R "$(id -u):$(id -g)" "$path"
             fi

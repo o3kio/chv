@@ -53,6 +53,12 @@ jobs:
   quality:
     name: Quality gate (CI)
     uses: ./.github/workflows/ci.yml
+    with:
+      # Coverage and Real-BFF E2E are PR-only lanes. `github.event_name`
+      # inside a called workflow is the caller's event (a tag push here), so
+      # gate them explicitly and keep the release path free of the
+      # instrumented coverage build.
+      skip_optional_checks: true
 
   # ---------------------------------------------------------------------------
   # Supply-chain preflight: the same two gates security.yml enforces on PRs

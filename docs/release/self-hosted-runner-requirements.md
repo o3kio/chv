@@ -186,8 +186,10 @@ Operational requirements:
   workspace is owned by the runner user; it sets `safe.directory` for the
   checkout so `env-preflight.sh` can record the candidate SHA. The workflow
   records the runner's `RUSTUP_HOME`/`CARGO_HOME`, passes them through
-  `sudo -E`, and `chown`s `target/` plus those homes back to the runner user
-  after the run so root staging cannot poison later caches or checkouts.
+  `sudo -E`, and `chown`s those homes back to the runner user after the run so
+  root staging cannot poison later caches or checkouts. `env-preflight.sh`
+  builds into the isolated `CHV_QUAL_ROOT/target` (via `--target-dir`), not
+  the workspace `target/`.
 
 ## Test User Expectations
 

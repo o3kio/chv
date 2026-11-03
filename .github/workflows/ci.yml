@@ -17,6 +17,16 @@ on:
   # no second, drifting copy of the quality gate. A tag push does not match
   # the push/pull_request triggers above, so it only runs when called.
   workflow_call:
+    inputs:
+      skip_optional_checks:
+        # Inside a called reusable workflow `github.event_name` is the
+        # caller's event (a tag push for release.yml), so event_name cannot
+        # distinguish direct PR/push runs from release gates. This explicit
+        # input is the structural gate for PR-only lanes.
+        description: 'Skip PR-only coverage and Real-BFF E2E lanes'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   rust:
@@ -299,11 +309,11 @@ jobs:
     # fast rather than burn a runner until the 6-hour cap. Cold instrumented
     # builds are slower than plain tests, hence the same 45-minute budget.
     timeout-minutes: 45
-    # Only report on the normal PR/push triggers. release.yml calls this
-    # workflow (workflow_call) as its release gate; keeping coverage on the
-    # PR surface avoids lengthening that path. Add it to workflow_call if the
-    # release gate should also enforce the floor.
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    # PR/push-only lane: release.yml calls ci.yml with
+    # skip_optional_checks: true so a tag release does not pay for the
+    # instrumented coverage run. Direct PR/push/dispatch runs use the input's
+    # default false and therefore run this job.
+    if: ${{ !inputs.skip_optional_checks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
 
@@ -331,23 +341,22 @@ jobs:
 
       - name: Install cargo-nextest
         # Coverage uses `cargo llvm-cov nextest`, so install the same pinned
-        # nextest as the Rust checks job. libtest aborts the coverage report on
-        # the first flaky timing test; nextest isolates tests and applies the
-        # retry profile from .config/nextest.toml.
+        # nextest as the Rust checks job. The dedicated `coverage` profile
+        # carries the retry budget; the default profile (Rust checks) has 0.
         uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
         with:
           tool: cargo-nextest@0.9.151
 
-      - name: Run coverage (lcov, nextest, floor at 76% lines)
-        # Nextest matches the Rust checks runner and, with the retry profile
-        # in .config/nextest.toml, prevents one flaky 5s timing assertion from
-        # aborting the whole covered run. --no-fail-fast keeps the full
-        # blast radius visible. --fail-under-lines makes this job blocking:
-        # the command exits non-zero when line coverage drops below the floor,
-        # in addition to failing on build/test errors. Keep the lcov output so
-        # the artifact and summary below still publish on a floor failure.
+      - name: Run coverage (lcov, nextest coverage profile, floor at 76% lines)
+        # --profile coverage is the ONLY place retries are enabled
+        # (.config/nextest.toml: retries=2, fail-fast=false); Rust checks
+        # stays at retries=0. --no-fail-fast keeps the full blast radius
+        # visible. --fail-under-lines makes this job blocking: the command
+        # exits non-zero when line coverage drops below the floor, in addition
+        # to failing on build/test errors. Keep the lcov output so the
+        # artifact and summary below still publish on a floor failure.
         run: >-
-          cargo llvm-cov nextest --workspace
+          cargo llvm-cov nextest --workspace --profile coverage
           --lcov --output-path lcov.info --fail-under-lines 76 --no-fail-fast
 
       - name: Publish coverage summary
@@ -484,9 +493,10 @@ jobs:
   real-bff-e2e:
     name: Real-BFF E2E
     runs-on: ubuntu-latest
-    # Only on the normal PR/push triggers, matching the coverage job: the
-    # release gate should not gain a second, longer instrumented build path.
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    # Same PR/push-only gate as coverage: release.yml passes
+    # skip_optional_checks: true so the release gate does not gain a second
+    # long build path. Direct PR/push/dispatch runs use the default false.
+    if: ${{ !inputs.skip_optional_checks }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)

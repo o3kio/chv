@@ -41,7 +41,7 @@ cargo nextest run --workspace --no-fail-fast
 cargo test --workspace --doc
 
 # Coverage floor (same command CI uses; main baseline 78.97%, threshold 76%)
-cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --fail-under-lines 76 --no-fail-fast
+cargo llvm-cov nextest --workspace --profile coverage --lcov --output-path lcov.info --fail-under-lines 76 --no-fail-fast
 
 # Rust linting
 cargo clippy --workspace -- -D warnings

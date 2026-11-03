@@ -7,16 +7,18 @@ treating a skipped capability check as a pass (#659).
 
 ## Tier 1 — Pull requests (GitHub-hosted, blocking)
 
-Every PR to `main` runs `.github/workflows/ci.yml` on `ubuntu-latest`:
+Every PR to `main` runs `.github/workflows/ci.yml` on `ubuntu-latest`.
+Jobs marked **PR/push-only** are skipped when `release.yml` calls this workflow
+with `skip_optional_checks: true`; direct PR/push runs use the default `false`:
 
 | Job | Evidence produced | Gate |
 |-----|-------------------|------|
-| `Rust checks` | fmt/check/clippy `--all-targets`, `cargo nextest --workspace --no-fail-fast`, doctests, process-level security/startup smokes, architecture and packaging guards | Blocking (required check) |
-| `Rust coverage (ratchet, lines >= 76%)` | `cargo llvm-cov nextest` + retry profile, lcov artifact `rust-coverage-lcov`, `cargo llvm-cov report --summary-only` in the job summary | Fails the workflow below 76% lines; required-check addition is an admin step |
+| `Rust checks` | fmt/check/clippy `--all-targets`, `cargo nextest --workspace --no-fail-fast` (default profile, `retries = 0`), doctests, process-level security/startup smokes, architecture and packaging guards | Blocking (required check) |
+| `Rust coverage (ratchet, lines >= 76%)` | `cargo llvm-cov nextest --profile coverage` + coverage-only retry profile, lcov artifact `rust-coverage-lcov`, `cargo llvm-cov report --summary-only` in the job summary | PR/push-only; fails the workflow below 76% lines; required-check addition is an admin step |
 | `UI checks` | `npm run build` + `svelte-check` | Blocking (required check) |
 | `UI unit tests (Vitest)` | Vitest results | Fails the workflow; required-check addition is an admin step |
 | `E2E tests` | Playwright against `ui/tests/e2e/mock-bff.mjs` and per-spec `page.route` fixtures; HTML report + traces uploaded on failure | Blocking (required check) |
-| `Real-BFF E2E` | Playwright against a **real `chv-controlplane`** (BFF router + serde), disposable SQLite, migrations, seeded admin. Control-plane log, harness log, HTML report and traces uploaded on failure | Fails the workflow; required-check addition is an admin step |
+| `Real-BFF E2E` | Playwright against a **real `chv-controlplane`** (BFF router + serde), disposable SQLite, migrations, seeded admin. Control-plane log, harness log, HTML report and traces uploaded on failure | PR/push-only; fails the workflow; required-check addition is an admin step |
 
 ### Coverage floor
 
@@ -26,12 +28,13 @@ Every PR to `main` runs `.github/workflows/ci.yml` on `ubuntu-latest`:
 The job fails below **76%** (`--fail-under-lines 76`), leaving ~3 points of
 headroom for unrelated refactors.
 
-Nextest runs each test in its own process. The retry profile in
-`.config/nextest.toml` (`retries = 2`, `fail-fast = false`) absorbs known
-timing flakes such as the vsock forwarder close assertion; the coverage
-command also passes `--no-fail-fast`, matching `Rust checks`. This matters
-because a blocking libtest run previously aborted the whole report on one 5 s
-scheduling flake.
+Nextest runs each test in its own process. Only the `coverage` nextest profile
+in `.config/nextest.toml` enables retries (`retries = 2`,
+`fail-fast = false`); the default profile used by `Rust checks` keeps
+`retries = 0`, so the merge gate does not absorb intermittent failures. The
+coverage command also passes `--no-fail-fast` so the report is not aborted by
+the first failure. This matters because a blocking libtest run previously
+aborted the whole report on one 5 s scheduling flake.
 
 This is a **floor, not a trend ratchet**. It does not compare the current PR
 against the previous one, so slow drift between baseline refreshes is
@@ -143,7 +146,10 @@ container, not the GitHub-hosted or self-hosted fleets. Specifically:
 - The real-BFF harness and Playwright spec were exercised locally against a
   `chv-controlplane` built with `--features dev` (disposable SQLite, seeded
   admin): all 3 tests passed, and the spec skipped cleanly with
-  `REAL_BFF_BASE_URL` unset. The GitHub-hosted `Real-BFF E2E` job also passed
-  on PR #689 (4m29s).
+  `REAL_BFF_BASE_URL` unset. The strengthened assertions landed in commit
+  `f6b76f88`; the GitHub-hosted `Real-BFF E2E` job passed on exactly that
+  commit in
+  [run 41696156512](https://github.com/o3kio/chv/actions/runs/41696156512/job/126127119260)
+  (4m35s).
 - No claim is made that the self-hosted scenarios are green on the current
   candidate until the nightly lane reports on that candidate.
