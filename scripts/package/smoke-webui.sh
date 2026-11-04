@@ -31,7 +31,7 @@
 #                                 -> agent-sourced response (4xx or
 #                                    101), never an edge 502 — proves
 #                                    the /ws/ proxy reaches the agent.
-#                                    The console token travels as a
+#                                    The console token is offered as a
 #                                    Sec-WebSocket-Protocol value; the
 #                                    query-string form is ignored.
 #
@@ -362,13 +362,15 @@ fi
 # answer (401/403/400/404 for the bogus token/VM, or 101 if a console
 # existed) — an nginx 502/504 would mean the edge cannot reach the
 # agent, which is the failure this assertion exists to catch. The token is
-# sent as the negotiated subprotocol (#660); a query-string token is ignored.
+# offered as the `Sec-WebSocket-Protocol` value (#660); a query-string token
+# is ignored. The JWT-shaped value reaches the token-validation branch rather
+# than the missing-token branch.
 do_request "http://127.0.0.1:80/ws/vms/smoke-node/smoke-vm/console" \
     -H 'Connection: Upgrade' \
     -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' \
     -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-    -H 'Sec-WebSocket-Protocol: invalid-smoke-token'
+    -H 'Sec-WebSocket-Protocol: invalid.smoke.token'
 WS_STATUS="$(head -n1 "${TMP}/h" | tr -d '\r' | awk '{print $2}')"
 case "${WS_STATUS}" in
     101|400|401|403|404)
