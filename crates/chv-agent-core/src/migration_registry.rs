@@ -26,7 +26,9 @@
 //! - `cancel(op_id)` flips the `CancellationToken` first, waits a bounded
 //!   grace window, then triggers the `AbortHandle`. The grace lets the future
 //!   unwind at a phase boundary (and resume a VM it paused) instead of being
-//!   dropped mid-cleanup.
+//!   dropped mid-cleanup. The force-abort is skipped while the task is inside
+//!   (or was sealed by) a non-cancellable VMM transfer; a caller with no
+//!   ambient runtime aborts immediately unless a transfer is live.
 //! - The registry is stored as `Arc<MigrationTaskRegistry>` inside `AgentServer`.
 //!   When the last `AgentServer` clone drops, the inner `Drop` aborts every
 //!   tracked task — the agent's "graceful shutdown" entry point.
@@ -212,8 +214,10 @@ impl MigrationTaskRegistry {
     }
 
     /// Insert a tracked task. Replaces any existing entry with the same
-    /// `operation_id` (and aborts the displaced task — duplicate operation_ids
-    /// would otherwise leak the older handle).
+    /// `operation_id`: the displaced task is signalled and force-aborted
+    /// unless it is inside a non-cancellable VMM transfer window (then only
+    /// the cooperative signal is safe). Duplicate operation_ids would
+    /// otherwise leak the older handle.
     pub fn insert(&self, op_id: String, abort: AbortHandle, cancel_token: CancellationToken) {
         self.insert_with_transfer_window(
             op_id,
@@ -756,6 +760,45 @@ mod tests {
         assert!(registry.transfer_in_progress("op-unknown"));
     }
 
+    /// A cancel that arrives before registration must still not force-drop a
+    /// late registration that has already entered the transfer window: the
+    /// cooperative signal is delivered and the task stays alive.
+    #[tokio::test]
+    async fn tombstone_respects_late_registration_transfer_window() {
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        assert!(!registry.cancel("op-late-transfer"), "no task exists yet");
+
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(
+            transfer.try_begin(),
+            "the late task entered the window before registering"
+        );
+        let token = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.insert_with_transfer_window(
+            "op-late-transfer".to_string(),
+            task.abort_handle(),
+            token.clone(),
+            transfer.clone(),
+        );
+        assert!(
+            token.is_cancelled(),
+            "the tombstone must signal the late task"
+        );
+        assert!(
+            !transfer.try_begin(),
+            "the tombstone must prevent a new transfer"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "a late task inside its VMM transfer must not be force-dropped"
+        );
+        task.abort();
+        let _ = task.await;
+        registry.remove("op-late-transfer");
+    }
+
     /// A duplicate registration must cancel the displaced task's token, but
     /// must not force-drop it while it is inside a non-cancellable VMM
     /// transfer (the transfer would keep running). Outside the window the old
@@ -808,9 +851,12 @@ mod tests {
             CancellationToken::new(),
         );
         assert!(token.is_cancelled());
+        let joined = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a displaced task outside the transfer must be aborted, not wedged");
         assert!(
-            task.await
-                .expect_err("a displaced task outside the transfer must be aborted")
+            joined
+                .expect_err("the displaced task must be aborted")
                 .is_cancelled(),
             "the displaced task must be force-aborted"
         );
@@ -832,8 +878,10 @@ mod tests {
         registry.insert("op-sync".to_string(), task.abort_handle(), token.clone());
         assert!(registry.cancel("op-sync"));
         assert!(token.is_cancelled());
-        assert!(rt
-            .block_on(task)
+        let joined = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await })
+            .expect("a sync cancel must abort the task, not wedge it");
+        assert!(joined
             .expect_err("a sync cancel must hard-abort")
             .is_cancelled());
         registry.remove("op-sync");
@@ -857,8 +905,10 @@ mod tests {
         );
         transfer.end();
         assert!(registry.cancel("op-sync-transfer"));
-        assert!(rt
-            .block_on(task)
+        let joined = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await })
+            .expect("the retry must abort the task, not wedge it");
+        assert!(joined
             .expect_err("the retry must hard-abort once the transfer is over")
             .is_cancelled());
         registry.remove("op-sync-transfer");
