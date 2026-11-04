@@ -186,6 +186,84 @@ qual_chvctl() {
 }
 
 # ---------------------------------------------------------------------------
+# Migration authorization (issue #663)
+# ---------------------------------------------------------------------------
+# mint_migration_authorization VOLUME_ID SIZE_BYTES [DEST_NODE] [SOURCE_NODE] [TTL_S]
+#
+# Mints the control-plane-issued token that a migration receiver requires
+# before it creates a receiving volume. Must stay byte-compatible with
+# `chv_common::migration_auth::MigrationTokenCodec`:
+#
+#   key       = HMAC-SHA256(secret, "chv/stord/migration-authorization/key/v1")
+#   payload   = canonical JSON of the claims, in declaration order:
+#               version, source_node, destination_node, volume_id,
+#               size_bytes, issued_at_unix_ms, expires_at_unix_ms, nonce
+#   signature = HMAC-SHA256(key, "chv/stord/migration-authorization/token/v1\0" || payload)
+#   token     = "v1." || hex(payload) || "." || hex(signature)
+#
+# The harness mints these itself because scenario stords are triggered
+# directly over gRPC, bypassing the control plane that would normally mint
+# the token at MigrateVm dispatch. Python3 is already a harness requirement;
+# using it (rather than shell string building) keeps the JSON escaping and
+# raw-byte HMAC exact.
+mint_migration_authorization() {
+    local volume_id="$1" size_bytes="$2"
+    local dest="${3:-${QUAL_MIGRATION_DEST_NODE_ID:-qual-migration-dst}}"
+    local source="${4:-${QUAL_NODE_ID:-qual-migration-src}}"
+    local ttl="${5:-300}"
+    local secret_file="${QUAL_MIGRATION_SECRET_FILE:-}"
+
+    [ -n "$volume_id" ] || qual_die "mint_migration_authorization: volume id is required"
+    [ -n "$size_bytes" ] || qual_die "mint_migration_authorization: size_bytes is required"
+    [ -n "$secret_file" ] || qual_die "mint_migration_authorization: QUAL_MIGRATION_SECRET_FILE is not set"
+    [ -r "$secret_file" ] || qual_die "mint_migration_authorization: secret file is not readable: ${secret_file}"
+
+    python3 - "$secret_file" "$volume_id" "$size_bytes" "$dest" "$source" "$ttl" <<'PYEOF'
+import hashlib
+import hmac
+import json
+import secrets
+import sys
+import time
+
+secret_file, volume_id, size_bytes, dest, source, ttl = sys.argv[1:7]
+
+with open(secret_file, "r", encoding="utf-8") as f:
+    # Rust trims the file contents; mirror that exactly.
+    secret = f.read().strip().encode("utf-8")
+if len(secret) < 32:
+    sys.exit(f"migration signing secret is shorter than 32 bytes ({len(secret)})")
+
+key = hmac.new(
+    secret,
+    b"chv/stord/migration-authorization/key/v1",
+    hashlib.sha256,
+).digest()
+
+now_ms = int(time.time() * 1000)
+ttl_ms = int(ttl) * 1000
+claims = {
+    "version": 1,
+    "source_node": source,
+    "destination_node": dest,
+    "volume_id": volume_id,
+    "size_bytes": int(size_bytes),
+    "issued_at_unix_ms": now_ms,
+    "expires_at_unix_ms": now_ms + ttl_ms,
+    "nonce": secrets.token_hex(16),
+}
+# separators=(',', ':') matches serde_json::to_vec (no whitespace).
+payload = json.dumps(claims, separators=(",", ":")).encode("utf-8")
+signature = hmac.new(
+    key,
+    b"chv/stord/migration-authorization/token/v1\0" + payload,
+    hashlib.sha256,
+).hexdigest()
+print(f"v1.{payload.hex()}.{signature}")
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }

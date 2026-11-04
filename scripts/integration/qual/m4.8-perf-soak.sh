@@ -206,6 +206,11 @@ GRPCURL_DIR="${M48_DIR}/grpcurl"
 DST_PORT="51063"        # DST mTLS receiver listener (loopback only)
 VOL_SIZE_BYTES=$((4 * 1024 * 1024 * 1024))   # 4 GiB = 1024 x 4 MiB chunks
 SEED_FILE="${M48_DIR}/m48-seed.img"
+# Destination identity the migration receiver expects in its authorization
+# token (issue #663); bound into the DST config and the minted token.
+QUAL_MIGRATION_DEST_NODE_ID="qual-m48-dst"
+[ -n "${QUAL_MIGRATION_SECRET_FILE:-}" ] \
+    || qual_die "QUAL_MIGRATION_SECRET_FILE not set — run via deploy.sh --exec"
 
 # grpcurl pin (supply-chain discipline — same as M4.6/M4.7).
 GRPCURL_VERSION="1.9.3"
@@ -909,8 +914,10 @@ close_volume_quiet() {
 
 try_trigger_migration() {
     local sock="$1" volid="$2" handle="$3" endpoint="$4"
-    local json resp status mid
-    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\"}"
+    local size="${5:-$VOL_SIZE_BYTES}"
+    local auth json resp status mid
+    auth="$(mint_migration_authorization "$volid" "$size")" || { printf ''; return 1; }
+    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\",\"migrationAuthorization\":\"${auth}\"}"
     resp="$(stord_rpc "$sock" TriggerDiskMigration "$json" 2>&1)" || { printf ''; return 1; }
     status="$(printf '%s' "$resp" | jq -r '.result.status // empty')"
     mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty')"
@@ -1609,6 +1616,8 @@ listen_addr = "127.0.0.1:${4}"
 server_cert_path = "${CERTS_DIR}/dst-server.crt"
 server_key_path = "${CERTS_DIR}/dst-server.key"
 client_ca_path = "${CERTS_DIR}/ca.crt"
+node_id = "${QUAL_MIGRATION_DEST_NODE_ID}"
+signing_secret_file = "${QUAL_MIGRATION_SECRET_FILE}"
 EOF
 }
 
@@ -1628,6 +1637,8 @@ wait_for "P5: DST stord UDS up" 20 test -S "$DST_SOCK" \
     || qual_die "P5: DST stord did not come up — log: $(tail -20 "$DST_LOG" 2>/dev/null)"
 assert_file_contains "P5: DST receiver listener bound (mTLS, client auth required)" \
     "$DST_LOG" "storage migration receiver listening on 127.0.0.1:${DST_PORT}"
+assert_file_contains "P5: DST requires control-plane migration authorizations (not the insecure bypass)" \
+    "$DST_LOG" "storage migration authorizations enabled"
 
 # Seed: 4 GiB patterned (one random 4 MiB block repeated) — the M4.6/
 # M4.7 size, so the throughput record is comparable across milestones.

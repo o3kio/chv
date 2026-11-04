@@ -121,6 +121,13 @@ PLAIN_PORT="51053"    # N8 throwaway plaintext echo listener
 VOL_SIZE_BYTES=$((4 * 1024 * 1024 * 1024))
 SEED_FILE="${M46_DIR}/m46-seed.img"
 
+# Destination identity the migration receiver expects in its authorization
+# token (issue #663). Written into the DST config as migration.node_id and
+# bound into every token this scenario mints.
+QUAL_MIGRATION_DEST_NODE_ID="qual-m46-dst"
+[ -n "${QUAL_MIGRATION_SECRET_FILE:-}" ] \
+    || qual_die "QUAL_MIGRATION_SECRET_FILE not set — run via deploy.sh --exec"
+
 RPC_TIMEOUT=180       # per status poll loop budget (transfer + digest)
 STARTUP_TIMEOUT=20    # stord startup / expected-failure guard
 
@@ -276,11 +283,19 @@ close_volume() {
     return 1
 }
 
-# trigger_migration SOCK VOLID HANDLE ENDPOINT → migration_id on stdout.
+# trigger_migration SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → migration_id on
+# stdout. Mints a fresh, short-lived authorization for exactly this
+# destination/volume/size (issue #663): the direct stord RPC below bypasses
+# the control plane that would normally mint it. A fresh token per trigger is
+# required — the receiver consumes the nonce once, so recovery retries reuse
+# the volume but must not reuse the authorization.
 trigger_migration() {
     local sock="$1" volid="$2" handle="$3" endpoint="$4"
-    local json resp status mid
-    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\"}"
+    local size="${5:-$VOL_SIZE_BYTES}"
+    local auth json resp status mid
+    auth="$(mint_migration_authorization "$volid" "$size")" \
+        || { qual_error "minting migration authorization failed for ${volid}"; return 1; }
+    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\",\"migrationAuthorization\":\"${auth}\"}"
     resp="$(stord_rpc "$sock" TriggerDiskMigration "$json")" \
         || { qual_error "TriggerDiskMigration RPC failed for ${volid}"; return 1; }
     status="$(printf '%s' "$resp" | jq -r '.result.status // empty')"
@@ -611,6 +626,10 @@ listen_addr = "127.0.0.1:${4}"
 server_cert_path = "${5}"
 server_key_path = "${6}"
 client_ca_path = "${7}"
+# Issue #663: a receiver must know its own node id and share the control
+# plane's signing secret, or it refuses to start / denies every stream.
+node_id = "${QUAL_MIGRATION_DEST_NODE_ID}"
+signing_secret_file = "${QUAL_MIGRATION_SECRET_FILE}"
 EOF
 }
 
@@ -670,6 +689,11 @@ assert_file_contains "SRC is source-only (receiver listener not configured)" \
     "$SRC_LOG" "storage migration receiver listener not configured"
 assert_file_contains "DST logged the receiver listener bound (mTLS, client auth required)" \
     "$DST_LOG" "storage migration receiver listening on 127.0.0.1:${DST_PORT} (mTLS, client auth required)"
+# Positive proof the receiver is in token-required mode, not the insecure
+# bypass: without this line every migration below would be testing an
+# unauthenticated path.
+assert_file_contains "DST requires control-plane migration authorizations (not the insecure bypass)" \
+    "$DST_LOG" "storage migration authorizations enabled"
 tcp_port_open "$DST_PORT" \
     && qual_pass "DST receiver TCP listener accepts connections on ${DST_PORT}" \
     || qual_error "DST receiver TCP listener not reachable on ${DST_PORT}"
@@ -775,7 +799,7 @@ N1_VOL="m46n1"
 N1_HANDLE="$(open_volume "$DEPLOY_STORD_SOCK" "$N1_VOL" "m46n1.img" "8388608")" \
     || qual_die "aborting (Leg N1a) — could not open a volume on the deployed stord"
 qual_pass "OpenVolume on the DEPLOYED stord accepted (${N1_VOL}, handle ${N1_HANDLE})"
-N1_MID="$(trigger_migration "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" "https://127.0.0.1:${DST_PORT}")" \
+N1_MID="$(trigger_migration "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" "https://127.0.0.1:${DST_PORT}" "8388608")" \
     || qual_die "aborting (Leg N1a)"
 wait_for "deployed-stord migration task FAILED (no mTLS config)" "$RPC_TIMEOUT" \
     phase_is "$DEPLOY_STORD_SOCK" "$N1_MID" "FAILED" \
@@ -879,7 +903,7 @@ run_negative_src() {
         || { qual_error "N-leg ${name}: stord did not come up — log: $(tail -5 "$log" 2>/dev/null)"; return 1; }
     handle="$(open_volume "$sock" "$vol" "vol.img" "8388608")" \
         || { qual_error "N-leg ${name}: OpenVolume failed"; return 1; }
-    mid="$(trigger_migration "$sock" "$vol" "$handle" "https://127.0.0.1:${DST_PORT}")" \
+    mid="$(trigger_migration "$sock" "$vol" "$handle" "https://127.0.0.1:${DST_PORT}" "8388608")" \
         || { qual_error "N-leg ${name}: trigger failed"; return 1; }
     wait_for "N-${name}: migration task FAILED at the TLS handshake" "$RPC_TIMEOUT" \
         phase_is "$sock" "$mid" "FAILED" \
@@ -1037,7 +1061,7 @@ wait_for "N8 plaintext listener up" 10 tcp_port_open "$PLAIN_PORT" \
 N8_VOL="m46n8"
 N8_HANDLE="$(open_volume "$SRC_SOCK" "$N8_VOL" "n8.img" "8388608")" \
     || qual_die "aborting (Leg N8)"
-N8_MID="$(trigger_migration "$SRC_SOCK" "$N8_VOL" "$N8_HANDLE" "http://127.0.0.1:${PLAIN_PORT}")" \
+N8_MID="$(trigger_migration "$SRC_SOCK" "$N8_VOL" "$N8_HANDLE" "http://127.0.0.1:${PLAIN_PORT}" "8388608")" \
     || qual_die "aborting (Leg N8)"
 wait_for "N8: migration task FAILED against the non-TLS endpoint" "$RPC_TIMEOUT" \
     phase_is "$SRC_SOCK" "$N8_MID" "FAILED" \

@@ -393,6 +393,19 @@ MIGRATIONS_DIR="${REPO_ROOT_OVERRIDE:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}/cmd
 # into both files; this harness must do the same.
 JWT_SECRET="qual-$(openssl rand -hex 32)-jwt-secret"
 
+# Dedicated migration-signing secret (issue #663). Deliberately distinct from
+# the JWT/enrollment secret: rotating user auth must not invalidate in-flight
+# migration authorizations. The control plane mints tokens from this file and
+# every migration receiver (the scenario DST stords) verifies them with the
+# same file, so both sides must agree — like the agent-auth master above.
+# 32 random bytes (64 hex chars) meets the codec's minimum. The file is
+# trimmed by both readers.
+MIGRATION_SIGNING_SECRET_FILE="${TEST_DIR}/migration-signing.key"
+install -m 0600 /dev/null "$MIGRATION_SIGNING_SECRET_FILE"
+openssl rand -hex 32 > "$MIGRATION_SIGNING_SECRET_FILE"
+[ "$(tr -d '\n' < "$MIGRATION_SIGNING_SECRET_FILE" | wc -c)" -ge 32 ] \
+    || qual_die "generated migration signing secret is shorter than 32 bytes"
+
 # --- controlplane.toml ---
 # agent_socket_pattern / agent_runtime_dir / firmware_path: the candidate's
 # defaults match the PRODUCTION layout (/run/chv/agent/api.sock,
@@ -427,6 +440,14 @@ ca_key_path = "${certs_dir}/ca.key"
 server_cert_path = "${certs_dir}/server.crt"
 server_key_path = "${certs_dir}/server.key"
 client_ca_path = "${certs_dir}/ca.crt"
+
+# Issue #663: disk migrations are authorized with a short-lived HMAC token.
+# A production-shaped deployment must configure a dedicated secret or every
+# MigrateVm dispatch fails closed before contacting the agent. The same file
+# is handed to the scenario migration receivers.
+[migration]
+signing_secret_file = "${MIGRATION_SIGNING_SECRET_FILE}"
+token_ttl_seconds = 300
 EOF
 
 # --- agent.toml (core-managed authority) ---
@@ -573,6 +594,9 @@ CP_PID=$!
 disown "$CP_PID"
 wait_for "control-plane up after seeding" 30 cp_users_table_ready \
     || qual_die "control-plane did not restart — log: $(tail -20 "${logs_dir}/controlplane.log" 2>/dev/null)"
+assert_file_contains "control plane mints migration authorizations (dedicated signing secret loaded)" \
+    "${logs_dir}/controlplane.log" "migration authorization minting enabled" \
+    || true
 
 # ---------------------------------------------------------------------------
 # 3. Start stord + nwd, then the agent (enrolls at startup)
@@ -716,6 +740,7 @@ if [ -n "$EXEC_CMD" ]; then
         QUAL_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
         QUAL_CHVCTL_CONFIG_DIR="$QUAL_CHVCTL_CONFIG_DIR" \
         QUAL_CHVCTL="$QUAL_CHVCTL" QUAL_CP_PID="$CP_PID" \
+        QUAL_MIGRATION_SECRET_FILE="$MIGRATION_SIGNING_SECRET_FILE" \
         QUAL_STORD_PID="$STORD_PID" QUAL_NWD_PID="$NWD_PID" \
         QUAL_AGENT_PID="$AGENT_PID" QUAL_NETWORK_CIDR="$NETWORK_CIDR" \
         QUAL_GUEST_IMAGE_PATH="${CHV_QUAL_ROOT}/images/${GUEST_IMAGE}" \

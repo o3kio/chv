@@ -12,6 +12,10 @@
 #   2. the two-stord scenarios omitted `metrics_bind`; after #687 each stord
 #      binds 127.0.0.1:9101 by default, so the extra stords collided with the
 #      deployed stord (and with each other) and aborted at startup.
+#   3. the scenarios predate #663: a migration receiver now refuses to start
+#      without `node_id` + a signing secret, and refuses every stream without
+#      a control-plane authorization token. The harness mints those tokens
+#      itself (it drives stord directly, bypassing the CP minter).
 #
 # Plus the runner-hygiene/observability hooks that keep a failed lane from
 # poisoning the next one. This script is deliberately offline (no root, KVM,
@@ -85,6 +89,47 @@ check_scenario_metrics "${QUAL}/m4.6-migration.sh" 4
 # m4.7/m4.8 write SRC + DST.
 check_scenario_metrics "${QUAL}/m4.7-faults.sh" 2
 check_scenario_metrics "${QUAL}/m4.8-perf-soak.sh" 2
+
+# ---------------------------------------------------------------------------
+# 3b. migration authorization (issue #663)
+# ---------------------------------------------------------------------------
+# The CP mints tokens from a dedicated secret; every receiver verifies with
+# the same file. A drift here fails closed at dispatch/stream time, which
+# used to surface only as a red nightly run.
+grep -q '^MIGRATION_SIGNING_SECRET_FILE=' "$deploy" \
+    && pass "deploy.sh generates a dedicated migration-signing secret" \
+    || fail "deploy.sh no longer generates a migration-signing secret"
+grep -q '^signing_secret_file = "${MIGRATION_SIGNING_SECRET_FILE}"$' "$deploy" \
+    && pass "controlplane.toml points at the migration-signing secret" \
+    || fail "controlplane.toml lost [migration].signing_secret_file"
+grep -q 'QUAL_MIGRATION_SECRET_FILE="$MIGRATION_SIGNING_SECRET_FILE"' "$deploy" \
+    && pass "deploy.sh hands the signing secret to scenarios" \
+    || fail "deploy.sh no longer exports QUAL_MIGRATION_SECRET_FILE"
+grep -q '^mint_migration_authorization()' "${QUAL}/lib.sh" \
+    && pass "lib.sh provides the migration-authorization minter" \
+    || fail "lib.sh lost mint_migration_authorization"
+
+for scenario in m4.6-migration.sh m4.7-faults.sh m4.8-perf-soak.sh; do
+    file="${QUAL}/${scenario}"
+    grep -q 'QUAL_MIGRATION_SECRET_FILE not set' "$file" \
+        && pass "${scenario} refuses to run without the migration-signing secret" \
+        || fail "${scenario} no longer requires QUAL_MIGRATION_SECRET_FILE"
+    grep -q 'node_id = "${QUAL_MIGRATION_DEST_NODE_ID}"' "$file" \
+        && pass "${scenario} binds the receiver node id" \
+        || fail "${scenario} DST config lost migration.node_id"
+    grep -q 'signing_secret_file = "${QUAL_MIGRATION_SECRET_FILE}"' "$file" \
+        && pass "${scenario} gives the receiver the signing secret" \
+        || fail "${scenario} DST config lost migration.signing_secret_file"
+    grep -q 'migrationAuthorization' "$file" \
+        && pass "${scenario} attaches a fresh authorization to every trigger" \
+        || fail "${scenario} no longer attaches migrationAuthorization"
+done
+
+if grep -rn 'allow_insecure_unauthenticated *= *true' "$QUAL" >/dev/null 2>&1; then
+    fail "a qualification scenario enables the insecure migration bypass"
+else
+    pass "no qualification scenario enables the insecure migration bypass"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. teardown and lane hygiene
