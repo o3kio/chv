@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "outcome unknown" and stays tracked so a cancellation can never be falsely
   confirmed, and the source VM stays paused for operator verification. The reply confirms the task actually stopped
   (`Unavailable` keeps the row pending otherwise). A bounded
-  registry tombstone aborts a delayed `MigrateVm` that registers after a
-  `not_tracked` reply. The control plane queues cancellation durably in
+  registry tombstone signals a delayed `MigrateVm` that registers after a
+  `not_tracked` reply, and force-aborts it unless it has already entered a
+  non-cancellable VMM transfer window. The control plane queues cancellation durably in
   `migrations.agent_cancel_pending` (migration `0070`; plus
   `agent_cancel_confirmed_at`, `agent_cancel_attempts`,
   `agent_cancel_last_attempt_at`, `agent_cancel_last_error`) on every terminal

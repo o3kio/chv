@@ -4492,6 +4492,66 @@ mod tests {
         );
     }
 
+    /// The destination `migrate_vm` handler must register the spawned task
+    /// with the exact `TransferWindow` the task uses. A fresh default window
+    /// would let `CancelMigration` confirm and force-drop a live VMM receive.
+    #[tokio::test]
+    async fn migrate_vm_destination_shares_transfer_window_and_retains_sealed_task() {
+        let mock = Arc::new(MockCloudHypervisorAdapter::default());
+        *mock.migration_timeout.lock().unwrap() = true;
+        let mut cache = NodeCache::new("node-1");
+        cache.node_state = crate::state_machine::NodeState::TenantReady
+            .as_str()
+            .to_string();
+        cache.connectivity_state = crate::connectivity::ConnectivityState::Connected;
+        let server = AgentServer::new(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(mock),
+            std::path::PathBuf::from("/run/chv/stord/api.sock"),
+            std::path::PathBuf::from("/run/chv/nwd/api.sock"),
+            None,
+            std::path::PathBuf::from("/var/lib/chv/agent"),
+        );
+
+        let req = proto::MigrateVmRequest {
+            meta: Some(test_meta("1")),
+            node_id: "node-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            source_node_id: "node-2".to_string(),
+            destination_node_id: "node-1".to_string(),
+            config: None,
+        };
+        proto::lifecycle_service_server::LifecycleService::migrate_vm(&server, Request::new(req))
+            .await
+            .expect("the destination must ACK the migration");
+
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "the destination task must be registered before the ACK"
+        );
+
+        // The mock receive call returns a timeout, which seals the task's
+        // window. The registry entry only observes that state if it shares
+        // the same `TransferWindow`; wait for the task to reach it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !server.migration_tasks.transfer_in_progress("op-1") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the registry must observe the task's sealed transfer window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The completion reaper's remove must retain a sealed task, so a
+        // later cancel keeps failing closed instead of reporting not_tracked.
+        server.migration_tasks.remove("op-1");
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "a sealed destination task must stay tracked after remove"
+        );
+        assert!(server.migration_tasks.transfer_in_progress("op-1"));
+    }
+
     #[tokio::test]
     async fn apply_vm_desired_state_updates_generation_and_fragment() {
         let server = test_server();

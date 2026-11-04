@@ -713,8 +713,10 @@ mod tests {
             "the window must close when the transfer returns"
         );
         assert!(registry.cancel("op-transfer"));
-        assert!(handle
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
+            .expect("the retry must abort the task, not wedge it");
+        assert!(joined
             .expect_err("the retry must hard-abort once the transfer is over")
             .is_cancelled());
         registry.remove("op-transfer");
@@ -953,9 +955,11 @@ mod tests {
         registry.insert("op-late".to_string(), handle.abort_handle(), token.clone());
 
         assert!(token.is_cancelled(), "tombstone must cancel the late task");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the late registration must be aborted, not wedged");
         assert!(
-            handle
-                .await
+            joined
                 .expect_err("late task must be aborted")
                 .is_cancelled(),
             "late registration must be aborted, not left running"
