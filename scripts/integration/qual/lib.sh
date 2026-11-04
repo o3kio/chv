@@ -127,6 +127,58 @@ wait_for() {
     qual_pass "$desc"
 }
 
+# wait_vm_guest_stopped VM [TIMEOUT] — wait for a graceful `vm stop` to
+# reach a terminal GUEST state. Under the --no-shutdown contract the VMM
+# is deliberately retained after the guest shuts down; DeleteVm is what
+# explicitly stops it. Waiting for the CH process to exit here is wrong
+# (it burns the full timeout and mislabels a correct stop as a failure).
+# The VM's VMM must still be alive; only its API state tells us the guest
+# is down. A live process whose API socket never answers for 3 strikes is
+# the known #345 wedge and gets the documented SIGKILL remediation
+# (WARN, not error — the operator path). Sets VM_LAST_STOP_WEDGED=1 when
+# that remediation fires so perf accounting can annotate the sample.
+wait_vm_guest_stopped() {
+    local vm="$1" timeout="${2:-${STOP_TIMEOUT:-240}}" waited=0 strikes=0 pid
+    local sock="${VMS_DIR}/${vm}/vm.sock" info state
+    while :; do
+        if ! pgrep -f "(^|/)cloud-hypervisor( |$).*vms/${vm}" >/dev/null 2>&1; then
+            qual_pass "vm ${vm}: guest down (VMM exited)"
+            return 0
+        fi
+        info="$(curl -sg --max-time 2 --unix-socket "$sock" \
+            http://localhost/api/v1/vm.info 2>/dev/null || true)"
+        state="$(printf '%s' "$info" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("state", ""))
+except Exception:
+    print("")' 2>/dev/null || true)"
+        case "$state" in
+            Shutdown|Created)
+                qual_pass "vm ${vm}: guest reached terminal state ${state}; VMM retained per --no-shutdown"
+                return 0
+                ;;
+            "")
+                strikes=$((strikes + 1))
+                if [ "$strikes" -ge 3 ]; then
+                    pid="$(pgrep -f "(^|/)cloud-hypervisor( |$).*vms/${vm}" | head -1)"
+                    VM_LAST_STOP_WEDGED=1
+                    qual_warn "wait_vm_guest_stopped(${vm}): known #345 wedge — CH ${pid:-?} alive with a dead API after the graceful stop; remediating with SIGKILL (the documented operator path)"
+                    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+                    strikes=0
+                fi
+                ;;
+            *) strikes=0 ;;
+        esac
+        sleep 2
+        waited=$((waited + 2))
+        if [ "$waited" -ge "$timeout" ]; then
+            qual_error "wait_vm_guest_stopped(${vm}): guest did not reach a terminal state within ${timeout}s"
+            return 1
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Forbidden-outcome residue checks (used by every teardown)
 # ---------------------------------------------------------------------------

@@ -261,6 +261,24 @@ assert_no_ch_process() {
     fi
 }
 
+# wait_no_ch_process desc timeout — delete stops the retained VMM
+# asynchronously (the authority-side delete op completes before the CH
+# process is reaped). Wait for the process to disappear before asserting
+# absence, mirroring m4.7's wait_vm_stopped after delete. Without this the
+# assertion races the teardown and records a false FORBIDDEN residue.
+wait_no_ch_process() {
+    local desc="$1" timeout="$2" waited=0
+    while [ "$(count_cloud_hypervisor_processes)" != "0" ]; do
+        sleep 2
+        waited=$((waited + 2))
+        if [ "$waited" -ge "$timeout" ]; then
+            qual_error "${desc} (timed out after ${timeout}s)"
+            return 1
+        fi
+    done
+    qual_pass "${desc}"
+}
+
 # stop_daemon PID — SIGTERM, wait up to 10 s, then SIGKILL.
 stop_daemon() {
     local pid="$1"
@@ -691,6 +709,7 @@ if [ "$(vm_count)" = "0" ]; then
 else
     qual_warn "BFF list still renders the VM after delete — documented M2.5 deferred-scope retention (authority-side delete only; vm dir + volume also retained)"
 fi
+wait_no_ch_process "Leg F CH process reaped after delete" "$STOP_TIMEOUT" || true
 assert_no_ch_process "Leg F after delete"
 OPS_F="$(ops_snapshot)"
 qual_info "Leg F op snapshot: ${OPS_F}"

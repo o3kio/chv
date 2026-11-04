@@ -811,15 +811,36 @@ N1_VOL="m46n1"
 N1_HANDLE="$(open_volume "$DEPLOY_STORD_SOCK" "$N1_VOL" "m46n1.img" "8388608")" \
     || qual_die "aborting (Leg N1a) — could not open a volume on the deployed stord"
 qual_pass "OpenVolume on the DEPLOYED stord accepted (${N1_VOL}, handle ${N1_HANDLE})"
-N1_MID="$(trigger_migration "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" "https://127.0.0.1:${DST_PORT}" "8388608")" \
-    || qual_die "aborting (Leg N1a)"
-wait_for "deployed-stord migration task FAILED (no mTLS config)" "$RPC_TIMEOUT" \
-    phase_is "$DEPLOY_STORD_SOCK" "$N1_MID" "FAILED" \
-    || qual_error "deployed-stord migration task never failed (no mTLS config)"
-N1_ERR="$(migration_field "$DEPLOY_STORD_SOCK" "$N1_MID" errorMessage)"
-assert_contains "deployed-stord task error is the mTLS-required precondition" \
-    "$N1_ERR" "mTLS is required for storage migration"
-record_migration_error "leg-N1a deployed stord (no [migration])" "$DEPLOY_STORD_SOCK" "$N1_MID"
+# Two fail-closed shapes are conformant: the trigger can be refused
+# synchronously (current contract: a node with no client identity does
+# not initiate migrations at all) or accepted as a journaled task that
+# then fails with the mTLS-required precondition (older contract).
+N1_RESP="$(trigger_migration_raw "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" \
+    "https://127.0.0.1:${DST_PORT}" "8388608")"; N1_RC=$?
+if [ "$N1_RC" -ne 0 ]; then
+    assert_contains "deployed-stord trigger refuses synchronously (no migration client identity)" \
+        "$N1_RESP" "no migration client identity"
+    assert_contains "deployed-stord refusal names the mTLS requirement" \
+        "$N1_RESP" "mTLS is required for storage migration"
+    qual_pass "deployed-stord fails closed at TriggerDiskMigration (no client identity configured)"
+    {
+        echo "### leg-N1a deployed stord (no [migration]) — synchronous refusal ($(date -u +%FT%TZ))"
+        printf '%s\n\n' "$N1_RESP"
+    } >> "${EVIDENCE_DIR}/failed-migrations.jsonl"
+else
+    N1_STATUS="$(printf '%s' "$N1_RESP" | jq -r '.result.status // empty' 2>/dev/null)"
+    N1_MID="$(printf '%s' "$N1_RESP" | jq -r '.migrationId // empty' 2>/dev/null)"
+    if [ "$N1_STATUS" != "OK" ] || [ -z "$N1_MID" ]; then
+        qual_die "aborting (Leg N1a) — trigger neither refused nor accepted (status=${N1_STATUS}): $(printf '%s' "$N1_RESP" | head -c 300)"
+    fi
+    wait_for "deployed-stord migration task FAILED (no mTLS config)" "$RPC_TIMEOUT" \
+        phase_is "$DEPLOY_STORD_SOCK" "$N1_MID" "FAILED" \
+        || qual_error "deployed-stord migration task never failed (no mTLS config)"
+    N1_ERR="$(migration_field "$DEPLOY_STORD_SOCK" "$N1_MID" errorMessage)"
+    assert_contains "deployed-stord task error is the mTLS-required precondition" \
+        "$N1_ERR" "mTLS is required for storage migration"
+    record_migration_error "leg-N1a deployed stord (no [migration])" "$DEPLOY_STORD_SOCK" "$N1_MID"
+fi
 close_volume "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" || true
 
 # N1b: the startup-vs-trigger distinction (#393/#396/#395) — client or

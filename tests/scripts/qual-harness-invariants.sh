@@ -186,4 +186,31 @@ grep -q 'deploy.sh" --exec "./\${scenario}.sh" 9>&-' "$nightly" \
     && pass "scenario children do not inherit the lane lock" \
     || fail "scenario children may inherit and leak the lane lock"
 
+# ---------------------------------------------------------------------------
+# 4. graceful stop vs delete contract (--no-shutdown)
+# ---------------------------------------------------------------------------
+# A graceful stop keeps the VMM alive until DeleteVm; only the guest
+# reaches a terminal state. Scenarios that stop and then restart a VM must
+# wait for that terminal state. run 41912418366 failed m4.4/m4.5/m4.8
+# because they still waited for CH exit after `vm stop` (240 s each).
+grep -q '^wait_vm_guest_stopped()' "${QUAL}/lib.sh" \
+    && pass "lib.sh defines the shared terminal-guest stop wait" \
+    || fail "lib.sh lost wait_vm_guest_stopped (graceful-stop contract)"
+for f in m4.4-network m4.5-storage m4.8-perf-soak; do
+    grep -q 'wait_vm_guest_stopped "' "${QUAL}/${f}.sh" \
+        && pass "${f} waits for terminal guest state after stop" \
+        || fail "${f} does not use the terminal-guest stop wait"
+done
+grep -q 'wait_no_ch_process "Leg F CH process reaped after delete"' "${QUAL}/m4.3-lifecycle.sh" \
+    && pass "m4.3 waits for the VMM to be reaped after delete" \
+    || fail "m4.3 delete absence assertion races the async VMM reaping"
+grep -q 'no migration client identity' "${QUAL}/m4.6-migration.sh" \
+    && pass "m4.6 accepts the synchronous no-client-identity refusal" \
+    || fail "m4.6 only accepts the older async migration-refusal shape"
+
+# Targeted re-qualification without the soak (manual dispatch).
+grep -q 'QUAL_SCENARIOS' .github/workflows/nightly-kvm-qualification.yml \
+    && pass "workflow exposes a manual scenario-subset input" \
+    || fail "workflow lost the manual scenario-subset input"
+
 exit "$rc"
