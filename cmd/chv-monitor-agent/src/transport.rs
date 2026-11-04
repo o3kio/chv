@@ -505,8 +505,9 @@ mod tests {
     async fn forwarder_pipes_loopback_bytes_to_a_vsock_listener() {
         // Prove the pipe end-to-end against a REAL AF_VSOCK listener on
         // the local CID (kernel loopback, no host needed). Skipped when
-        // the kernel offers no vsock family (CI containers, bare metal)
-        // — the g5 rig covers the full path on real hardware.
+        // the kernel offers no vsock family or exposes AF_VSOCK without a
+        // working local loopback transport (CI containers, bare metal) —
+        // the g5 rig covers the full path on real hardware.
         let listen =
             unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if listen < 0 {
@@ -534,6 +535,49 @@ mod tests {
         assert_eq!(unsafe { libc::listen(listen, 16) }, 0);
         let port = addr.svm_port;
         assert_ne!(port, 0, "the port must be the one we chose");
+
+        // Some kernels expose AF_VSOCK but do not route VMADDR_CID_LOCAL
+        // (GitHub-hosted runners): socket/bind/listen succeed, but the
+        // forwarder's dial resets and the TCP side fails with a bare
+        // `ConnectionReset` that says nothing about the pipe. Probe the
+        // loopback transport once and skip when it is not truly usable.
+        let mut probe_addr = addr;
+        probe_addr.svm_cid = libc::VMADDR_CID_LOCAL;
+        let probe =
+            unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let probe_ok = probe >= 0
+            && unsafe {
+                libc::connect(
+                    probe,
+                    &probe_addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+                )
+            } == 0;
+        if !probe_ok {
+            let err = io::Error::last_os_error();
+            // SAFETY: both fds are valid on the paths that reach here.
+            unsafe {
+                if probe >= 0 {
+                    libc::close(probe);
+                }
+                libc::close(listen);
+            }
+            eprintln!(
+                "skipping: AF_VSOCK exists but the local loopback transport is unusable: {err}"
+            );
+            return;
+        }
+        // Drain the probe connection so the echo thread accepts the
+        // forwarder's connection (the listen backlog would otherwise hand
+        // it the already-closed probe first).
+        let accepted = unsafe { libc::accept(listen, std::ptr::null_mut(), std::ptr::null_mut()) };
+        // SAFETY: probe is a valid connected fd; accepted is valid on success.
+        unsafe {
+            if accepted >= 0 {
+                libc::close(accepted);
+            }
+            libc::close(probe);
+        }
 
         // Echo server on the vsock listener, in a blocking thread.
         let echo = std::thread::spawn(move || {
