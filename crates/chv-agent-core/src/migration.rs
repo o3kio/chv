@@ -1745,10 +1745,68 @@ mod tests {
         }
     }
 
+    /// The destination success and definitive-failure arms must end (not seal)
+    /// the window, and a pre-armed cancel must refuse to start receive at all.
+    #[tokio::test]
+    async fn destination_end_window_and_prearmed_cancel() {
+        let (rt, _mock) = test_runtime();
+        let transfer = Arc::new(TransferWindow::default());
+        spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-1".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect("the mock receive succeeds");
+        assert!(!transfer.is_unknown());
+        assert!(!transfer.in_progress(), "success must end the window");
+
+        let (rt, mock) = test_runtime();
+        *mock.migration_definitive_failure.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+        let err = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-1".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect_err("the mock reports a definitive failure");
+        assert!(err.contains("receive-migration failed"), "{err}");
+        assert!(!transfer.is_unknown());
+        assert!(
+            !transfer.in_progress(),
+            "a definitive failure must end the window"
+        );
+
+        // A cancel armed before the task starts must prevent the VMM call.
+        let (rt, mock) = test_runtime();
+        *mock.migration_timeout.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(!transfer.arm_cancel(), "nothing was active yet");
+        let err = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-1".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect_err("a pre-armed cancel must refuse to start receive");
+        assert_eq!(err, "migration cancelled before receive-migration");
+        assert!(!transfer.in_progress());
+    }
+
     /// The success and definitive-failure arms must end (not seal) the window.
-    /// A stuck `TRANSFER_ACTIVE` would make every later cancel return
-    /// `Unavailable` and skip the registry's force-abort for a task whose VMM
-    /// call already finished.
+    /// A stuck `TRANSFER_ACTIVE` would make a cancel that lands while the entry
+    /// is still tracked return `Unavailable` and skip the registry's delayed
+    /// force-abort, even though the VMM call already finished.
     #[tokio::test]
     async fn source_send_success_and_definitive_failure_end_window() {
         // Success: the migrated source stays paused, but the window is over.
@@ -1809,6 +1867,37 @@ mod tests {
             rt.get("vm-1").await.unwrap().runtime_status,
             "Running",
             "a definitive failure must resume the source"
+        );
+    }
+
+    /// A cancel armed before the memory phase must refuse to start the VMM
+    /// send and resume the VM paused for the disk pre-copy.
+    #[tokio::test]
+    async fn source_prearmed_cancel_resumes_paused_vm_without_send() {
+        let (rt, _mock) = test_runtime();
+        create_vm_record(&rt).await;
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(!transfer.arm_cancel(), "nothing was active yet");
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+
+        let err = send_memory_migration(
+            &rt,
+            "vm-1",
+            "op-1",
+            "node-1",
+            "tcp://127.0.0.1:1",
+            None,
+            &mut guard,
+            &transfer,
+        )
+        .await
+        .expect_err("a pre-armed cancel must not start send-migration");
+        assert_eq!(err, "migration cancelled before memory migration");
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Running",
+            "the VM paused for disk pre-copy must be resumed"
         );
     }
 }

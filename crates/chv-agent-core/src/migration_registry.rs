@@ -132,7 +132,7 @@ impl TransferWindow {
 
     /// Arm cancellation. Returns whether a transfer was active at that moment.
     /// No transfer can begin after this call.
-    fn arm_cancel(&self) -> bool {
+    pub(crate) fn arm_cancel(&self) -> bool {
         self.state.fetch_or(TRANSFER_CANCEL_ARMED, Ordering::SeqCst) & TRANSFER_ACTIVE != 0
     }
 
