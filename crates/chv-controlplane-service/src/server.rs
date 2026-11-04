@@ -1043,6 +1043,9 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         ))
     }
 
+    /// Transport relay for `MigrateVm`; the fail-closed `pause_first`
+    /// invariant is enforced in the lifecycle service so a direct gRPC
+    /// caller cannot bypass the BFF/CLI gate (issue #656).
     async fn migrate_vm(
         &self,
         request: Request<proto::MigrateVmRequest>,

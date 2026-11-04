@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **migration (direct-gRPC stop-the-world gate + dispatch config — #656)**:
+  `LifecycleService::migrate_vm` is reachable directly, not only through the
+  BFF/CLI, and previously accepted `pause_first=false` there. It now rejects
+  absent/false `pause_first` with `InvalidArgument` before any operation,
+  state write, or dispatch, mirroring the BFF. The same pre-journaling gate
+  rejects a `node_id` that is not the source, a self-migration, a VM whose
+  recorded placement is not the source node, and node references containing
+  `:` (the correlation-id delimiter — a `:`-bearing id would otherwise be
+  truncated into a different node pair at dispatch). **Dispatch metadata**:
+  the migration discriminator (`source=…:dest=…[:pause_first=true]`) is now
+  written in the operation INSERT itself, so the orchestrator always has the
+  config it needs; the previous post-hoc UPDATE could leave a `Pending`
+  operation with a NULL correlation id, a state neither the claim loop nor
+  the reaper revisits. A caller-id replay is only re-accepted when it names
+  the same operation type, VM, and configuration, and the existing operation
+  is still `Pending`/`Accepted`; the re-accept is conditioned on that state so
+  a concurrent claim cannot be resurrected. Tests: 10 migration-path rows (both
+  gate variants with zero journaling, the positive correlation round-trip,
+  placement/self-migration/delimiter/unplaced rejections, replay redirect
+  refusal, terminal replay refusal, and foreign-operation refusal). Refs #656.
 - **resource IDs (128-bit, #664)**: persistent resource and operation IDs are
   now 128-bit (32 lowercase hex characters via `chv_common::gen_resource_id()`)
   instead of 32-bit, and the eBPF `vm_key` / `struct rule_key.id` width was

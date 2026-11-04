@@ -41,8 +41,13 @@ is not supported until #394 is proven; set pause_first=true
 (stop-the-world)" — before dispatching the lifecycle RPC; both chvctl
 commands reject the live path client-side before sending; and the WebUI
 modal renders pause-first checked and disabled and always sends `true`.
-The VM is paused for the full disk+memory transfer. Live migration
-returns when #394 is proven; this gate is not a capability claim.
+The lifecycle gRPC adapter is gated too, so a direct caller cannot bypass
+the BFF: it rejects absent/false `pause_first`, a `node_id` that is not
+the source, a self-migration, a VM whose recorded placement is not the
+source node, and node references containing the correlation-id delimiter
+`:` — all before journaling an operation. The VM is paused for the full
+disk+memory transfer. Live migration returns when #394 is proven; this
+gate is not a capability claim.
 
 ## State Machine
 

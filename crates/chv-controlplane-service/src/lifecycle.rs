@@ -174,6 +174,9 @@ pub trait LifecycleService: Send + Sync {
         request: proto::RestartNetworkRequest,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// Fail-closed stop-the-world gate: `pause_first` must be explicit and
+    /// true. Both the BFF and this direct control-plane RPC reject the live
+    /// path before creating an operation (issue #656).
     async fn migrate_vm(
         &self,
         request: proto::MigrateVmRequest,
@@ -497,6 +500,37 @@ impl LifecycleServiceImplementation {
         meta: &proto::RequestMeta,
         idempotency_discriminator: Option<String>,
     ) -> Result<(OperationId, Generation, bool), ControlPlaneServiceError> {
+        self.create_operation_and_emit_with_correlation(
+            operation_type,
+            node_id,
+            resource_kind,
+            resource_id,
+            meta,
+            idempotency_discriminator,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::create_operation_and_emit`], but allows the caller to
+    /// supply `operations.correlation_id` in the INSERT itself.
+    ///
+    /// `MigrateVm` carries its source/dest/config discriminator through that
+    /// column. Writing it at INSERT time (rather than a post-hoc UPDATE)
+    /// removes the failure window where an operation existed as `Pending`
+    /// with a NULL correlation id: that state is never claimed or reaped, so
+    /// a failed UPDATE could strand it forever.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_operation_and_emit_with_correlation(
+        &self,
+        operation_type: &str,
+        node_id: NodeId,
+        resource_kind: ResourceKind,
+        resource_id: Option<ResourceId>,
+        meta: &proto::RequestMeta,
+        idempotency_discriminator: Option<String>,
+        correlation_id_override: Option<String>,
+    ) -> Result<(OperationId, Generation, bool), ControlPlaneServiceError> {
         self.require_node_exists(&node_id).await?;
         let now = Self::now_ms();
         let desired_generation = Self::desired_generation_from_meta(meta)?;
@@ -528,11 +562,13 @@ impl LifecycleServiceImplementation {
         ))
         .map_err(|e| ControlPlaneServiceError::Internal(format!("invalid operation_id: {}", e)))?;
 
-        let caller_correlation_id = if meta.operation_id.trim().is_empty() {
-            None
-        } else {
-            Some(meta.operation_id.trim().to_string())
-        };
+        let caller_correlation_id = correlation_id_override.or_else(|| {
+            if meta.operation_id.trim().is_empty() {
+                None
+            } else {
+                Some(meta.operation_id.trim().to_string())
+            }
+        });
 
         let receipt = self
             .operation_repo
@@ -1986,6 +2022,21 @@ impl LifecycleService for LifecycleServiceImplementation {
         &self,
         request: proto::MigrateVmRequest,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        // Issue #656: this RPC is reachable directly, not only through the
+        // BFF/CLI gate. Live/concurrent-write migration stays fail-closed
+        // until #394 is proven; reject absent or false `pause_first` before
+        // touching state, creating an operation, or dispatching anything.
+        // Do NOT coerce false to true: that would claim a stop-the-world
+        // pause the caller did not request.
+        let pause_first = request.config.as_ref().is_some_and(|c| c.pause_first);
+        if !pause_first {
+            return Err(ControlPlaneServiceError::InvalidArgument(
+                "live/concurrent-write migration is not supported until #394 is proven; \
+                 set pause_first=true (stop-the-world)"
+                    .into(),
+            ));
+        }
+
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
         let vm_id = Self::parse_vm_id(request.vm_id)?;
@@ -1999,32 +2050,180 @@ impl LifecycleService for LifecycleServiceImplementation {
                     "invalid node reference {node_ref:?}: must be a single path component"
                 )));
             }
+            // The discriminator is `source=…:dest=…[:pause_first=true]` and
+            // the migration state machine splits it on `:`. Node ids are
+            // otherwise permitted to contain `:` (tag-style names), so a
+            // reference containing one would be truncated into a different
+            // node pair at dispatch. Fail closed at the RPC instead.
+            if node_ref.contains(':') {
+                return Err(ControlPlaneServiceError::InvalidArgument(format!(
+                    "invalid node reference {node_ref:?}: ':' is the migration correlation delimiter"
+                )));
+            }
         }
 
-        // Issue #394 Option C: the correlation_id is the only carrier from
-        // this RPC's `MigrationConfig` to the migration state machine (the
-        // orchestrator rebuilds the config from it via
-        // `from_correlation_id`), so the operator's stop-the-world opt-in
-        // must ride it — dropping the key here would silently downgrade
-        // the request to quiescent-assumed.
-        let pause_first = request.config.as_ref().is_some_and(|c| c.pause_first);
-        let (operation_id, _, _) = self
-            .create_operation_and_emit(
+        // The operation's start event and idempotency key are scoped to
+        // `node_id`, while the state machine migrates from
+        // `source_node_id`. Keep the two aligned so a direct caller cannot
+        // label (and idempotency-key) the operation against a node other
+        // than the one the migration actually reads. The BFF already
+        // passes the source node as both fields.
+        if node_id.as_str() != request.source_node_id {
+            return Err(ControlPlaneServiceError::InvalidArgument(format!(
+                "node_id {:?} must equal source_node_id {:?} for migration",
+                node_id.as_str(),
+                request.source_node_id
+            )));
+        }
+
+        // The BFF rejects a self-migration and resolves the VM's current
+        // placement before dispatching. The direct RPC must enforce the same
+        // invariants, otherwise a node-authenticated caller can journal an
+        // operation that is accepted here but can never be dispatched (or
+        // that asks the wrong source node to migrate a VM it does not own).
+        if request.destination_node_id == request.source_node_id {
+            return Err(ControlPlaneServiceError::InvalidArgument(
+                "destination_node_id must differ from source_node_id".into(),
+            ));
+        }
+        let vm_node_id: Option<String> =
+            sqlx::query_scalar("SELECT node_id FROM vms WHERE vm_id = ?")
+                .bind(vm_id.as_str())
+                .fetch_optional(self.operation_repo.pool())
+                .await
+                .map_err(|e| {
+                    ControlPlaneServiceError::Internal(format!(
+                        "failed to look up placement for vm {}: {}",
+                        vm_id, e
+                    ))
+                })?
+                .flatten();
+        match vm_node_id {
+            Some(node) if node == request.source_node_id => {}
+            Some(node) => {
+                return Err(ControlPlaneServiceError::InvalidArgument(format!(
+                    "vm {} is placed on node {}, not source_node_id {}",
+                    vm_id, node, request.source_node_id
+                )));
+            }
+            None => {
+                return Err(ControlPlaneServiceError::NotFound(format!(
+                    "vm {} not found or has no placement",
+                    vm_id
+                )));
+            }
+        }
+
+        // Issue #394 Option C: the operator's stop-the-world opt-in must
+        // ride the migration metadata built below (source/dest plus the
+        // optional `pause_first=true` key); the orchestrator rebuilds the
+        // config from it via `from_correlation_id`. Dropping the key here
+        // would silently downgrade the request to quiescent-assumed.
+        let correlation_id = format!(
+            "source={}:dest={}{}",
+            request.source_node_id,
+            request.destination_node_id,
+            if pause_first { ":pause_first=true" } else { "" }
+        );
+        // Write the discriminator in the same INSERT as the operation. The
+        // migration state machine reads source/dest/config from
+        // `operations.correlation_id`; a post-hoc UPDATE could fail after
+        // the row existed as `Pending`, a state neither the claim loop nor
+        // the reaper revisits. The idempotency discriminator is the same
+        // string, so an idempotent replay cannot rewrite it.
+        let (operation_id, _, created) = self
+            .create_operation_and_emit_with_correlation(
                 "MigrateVm",
                 node_id.clone(),
                 ResourceKind::Vm,
                 Some(vm_id.clone()),
                 &meta,
-                Some(format!(
-                    "source={}:dest={}{}",
-                    request.source_node_id,
-                    request.destination_node_id,
-                    if pause_first { ":pause_first=true" } else { "" }
-                )),
+                Some(correlation_id.clone()),
+                Some(correlation_id.clone()),
             )
             .await?;
 
-        self.accept_operation(&operation_id).await?;
+        if !created {
+            // `create_or_get` matched a caller-supplied operation id. A
+            // replay may only re-accept the same migration; a different
+            // source/dest/config or a terminal/running operation must not be
+            // silently resurrected or redirected.
+            let (status, persisted_correlation_id, operation_type, resource_id): (
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT status, correlation_id, operation_type, resource_id \
+                 FROM operations WHERE operation_id = ?",
+            )
+            .bind(operation_id.as_str())
+            .fetch_one(self.operation_repo.pool())
+            .await
+            .map_err(|e| {
+                ControlPlaneServiceError::Internal(format!(
+                    "failed to read replayed MigrateVm operation {}: {}",
+                    operation_id, e
+                ))
+            })?;
+            // A caller-supplied operation id is looked up by an
+            // operation-type-agnostic idempotency key. Without these checks a
+            // `MigrateVm` replay could name an operation journaled by a
+            // different RPC and receive an OK without a migration existing.
+            if operation_type != "MigrateVm" || resource_id.as_deref() != Some(vm_id.as_str()) {
+                return Err(ControlPlaneServiceError::Conflict(format!(
+                    "operation {} already exists for {}{}, not this MigrateVm",
+                    operation_id,
+                    operation_type,
+                    resource_id
+                        .as_deref()
+                        .map(|id| format!(" {id}"))
+                        .unwrap_or_default()
+                )));
+            }
+            if persisted_correlation_id.as_deref() != Some(correlation_id.as_str()) {
+                return Err(ControlPlaneServiceError::Conflict(format!(
+                    "operation {} already exists with a different migration configuration",
+                    operation_id
+                )));
+            }
+            if status != "Pending" && status != "Accepted" {
+                return Err(ControlPlaneServiceError::Conflict(format!(
+                    "operation {} already exists in terminal/running state {}",
+                    operation_id, status
+                )));
+            }
+
+            // `accept_operation` has no status predicate. On the replay path
+            // the orchestrator may claim the row between the guard read and
+            // the write, so condition the update on the states we just
+            // validated; otherwise a Failed/Running row could be resurrected
+            // into Accepted and re-dispatched.
+            let updated = sqlx::query(
+                "UPDATE operations \
+                 SET status = 'Accepted', \
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', ? / 1000.0, 'unixepoch') \
+                 WHERE operation_id = ? AND status IN ('Pending', 'Accepted')",
+            )
+            .bind(Self::now_ms())
+            .bind(operation_id.as_str())
+            .execute(self.operation_repo.pool())
+            .await
+            .map_err(|e| {
+                ControlPlaneServiceError::Internal(format!(
+                    "failed to re-accept replayed MigrateVm operation {}: {}",
+                    operation_id, e
+                ))
+            })?;
+            if updated.rows_affected() == 0 {
+                return Err(ControlPlaneServiceError::Conflict(format!(
+                    "operation {} changed state while being replayed",
+                    operation_id
+                )));
+            }
+        } else {
+            self.accept_operation(&operation_id).await?;
+        }
 
         Ok(Self::ok_ack(&operation_id, "migrate vm accepted"))
     }

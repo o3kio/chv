@@ -2329,6 +2329,505 @@ async fn test_lifecycle_create_volume_shim_stays_closed() {
     );
 }
 
+fn lifecycle_service_for_migration_test(pool: &StorePool) -> LifecycleServiceImplementation {
+    LifecycleServiceImplementation::new(
+        NodeRepository::new(pool.clone()),
+        OperationRepository::new(pool.clone()),
+        EventRepository::new(pool.clone()),
+        DesiredStateRepository::new(pool.clone()),
+    )
+}
+
+async fn seed_migration_fixture(pool: &StorePool, vm_node_id: &str) {
+    for node_id in ["node-656-a", "node-656-b"] {
+        sqlx::query(
+            "INSERT OR IGNORE INTO nodes (node_id, hostname, display_name) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .bind(node_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO vms (vm_id, node_id, display_name) VALUES ('vm-656', ?, 'vm-656')")
+        .bind(vm_node_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn migrate_vm_request(
+    node_id: &str,
+    config: Option<proto::MigrationConfig>,
+) -> proto::MigrateVmRequest {
+    proto::MigrateVmRequest {
+        meta: Some(proto::RequestMeta {
+            operation_id: String::new(),
+            requested_by: "test-user".into(),
+            target_node_id: "node-656-a".into(),
+            desired_state_version: "1".into(),
+            request_unix_ms: 1000,
+        }),
+        node_id: node_id.into(),
+        vm_id: "vm-656".into(),
+        source_node_id: "node-656-a".into(),
+        destination_node_id: "node-656-b".into(),
+        config,
+    }
+}
+
+/// Issue #656: the CP's `LifecycleService::migrate_vm` is directly
+/// reachable (not only through the BFF/CLI gate). Absent or false
+/// `pause_first` must fail closed before any operation is journaled.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_live_path_without_operation() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    for (label, config) in [
+        ("absent", None),
+        (
+            "false",
+            Some(proto::MigrationConfig {
+                pause_first: false,
+                ..Default::default()
+            }),
+        ),
+    ] {
+        let err = service
+            .migrate_vm(migrate_vm_request("node-656-a", config))
+            .await
+            .expect_err("live migration must fail closed");
+        match err {
+            ControlPlaneServiceError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("#394") && msg.contains("pause_first=true"),
+                    "{label} pause_first rejection must explain the gate and remedy: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument for {label} config, got {other:?}"),
+        }
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a rejected live migration must not journal an operation"
+    );
+}
+
+/// The stop-the-world path remains accepted through the same direct trait
+/// boundary, and the persisted correlation id round-trips source, dest,
+/// and the flag into the orchestrator's config parser.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_accepts_pause_first() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    service
+        .migrate_vm(migrate_vm_request(
+            "node-656-a",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect("pause-first migration must be accepted");
+
+    let (status, idempotency_key, correlation_id): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, idempotency_key, correlation_id \
+             FROM operations WHERE operation_type = 'MigrateVm'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "Accepted");
+    assert!(
+        idempotency_key.contains("source=node-656-a:dest=node-656-b:pause_first=true"),
+        "the stop-the-world flag must ride the migration discriminator: {idempotency_key}"
+    );
+    let correlation_id = correlation_id.expect("migration correlation id must be persisted");
+    assert_eq!(
+        correlation_id,
+        "source=node-656-a:dest=node-656-b:pause_first=true"
+    );
+    let (source, destination, config) =
+        crate::migration::MigrationConfig::from_correlation_id(&correlation_id);
+    assert_eq!(source, "node-656-a");
+    assert_eq!(destination, "node-656-b");
+    assert!(
+        config.pause_first,
+        "the persisted correlation id must round-trip pause_first=true"
+    );
+}
+
+/// A self-migration is rejected before journaling. The BFF enforces this,
+/// but the direct RPC must not accept an operation the state machine can
+/// never dispatch as source → destination.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_same_destination() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut request = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    request.destination_node_id = request.source_node_id.clone();
+    let err = service
+        .migrate_vm(request)
+        .await
+        .expect_err("source == destination must be rejected");
+    match err {
+        ControlPlaneServiceError::InvalidArgument(msg) => {
+            assert!(msg.contains("destination_node_id"), "got: {msg}");
+        }
+        other => panic!("expected InvalidArgument for self-migration, got {other:?}"),
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "a self-migration must not journal an operation");
+}
+
+/// A direct caller must not be able to migrate a VM that is placed on a
+/// different node from `source_node_id`.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_vm_on_other_node() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-b").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let err = service
+        .migrate_vm(migrate_vm_request(
+            "node-656-a",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect_err("VM placement must match source_node_id");
+    match err {
+        ControlPlaneServiceError::InvalidArgument(msg) => {
+            assert!(
+                msg.contains("vm-656") && msg.contains("node-656-b"),
+                "the placement rejection must name the VM and actual node: {msg}"
+            );
+        }
+        other => panic!("expected InvalidArgument for placement mismatch, got {other:?}"),
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a misplaced migration must not journal an operation"
+    );
+}
+
+/// `:` is the discriminator delimiter, so a node reference containing one
+/// would be truncated to a different node at dispatch. Reject it before
+/// journaling.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_colon_in_node_reference() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut request = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    request.destination_node_id = "node-656-b:rack2".into();
+    let err = service
+        .migrate_vm(request)
+        .await
+        .expect_err("delimiter-bearing node reference must be rejected");
+    match err {
+        ControlPlaneServiceError::InvalidArgument(msg) => {
+            assert!(msg.contains("delimiter"), "got: {msg}");
+        }
+        other => panic!("expected InvalidArgument for delimiter-bearing id, got {other:?}"),
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a malformed migration must not journal an operation"
+    );
+}
+
+/// A caller-supplied operation id replays the existing row. The replay must
+/// not redirect the migration to a different source/dest pair, and must not
+/// resurrect a terminal/running operation.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_replay_rejects_changed_configuration() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut first = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    first.meta.as_mut().unwrap().operation_id = "op-migrate-replay".into();
+    service
+        .migrate_vm(first)
+        .await
+        .expect("first request is accepted");
+
+    let mut replay = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    replay.meta.as_mut().unwrap().operation_id = "op-migrate-replay".into();
+    replay.destination_node_id = "node-656-b-different".into();
+    let err = service
+        .migrate_vm(replay)
+        .await
+        .expect_err("a replay with a different destination must conflict");
+    assert!(
+        matches!(err, ControlPlaneServiceError::Conflict(_)),
+        "expected Conflict for a changed replay, got {err:?}"
+    );
+
+    let correlation_id: Option<String> = sqlx::query_scalar(
+        "SELECT correlation_id FROM operations WHERE operation_type = 'MigrateVm'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        correlation_id.as_deref(),
+        Some("source=node-656-a:dest=node-656-b:pause_first=true"),
+        "the rejected replay must not rewrite the original migration config"
+    );
+}
+
+/// A VM with no recorded placement cannot be migrated from any source.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_unplaced_vm() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    for node_id in ["node-656-a", "node-656-b"] {
+        sqlx::query(
+            "INSERT OR IGNORE INTO nodes (node_id, hostname, display_name) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .bind(node_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO vms (vm_id, node_id, display_name) VALUES ('vm-656', NULL, 'vm-656')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let err = service
+        .migrate_vm(migrate_vm_request(
+            "node-656-a",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect_err("an unplaced VM cannot be migrated");
+    assert!(
+        matches!(err, ControlPlaneServiceError::NotFound(_)),
+        "expected NotFound for an unplaced VM, got {err:?}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "an unplaced migration must not journal an operation"
+    );
+}
+
+/// A replay of the same configuration must not resurrect a terminal or
+/// running operation.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_replay_rejects_terminal_operation() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut request = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    request.meta.as_mut().unwrap().operation_id = "op-migrate-terminal".into();
+    service
+        .migrate_vm(request.clone())
+        .await
+        .expect("first request is accepted");
+
+    sqlx::query("UPDATE operations SET status = 'Succeeded' WHERE operation_type = 'MigrateVm'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = service
+        .migrate_vm(request)
+        .await
+        .expect_err("a terminal operation must not be re-accepted");
+    match err {
+        ControlPlaneServiceError::Conflict(msg) => {
+            assert!(msg.contains("terminal/running"), "got: {msg}");
+        }
+        other => panic!("expected Conflict for a terminal replay, got {other:?}"),
+    }
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM operations WHERE operation_type = 'MigrateVm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "Succeeded", "the replay must not change the status");
+}
+
+/// A caller-supplied operation id is matched by an operation-type-agnostic
+/// idempotency key. A `MigrateVm` replay must not accept an operation
+/// journaled by a different RPC (and report OK without a migration).
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_replay_rejects_foreign_operation() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    sqlx::query(
+        "INSERT INTO operations \
+            (operation_id, idempotency_key, resource_kind, resource_id, \
+             operation_type, status) \
+         VALUES ('StartVm-foreign', 'request:op-foreign', 'vm', 'vm-656', \
+                 'StartVm', 'Pending')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut request = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    request.meta.as_mut().unwrap().operation_id = "op-foreign".into();
+    let err = service
+        .migrate_vm(request)
+        .await
+        .expect_err("a foreign operation id must not be re-accepted as a migration");
+    match err {
+        ControlPlaneServiceError::Conflict(msg) => {
+            assert!(msg.contains("not this MigrateVm"), "got: {msg}");
+        }
+        other => panic!("expected Conflict for a foreign operation, got {other:?}"),
+    }
+
+    let migrations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM operations WHERE operation_type = 'MigrateVm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        migrations, 0,
+        "no migration may be journaled for the foreign replay"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM operations WHERE operation_id = 'StartVm-foreign'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "Pending", "the foreign operation must be untouched");
+}
+
+/// The operation's start event and idempotency key are scoped to
+/// `node_id`, so a direct caller must not name a node other than the
+/// migration source.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_node_source_mismatch() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let err = service
+        .migrate_vm(migrate_vm_request(
+            "node-656-b",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect_err("node_id must match source_node_id");
+    match err {
+        ControlPlaneServiceError::InvalidArgument(msg) => {
+            assert!(
+                msg.contains("source_node_id"),
+                "the mismatch rejection must name the invariant: {msg}"
+            );
+        }
+        other => panic!("expected InvalidArgument for node mismatch, got {other:?}"),
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a mismatched migration must not journal an operation"
+    );
+}
+
 #[tokio::test]
 async fn test_duplicate_idempotency_returns_same_operation() {
     let test_db = chv_controlplane_store::test_util::TestDb::new().await;
