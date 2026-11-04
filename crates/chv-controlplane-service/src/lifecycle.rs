@@ -174,6 +174,9 @@ pub trait LifecycleService: Send + Sync {
         request: proto::RestartNetworkRequest,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// Fail-closed stop-the-world gate: `pause_first` must be explicit and
+    /// true. Both the BFF and this direct control-plane RPC reject the live
+    /// path before creating an operation (issue #656).
     async fn migrate_vm(
         &self,
         request: proto::MigrateVmRequest,
@@ -1986,6 +1989,21 @@ impl LifecycleService for LifecycleServiceImplementation {
         &self,
         request: proto::MigrateVmRequest,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        // Issue #656: this RPC is reachable directly, not only through the
+        // BFF/CLI gate. Live/concurrent-write migration stays fail-closed
+        // until #394 is proven; reject absent or false `pause_first` before
+        // touching state, creating an operation, or dispatching anything.
+        // Do NOT coerce false to true: that would claim a stop-the-world
+        // pause the caller did not request.
+        let pause_first = request.config.as_ref().is_some_and(|c| c.pause_first);
+        if !pause_first {
+            return Err(ControlPlaneServiceError::InvalidArgument(
+                "live/concurrent-write migration is not supported until #394 is proven; \
+                 set pause_first=true (stop-the-world)"
+                    .into(),
+            ));
+        }
+
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
         let vm_id = Self::parse_vm_id(request.vm_id)?;
@@ -2001,13 +2019,31 @@ impl LifecycleService for LifecycleServiceImplementation {
             }
         }
 
-        // Issue #394 Option C: the correlation_id is the only carrier from
-        // this RPC's `MigrationConfig` to the migration state machine (the
-        // orchestrator rebuilds the config from it via
-        // `from_correlation_id`), so the operator's stop-the-world opt-in
-        // must ride it — dropping the key here would silently downgrade
-        // the request to quiescent-assumed.
-        let pause_first = request.config.as_ref().is_some_and(|c| c.pause_first);
+        // The operation's start event and idempotency key are scoped to
+        // `node_id`, while the state machine migrates from
+        // `source_node_id`. Keep the two aligned so a direct caller cannot
+        // label (and idempotency-key) the operation against a node other
+        // than the one the migration actually reads. The BFF already
+        // passes the source node as both fields.
+        if node_id.as_str() != request.source_node_id {
+            return Err(ControlPlaneServiceError::InvalidArgument(format!(
+                "node_id {:?} must equal source_node_id {:?} for migration",
+                node_id.as_str(),
+                request.source_node_id
+            )));
+        }
+
+        // Issue #394 Option C: the operator's stop-the-world opt-in must
+        // ride the migration metadata built below (source/dest plus the
+        // optional `pause_first=true` key); the orchestrator rebuilds the
+        // config from it via `from_correlation_id`. Dropping the key here
+        // would silently downgrade the request to quiescent-assumed.
+        let correlation_id = format!(
+            "source={}:dest={}{}",
+            request.source_node_id,
+            request.destination_node_id,
+            if pause_first { ":pause_first=true" } else { "" }
+        );
         let (operation_id, _, _) = self
             .create_operation_and_emit(
                 "MigrateVm",
@@ -2015,14 +2051,35 @@ impl LifecycleService for LifecycleServiceImplementation {
                 ResourceKind::Vm,
                 Some(vm_id.clone()),
                 &meta,
-                Some(format!(
-                    "source={}:dest={}{}",
-                    request.source_node_id,
-                    request.destination_node_id,
-                    if pause_first { ":pause_first=true" } else { "" }
-                )),
+                Some(correlation_id.clone()),
             )
             .await?;
+
+        // `create_operation_and_emit` only copies `meta.operation_id` into
+        // the correlation column. The migration state machine reads the
+        // source/dest/config discriminator from there, so persist it and
+        // fail closed if we cannot: accepting an operation the orchestrator
+        // can never dispatch would report success for a dead migration.
+        if let Err(e) =
+            sqlx::query("UPDATE operations SET correlation_id = ? WHERE operation_id = ?")
+                .bind(&correlation_id)
+                .bind(operation_id.as_str())
+                .execute(self.operation_repo.pool())
+                .await
+        {
+            let err = ControlPlaneServiceError::Internal(format!(
+                "failed to persist MigrateVm correlation_id for operation {}: {}",
+                operation_id, e
+            ));
+            if let Err(fail_err) = self.fail_operation(&operation_id, &err).await {
+                tracing::error!(
+                    error = %fail_err,
+                    operation_id = %operation_id,
+                    "failed to mark MigrateVm operation Failed after correlation_id persistence failure"
+                );
+            }
+            return Err(err);
+        }
 
         self.accept_operation(&operation_id).await?;
 

@@ -2329,6 +2329,233 @@ async fn test_lifecycle_create_volume_shim_stays_closed() {
     );
 }
 
+fn lifecycle_service_for_migration_test(pool: &StorePool) -> LifecycleServiceImplementation {
+    LifecycleServiceImplementation::new(
+        NodeRepository::new(pool.clone()),
+        OperationRepository::new(pool.clone()),
+        EventRepository::new(pool.clone()),
+        DesiredStateRepository::new(pool.clone()),
+    )
+}
+
+fn migrate_vm_request(
+    node_id: &str,
+    config: Option<proto::MigrationConfig>,
+) -> proto::MigrateVmRequest {
+    proto::MigrateVmRequest {
+        meta: Some(proto::RequestMeta {
+            operation_id: String::new(),
+            requested_by: "test-user".into(),
+            target_node_id: "node-656-a".into(),
+            desired_state_version: "1".into(),
+            request_unix_ms: 1000,
+        }),
+        node_id: node_id.into(),
+        vm_id: "vm-656".into(),
+        source_node_id: "node-656-a".into(),
+        destination_node_id: "node-656-b".into(),
+        config,
+    }
+}
+
+/// Issue #656: the CP's `LifecycleService::migrate_vm` is directly
+/// reachable (not only through the BFF/CLI gate). Absent or false
+/// `pause_first` must fail closed before any operation is journaled.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_live_path_without_operation() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    for (label, config) in [
+        ("absent", None),
+        (
+            "false",
+            Some(proto::MigrationConfig {
+                pause_first: false,
+                ..Default::default()
+            }),
+        ),
+    ] {
+        let err = service
+            .migrate_vm(migrate_vm_request("node-656-a", config))
+            .await
+            .expect_err("live migration must fail closed");
+        match err {
+            ControlPlaneServiceError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("#394") && msg.contains("pause_first=true"),
+                    "{label} pause_first rejection must explain the gate and remedy: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument for {label} config, got {other:?}"),
+        }
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a rejected live migration must not journal an operation"
+    );
+}
+
+/// The stop-the-world path remains accepted through the same direct trait
+/// boundary, and the persisted correlation id round-trips source, dest,
+/// and the flag into the orchestrator's config parser.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_accepts_pause_first() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    sqlx::query(
+        "INSERT INTO nodes (node_id, hostname, display_name) \
+         VALUES ('node-656-a', 'host-a', 'host-a')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    service
+        .migrate_vm(migrate_vm_request(
+            "node-656-a",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect("pause-first migration must be accepted");
+
+    let (status, idempotency_key, correlation_id): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, idempotency_key, correlation_id \
+             FROM operations WHERE operation_type = 'MigrateVm'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "Accepted");
+    assert!(
+        idempotency_key.contains("source=node-656-a:dest=node-656-b:pause_first=true"),
+        "the stop-the-world flag must ride the migration discriminator: {idempotency_key}"
+    );
+    let correlation_id = correlation_id.expect("migration correlation id must be persisted");
+    assert_eq!(
+        correlation_id,
+        "source=node-656-a:dest=node-656-b:pause_first=true"
+    );
+    let (source, destination, config) =
+        crate::migration::MigrationConfig::from_correlation_id(&correlation_id);
+    assert_eq!(source, "node-656-a");
+    assert_eq!(destination, "node-656-b");
+    assert!(
+        config.pause_first,
+        "the persisted correlation id must round-trip pause_first=true"
+    );
+}
+
+/// If the correlation id cannot be persisted, the operation must be
+/// terminally Failed instead of Accepted with a NULL correlation id (the
+/// orchestrator would only fail it later, after reporting success).
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_fails_closed_when_correlation_persist_fails() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    sqlx::query(
+        "INSERT INTO nodes (node_id, hostname, display_name) \
+         VALUES ('node-656-a', 'host-a', 'host-a')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"CREATE TRIGGER reject_migrate_correlation
+           BEFORE UPDATE OF correlation_id ON operations
+           BEGIN
+               SELECT RAISE(ABORT, 'correlation_id unavailable');
+           END"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("create correlation update trigger");
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let err = service
+        .migrate_vm(migrate_vm_request(
+            "node-656-a",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect_err("correlation persistence failure must fail closed");
+    match err {
+        ControlPlaneServiceError::Internal(msg) => {
+            assert!(
+                msg.contains("correlation_id") && msg.contains("MigrateVm"),
+                "the failure must name the persistence gap: {msg}"
+            );
+        }
+        other => panic!("expected Internal for correlation persistence failure, got {other:?}"),
+    }
+
+    let (status, error_code): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, error_code FROM operations WHERE operation_type = 'MigrateVm'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "Failed");
+    assert_eq!(
+        error_code.as_deref(),
+        Some("INTENT_PERSISTENCE_FAILED"),
+        "fail_operation must terminally mark the operation"
+    );
+}
+
+/// The operation's start event and idempotency key are scoped to
+/// `node_id`, so a direct caller must not name a node other than the
+/// migration source.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_node_source_mismatch() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let err = service
+        .migrate_vm(migrate_vm_request(
+            "node-656-b",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect_err("node_id must match source_node_id");
+    match err {
+        ControlPlaneServiceError::InvalidArgument(msg) => {
+            assert!(
+                msg.contains("source_node_id"),
+                "the mismatch rejection must name the invariant: {msg}"
+            );
+        }
+        other => panic!("expected InvalidArgument for node mismatch, got {other:?}"),
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a mismatched migration must not journal an operation"
+    );
+}
+
 #[tokio::test]
 async fn test_duplicate_idempotency_returns_same_operation() {
     let test_db = chv_controlplane_store::test_util::TestDb::new().await;
