@@ -642,14 +642,19 @@ pass acts, so a terminal progress report still queued on the agent cannot race
 the resume. It also refuses when a late `Completed` report arrived after the
 row was terminalized `Failed`/`RolledBack` (`reaper_resume_state = 'blocked'`):
 the detached agent may have completed the transfer, so the destination could
-own the VM. Only requeue (`agent_cancel_pending = 1`,
-`agent_cancel_last_error = NULL`) after the node has been upgraded or verified
-idle. A permanently refused row is also left `reaper_resume_state = 'blocked'`,
-which the resume pass never re-selects: after clearing the parked error, set
-`reaper_resume_state = 'pending'` and let the requeued cancel confirm before
-expecting an automatic resume — but only once you have verified the destination
-does not own the VM; otherwise leave the row blocked and resume explicitly
-where the VM actually is.
+own the VM. Only requeue after the node has been upgraded or verified idle, and write all
+three columns in one statement:
+`agent_cancel_pending = 1, agent_cancel_last_error = NULL,
+reaper_resume_state = 'pending'`. The resume pass re-selects a row only when
+`reaper_resume_state` is `pending` or `resuming`; a permanent refusal leaves a
+reaper-failed row `blocked`, while a restart-recovered row keeps the state NULL,
+and neither is resumed automatically. Setting `pending` without the queued
+cancel is unsafe: `agent_cancel_pending` is 0, so the resume pass is not held by
+an outstanding cancel, and with no fresh confirmation the 30 s settle gate does
+not apply — the source could be resumed on the next tick. Let the requeued
+cancel confirm (then settle) before expecting an automatic resume, and only
+once you have verified the destination does not own the VM; otherwise leave the
+row blocked and resume explicitly where the VM actually is.
 
 A successful pause-first migration can leave the destination VM paused. When
 the source agent reports `Completed`, the control plane resumes the destination
