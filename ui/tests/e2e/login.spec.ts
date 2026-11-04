@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { mockApiResponse } from './helpers';
+import { loginAsAdmin, mockApiResponse, waitForHydration } from './helpers';
 
 test.describe('Authentication', () => {
 	test('has expected login form', async ({ page }) => {
@@ -12,6 +12,7 @@ test.describe('Authentication', () => {
 
 	test('shows error on invalid credentials', async ({ page }) => {
 		await page.goto('/login');
+		await waitForHydration(page);
 		await mockApiResponse(page, '/v1/auth/login', { error: { message: 'Invalid credentials' } }, 401);
 
 		await page.getByLabel(/operator identity/i).fill('admin');
@@ -23,19 +24,26 @@ test.describe('Authentication', () => {
 
 	test('successful login redirects and stores no token client-side', async ({ page }) => {
 		await page.goto('/login');
+		await waitForHydration(page);
 		// The browser login no longer returns a JWT (#660); only the server's
 		// HttpOnly cookie carries the credential. The hint cookies are
-		// non-credential UX state the SPA can read.
-		await mockApiResponse(page, '/v1/auth/login', {
-			user: { username: 'admin', role: 'admin' },
-			must_change_password: false
-		});
-
-		const origin = new URL(page.url()).origin;
-		await page.context().addCookies([
-			{ name: 'chv_logged_in', value: '1', url: origin, sameSite: 'Strict' },
-			{ name: 'chv_role', value: 'admin', url: origin, sameSite: 'Strict' }
-		]);
+		// non-credential UX state the SPA can read. Mirror the BFF by setting
+		// them on the login response rather than pre-seeding them: seeding
+		// them before the page hydrates races the login page's onMount
+		// session probe, which redirects when /v1/overview answers OK.
+		await mockApiResponse(
+			page,
+			'/v1/auth/login',
+			{
+				user: { username: 'admin', role: 'admin' },
+				must_change_password: false
+			},
+			200,
+			{
+				'set-cookie':
+					'chv_logged_in=1; Path=/; SameSite=Strict\nchv_role=admin; Path=/; SameSite=Strict'
+			}
+		);
 
 		await page.getByLabel(/operator identity/i).fill('admin');
 		await page.getByLabel(/access credential/i).fill('correct-password');
@@ -58,12 +66,9 @@ test.describe('Authentication', () => {
 	});
 
 	test('session hint cookie allows direct access to dashboard', async ({ page }) => {
-		await page.goto('/login');
-		const origin = new URL(page.url()).origin;
-		await page.context().addCookies([
-			{ name: 'chv_logged_in', value: '1', url: origin, sameSite: 'Strict' },
-			{ name: 'chv_role', value: 'admin', url: origin, sameSite: 'Strict' }
-		]);
+		// Seed the hint before navigating so the test models arriving with an
+		// existing session rather than racing the login page's onMount probe.
+		await loginAsAdmin(page);
 		await page.goto('/');
 		await expect(page.getByText('Fleet Overview')).toBeVisible();
 	});
