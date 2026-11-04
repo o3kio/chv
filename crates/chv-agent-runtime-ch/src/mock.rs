@@ -248,6 +248,10 @@ pub struct MockCloudHypervisorAdapter {
     /// reply lost after the request was delivered. Must seal exactly like a
     /// timeout (the transfer may still run).
     pub migration_outcome_unknown: Arc<Mutex<bool>>,
+    /// When true, `send_migration`/`receive_migration` return a definitive
+    /// `ChvError::Internal`. Used to pin the non-sealing branch: the transfer
+    /// window must end and a paused source must be resumed.
+    pub migration_definitive_failure: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
@@ -440,6 +444,11 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
                 reason: "reply lost after delivery".to_string(),
             });
         }
+        if *self.migration_definitive_failure.lock().unwrap() {
+            return Err(ChvError::Internal {
+                reason: "send-migration failed (mock)".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -459,6 +468,11 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
             return Err(ChvError::OutcomeUnknown {
                 operation: "receive-migration (mock)".to_string(),
                 reason: "reply lost after delivery".to_string(),
+            });
+        }
+        if *self.migration_definitive_failure.lock().unwrap() {
+            return Err(ChvError::Internal {
+                reason: "receive-migration failed (mock)".to_string(),
             });
         }
         Ok(())

@@ -1744,4 +1744,71 @@ mod tests {
             );
         }
     }
+
+    /// The success and definitive-failure arms must end (not seal) the window.
+    /// A stuck `TRANSFER_ACTIVE` would make every later cancel return
+    /// `Unavailable` and skip the registry's force-abort for a task whose VMM
+    /// call already finished.
+    #[tokio::test]
+    async fn source_send_success_and_definitive_failure_end_window() {
+        // Success: the migrated source stays paused, but the window is over.
+        let (rt, _mock) = test_runtime();
+        create_vm_record(&rt).await;
+        let transfer = Arc::new(TransferWindow::default());
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+        send_memory_migration(
+            &rt,
+            "vm-1",
+            "op-1",
+            "node-1",
+            "tcp://127.0.0.1:1",
+            None,
+            &mut guard,
+            &transfer,
+        )
+        .await
+        .expect("the mock send succeeds");
+        assert!(!transfer.is_unknown());
+        assert!(!transfer.in_progress(), "success must end the window");
+        assert!(
+            guard.is_paused(),
+            "a successfully migrated source must not be resumed"
+        );
+        assert!(
+            transfer.try_begin(),
+            "the window must be reusable after end"
+        );
+
+        // Definitive failure: end the window and resume the paused source.
+        let (rt, mock) = test_runtime();
+        create_vm_record(&rt).await;
+        *mock.migration_definitive_failure.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+        let err = send_memory_migration(
+            &rt,
+            "vm-1",
+            "op-1",
+            "node-1",
+            "tcp://127.0.0.1:1",
+            None,
+            &mut guard,
+            &transfer,
+        )
+        .await
+        .expect_err("the mock reports a definitive failure");
+        assert!(err.contains("memory migration failed"), "{err}");
+        assert!(!transfer.is_unknown());
+        assert!(
+            !transfer.in_progress(),
+            "a definitive failure must end the window"
+        );
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Running",
+            "a definitive failure must resume the source"
+        );
+    }
 }
