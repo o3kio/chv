@@ -8,20 +8,22 @@
 //! been running for hours but is still reporting is left alone.
 //!
 //! Before the reaper resumes a source VM it confirms that the sender is no
-//! longer live. Since #656 it first signals a bounded abort through the
-//! source agent's `MigrationControlService.CancelMigration` RPC
-//! (`agent_cancel_pending`), so a detached task is stopped rather than left
-//! writing to the destination. The RPC is best-effort: if the agent cannot be
-//! reached the row stays pending and the next tick retries. The resume path is
-//! still conservative — the migration must already be terminal (the reaper's
-//! own guarded update won), no progress may have arrived for at least
-//! `max(stall timeout, STALE_ROW_SECS)`, and the source node must be reporting
-//! heartbeats. If any check fails the source VM is left paused and an operator
-//! warning is logged rather than unpausing a VM underneath a live sender.
+//! longer live. Since #656 it first signals a bounded abort through the source
+//! *and* destination agents' `MigrationControlService.CancelMigration` RPC
+//! (`agent_cancel_pending`), so both detached task halves are stopped rather
+//! than left writing/receiving. The RPC is best-effort: if an agent cannot be
+//! reached the row stays pending and the next tick retries; a permanent agent
+//! refusal is parked with `agent_cancel_last_error`. The resume path is still
+//! conservative — the migration must already be terminal (the reaper's own
+//! guarded update won), the cancel must be confirmed, no progress may have
+//! arrived for at least `max(stall timeout, STALE_ROW_SECS)`, and the source
+//! node must be reporting heartbeats. If any check fails the source VM is left
+//! paused and an operator warning is logged rather than unpausing a VM
+//! underneath a live sender.
 
 use crate::migration::{resolve_agent_socket, SOURCE_NODE_HEARTBEAT_MAX_AGE_SECS, STALE_ROW_SECS};
 use crate::node_client_pool::NodeClientPool;
-use chv_controlplane_store::{MigrationRepository, StorePool};
+use chv_controlplane_store::{MigrationRepository, PendingAgentCancel, StorePool};
 use chv_errors::ChvError;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -40,7 +42,8 @@ const PENDING_CANCEL_BATCH: i64 = 8;
 
 /// Per-call bound for `CancelMigration`. The shared node-client timeout is
 /// 30s, which is too long for a best-effort side channel that already has a
-/// durable retry queue behind it.
+/// durable retry queue behind it. The same bound wraps `get_or_connect` so a
+/// wedged-but-listening agent socket cannot stall the whole reap loop.
 const PENDING_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Background task that reaps migrations which have stopped making progress.
@@ -50,6 +53,7 @@ pub struct MigrationReaper {
     stall_timeout_secs: i64,
     node_client_pool: NodeClientPool,
     agent_socket_pattern: String,
+    pending_cancel_timeout: Duration,
 }
 
 impl MigrationReaper {
@@ -64,6 +68,7 @@ impl MigrationReaper {
             stall_timeout_secs: DEFAULT_MIGRATION_STALL_TIMEOUT_SECS,
             node_client_pool,
             agent_socket_pattern,
+            pending_cancel_timeout: PENDING_CANCEL_TIMEOUT,
         }
     }
 
@@ -71,6 +76,13 @@ impl MigrationReaper {
     /// clamped to one second so the SQL predicate can never mean "now".
     pub fn with_timeout_secs(mut self, stall_timeout_secs: i64) -> Self {
         self.stall_timeout_secs = stall_timeout_secs.max(1);
+        self
+    }
+
+    /// Override the per-call bound for agent cancels (tests use a short value;
+    /// production keeps [`PENDING_CANCEL_TIMEOUT`]).
+    pub fn with_pending_cancel_timeout(mut self, timeout: Duration) -> Self {
+        self.pending_cancel_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -91,11 +103,15 @@ impl MigrationReaper {
                     break;
                 }
             }
-            if let Err(e) = self.reap_stuck_migrations().await {
-                warn!(error = %e, "migration reaper tick failed");
-            }
+            // Cancel first: a resume must never unpause the source VM while a
+            // detached sender may still be streaming. Rows failed later in
+            // this tick stay `agent_cancel_pending` and their resume is gated
+            // until a subsequent tick confirms the cancel.
             if let Err(e) = self.drain_pending_agent_cancels().await {
                 warn!(error = %e, "migration reaper agent-cancel drain failed");
+            }
+            if let Err(e) = self.reap_stuck_migrations().await {
+                warn!(error = %e, "migration reaper tick failed");
             }
         }
     }
@@ -208,15 +224,17 @@ impl MigrationReaper {
         Ok(())
     }
 
-    /// Signal the source agent to abort detached migration tasks whose
-    /// control-plane owner is gone (#656).
+    /// Signal the source *and* destination agents to abort detached migration
+    /// tasks whose control-plane owner is gone (#656).
     ///
     /// A row is queued when restart recovery / a terminal transition / the
     /// reap ends control-plane ownership. `cancelled=false` (`not_tracked`) is
     /// success: the agent has no task, which is exactly what an agent restart
-    /// leaves behind. Only a transport error keeps the row pending, and the
-    /// attempt marker rotates it behind untouched rows so a dead node cannot
-    /// starve the queue.
+    /// leaves behind. A transport error keeps the row pending, and the attempt
+    /// marker rotates it behind untouched rows so a dead node cannot starve
+    /// the queue. A permanent refusal (`Unimplemented` for a core-managed or
+    /// pre-#656 agent, `InvalidArgument` for a misrouted request) parks the row
+    /// with `agent_cancel_last_error` instead of retrying forever.
     async fn drain_pending_agent_cancels(&self) -> Result<(), ChvError> {
         let repo = MigrationRepository::new(self.pool.clone());
         let rows = repo
@@ -231,7 +249,7 @@ impl MigrationReaper {
 
         let mut confirmed = 0usize;
         for row in rows {
-            // Count the attempt before contacting the node: connection
+            // Count the attempt before contacting any node: connection
             // failures and timeouts must also move this row to the back.
             if let Err(e) = repo.record_agent_cancel_attempt(&row.migration_id).await {
                 warn!(
@@ -241,111 +259,95 @@ impl MigrationReaper {
                 );
             }
 
-            let socket = match resolve_agent_socket(&self.agent_socket_pattern, &row.source_node_id)
-            {
-                Ok(socket) => socket,
-                Err(e) => {
-                    warn!(
-                        migration_id = %row.migration_id,
-                        node_id = %row.source_node_id,
-                        error = %e,
-                        "migration reaper: cannot resolve source agent socket for pending cancel"
-                    );
-                    continue;
-                }
-            };
-            let mut client = match self
-                .node_client_pool
-                .get_or_connect(&row.source_node_id, &socket)
-                .await
-            {
-                Ok(client) => client,
-                Err(e) => {
-                    warn!(
-                        migration_id = %row.migration_id,
-                        node_id = %row.source_node_id,
-                        attempts = row.agent_cancel_attempts + 1,
-                        error = %e,
-                        "migration reaper: source agent unreachable for pending cancel; will retry"
-                    );
-                    metrics::counter!(
-                        "chv_migration_agent_cancel_failures_total",
-                        "reason" => "unreachable"
-                    )
-                    .increment(1);
-                    continue;
-                }
-            };
+            // Both agents register a detached task under the same
+            // `operation_id`; a cancel that only reaches the source leaves the
+            // destination receiver (and its allocated port) alive.
+            let mut nodes: Vec<&str> = vec![row.source_node_id.as_str()];
+            if row.destination_node_id != row.source_node_id {
+                nodes.push(row.destination_node_id.as_str());
+            }
 
-            let result = tokio::time::timeout(
-                PENDING_CANCEL_TIMEOUT,
-                client.cancel_migration(&row.source_node_id, &row.operation_id, &row.migration_id),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(response)) => {
-                    if let Err(e) = repo.confirm_agent_cancel(&row.migration_id).await {
-                        // The agent has aborted the task, but we could not
-                        // persist it. Retrying is harmless (the agent reports
-                        // `not_tracked`); surface the store failure.
-                        warn!(
+            let mut retry = false;
+            let mut permanent: Option<String> = None;
+            for node_id in nodes {
+                match self.cancel_on_node(&row, node_id).await {
+                    NodeCancelOutcome::Confirmed { cancelled, outcome } => {
+                        metrics::counter!(
+                            "chv_migration_agent_cancel_total",
+                            "outcome" => outcome.clone()
+                        )
+                        .increment(1);
+                        info!(
                             migration_id = %row.migration_id,
-                            error = %e,
-                            "migration reaper: agent cancel succeeded but confirmation could not be recorded"
+                            operation_id = %row.operation_id,
+                            node_id = %node_id,
+                            attempts = row.agent_cancel_attempts + 1,
+                            cancelled,
+                            outcome = %outcome,
+                            "migration reaper: detached migration task cancel confirmed"
                         );
-                        continue;
                     }
-                    confirmed += 1;
-                    let outcome = if response.cancelled {
-                        "cancelled"
-                    } else {
-                        "not_tracked"
-                    };
-                    metrics::counter!(
-                        "chv_migration_agent_cancel_total",
-                        "outcome" => outcome
-                    )
-                    .increment(1);
-                    info!(
-                        migration_id = %row.migration_id,
-                        operation_id = %row.operation_id,
-                        node_id = %row.source_node_id,
-                        attempts = row.agent_cancel_attempts + 1,
-                        cancelled = response.cancelled,
-                        outcome = %response.outcome,
-                        "migration reaper: detached migration task cancel confirmed"
-                    );
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        migration_id = %row.migration_id,
-                        node_id = %row.source_node_id,
-                        attempts = row.agent_cancel_attempts + 1,
-                        error = %e,
-                        "migration reaper: agent cancel failed; will retry"
-                    );
-                    metrics::counter!(
-                        "chv_migration_agent_cancel_failures_total",
-                        "reason" => "rpc_error"
-                    )
-                    .increment(1);
-                }
-                Err(_) => {
-                    warn!(
-                        migration_id = %row.migration_id,
-                        node_id = %row.source_node_id,
-                        attempts = row.agent_cancel_attempts + 1,
-                        timeout_secs = PENDING_CANCEL_TIMEOUT.as_secs(),
-                        "migration reaper: agent cancel timed out; will retry"
-                    );
-                    metrics::counter!(
-                        "chv_migration_agent_cancel_failures_total",
-                        "reason" => "timeout"
-                    )
-                    .increment(1);
+                    NodeCancelOutcome::Retry { reason } => {
+                        retry = true;
+                        metrics::counter!(
+                            "chv_migration_agent_cancel_failures_total",
+                            "reason" => reason
+                        )
+                        .increment(1);
+                    }
+                    NodeCancelOutcome::Permanent { reason } => {
+                        permanent = Some(reason);
+                    }
                 }
             }
+
+            if let Some(reason) = permanent {
+                // Keep the reason operator-visible, but never claim success:
+                // `agent_cancel_confirmed_at` is deliberately left NULL.
+                if let Err(e) = repo.abandon_agent_cancel(&row.migration_id, &reason).await {
+                    warn!(
+                        migration_id = %row.migration_id,
+                        error = %e,
+                        "migration reaper: failed to park permanently refused agent cancel"
+                    );
+                }
+                metrics::counter!(
+                    "chv_migration_agent_cancel_failures_total",
+                    "reason" => "permanent"
+                )
+                .increment(1);
+                warn!(
+                    migration_id = %row.migration_id,
+                    operation_id = %row.operation_id,
+                    attempts = row.agent_cancel_attempts + 1,
+                    reason = %reason,
+                    "migration reaper: agent permanently refused the cancel; parking row for operator review"
+                );
+                continue;
+            }
+
+            if retry {
+                warn!(
+                    migration_id = %row.migration_id,
+                    operation_id = %row.operation_id,
+                    attempts = row.agent_cancel_attempts + 1,
+                    "migration reaper: at least one agent could not be signalled; will retry"
+                );
+                continue;
+            }
+
+            if let Err(e) = repo.confirm_agent_cancel(&row.migration_id).await {
+                // Both agents aborted the tasks, but we could not persist it.
+                // Retrying is harmless (the agents report `not_tracked`);
+                // surface the store failure.
+                warn!(
+                    migration_id = %row.migration_id,
+                    error = %e,
+                    "migration reaper: agent cancels succeeded but confirmation could not be recorded"
+                );
+                continue;
+            }
+            confirmed += 1;
         }
 
         if confirmed > 0 {
@@ -355,6 +357,127 @@ impl MigrationReaper {
             );
         }
         Ok(())
+    }
+
+    /// Signal one endpoint of a migration. Never panics; every failure is
+    /// classified as retryable or permanent so the drain stays bounded.
+    async fn cancel_on_node(&self, row: &PendingAgentCancel, node_id: &str) -> NodeCancelOutcome {
+        let socket = match resolve_agent_socket(&self.agent_socket_pattern, node_id) {
+            Ok(socket) => socket,
+            Err(e) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    error = %e,
+                    "migration reaper: cannot resolve agent socket for pending cancel"
+                );
+                return if matches!(e, ChvError::InvalidArgument { .. }) {
+                    NodeCancelOutcome::Permanent {
+                        reason: "invalid source/destination node id".to_string(),
+                    }
+                } else {
+                    NodeCancelOutcome::Retry {
+                        reason: "resolve_error",
+                    }
+                };
+            }
+        };
+
+        // The connect handshake is part of the bounded work: a socket that
+        // accepts but never completes HTTP/2 must not stall the reap loop.
+        let client = match tokio::time::timeout(
+            self.pending_cancel_timeout,
+            self.node_client_pool.get_or_connect(node_id, &socket),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    attempts = row.agent_cancel_attempts + 1,
+                    error = %e,
+                    "migration reaper: agent unreachable for pending cancel; will retry"
+                );
+                return NodeCancelOutcome::Retry {
+                    reason: "unreachable",
+                };
+            }
+            Err(_) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    attempts = row.agent_cancel_attempts + 1,
+                    timeout_secs = self.pending_cancel_timeout.as_secs(),
+                    "migration reaper: agent connect timed out for pending cancel; will retry"
+                );
+                return NodeCancelOutcome::Retry {
+                    reason: "connect_timeout",
+                };
+            }
+        };
+
+        let mut client = client;
+        let result = tokio::time::timeout(
+            self.pending_cancel_timeout,
+            client.cancel_migration(node_id, &row.operation_id, &row.migration_id),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(response)) => NodeCancelOutcome::Confirmed {
+                cancelled: response.cancelled,
+                outcome: if response.cancelled {
+                    "cancelled".to_string()
+                } else {
+                    "not_tracked".to_string()
+                },
+            },
+            Ok(Err(ChvError::Unimplemented { .. })) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    "migration reaper: agent does not implement CancelMigration (core-managed or pre-#656)"
+                );
+                NodeCancelOutcome::Permanent {
+                    reason: "agent does not implement CancelMigration".to_string(),
+                }
+            }
+            Ok(Err(ChvError::InvalidArgument { reason, .. })) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    reason = %reason,
+                    "migration reaper: agent rejected the cancel as invalid"
+                );
+                NodeCancelOutcome::Permanent {
+                    reason: format!("agent rejected cancel: {reason}"),
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    attempts = row.agent_cancel_attempts + 1,
+                    error = %e,
+                    "migration reaper: agent cancel failed; will retry"
+                );
+                NodeCancelOutcome::Retry {
+                    reason: "rpc_error",
+                }
+            }
+            Err(_) => {
+                warn!(
+                    migration_id = %row.migration_id,
+                    node_id = %node_id,
+                    attempts = row.agent_cancel_attempts + 1,
+                    timeout_secs = self.pending_cancel_timeout.as_secs(),
+                    "migration reaper: agent cancel timed out; will retry"
+                );
+                NodeCancelOutcome::Retry { reason: "timeout" }
+            }
+        }
     }
 
     /// Rows whose source-VM resume has not reached a final state.
@@ -464,8 +587,24 @@ impl MigrationReaper {
                     );
                     Some("blocked")
                 }
+                Ok(ResumeOutcome::SkippedAgentCancelRefused { reason }) => {
+                    metrics::counter!(
+                        "migration_reaper_resume_skipped_total",
+                        "reason" => "agent_cancel_refused"
+                    )
+                    .increment(1);
+                    warn!(
+                        migration_id = %row.migration_id,
+                        vm_id = %row.vm_id,
+                        source_node_id = %row.source_node_id,
+                        reason = %reason,
+                        "migration reaper: refusing to auto-resume source VM because the agent permanently refused the cancel; operator review required"
+                    );
+                    Some("blocked")
+                }
                 Ok(
-                    outcome @ (ResumeOutcome::SkippedSenderActive { .. }
+                    outcome @ (ResumeOutcome::SkippedAgentCancelPending
+                    | ResumeOutcome::SkippedSenderActive { .. }
                     | ResumeOutcome::SkippedSourceNodeNotReporting { .. }),
                 ) => {
                     metrics::counter!(
@@ -597,14 +736,18 @@ impl MigrationReaper {
     /// Resume the source VM after a stall, but only when sender liveness is
     /// positively excluded.
     ///
-    /// The protocol has no "abort migration and acknowledge" RPC. Instead of
-    /// unpausing underneath a possibly-live stream we require all of:
+    /// Best-effort `CancelMigration` is not enough on its own: the agent may be
+    /// unreachable, or the RPC may still be in flight. Instead of unpausing
+    /// underneath a possibly-live stream we require all of:
     ///
     /// 1. the migration row is terminal (`Failed`/`RolledBack`) — a raced
     ///    progress report that moved the phase wins and blocks the resume;
-    /// 2. no progress has been observed for at least the stall timeout (and
+    /// 2. the durable `agent_cancel_pending` flag has been cleared, i.e. both
+    ///    participating agents confirmed the cancel (or reported no task), and
+    ///    no permanent refusal was parked in `agent_cancel_last_error`;
+    /// 3. no progress has been observed for at least the stall timeout (and
     ///    never less than `STALE_ROW_SECS`);
-    /// 3. the source node is still sending node heartbeats, i.e. the agent is
+    /// 4. the source node is still sending node heartbeats, i.e. the agent is
     ///    alive and reachable but is not reporting migration progress.
     ///
     /// If the source node is unreachable we cannot prove the migration task is
@@ -615,25 +758,46 @@ impl MigrationReaper {
         // 1. Confirm the reaper's transition actually won (or the migration was
         // already rolled back). Never resume a Completed migration: VM state
         // lives on the destination in that case.
-        let phase: Option<String> =
-            sqlx::query_scalar("SELECT phase FROM migrations WHERE migration_id = ?")
-                .bind(&row.migration_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| ChvError::Internal {
-                    reason: format!(
-                        "reaper: failed to re-check phase for migration {}: {e}",
-                        row.migration_id
-                    ),
-                })?;
-        match phase.as_deref() {
-            Some("Failed") | Some("RolledBack") => {}
-            Some(other) => {
+        let state: Option<(String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT phase, agent_cancel_pending, agent_cancel_last_error \
+             FROM migrations WHERE migration_id = ?",
+        )
+        .bind(&row.migration_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ChvError::Internal {
+            reason: format!(
+                "reaper: failed to re-check phase for migration {}: {e}",
+                row.migration_id
+            ),
+        })?;
+        let (phase, agent_cancel_pending, agent_cancel_last_error) = match state {
+            Some(state) => state,
+            None => return Ok(ResumeOutcome::SkippedMissing),
+        };
+        match phase.as_str() {
+            "Failed" | "RolledBack" => {}
+            other => {
                 return Ok(ResumeOutcome::SkippedNotTerminal {
                     phase: other.to_string(),
                 });
             }
-            None => return Ok(ResumeOutcome::SkippedMissing),
+        }
+
+        // 2. Cancel before resume. A detached agent task may still be alive
+        // even though its control-plane owner is gone; unpausing the source
+        // underneath it would race a live sender. The drain runs before the
+        // reap on every tick, so a newly failed row resumes on the next tick
+        // at the earliest.
+        if agent_cancel_pending != 0 {
+            return Ok(ResumeOutcome::SkippedAgentCancelPending);
+        }
+        // A permanent refusal clears the pending flag (so the drain stops
+        // retrying) but it is *not* a confirmation. The agent may still be
+        // running a detached task, so never auto-resume; an operator must
+        // inspect the node/VM (docs/OPERATIONS.md).
+        if let Some(reason) = agent_cancel_last_error {
+            return Ok(ResumeOutcome::SkippedAgentCancelRefused { reason });
         }
 
         // Restart recovery cannot prove an agent-side task stopped. If it
@@ -654,7 +818,7 @@ impl MigrationReaper {
             }
         }
 
-        // 2. The candidate's pre-failure progress age is the authoritative
+        // 3. The candidate's pre-failure progress age is the authoritative
         // "sender has been silent for" duration: `fail_migration` just wrote
         // `updated_at = now`, so re-reading that column here would erase the
         // very evidence we need.
@@ -666,7 +830,7 @@ impl MigrationReaper {
             });
         }
 
-        // 3. Positive evidence that the agent is alive. A stale heartbeat means
+        // 4. Positive evidence that the agent is alive. A stale heartbeat means
         // we cannot tell whether a sender is still running, so refuse.
         let heartbeat_age_secs = self
             .source_node_heartbeat_age_secs(&row.source_node_id)
@@ -763,6 +927,16 @@ impl MigrationReaper {
     }
 }
 
+/// Result of signalling one agent endpoint.
+enum NodeCancelOutcome {
+    /// The agent answered (task aborted, or no task was tracked).
+    Confirmed { cancelled: bool, outcome: String },
+    /// The agent could not be reached or failed transiently.
+    Retry { reason: &'static str },
+    /// The agent can never honour this cancel; retrying is pointless.
+    Permanent { reason: String },
+}
+
 /// Why a source VM was (or was not) resumed after a reap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeOutcome {
@@ -771,6 +945,14 @@ enum ResumeOutcome {
     /// report raced the reap. Do not touch the VM.
     SkippedNotTerminal {
         phase: String,
+    },
+    /// A detached agent task may still exist; the durable cancel has not been
+    /// confirmed yet.
+    SkippedAgentCancelPending,
+    /// The agent permanently refused the cancel, so confirmation is
+    /// impossible. The task may still exist; block for operator review.
+    SkippedAgentCancelRefused {
+        reason: String,
     },
     /// The sender has not been silent long enough to prove it is gone.
     SkippedSenderActive {
@@ -797,6 +979,8 @@ impl ResumeOutcome {
         match self {
             Self::Resumed => "resumed",
             Self::SkippedNotTerminal { .. } => "not_terminal",
+            Self::SkippedAgentCancelPending => "agent_cancel_pending",
+            Self::SkippedAgentCancelRefused { .. } => "agent_cancel_refused",
             Self::SkippedSenderActive { .. } => "sender_active",
             Self::SkippedSourceNodeNotReporting { .. } => "source_node_not_reporting",
             Self::SkippedInterruptedAmbiguous { .. } => "interrupted_ambiguous",
@@ -1356,38 +1540,162 @@ mod tests {
         );
     }
 
+    /// The resume gate must refuse while the durable agent cancel is still
+    /// pending. Otherwise the source VM can be unpaused underneath a detached
+    /// sender that has not been signalled yet.
+    #[tokio::test]
+    async fn resume_source_vm_refuses_while_agent_cancel_is_pending() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "cancel-pending", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations \
+             SET agent_cancel_pending = 1, reaper_resume_state = 'pending', \
+                 reaper_stalled_secs = 10_800 \
+             WHERE migration_id = 'cancel-pending'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("mark cancel pending");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let row = StuckMigrationRow {
+            migration_id: "cancel-pending".to_string(),
+            operation_id: "op-cancel-pending".to_string(),
+            vm_id: "vm-cancel-pending".to_string(),
+            source_node_id: "source-node".to_string(),
+            phase: "Failed".to_string(),
+            started_at: "ignored".to_string(),
+            last_progress_at: "ignored".to_string(),
+            interrupted_from_phase: None,
+            interrupted_at: None,
+            started_age_secs: 10_800,
+            stalled_secs: 10_800,
+        };
+
+        let outcome = reaper
+            .resume_source_vm(&row)
+            .await
+            .expect("a deferred resume is not an error");
+
+        assert_eq!(outcome, ResumeOutcome::SkippedAgentCancelPending);
+    }
+
+    /// A permanently refused cancel clears `agent_cancel_pending` so the drain
+    /// stops retrying, but it is not a confirmation: the source VM must stay
+    /// paused for operator review.
+    #[tokio::test]
+    async fn resume_source_vm_refuses_after_permanent_cancel_refusal() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "cancel-refused", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations \
+             SET agent_cancel_pending = 0, \
+                 agent_cancel_last_error = 'agent does not implement CancelMigration', \
+                 reaper_resume_state = 'pending', reaper_stalled_secs = 10_800 \
+             WHERE migration_id = 'cancel-refused'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("park refused cancel");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let row = StuckMigrationRow {
+            migration_id: "cancel-refused".to_string(),
+            operation_id: "op-cancel-refused".to_string(),
+            vm_id: "vm-cancel-refused".to_string(),
+            source_node_id: "source-node".to_string(),
+            phase: "Failed".to_string(),
+            started_at: "ignored".to_string(),
+            last_progress_at: "ignored".to_string(),
+            interrupted_from_phase: None,
+            interrupted_at: None,
+            started_age_secs: 10_800,
+            stalled_secs: 10_800,
+        };
+
+        let outcome = reaper
+            .resume_source_vm(&row)
+            .await
+            .expect("a deferred resume is not an error");
+
+        assert_eq!(
+            outcome,
+            ResumeOutcome::SkippedAgentCancelRefused {
+                reason: "agent does not implement CancelMigration".to_string()
+            }
+        );
+    }
+
     // ---------------------------------------------------------------------
     // #656: detached agent-task cancellation drain
     // ---------------------------------------------------------------------
 
     use control_plane_node_api::control_plane_node_api as proto;
+    use std::sync::{Arc, Mutex};
     use tokio_stream::wrappers::UnixListenerStream;
 
-    struct FakeCancelAgent {
+    #[derive(Default)]
+    struct FakeCancelState {
         cancelled: bool,
+        unimplemented: bool,
+        delay: Option<Duration>,
+        expected_token: Option<String>,
+        requests: Mutex<Vec<proto::CancelMigrationRequest>>,
+    }
+
+    struct FakeCancelAgent {
+        state: Arc<FakeCancelState>,
     }
 
     #[tonic::async_trait]
     impl proto::migration_control_service_server::MigrationControlService for FakeCancelAgent {
         async fn cancel_migration(
             &self,
-            _req: tonic::Request<proto::CancelMigrationRequest>,
+            req: tonic::Request<proto::CancelMigrationRequest>,
         ) -> Result<tonic::Response<proto::CancelMigrationResponse>, tonic::Status> {
-            let outcome = if self.cancelled {
+            if let Some(expected) = &self.state.expected_token {
+                let got = req
+                    .metadata()
+                    .get(chv_common::NODE_AUTH_METADATA_KEY)
+                    .and_then(|v| v.to_str().ok());
+                if got != Some(expected.as_str()) {
+                    return Err(tonic::Status::unauthenticated("bad agent token"));
+                }
+            }
+            if self.state.unimplemented {
+                return Err(tonic::Status::unimplemented("cancel_migration unsupported"));
+            }
+            if let Some(delay) = self.state.delay {
+                tokio::time::sleep(delay).await;
+            }
+            let inner = req.into_inner();
+            self.state
+                .requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(inner);
+            let outcome = if self.state.cancelled {
                 "cancelled"
             } else {
                 "not_tracked"
             };
             Ok(tonic::Response::new(proto::CancelMigrationResponse {
-                cancelled: self.cancelled,
+                cancelled: self.state.cancelled,
                 outcome: outcome.to_string(),
             }))
         }
     }
 
+    fn fake_state(cancelled: bool) -> Arc<FakeCancelState> {
+        Arc::new(FakeCancelState {
+            cancelled,
+            ..FakeCancelState::default()
+        })
+    }
+
     fn spawn_cancel_agent(
         socket: &std::path::Path,
-        cancelled: bool,
+        state: Arc<FakeCancelState>,
     ) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::UnixListener::bind(socket).expect("bind fake cancel agent");
         let incoming = UnixListenerStream::new(listener);
@@ -1395,12 +1703,20 @@ mod tests {
             let _ = tonic::transport::Server::builder()
                 .add_service(
                     proto::migration_control_service_server::MigrationControlServiceServer::new(
-                        FakeCancelAgent { cancelled },
+                        FakeCancelAgent { state },
                     ),
                 )
                 .serve_with_incoming(incoming)
                 .await;
         })
+    }
+
+    fn per_node_pattern(dir: &std::path::Path) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        (
+            dir.join("{node_id}.sock").to_string_lossy().into_owned(),
+            dir.join("source-node.sock"),
+            dir.join("dest-node.sock"),
+        )
     }
 
     async fn seed_pending_cancel(pool: &StorePool, id: &str) {
@@ -1412,10 +1728,13 @@ mod tests {
             .expect("mark agent cancel pending");
     }
 
-    async fn cancel_state(pool: &StorePool, id: &str) -> (i64, Option<String>, i64) {
+    async fn cancel_state(
+        pool: &StorePool,
+        id: &str,
+    ) -> (i64, Option<String>, i64, Option<String>) {
         sqlx::query_as(
-            "SELECT agent_cancel_pending, agent_cancel_confirmed_at, agent_cancel_attempts \
-             FROM migrations WHERE migration_id = ?",
+            "SELECT agent_cancel_pending, agent_cancel_confirmed_at, agent_cancel_attempts, \
+             agent_cancel_last_error FROM migrations WHERE migration_id = ?",
         )
         .bind(id)
         .fetch_one(pool)
@@ -1423,29 +1742,49 @@ mod tests {
         .expect("read agent cancel state")
     }
 
+    fn requests(state: &FakeCancelState) -> Vec<proto::CancelMigrationRequest> {
+        state
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Both detached task owners (source and destination) are signalled, with
+    /// the exact operation id and node identity the control plane recorded.
     #[tokio::test]
-    async fn drain_confirms_agent_cancel_and_clears_pending_flag() {
+    async fn drain_confirms_both_agents_and_clears_pending_flag() {
         let test_db = TestDb::new().await;
         seed_pending_cancel(&test_db.pool, "orphan").await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("source-node.sock");
-        let server = spawn_cancel_agent(&socket, true);
-        let reaper = MigrationReaper::new(
-            test_db.pool.clone(),
-            NodeClientPool::new(),
-            socket.to_string_lossy().into_owned(),
-        );
+        let (pattern, source_socket, dest_socket) = per_node_pattern(dir.path());
+        let source_state = fake_state(true);
+        let dest_state = fake_state(true);
+        let source_server = spawn_cancel_agent(&source_socket, source_state.clone());
+        let dest_server = spawn_cancel_agent(&dest_socket, dest_state.clone());
+        let reaper =
+            MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern.clone());
 
         reaper
             .drain_pending_agent_cancels()
             .await
             .expect("drain is best-effort");
 
-        let (pending, confirmed_at, attempts) = cancel_state(&test_db.pool, "orphan").await;
+        for (state, expected_node) in [(&source_state, "source-node"), (&dest_state, "dest-node")] {
+            let seen = requests(state);
+            assert_eq!(seen.len(), 1, "each endpoint must be signalled once");
+            assert_eq!(seen[0].node_id, expected_node);
+            assert_eq!(seen[0].operation_id, "op-orphan");
+            assert_eq!(seen[0].migration_id, "orphan");
+        }
+
+        let (pending, confirmed_at, attempts, last_error) =
+            cancel_state(&test_db.pool, "orphan").await;
         assert_eq!(pending, 0, "a confirmed cancel must clear the flag");
         assert!(confirmed_at.is_some());
         assert_eq!(attempts, 1);
+        assert!(last_error.is_none());
 
         // A cleared row is not attempted again.
         reaper
@@ -1453,7 +1792,10 @@ mod tests {
             .await
             .expect("second drain");
         assert_eq!(cancel_state(&test_db.pool, "orphan").await.2, 1);
-        server.abort();
+        assert_eq!(requests(&source_state).len(), 1);
+        assert_eq!(requests(&dest_state).len(), 1);
+        source_server.abort();
+        dest_server.abort();
     }
 
     /// `not_tracked` means the agent restarted or the task already finished.
@@ -1464,27 +1806,26 @@ mod tests {
         seed_pending_cancel(&test_db.pool, "already-gone").await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("source-node.sock");
-        let server = spawn_cancel_agent(&socket, false);
-        let reaper = MigrationReaper::new(
-            test_db.pool.clone(),
-            NodeClientPool::new(),
-            socket.to_string_lossy().into_owned(),
-        );
+        let (pattern, source_socket, dest_socket) = per_node_pattern(dir.path());
+        let source_server = spawn_cancel_agent(&source_socket, fake_state(false));
+        let dest_server = spawn_cancel_agent(&dest_socket, fake_state(false));
+        let reaper = MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern);
 
         reaper
             .drain_pending_agent_cancels()
             .await
             .expect("drain is best-effort");
 
-        let (pending, confirmed_at, attempts) = cancel_state(&test_db.pool, "already-gone").await;
+        let (pending, confirmed_at, attempts, _) =
+            cancel_state(&test_db.pool, "already-gone").await;
         assert_eq!(pending, 0);
         assert!(confirmed_at.is_some());
         assert_eq!(attempts, 1);
-        server.abort();
+        source_server.abort();
+        dest_server.abort();
     }
 
-    /// An unreachable source agent keeps the flag set so a later tick retries.
+    /// An unreachable endpoint keeps the flag set so a later tick retries.
     /// The tick itself still succeeds (best-effort side channel).
     #[tokio::test]
     async fn drain_leaves_unreachable_cancel_pending() {
@@ -1492,7 +1833,7 @@ mod tests {
         seed_pending_cancel(&test_db.pool, "unreachable").await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("no-such-agent.sock");
+        let missing = dir.path().join("no-such-{node_id}.sock");
         let reaper = MigrationReaper::new(
             test_db.pool.clone(),
             NodeClientPool::new(),
@@ -1504,9 +1845,286 @@ mod tests {
             .await
             .expect("an unreachable agent is not a reaper error");
 
-        let (pending, confirmed_at, attempts) = cancel_state(&test_db.pool, "unreachable").await;
+        let (pending, confirmed_at, attempts, _) = cancel_state(&test_db.pool, "unreachable").await;
         assert_eq!(pending, 1, "the row must be retried on the next tick");
         assert!(confirmed_at.is_none());
         assert_eq!(attempts, 1);
+    }
+
+    /// One reachable endpoint is not enough to clear the flag; the next tick
+    /// retries both (the already-cancelled one reports `not_tracked`).
+    #[tokio::test]
+    async fn drain_retries_both_when_one_endpoint_is_unreachable() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "partial").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pattern, source_socket, _dest_socket) = per_node_pattern(dir.path());
+        let source_state = fake_state(true);
+        let source_server = spawn_cancel_agent(&source_socket, source_state.clone());
+        let reaper = MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern);
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("drain is best-effort");
+        let (pending, confirmed_at, attempts, _) = cancel_state(&test_db.pool, "partial").await;
+        assert_eq!(pending, 1);
+        assert!(confirmed_at.is_none());
+        assert_eq!(attempts, 1);
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("second drain");
+        assert_eq!(cancel_state(&test_db.pool, "partial").await.2, 2);
+        assert_eq!(
+            requests(&source_state).len(),
+            2,
+            "the reachable endpoint is retried after a partial tick"
+        );
+        assert_eq!(cancel_state(&test_db.pool, "partial").await.0, 1);
+        source_server.abort();
+    }
+
+    /// A permanent refusal (`Unimplemented`: core-managed or pre-#656 agent)
+    /// must not retry forever or masquerade as a confirmed cancel.
+    #[tokio::test]
+    async fn drain_parks_permanently_refused_cancel() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "unsupported").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pattern, source_socket, dest_socket) = per_node_pattern(dir.path());
+        let source_state = Arc::new(FakeCancelState {
+            unimplemented: true,
+            ..FakeCancelState::default()
+        });
+        let dest_state = Arc::new(FakeCancelState {
+            unimplemented: true,
+            ..FakeCancelState::default()
+        });
+        let source_server = spawn_cancel_agent(&source_socket, source_state.clone());
+        let dest_server = spawn_cancel_agent(&dest_socket, dest_state.clone());
+        let reaper =
+            MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern.clone());
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("a refusal is not a drain error");
+
+        let (pending, confirmed_at, attempts, last_error) =
+            cancel_state(&test_db.pool, "unsupported").await;
+        assert_eq!(pending, 0, "a permanent refusal must be parked");
+        assert!(confirmed_at.is_none(), "refusal is not a cancellation");
+        assert_eq!(attempts, 1);
+        assert!(last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("does not implement")));
+
+        // No further attempts.
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("second drain");
+        assert_eq!(cancel_state(&test_db.pool, "unsupported").await.2, 1);
+        source_server.abort();
+        dest_server.abort();
+    }
+
+    /// `NodeClient` must attach the configured agent bearer token to the
+    /// cancel RPC; the wrong token is a retryable failure, not a confirmation.
+    #[tokio::test]
+    async fn drain_attaches_agent_token() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "authed").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pattern, source_socket, dest_socket) = per_node_pattern(dir.path());
+        let state = Arc::new(FakeCancelState {
+            cancelled: true,
+            expected_token: Some("agent-token-0123456789abcdef0123456789".to_string()),
+            ..FakeCancelState::default()
+        });
+        let source_server = spawn_cancel_agent(&source_socket, state.clone());
+        let dest_server = spawn_cancel_agent(&dest_socket, state.clone());
+
+        let wrong = MigrationReaper::new(
+            test_db.pool.clone(),
+            NodeClientPool::new().with_auth_token("wrong-token"),
+            pattern.clone(),
+        );
+        wrong
+            .drain_pending_agent_cancels()
+            .await
+            .expect("wrong token is a retryable RPC error");
+        assert_eq!(cancel_state(&test_db.pool, "authed").await.0, 1);
+        assert!(requests(&state).is_empty());
+
+        let right = MigrationReaper::new(
+            test_db.pool.clone(),
+            NodeClientPool::new().with_auth_token("agent-token-0123456789abcdef0123456789"),
+            pattern,
+        );
+        right
+            .drain_pending_agent_cancels()
+            .await
+            .expect("correct token is accepted");
+        let (pending, confirmed_at, attempts, _) = cancel_state(&test_db.pool, "authed").await;
+        assert_eq!(pending, 0);
+        assert!(confirmed_at.is_some());
+        assert_eq!(attempts, 2);
+        assert_eq!(requests(&state).len(), 2);
+        source_server.abort();
+        dest_server.abort();
+    }
+
+    /// A slow agent is bounded by the per-call timeout and retried later.
+    #[tokio::test]
+    async fn drain_times_out_slow_agent_and_retries() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "slow").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pattern, source_socket, dest_socket) = per_node_pattern(dir.path());
+        let state = Arc::new(FakeCancelState {
+            cancelled: true,
+            delay: Some(Duration::from_millis(500)),
+            ..FakeCancelState::default()
+        });
+        let source_server = spawn_cancel_agent(&source_socket, state.clone());
+        let dest_server = spawn_cancel_agent(&dest_socket, state);
+        let reaper = MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern)
+            .with_pending_cancel_timeout(Duration::from_millis(50));
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("a timeout is not a drain error");
+
+        let (pending, confirmed_at, attempts, _) = cancel_state(&test_db.pool, "slow").await;
+        assert_eq!(pending, 1);
+        assert!(confirmed_at.is_none());
+        assert_eq!(attempts, 1);
+        source_server.abort();
+        dest_server.abort();
+    }
+
+    /// A socket that accepts but never completes the HTTP/2 handshake must not
+    /// stall the reap loop; the connect itself is bounded.
+    #[tokio::test]
+    async fn drain_bounds_connect_handshake() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "wedged").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("wedged.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind wedged socket");
+        // Never accept; a client connect/handshake cannot complete.
+        let reaper = MigrationReaper::new(
+            test_db.pool.clone(),
+            NodeClientPool::new(),
+            socket.to_string_lossy().into_owned(),
+        )
+        .with_pending_cancel_timeout(Duration::from_millis(50));
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("a wedged connect is not a drain error");
+
+        let (pending, _, attempts, _) = cancel_state(&test_db.pool, "wedged").await;
+        assert_eq!(pending, 1);
+        assert_eq!(attempts, 1);
+        drop(listener);
+    }
+
+    /// Full composition: the real `NodeClient` (bearer-token metadata,
+    /// circuit breaker, timeout) talks to the real `AgentServer` (peer-UID
+    /// gate, auth interceptor, migration registry) over UDS.
+    #[tokio::test]
+    async fn cancel_rpc_composes_with_real_agent_auth_and_registry() {
+        use chv_agent_core::connectivity::ConnectivityState;
+        use chv_agent_core::state_machine::NodeState;
+        use chv_agent_core::{AgentAuth, AgentServer, NodeCache, VmRuntime};
+        use chv_agent_runtime_ch::mock::MockCloudHypervisorAdapter;
+        use std::os::unix::fs::MetadataExt;
+        use tokio_util::sync::CancellationToken;
+
+        const TOKEN: &str = "agent-token-0123456789abcdef0123456789";
+
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "e2e").await;
+        // One real agent serves both endpoints for this test; the store's row
+        // normally names distinct nodes, and self-migration is rejected
+        // elsewhere in the control plane.
+        sqlx::query(
+            "UPDATE migrations SET destination_node_id = source_node_id WHERE migration_id = 'e2e'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("collapse endpoints for the single-agent test");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("agent.sock");
+        let mut cache = NodeCache::new("source-node");
+        cache.node_state = NodeState::TenantReady.as_str().to_string();
+        cache.connectivity_state = ConnectivityState::Connected;
+        let uid = std::fs::metadata("/proc/self").expect("read own uid").uid();
+        let agent = AgentServer::new(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(Arc::new(MockCloudHypervisorAdapter::default())),
+            dir.path().join("stord.sock"),
+            dir.path().join("nwd.sock"),
+            None,
+            dir.path().join("runtime"),
+        )
+        .with_agent_auth(AgentAuth::new(TOKEN, false, vec![uid]));
+
+        let serving = agent.clone();
+        let serving_socket = socket.clone();
+        tokio::spawn(async move {
+            let _ = serving.serve(&serving_socket).await;
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "agent socket was not bound");
+
+        let cancel_token = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        agent.migration_tasks.insert(
+            "op-e2e".to_string(),
+            task.abort_handle(),
+            cancel_token.clone(),
+        );
+
+        let reaper = MigrationReaper::new(
+            test_db.pool.clone(),
+            NodeClientPool::new().with_auth_token(TOKEN),
+            socket.to_string_lossy().into_owned(),
+        )
+        .with_pending_cancel_timeout(Duration::from_secs(2));
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("drain with a real agent");
+
+        let (pending, confirmed_at, attempts, last_error) =
+            cancel_state(&test_db.pool, "e2e").await;
+        assert_eq!(pending, 0, "the real agent must confirm the cancel");
+        assert!(confirmed_at.is_some());
+        assert_eq!(attempts, 1);
+        assert!(last_error.is_none());
+        assert!(cancel_token.is_cancelled());
+        assert!(task
+            .await
+            .expect_err("tracked task must be aborted")
+            .is_cancelled());
     }
 }

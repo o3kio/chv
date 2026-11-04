@@ -602,8 +602,31 @@ Do **not** mark an interrupted row `Completed` to make it disappear: `Completed`
 means the destination owns the VM and placement was atomically updated.
 Interrupted migrations are not retried automatically; start a new migration only
 after confirming placement and cleaning up any partial destination volume.
-A cancel request for an interrupted row returns `already_terminal` because the
-migration task no longer exists; cancel only affects a live task.
+A cancel request for an interrupted row returns `already_terminal`: the
+control-plane state machine is gone, so there is nothing to roll back. Recovery
+already queued `migrations.agent_cancel_pending` for the detached agent task;
+for a terminal `Failed`/`RolledBack` row an operator cancel also (re-)queues it.
+The migration reaper drains the flag through the source and destination agents'
+`CancelMigration` RPC. Inspect the row with:
+
+```sql
+SELECT migration_id, phase, agent_cancel_pending, agent_cancel_confirmed_at,
+       agent_cancel_attempts, agent_cancel_last_attempt_at, agent_cancel_last_error
+FROM migrations
+WHERE migration_id = '<MIGRATION_ID>';
+```
+
+`agent_cancel_pending = 1` means at least one endpoint has not confirmed the
+cancel yet. `agent_cancel_confirmed_at IS NOT NULL` with a NULL error means both
+agents aborted their detached task (or reported `not_tracked` because the agent
+restarted). A non-NULL `agent_cancel_last_error` means the agent refused
+permanently (core-managed or pre-#656 agent); the detached task may still exist,
+so verify placement and the agent process before resuming the source VM. The
+reaper will not auto-resume a source VM while `agent_cancel_pending = 1`, nor
+when `agent_cancel_last_error` records a permanent refusal (the task may still
+be running). Only requeue (`agent_cancel_pending = 1`,
+`agent_cancel_last_error = NULL`) after the node has been upgraded or verified
+idle.
 
 The startup log line `migration restart recovery completed` reports
 `reconciled`, `already_terminal`, and `unresolved` counts; reconciliation also
@@ -878,7 +901,9 @@ counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`)
 | `chv_migration_dirty_blocks` | Gauge | Remaining dirty blocks during convergence |
 | `chv_migration_restart_reconciled_total` | Counter | Rows reconciled at startup, labelled by `recovered_phase`; nonzero means a restart interrupted migrations |
 | `chv_migration_progress_dropped_total` | Counter | Late progress reports dropped after a terminal transition, labelled by `stored_phase` and `reported_phase`; `reported_phase="Completed"` after recovery is especially important |
-| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
+| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`agent_cancel_pending`, `agent_cancel_refused`, `sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
+| `chv_migration_agent_cancel_total` | Counter | Detached agent migration tasks signalled, labelled by `outcome` (`cancelled`, `not_tracked`); `not_tracked` is success (agent restarted / task already finished) |
+| `chv_migration_agent_cancel_failures_total` | Counter | Agent cancel attempts that did not confirm, labelled by `reason` (`unreachable`, `connect_timeout`, `timeout`, `rpc_error`, `permanent`); `permanent` parks the row in `agent_cancel_last_error` |
 
 **Expected phase durations** (100GB disk, 16GB RAM):
 

@@ -236,7 +236,7 @@ operator-initiated migration is stop-the-world until #394 is proven.
 
 - New operation type: `MigrateVm` in orchestrator dispatch table
 - Operation follows existing retry/timeout pattern (but migration is NOT retried automatically — failure requires operator review)
-- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The same tick drains `agent_cancel_pending`: it signals the source agent's `CancelMigration` RPC (bounded per call and per batch) so a detached `MigrateVm` task is aborted; `not_tracked` is success, transport failures are retried with attempt-based rotation. The source VM is resumed only after a liveness gate: the row is terminal, no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`). Rows marked by restart recovery with `interrupted_at` are failed but never auto-resumed when either `interrupted_from_phase` or the phase scanned at reap time is ambiguous (`MemoryMigration`/`Paused`); the reaper records `reaper_resume_state = 'blocked'`.
+- Operation reaper: scans every 60 s; a migration in a non-terminal phase whose `updated_at` has not moved for the stall timeout (default 7200 s, overridable with `CHV_MIGRATION_STALL_TIMEOUT_SECS`; this is a no-progress threshold, not a total-runtime cap) is marked Failed and its parent operation failed. The same tick drains `agent_cancel_pending` before the resume pass: it signals both the source and destination agents' `CancelMigration` RPC (bounded per call and per batch, with a bounded connect handshake) so every detached `MigrateVm` task half is aborted; `not_tracked` is success, transport failures are retried with attempt-based rotation, and a permanent agent refusal (core-managed/pre-#656 `Unimplemented`, `InvalidArgument`) is parked in `agent_cancel_last_error`. The source VM is resumed only after a liveness gate: the row is terminal, `agent_cancel_pending = 0` (both endpoints confirmed or reported no task), `agent_cancel_last_error` is NULL (a permanent refusal is not a confirmation), no progress has arrived for at least `max(stall timeout, 90 s)`, and the source node heartbeat is fresh (≤ 30 s). If the gate fails, the VM stays paused for operator review (`crates/chv-controlplane-service/src/migration_reaper.rs`). Rows marked by restart recovery with `interrupted_at` are failed but never auto-resumed when either `interrupted_from_phase` or the phase scanned at reap time is ambiguous (`MemoryMigration`/`Paused`); the reaper records `reaper_resume_state = 'blocked'`.
 
 ## Configuration
 
@@ -363,7 +363,7 @@ constants above.
 | Phase 5: Completed / cleanup | migration.rs | DONE |
 | Rollback per phase | migration.rs | DONE |
 | Migration reaper (stale ops) | migration_reaper.rs | DONE |
-| Detached agent-task cancel (#656) | control-plane-node.proto `MigrationControlService.CancelMigration`, migration_reaper.rs, migration_registry.rs | DONE — terminal transitions/recovery/operator cancel set `agent_cancel_pending`; reaper drains it with per-call/per-batch bounds; `not_tracked` counts as success; unreachable agents retry with attempt rotation. Migration `0070` adds the columns. A source task survives only while its agent stays unreachable |
+| Detached agent-task cancel (#656) | control-plane-node.proto `MigrationControlService.CancelMigration`, migration_reaper.rs, migration_registry.rs | DONE — terminal transitions/recovery/agent-reported failure/operator cancel set `agent_cancel_pending`; reaper drains both endpoints with per-call/per-batch/connect bounds; `not_tracked` counts as success; unreachable agents retry with attempt rotation; permanent refusals park in `agent_cancel_last_error`; a late `MigrateVm` after a `not_tracked` is aborted by a bounded agent tombstone. Source-VM resume requires the cancel to be confirmed or no task to be tracked; a parked refusal blocks it. Migration `0070` adds the columns and backfills recent terminal orphans. A task survives only while its agent stays unreachable or refused the cancel |
 | Restart reconciliation | migration.rs `MigrationRegistry`, chv-controlplane-store `migrations.rs` | DONE — non-terminal rows become `RolledBack` (pre-memory) or `Failed` (memory/paused/unknown), operator-only; terminal rows untouched; migration `0065` records `interrupted_from_phase`/`interrupted_at`, migration `0070` queues the agent cancel (#656) |
 | Phase timeouts | migration.rs `PhaseTimeouts` | DONE |
 | MigrationProgress proto | control-plane-node.proto | DONE |
@@ -429,22 +429,27 @@ constants above.
   - `Completed`, `Failed`, and `RolledBack` rows are never modified (a terminal
     migration must never be resurrected).
 
-  Only the control-plane task is known to be gone; the agent-side task may
-  still be running. Every terminal transition ends control-plane ownership and
-  sets `agent_cancel_pending`: restart reconciliation, the state machine's
-  `Failed`/`RolledBack` transitions (rollback or error), the reaper's
-  force-fail, and an operator cancel of an already-terminal row. The migration
-  reaper drains the flag on its next tick through the source agent's
-  `MigrationControlService.CancelMigration` RPC (`proto/controlplane/control-plane-node.proto`),
-  which aborts the detached `MigrateVm` task by `operation_id` after verifying
-  the request names the agent's own node. `cancelled=false` /
-  `outcome=not_tracked` is success: the agent has no task, which is the normal
-  agent-restart outcome. A transport failure leaves the flag set for retry; an
-  attempt timestamp rotates a persistently unreachable node behind untouched
-  rows so it cannot starve the queue. This narrows, but does not remove, the
-  window: while the source agent is unreachable its task may keep running, and
-  the pause-first gate normally leaves the source VM paused for operator review
-  (`agent_cancel_pending` is inspectable in the `migrations` table).
+  Only the control-plane task is known to be gone; the source and destination
+  agent-side tasks may still be running. The following terminal transitions set
+  `agent_cancel_pending`: restart reconciliation, the state machine's
+  `Failed`/`RolledBack` transitions (rollback or error), an agent-reported
+  `Failed`/`RolledBack` progress update, the reaper's force-fail, and an
+  operator cancel of an already-terminal row. `Completed` never queues and
+  clears any stale marker. The migration reaper drains the flag on its next tick
+  (≤ 60 s) through both agents' `MigrationControlService.CancelMigration` RPC
+  (`proto/controlplane/control-plane-node.proto`), which aborts the detached
+  `MigrateVm` task by `operation_id` after verifying the request names the
+  agent's own node. `cancelled=false` / `outcome=not_tracked` is success: the
+  agent has no task, which is the normal agent-restart outcome. A transport
+  failure leaves the flag set for retry; an attempt timestamp rotates a
+  persistently unreachable node behind untouched rows so it cannot starve the
+  queue. A permanently refused cancel (`Unimplemented` on a core-managed or
+  pre-#656 agent, `InvalidArgument` for a misroute) is parked with the reason in
+  `agent_cancel_last_error` and is not misreported as confirmed. This narrows,
+  but does not remove, the window: while an agent is unreachable its task may
+  keep running, and the pause-first gate normally leaves the source VM paused
+  for operator review (`agent_cancel_pending` is inspectable in the `migrations`
+  table).
   No recovered row gets an automatic source-VM resume. The
   row becomes terminal immediately, and the normal progress path drops late
   reports from a still-running agent task; reaper "silence" would therefore not

@@ -78,7 +78,7 @@ pub use hypervisor_settings::{HypervisorSettingsRepository, HypervisorSettingsRo
 pub use images::{ImageRepository, ImageRow};
 pub use migrations::{
     is_terminal_phase, InterruptedMigrationOutcome, InterruptedMigrationUpdate, MigrationRecord,
-    MigrationRepository,
+    MigrationRepository, PendingAgentCancel,
 };
 pub use monitoring_agents::{
     AgentAuthError, AgentCredential, AgentOsMetadata, ClaimConsumeError, ConsumedClaim,

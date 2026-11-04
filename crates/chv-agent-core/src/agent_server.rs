@@ -3867,10 +3867,17 @@ impl proto::migration_control_service_server::MigrationControlService for AgentS
         // or mismatched id is a routing bug, not a wildcard.
         let my_node_id = self.cache.lock().await.node_id.clone();
         if inner.node_id != my_node_id {
-            return Err(Status::invalid_argument(format!(
-                "this node ({my_node_id}) is not the migration source requested ({})",
-                inner.node_id
-            )));
+            // Do not echo node ids back to the caller (or into CP logs): the
+            // caller already knows the value it sent, and a mismatch is a
+            // routing bug, not a lookup service.
+            tracing::warn!(
+                requested_node_id = %inner.node_id,
+                operation_id = %inner.operation_id,
+                "refusing migration cancel addressed to another node"
+            );
+            return Err(Status::invalid_argument(
+                "node_id does not match this agent's migration source identity",
+            ));
         }
 
         // `false` means the registry has no task for this operation — the
@@ -4086,7 +4093,11 @@ mod tests {
             .await
             .expect_err("cancel for another node must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("node-1"));
+        assert!(
+            !err.message().contains("node-2") && !err.message().contains("node-1"),
+            "the refusal must not echo node ids: {}",
+            err.message()
+        );
 
         let err =
             proto::migration_control_service_server::MigrationControlService::cancel_migration(
@@ -4096,6 +4107,42 @@ mod tests {
             .await
             .expect_err("empty operation id must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Core-managed mode has no legacy migration task to cancel, exactly like
+    /// `migrate_vm`; fail closed before touching the registry.
+    #[tokio::test]
+    async fn migration_control_refuses_core_managed_mode() {
+        let server = test_server()
+            .with_core_authority(cellhv_core_operations::AuthorityHandle::disconnected());
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-live", "node-1")),
+            )
+            .await
+            .expect_err("core-managed cancel must be refused");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("core-managed"));
+    }
+
+    /// The new service is registered behind the same auth interceptor as the
+    /// existing services; a missing token must never reach the handler.
+    #[tokio::test]
+    async fn migration_control_rejects_missing_token_over_uds() {
+        let (_dir, socket) = spawn_agent_with_auth(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+        let mut client = connect_migration_control(&socket).await;
+        let status = client
+            .cancel_migration(cancel_request("op-live", "node-1"))
+            .await
+            .expect_err("missing token must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 
     async fn connect_reconcile(

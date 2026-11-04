@@ -32,8 +32,19 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
+
+/// How long a cancel for an untracked operation is remembered. The control
+/// plane's dispatch timeout is 30 s, so 10 minutes covers a `MigrateVm` that
+/// was delayed long enough for the owner to cancel before the task registered.
+/// Operation ids are unique, so the tombstone can never affect a later
+/// legitimate migration.
+const CANCELLED_OP_TOMBSTONE_TTL: Duration = Duration::from_secs(600);
+
+/// Bound the tombstone map so a misbehaving caller cannot grow it forever.
+const MAX_CANCELLED_OP_TOMBSTONES: usize = 256;
 
 /// A handle for a single tracked migration.
 struct TrackedTask {
@@ -41,10 +52,45 @@ struct TrackedTask {
     cancel_token: CancellationToken,
 }
 
+#[derive(Default)]
+struct RegistryState {
+    tasks: HashMap<String, TrackedTask>,
+    /// Operations cancelled while no task was registered. A task that
+    /// registers later (a delayed `MigrateVm`) must be aborted immediately
+    /// instead of running with no control-plane owner.
+    cancelled: HashMap<String, Instant>,
+}
+
+impl RegistryState {
+    fn remember_cancelled(&mut self, op_id: &str) {
+        let now = Instant::now();
+        self.cancelled
+            .retain(|_, at| now.duration_since(*at) < CANCELLED_OP_TOMBSTONE_TTL);
+        if self.cancelled.len() >= MAX_CANCELLED_OP_TOMBSTONES {
+            if let Some(oldest) = self
+                .cancelled
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| id.clone())
+            {
+                self.cancelled.remove(&oldest);
+            }
+        }
+        self.cancelled.insert(op_id.to_string(), now);
+    }
+
+    fn take_fresh_cancelled(&mut self, op_id: &str) -> bool {
+        match self.cancelled.remove(op_id) {
+            Some(at) => at.elapsed() < CANCELLED_OP_TOMBSTONE_TTL,
+            None => false,
+        }
+    }
+}
+
 /// Tracks the abort/cancel handles of every in-flight migration task.
 #[derive(Default)]
 pub struct MigrationTaskRegistry {
-    inner: Mutex<HashMap<String, TrackedTask>>,
+    inner: Mutex<RegistryState>,
 }
 
 impl MigrationTaskRegistry {
@@ -58,8 +104,8 @@ impl MigrationTaskRegistry {
     /// would otherwise leak the older handle).
     pub fn insert(&self, op_id: String, abort: AbortHandle, cancel_token: CancellationToken) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = guard.insert(
-            op_id,
+        if let Some(prev) = guard.tasks.insert(
+            op_id.clone(),
             TrackedTask {
                 abort,
                 cancel_token,
@@ -68,12 +114,23 @@ impl MigrationTaskRegistry {
             prev.cancel_token.cancel();
             prev.abort.abort();
         }
+
+        // A cancel may have arrived while this `MigrateVm` was still in flight
+        // (the control plane timed out that RPC but the handler later
+        // registered the task). Honour it now rather than leaking an unowned
+        // migration.
+        if guard.take_fresh_cancelled(&op_id) {
+            if let Some(task) = guard.tasks.get(&op_id) {
+                task.cancel_token.cancel();
+                task.abort.abort();
+            }
+        }
     }
 
     /// Remove the entry for `op_id` (called by the reaper when the task ends).
     pub fn remove(&self, op_id: &str) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(op_id);
+        guard.tasks.remove(op_id);
     }
 
     /// Cancel the migration task associated with `op_id`.
@@ -82,10 +139,13 @@ impl MigrationTaskRegistry {
     /// next phase boundary) and the `AbortHandle` (so the future is force-dropped
     /// at the next `.await` if it doesn't honor the token quickly).
     ///
-    /// Returns `true` if a task was found and signalled.
+    /// Returns `true` if a task was found and signalled. When no task exists a
+    /// bounded tombstone is recorded so a late registration is aborted too;
+    /// `false` still means "the agent has no task right now" to the caller.
     pub fn cancel(&self, op_id: &str) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(task) = guard.get(op_id) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remember_cancelled(op_id);
+        if let Some(task) = guard.tasks.get(op_id) {
             task.cancel_token.cancel();
             task.abort.abort();
             true
@@ -96,7 +156,11 @@ impl MigrationTaskRegistry {
 
     /// Number of in-flight migration tasks.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .len()
     }
 
     /// Whether there are no in-flight migration tasks.
@@ -109,13 +173,14 @@ impl MigrationTaskRegistry {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .tasks
             .contains_key(op_id)
     }
 
     /// Abort every tracked task. Used on agent shutdown.
     pub fn abort_all(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for (op_id, task) in guard.drain() {
+        for (op_id, task) in guard.tasks.drain() {
             tracing::warn!(
                 operation_id = %op_id,
                 "aborting in-flight migration task on agent shutdown"
@@ -133,7 +198,7 @@ impl Drop for MigrationTaskRegistry {
     fn drop(&mut self) {
         // Avoid panicking in Drop: skip if the lock is poisoned.
         if let Ok(mut guard) = self.inner.lock() {
-            for (op_id, task) in guard.drain() {
+            for (op_id, task) in guard.tasks.drain() {
                 tracing::warn!(
                     operation_id = %op_id,
                     "aborting in-flight migration task on registry drop"
@@ -325,6 +390,41 @@ mod tests {
             registry.insert("op-poison-test".to_string(), abort_handle, ct);
             assert_eq!(registry.len(), 1);
         });
+    }
+
+    /// A cancel that arrives before a delayed `MigrateVm` registers its task
+    /// must not be lost: the tombstone aborts the late registration.
+    #[tokio::test]
+    async fn cancel_before_registration_aborts_late_task() {
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        assert!(!registry.cancel("op-late"), "no task exists yet");
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        registry.insert("op-late".to_string(), handle.abort_handle(), token.clone());
+
+        assert!(token.is_cancelled(), "tombstone must cancel the late task");
+        assert!(
+            handle
+                .await
+                .expect_err("late task must be aborted")
+                .is_cancelled(),
+            "late registration must be aborted, not left running"
+        );
+        registry.remove("op-late");
+        assert!(
+            registry.is_empty(),
+            "the cancelled task must not be reported as live"
+        );
+
+        // A second insert for the same (already consumed) operation id is not
+        // affected by a stale tombstone.
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        registry.insert("op-late".to_string(), handle.abort_handle(), token.clone());
+        assert!(!token.is_cancelled());
+        registry.remove("op-late");
+        handle.abort();
     }
 
     /// Helper: a tiny "send on drop" guard so a spawned task can signal

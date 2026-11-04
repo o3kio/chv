@@ -49,7 +49,7 @@ pub async fn cancel_migration(
             Json(serde_json::json!({
                 "migration_id": migration_id,
                 "outcome": "already_terminal",
-                "message": "migration is already in a terminal phase; cancel is a no-op"
+                "message": "migration is already terminal; Completed is a no-op, Failed/RolledBack queue an agent-side cancel for any surviving detached task"
             })),
         ),
         Ok(CancelMigrationOutcome::NotFound) => (
