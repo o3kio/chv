@@ -104,6 +104,91 @@ fail() {
     exit 1
 }
 
+# --- Runner hygiene and failure observability ------------------------------
+# The self-hosted runner is dedicated to this lane. A lane that dies
+# mid-scenario can leave chv daemons/VMMs holding 8443/8080/9100-9103 and
+# /tmp/chv-qual-* trees behind; the next lane then fails for reasons that
+# have nothing to do with the candidate ("Address already in use", CP→agent
+# auth against a stale process). Sweep before preflight, scoped by argv[0]
+# and the qualification roots so nothing else on the host is touched.
+qual_daemon_pattern="(^|/)(cloud-hypervisor|chv-controlplane|chv-agent|chv-stord|chv-nwd)( |\$).*(/tmp/chv-qual-|${CHV_QUAL_ROOT})"
+
+sweep_stale_qual_state() {
+    local found
+    found="$(pgrep -af "$qual_daemon_pattern" 2>/dev/null || true)"
+    if [ -n "$found" ]; then
+        echo "::warning::nightly-run: killing stale qualification processes from a previous lane:" >&2
+        printf '%s\n' "$found" >&2
+        pkill -f "$qual_daemon_pattern" 2>/dev/null || true
+        sleep 2
+        pkill -9 -f "$qual_daemon_pattern" 2>/dev/null || true
+        sleep 1
+    fi
+    # Only the throwaway trees: the persistent root holds staged binaries,
+    # firmware, and guest images and must survive.
+    find /tmp -maxdepth 1 -type d -name 'chv-qual-*' -exec rm -rf {} + 2>/dev/null || true
+    # nwd hardcodes its dnsmasq runtime here; a killed nwd can leave it behind.
+    rm -rf /run/chv/nwd 2>/dev/null || true
+}
+
+require_qual_ports_free() {
+    local ports="8080 8443 8444 9100 9101 9102 9103 51052 51053 51062 51063"
+    local busy
+    busy="$(ss -ltnH 2>/dev/null | awk -v want="$ports" \
+        'BEGIN { split(want, a, " "); for (i in a) w[a[i]] = 1 }
+         { n = split($4, p, ":"); if (p[n] in w) print $4 }')"
+    if [ -n "$busy" ]; then
+        fail "qualification ports still in use after the stale-state sweep: $(echo "$busy" | tr '\n' ' ') — inspect with: ss -ltnp"
+    fi
+}
+
+snapshot_host_state() {
+    local out="$1"
+    {
+        date -u
+        hostname
+        echo "--- listeners"
+        ss -ltnp 2>/dev/null | grep -E ':(8080|8443|8444|9100|9101|9102|9103|5105[0-9]|5106[0-9])\b' || true
+        echo "--- qual processes"
+        ps -eo pid,ppid,etime,rss,args 2>/dev/null \
+            | grep -E 'cloud-hypervisor|chv-(agent|stord|nwd|controlplane)' \
+            | grep -v grep || true
+        echo "--- memory/disk"
+        free -h 2>/dev/null || true
+        df -h / /tmp 2>/dev/null || true
+        echo "--- kernel"
+        dmesg 2>/dev/null | tail -n 50 || true
+    } > "$out" 2>&1
+}
+
+# Copy the log/state files from each NEWLY preserved failed test tree into the
+# uploaded artifact. The deploy teardown keeps those trees on the runner for
+# post-mortem, but the workflow artifact only carries QUAL_ARTIFACT_ROOT, so
+# without this the per-VM console and daemon logs that explain a boot or
+# volume failure never leave the runner. Text files only, capped per file.
+preserve_failed_dirs() {
+    local before="$1" scenario="$2" d f rel out dest
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ -n "$before" ] && printf '%s\n' "$before" | grep -Fxq -- "$d"; then
+            continue
+        fi
+        dest="${QUAL_ARTIFACT_ROOT}/failed/${scenario}/$(basename "$d")"
+        mkdir -p "$dest"
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            rel="${f#"$d"/}"
+            out="${dest}/${rel}"
+            mkdir -p "$(dirname "$out")"
+            head -c 2097152 "$f" > "$out" 2>/dev/null || true
+        done < <(find "$d" -type f \
+            \( -name '*.log' -o -name '*.toml' -o -name 'deployment.map' \
+               -o -name 'pids.current' -o -name 'host-state.txt' -o -name '*.jsonl' \) \
+            -print 2>/dev/null)
+        echo "::warning::nightly-run: preserved failed test tree for ${scenario}: ${dest}" >&2
+    done < <(ls -1d /tmp/chv-qual-failed-* 2>/dev/null || true)
+}
+
 [ "$(id -u)" -eq 0 ] || fail "must run as root on the self-hosted KVM runner"
 [ -e /dev/kvm ] || fail "/dev/kvm is absent on this runner — real-KVM qualification cannot run (this is a failure, not a skip)"
 [ -n "$SCENARIOS" ] || fail "no scenarios requested (use --scenarios)"
@@ -115,6 +200,10 @@ printf 'scenario\tstatus\trc\tduration_s\tlog\tevidence\n' > "$RESULT_FILE"
 # deploy.sh resolves the --exec command relative to its caller's working
 # directory (the documented usage is `cd qual && ./deploy.sh --exec ./m4.x.sh`).
 cd "$SCRIPT_DIR" || fail "cannot cd to ${SCRIPT_DIR}"
+
+echo "[qual-nightly] sweeping stale qualification state from a previous lane"
+sweep_stale_qual_state
+require_qual_ports_free
 
 # The stock Ubuntu cloud image cannot boot through the CHV firmware chain
 # (GRUB's LABEL= root needs an initramfs the shim/firmware path never
@@ -151,6 +240,7 @@ for scenario in $SCENARIOS; do
 
     echo "[qual-nightly] running ${scenario}"
     started="$(date +%s)"
+    failed_before="$(ls -1d /tmp/chv-qual-failed-* 2>/dev/null || true)"
     if "${SCRIPT_DIR}/deploy.sh" --exec "./${scenario}.sh" > "$scenario_log" 2>&1; then
         status="pass"
         scenario_rc=0
@@ -161,6 +251,11 @@ for scenario in $SCENARIOS; do
         echo "::error::nightly-run: ${scenario} failed (rc=${scenario_rc}); log artifact: ${scenario_log}"
     fi
     duration="$(( $(date +%s) - started ))"
+
+    preserve_failed_dirs "$failed_before" "$scenario"
+    if [ "$status" = "fail" ]; then
+        snapshot_host_state "${LOG_DIR}/${scenario}-host-state.txt"
+    fi
 
     if [ -d "$evidence_src" ]; then
         rm -rf "$evidence_dst"

@@ -575,6 +575,10 @@ write_src_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+# Port 0: scenario stords run alongside the deployed stord (9101) and up to
+# two at once; a fixed default would collide (#687 makes the metrics bind
+# fatal). The harness never scrapes these listeners.
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -594,6 +598,7 @@ write_dst_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -790,6 +795,7 @@ cat > "${N1B_DIR}/client-disabled.toml" <<EOF
 socket_path = "${N1B_DIR}/client.sock"
 runtime_dir = "${N1B_DIR}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 
 [migration]
 enabled = false
@@ -806,6 +812,7 @@ cat > "${N1B_DIR}/receiver-disabled.toml" <<EOF
 socket_path = "${N1B_DIR}/receiver.sock"
 runtime_dir = "${N1B_DIR}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 
 [migration]
 enabled = false

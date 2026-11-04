@@ -1680,6 +1680,7 @@ write_src_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -1695,6 +1696,7 @@ write_dst_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]

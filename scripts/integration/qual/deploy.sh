@@ -192,6 +192,31 @@ cleanup() {
     sleep 1
     pkill -9 -f "(^|/)chv-nwd( |$).*${TEST_DIR}" 2>/dev/null || true
 
+    # Same safety net for every other daemon: pids.current is written by the
+    # SCENARIO, so a scenario that dies before its first write (or a
+    # supervisor respawn that races the last write) used to leave the agent,
+    # stord, or control plane holding 8443/9100/9101/9103 into the NEXT
+    # scenario — observed as `127.0.0.1:9101: Address already in use` and as
+    # CP→agent auth failures against the stale process. Scope is THIS test
+    # dir's config path, so nothing else on the host is touched.
+    for spec in \
+        "chv-agent|${TEST_DIR}/agent.toml" \
+        "chv-stord|${TEST_DIR}/(stord\.toml$|agent/chv-stord)" \
+        "chv-controlplane|${TEST_DIR}/controlplane.toml"; do
+        bin="${spec%%|*}"
+        cfg="${spec#*|}"
+        pkill -f "(^|/)${bin}( |$).*${cfg}" 2>/dev/null || true
+    done
+    sleep 1
+    for spec in \
+        "chv-agent|${TEST_DIR}/agent.toml" \
+        "chv-stord|${TEST_DIR}/(stord\.toml$|agent/chv-stord)" \
+        "chv-controlplane|${TEST_DIR}/controlplane.toml"; do
+        bin="${spec%%|*}"
+        cfg="${spec#*|}"
+        pkill -9 -f "(^|/)${bin}( |$).*${cfg}" 2>/dev/null || true
+    done
+
     # Remove nwd-owned links this deployment created (bridges and taps —
     # see chv-common bridge_name_for_network: 'br-<id>' or
     # 'br-<first8><hash>' past 15 chars, and 'tap-*', PLUS 'chvbr0' for the
@@ -358,6 +383,16 @@ ADMIN_PASSWORD="$(openssl rand -hex 12)"
 MIGRATIONS_DIR="${REPO_ROOT_OVERRIDE:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}/cmd/chv-controlplane/migrations"
 [ -d "$MIGRATIONS_DIR" ] || qual_die "migrations dir not found: $MIGRATIONS_DIR"
 
+# One master secret shared by BOTH configs. Since #662/#693 the control plane
+# authenticates every CP→agent RPC with `[secrets] agent_auth_token`; when
+# that key is absent, both sides derive it from their own `jwt_secret`. If
+# only the control plane is given a secret and the agent is not, the agent
+# mints an unrelated random one at startup and every dispatch fails closed
+# with "invalid agent authentication token" (#659: nightly red on every
+# scenario after #693). install.sh has always written the same JWT_SECRET
+# into both files; this harness must do the same.
+JWT_SECRET="qual-$(openssl rand -hex 32)-jwt-secret"
+
 # --- controlplane.toml ---
 # agent_socket_pattern / agent_runtime_dir / firmware_path: the candidate's
 # defaults match the PRODUCTION layout (/run/chv/agent/api.sock,
@@ -374,7 +409,7 @@ grpc_bind = "127.0.0.1:8443"
 http_bind = "127.0.0.1:8080"
 log_level = "${LOG_LEVEL}"
 runtime_dir = "${cp_dir}"
-jwt_secret = "qual-$(openssl rand -hex 16)-jwt-secret"
+jwt_secret = "${JWT_SECRET}"
 agent_socket_pattern = "${agent_dir}/api.sock"
 agent_runtime_dir = "${agent_dir}"
 firmware_path = "${CHV_QUAL_ROOT}/hypervisor-fw"
@@ -431,6 +466,12 @@ stord_config_path = "${TEST_DIR}/stord.toml"
 tls_cert_path = "${certs_dir}/enroll-client.crt"
 tls_key_path = "${certs_dir}/enroll-client.key"
 ca_cert_path = "${certs_dir}/ca.crt"
+
+# Must match controlplane.toml: the agent derives the same
+# [secrets] agent_auth_token from this master value. Omitting it makes the
+# agent mint its own random secret, so every CP→agent RPC is rejected
+# (see the note above JWT_SECRET).
+jwt_secret = "${JWT_SECRET}"
 EOF
 
 # --- stord.toml (operator-shaped path allowlist) ---
@@ -438,6 +479,10 @@ cat > "${TEST_DIR}/stord.toml" <<EOF
 socket_path = "${stord_dir}/api.sock"
 runtime_dir = "${stord_dir}"
 log_level = "${LOG_LEVEL}"
+# Explicit so the deployed daemon never relies on the loopback default: the
+# scenario topologies below start additional stords and must know which
+# ports are already taken (#687 made the metrics listener fatal on conflict).
+metrics_bind = "127.0.0.1:9101"
 path_allowlist = ["${agent_dir}", "${stord_dir}", "${images_dir}"]
 # #379 DP5: the standard device allowlist — dm-path tokens only, which
 # the LVM locator convention (/dev/mapper/{vg}-{vid}) is shaped to pass.
@@ -451,7 +496,21 @@ cat > "${TEST_DIR}/nwd.toml" <<EOF
 socket_path = "${nwd_dir}/api.sock"
 runtime_dir = "${nwd_dir}"
 log_level = "${LOG_LEVEL}"
+metrics_bind = "127.0.0.1:9102"
 EOF
+
+# Regression guard for the #662/#693 shared-secret invariant: both configs
+# must resolve to the SAME agent-auth credential. This is the check whose
+# absence let the nightly lane go red on every scenario while the harness
+# itself looked healthy. Derivation is `[secrets] agent_auth_token` when set,
+# else HMAC(jwt_secret); this harness writes no explicit [secrets], so equal
+# jwt_secret values are the invariant.
+CP_AGENT_MASTER="$(sed -n 's/^jwt_secret = "\(.*\)"$/\1/p' "${TEST_DIR}/controlplane.toml")"
+AGENT_MASTER="$(sed -n 's/^jwt_secret = "\(.*\)"$/\1/p' "${TEST_DIR}/agent.toml")"
+if [ -z "$CP_AGENT_MASTER" ] || [ "$CP_AGENT_MASTER" != "$AGENT_MASTER" ]; then
+    qual_die "agent-auth master mismatch between controlplane.toml and agent.toml — CP→agent RPCs would fail closed with 'invalid agent authentication token'"
+fi
+qual_pass "control-plane and agent share the agent-auth master secret"
 
 # Agent runtime dir MUST be 0700 for the Core-authority startup validation
 # (cellhv-core-startup::validate_paths). Done last, after token file writes.
