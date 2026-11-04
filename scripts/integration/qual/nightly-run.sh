@@ -112,9 +112,51 @@ fail() {
 # auth against a stale process). Sweep before preflight, scoped by argv[0]
 # and the qualification roots so nothing else on the host is touched.
 qual_daemon_pattern="(^|/)(cloud-hypervisor|chv-controlplane|chv-agent|chv-stord|chv-nwd)( |\$).*(/tmp/chv-qual-|${CHV_QUAL_ROOT})"
+qual_harness_pattern='(^|/)(nightly-run|deploy)\.sh( |$)|(^| )\./m4\.[0-9][^ ]*\.sh( |$)'
+
+# Kill orphaned HARNESS scripts, not just their daemons. A canceled workflow
+# does not reap the self-hosted job's children: an orphaned nightly-run.sh
+# keeps iterating scenarios and starts a *new* stack (new /tmp/chv-qual-*
+# dir) after the daemon sweep — observed in run 41905691606 as a fresh
+# control plane holding :9103 two minutes after the sweep had passed. Match
+# the qualification scripts by argv (absolute path for nightly-run/deploy,
+# `./m4.N-*.sh` for scenario children) and by the qual script cwd, and
+# never touch this invocation or its ancestors.
+sweep_orphaned_harness() {
+    local pid cmd cwd
+    local -a p_kill=()
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        case " ${protected_pids} " in *" ${pid} "*) continue ;; esac
+        # Scope by cwd: the harness always runs from this directory, so a
+        # same-named deploy.sh/nightly-run.sh from another project on the
+        # runner is never touched.
+        cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+        [ "$cwd" = "$SCRIPT_DIR" ] || continue
+        cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+        printf '%s' "$cmd" | grep -Eq "$qual_harness_pattern" || continue
+        p_kill+=("$pid")
+    done < <(ls -1 /proc 2>/dev/null | grep -E '^[0-9]+$')
+    if [ "${#p_kill[@]}" -gt 0 ]; then
+        echo "::warning::nightly-run: killing orphaned qualification harness scripts (a canceled lane does not reap its children): ${p_kill[*]}" >&2
+        ps -o pid,ppid,etime,args -p "$(IFS=,; echo "${p_kill[*]}")" >&2 2>/dev/null || true
+        kill -TERM "${p_kill[@]}" 2>/dev/null || true
+        sleep 2
+        kill -KILL "${p_kill[@]}" 2>/dev/null || true
+    fi
+}
 
 sweep_stale_qual_state() {
     local found
+    # Protect self and ancestors: this script's own argv matches the pattern.
+    protected_pids="$$"
+    local p=$$
+    while [ "$p" -gt 1 ]; do
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+        [ -n "$p" ] && [ "$p" -gt 1 ] || break
+        protected_pids="${protected_pids} ${p}"
+    done
+    sweep_orphaned_harness
     found="$(pgrep -af "$qual_daemon_pattern" 2>/dev/null || true)"
     if [ -n "$found" ]; then
         echo "::warning::nightly-run: killing stale qualification processes from a previous lane:" >&2
@@ -124,6 +166,10 @@ sweep_stale_qual_state() {
         pkill -9 -f "$qual_daemon_pattern" 2>/dev/null || true
         sleep 1
     fi
+    # A daemon restarted by an orphan just before it died can still be
+    # shutting down; retry the daemon kill once after the harness is gone.
+    pkill -9 -f "$qual_daemon_pattern" 2>/dev/null || true
+    sleep 1
     # Only the throwaway trees: the persistent root holds staged binaries,
     # firmware, and guest images and must survive. Never touch the artifact
     # root, even when a manual invocation puts it under /tmp.
@@ -140,13 +186,17 @@ sweep_stale_qual_state() {
 
 require_qual_ports_free() {
     local ports="8080 8443 8444 9100 9101 9102 9103 51052 51053 51062 51063"
-    local busy
-    busy="$(ss -ltnH 2>/dev/null | awk -v want="$ports" \
-        'BEGIN { split(want, a, " "); for (i in a) w[a[i]] = 1 }
-         { n = split($4, p, ":"); if (p[n] in w) print $4 }')"
-    if [ -n "$busy" ]; then
-        fail "qualification ports still in use after the stale-state sweep: $(echo "$busy" | tr '\n' ' ') — inspect with: ss -ltnp"
-    fi
+    local busy attempt
+    # SIGKILL is immediate, but a process that was mid-restart can take a
+    # moment to lose its listeners. Retry before declaring the runner dirty.
+    for attempt in $(seq 1 15); do
+        busy="$(ss -ltnH 2>/dev/null | awk -v want="$ports" \
+            'BEGIN { split(want, a, " "); for (i in a) w[a[i]] = 1 }
+             { n = split($4, p, ":"); if (p[n] in w) print $4 }')"
+        [ -z "$busy" ] && return 0
+        sleep 1
+    done
+    fail "qualification ports still in use after the stale-state sweep: $(echo "$busy" | tr '\n' ' ') — inspect with: ss -ltnp"
 }
 
 snapshot_host_state() {
@@ -204,6 +254,24 @@ command -v curl >/dev/null 2>&1 || fail "curl is required by the qualification h
 
 printf 'scenario\tstatus\trc\tduration_s\tlog\tevidence\n' > "$RESULT_FILE"
 
+# --- Single-lane lock --------------------------------------------------------
+# The workflow concurrency group serializes GitHub jobs but cannot see a
+# canceled job's orphaned children (the sweep below kills those). This lock
+# makes a second *live* lane fail fast instead of letting its sweep kill the
+# first lane's daemons mid-run.
+mkdir -p "$CHV_QUAL_ROOT" || fail "cannot create ${CHV_QUAL_ROOT}"
+LANE_LOCK="${CHV_QUAL_ROOT}/.nightly-run.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$LANE_LOCK"
+    if ! flock -n 9; then
+        holder="$(tr -d '\n' < "$LANE_LOCK" 2>/dev/null || true)"
+        fail "another qualification lane holds ${LANE_LOCK}${holder:+ (${holder})}; refusing to run two lanes concurrently"
+    fi
+    printf 'pid=%s started=%s\n' "$$" "$(date -u +%FT%TZ)" > "$LANE_LOCK"
+else
+    echo "::warning::nightly-run: flock not available; cannot assert a single active lane" >&2
+fi
+
 # deploy.sh resolves the --exec command relative to its caller's working
 # directory (the documented usage is `cd qual && ./deploy.sh --exec ./m4.x.sh`).
 cd "$SCRIPT_DIR" || fail "cannot cd to ${SCRIPT_DIR}"
@@ -248,7 +316,12 @@ for scenario in $SCENARIOS; do
     echo "[qual-nightly] running ${scenario}"
     started="$(date +%s)"
     failed_before="$(ls -1d /tmp/chv-qual-failed-* 2>/dev/null || true)"
-    if "${SCRIPT_DIR}/deploy.sh" --exec "./${scenario}.sh" > "$scenario_log" 2>&1; then
+    # Do NOT let the scenario/deploy tree inherit the lane lock (fd 9). A
+    # canceled job can leave deploy.sh + daemons alive; if they held the lock
+    # the next lane could never acquire it and could not sweep them. Closing
+    # the fd here keeps the lock owned by this script alone, which the orphan
+    # sweep below is allowed to kill.
+    if "${SCRIPT_DIR}/deploy.sh" --exec "./${scenario}.sh" 9>&- > "$scenario_log" 2>&1; then
         status="pass"
         scenario_rc=0
     else

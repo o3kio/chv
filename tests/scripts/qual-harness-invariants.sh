@@ -109,4 +109,22 @@ grep -q 'snapshot_host_state "\${LOG_DIR}' "$nightly" \
     && pass "nightly lane captures host state on scenario failure" \
     || fail "nightly lane no longer captures host state on failure"
 
+# A canceled workflow leaves the job's children alive; an orphaned
+# nightly-run/deploy keeps starting new stacks after the daemon sweep.
+grep -q '^sweep_orphaned_harness()' "$nightly" \
+    && pass "nightly lane kills orphaned harness scripts, not just daemons" \
+    || fail "nightly lane no longer kills orphaned harness scripts"
+grep -q '^    sweep_orphaned_harness$' "$nightly" \
+    && pass "the orphaned-harness sweep runs inside the stale-state sweep" \
+    || fail "orphaned-harness sweep is not invoked"
+grep -q 'nightly-run.lock' "$nightly" \
+    && pass "nightly lane holds a single-lane lock" \
+    || fail "nightly lane lost its single-lane lock"
+grep -q 'for attempt in \$(seq 1 15)' "$nightly" \
+    && pass "port assertion retries while a killed daemon releases listeners" \
+    || fail "port assertion no longer tolerates a dying daemon"
+grep -q 'deploy.sh" --exec "./\${scenario}.sh" 9>&-' "$nightly" \
+    && pass "scenario children do not inherit the lane lock" \
+    || fail "scenario children may inherit and leak the lane lock"
+
 exit "$rc"
