@@ -644,7 +644,12 @@ row was terminalized `Failed`/`RolledBack` (`reaper_resume_state = 'blocked'`):
 the detached agent may have completed the transfer, so the destination could
 own the VM. Only requeue (`agent_cancel_pending = 1`,
 `agent_cancel_last_error = NULL`) after the node has been upgraded or verified
-idle.
+idle. A permanently refused row is also left `reaper_resume_state = 'blocked'`,
+which the resume pass never re-selects: after clearing the parked error, set
+`reaper_resume_state = 'pending'` and let the requeued cancel confirm before
+expecting an automatic resume — but only once you have verified the destination
+does not own the VM; otherwise leave the row blocked and resume explicitly
+where the VM actually is.
 
 A successful pause-first migration can leave the destination VM paused. When
 the source agent reports `Completed`, the control plane resumes the destination
