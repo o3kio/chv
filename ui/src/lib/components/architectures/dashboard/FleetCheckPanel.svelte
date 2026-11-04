@@ -109,7 +109,7 @@
 				size="sm"
 				loading={loading}
 				onclick={onRefresh}
-				ariaLabel="Refresh fleet inventory"
+				ariaLabel={refreshLabel}
 				data-testid="fleet-refresh-button"
 			>
 				{refreshLabel}

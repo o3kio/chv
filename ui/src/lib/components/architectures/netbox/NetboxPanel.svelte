@@ -188,7 +188,7 @@
 				loading={dryRunLoading}
 				disabled={!config}
 				data-testid="netbox-dry-run-button"
-				ariaLabel="Compute the NetBox projection plan"
+				ariaLabel={dryRunLoading ? 'Computing…' : 'Run dry-run'}
 			>
 				{dryRunLoading ? 'Computing…' : 'Run dry-run'}
 			</Button>

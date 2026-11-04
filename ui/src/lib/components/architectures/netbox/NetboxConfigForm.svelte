@@ -237,7 +237,7 @@
 			type="submit"
 			loading={saving}
 			data-testid="netbox-config-save-button"
-			ariaLabel="Save NetBox projection config"
+			ariaLabel={saving ? 'Saving…' : config ? 'Save config' : 'Create config'}
 		>
 			{saving ? 'Saving…' : config ? 'Save config' : 'Create config'}
 		</Button>
@@ -248,7 +248,7 @@
 				onclick={handleDelete}
 				loading={deleting}
 				data-testid="netbox-config-delete-button"
-				ariaLabel="Remove NetBox projection config"
+				ariaLabel={deleting ? 'Removing…' : 'Remove config'}
 			>
 				{deleting ? 'Removing…' : 'Remove config'}
 			</Button>

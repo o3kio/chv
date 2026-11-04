@@ -83,7 +83,7 @@
 	loading={exporting}
 	disabled={disabled}
 	data-testid="netbox-export-button"
-	ariaLabel="Export architecture to NetBox"
+	ariaLabel={exporting ? 'Queuing…' : 'Export to NetBox'}
 >
 	{exporting ? 'Queuing…' : 'Export to NetBox'}
 </Button>
