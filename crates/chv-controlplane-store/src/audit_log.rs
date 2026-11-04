@@ -1,10 +1,11 @@
-//! Durable audit log for privileged BFF mutations (#658).
+//! Durable audit log for privileged mutations (#658).
 //!
-//! The BFF middleware owns emission; this module owns persistence,
-//! filtered pagination, bounded export reads, and retention. The table
-//! is deliberately independent of `users` so audit rows survive account
+//! The BFF middleware and the node-facing gRPC lifecycle/enrollment
+//! boundaries own emission; this module owns persistence, filtered
+//! pagination, bounded export reads, and retention. The table is
+//! deliberately independent of `users` so audit rows survive account
 //! deletion, and the repository never accepts free-form metadata — the
-//! BFF constructs the already-redacted JSON object from an allowlist.
+//! caller constructs the already-redacted JSON object from an allowlist.
 
 use crate::{StoreError, StorePool};
 
@@ -73,7 +74,8 @@ pub struct AuditLogRow {
 }
 
 /// Fields required to append one audit row. `metadata` must already be
-/// the allowlisted, redacted JSON object produced by the BFF.
+/// the allowlisted, redacted JSON object produced by the BFF or the
+/// node-facing gRPC audit boundary.
 #[derive(Debug, Clone)]
 pub struct AuditLogInsert {
     pub occurred_at_ms: i64,
