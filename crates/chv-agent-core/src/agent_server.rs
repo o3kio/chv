@@ -389,7 +389,10 @@ impl AgentServer {
             .layer(chv_observability::GrpcMetricsLayer::new())
             .layer(InterceptorLayer::new(self.auth.clone()))
             .add_service(proto::reconcile_service_server::ReconcileServiceServer::new(self.clone()))
-            .add_service(proto::lifecycle_service_server::LifecycleServiceServer::new(self))
+            .add_service(proto::lifecycle_service_server::LifecycleServiceServer::new(self.clone()))
+            .add_service(
+                proto::migration_control_service_server::MigrationControlServiceServer::new(self),
+            )
             .serve_with_incoming(uds_stream)
             .await
             .map_err(|e| ChvError::Internal {
@@ -3836,6 +3839,70 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
     }
 }
 
+/// `MigrateVm` is fire-and-forget: the agent ACKs immediately and runs the
+/// migration on a detached task. When the control plane loses ownership
+/// (restart, reaper, rollback, operator cancel) it has no other way to abort
+/// that surviving task. This service is the bounded, idempotent cancel path.
+#[tonic::async_trait]
+impl proto::migration_control_service_server::MigrationControlService for AgentServer {
+    async fn cancel_migration(
+        &self,
+        req: Request<proto::CancelMigrationRequest>,
+    ) -> Result<Response<proto::CancelMigrationResponse>, Status> {
+        // Mirror `migrate_vm`: legacy live migration cannot run behind the
+        // Core authority, so a cancel for it is not addressable either.
+        if self.core_authority.is_some() {
+            return Err(Status::unimplemented(
+                "cancel_migration is unsupported in core-managed mode",
+            ));
+        }
+
+        let inner = req.into_inner();
+        if inner.operation_id.trim().is_empty() {
+            return Err(Status::invalid_argument("operation_id is required"));
+        }
+
+        // A misrouted cancel must never abort another node's task. The
+        // control plane resolves the source agent socket per row, so an empty
+        // or mismatched id is a routing bug, not a wildcard.
+        let my_node_id = self.cache.lock().await.node_id.clone();
+        if inner.node_id != my_node_id {
+            return Err(Status::invalid_argument(format!(
+                "this node ({my_node_id}) is not the migration source requested ({})",
+                inner.node_id
+            )));
+        }
+
+        // `false` means the registry has no task for this operation — the
+        // task already finished, or this agent restarted. Both are success
+        // for the caller: there is nothing left to cancel.
+        let cancelled = self.cancel_migration(&inner.operation_id);
+        let outcome = if cancelled {
+            "cancelled"
+        } else {
+            "not_tracked"
+        };
+        if cancelled {
+            info!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                "cancel signalled for tracked migration task"
+            );
+        } else {
+            info!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                "cancel found no tracked migration task (already finished or agent restarted)"
+            );
+        }
+
+        Ok(Response::new(proto::CancelMigrationResponse {
+            cancelled,
+            outcome: outcome.to_string(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3893,12 +3960,22 @@ mod tests {
     const TEST_AGENT_TOKEN: &str = "agent-token-0123456789abcdef0123456789";
 
     async fn spawn_agent_with_auth(auth: AgentAuth) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, socket, _server) = spawn_agent_with_auth_and_server(auth).await;
+        (dir, socket)
+    }
+
+    /// Same as [`spawn_agent_with_auth`], but also returns a handle to the
+    /// served `AgentServer` so a test can seed the migration task registry.
+    async fn spawn_agent_with_auth_and_server(
+        auth: AgentAuth,
+    ) -> (tempfile::TempDir, std::path::PathBuf, AgentServer) {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("agent.sock");
         let server = test_server().with_agent_auth(auth);
+        let serving = server.clone();
         let server_socket = socket.clone();
         tokio::spawn(async move {
-            let _ = server.serve(&server_socket).await;
+            let _ = serving.serve(&server_socket).await;
         });
         for _ in 0..100 {
             if socket.exists() {
@@ -3907,7 +3984,118 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(socket.exists(), "agent socket was not bound");
-        (dir, socket)
+        (dir, socket, server)
+    }
+
+    async fn connect_migration_control(
+        socket: &std::path::Path,
+    ) -> proto::migration_control_service_client::MigrationControlServiceClient<
+        tonic::transport::Channel,
+    > {
+        let path = socket.to_path_buf();
+        let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")
+            .expect("endpoint")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let path = path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await
+            .expect("connect to agent");
+        proto::migration_control_service_client::MigrationControlServiceClient::new(channel)
+    }
+
+    fn cancel_request(op_id: &str, node_id: &str) -> proto::CancelMigrationRequest {
+        proto::CancelMigrationRequest {
+            meta: Some(test_meta("1")),
+            node_id: node_id.to_string(),
+            operation_id: op_id.to_string(),
+            migration_id: format!("mig-{op_id}"),
+        }
+    }
+
+    /// The served cancel RPC aborts a tracked task and reports `not_tracked`
+    /// (still success) once the registry entry is gone.
+    #[tokio::test]
+    async fn migration_control_service_cancels_tracked_task_over_uds() {
+        let (_dir, socket, server) = spawn_agent_with_auth_and_server(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+
+        let cancel_token = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        server.migration_tasks.insert(
+            "op-live".to_string(),
+            task.abort_handle(),
+            cancel_token.clone(),
+        );
+
+        let mut client = connect_migration_control(&socket).await;
+        let response = client
+            .cancel_migration(with_token(
+                cancel_request("op-live", "node-1"),
+                TEST_AGENT_TOKEN,
+            ))
+            .await
+            .expect("cancel should be served")
+            .into_inner();
+        assert!(response.cancelled);
+        assert_eq!(response.outcome, "cancelled");
+        assert!(cancel_token.is_cancelled());
+        assert!(task
+            .await
+            .expect_err("tracked task must be aborted")
+            .is_cancelled());
+
+        // The production reaper removes the registry entry when the task's
+        // future ends. This test inserted the entry directly, so model that
+        // completion here; the retry then exercises the agent-restart case.
+        server.migration_tasks.remove("op-live");
+
+        // A retry must be a benign `not_tracked`, not an error (the agent
+        // restart case: the task is already gone).
+        let response = client
+            .cancel_migration(with_token(
+                cancel_request("op-live", "node-1"),
+                TEST_AGENT_TOKEN,
+            ))
+            .await
+            .expect("unknown op is idempotent success")
+            .into_inner();
+        assert!(!response.cancelled);
+        assert_eq!(response.outcome, "not_tracked");
+    }
+
+    /// A cancel naming another node, or missing the operation id, is refused
+    /// before it can touch this agent's registry.
+    #[tokio::test]
+    async fn migration_control_rejects_misrouted_cancel() {
+        let server = test_server();
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-live", "node-2")),
+            )
+            .await
+            .expect_err("cancel for another node must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("node-1"));
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("   ", "node-1")),
+            )
+            .await
+            .expect_err("empty operation id must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     async fn connect_reconcile(

@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **migration (detached agent-task cancellation across restarts — #656)**:
+  `MigrateVm` is fire-and-forget, so the source agent keeps a detached task
+  after the control plane restarts, the reaper force-fails a stale row, the
+  state machine rolls back, or an operator cancels an already-terminal row.
+  Nothing could abort that orphan. The wire now has
+  `MigrationControlService.CancelMigration` (agent-served; rejects a request
+  naming another node and refuses core-managed mode), which signals the task's
+  cancellation token and abort handle by `operation_id`. The control plane
+  queues cancellation durably in `migrations.agent_cancel_pending` (migration
+  `0070`; plus `agent_cancel_confirmed_at`, `agent_cancel_attempts`,
+  `agent_cancel_last_attempt_at`) on every terminal `Failed`/`RolledBack`
+  transition, on restart reconciliation, on the reaper's force-fail, and when
+  an operator cancels an already-terminal row (`Completed` is never queued).
+  The reaper drains up to 8 rows per tick with a 5 s per-call bound;
+  `cancelled=false`/`not_tracked` is success (the agent restarted and the task
+  is gone), while transport failures leave the row queued and rotate it behind
+  untouched rows via the attempt timestamp. Tests: agent UDS cancel service
+  (tracked task aborted, `not_tracked` retry, misrouted/empty-op refusal),
+  store queue/confirm/attempt semantics, terminal-transition queueing,
+  post-restart operator-cancel queueing, and reaper drain success,
+  `not_tracked`, and unreachable-agent retry rows. Refs #656.
 - **migration (direct-gRPC stop-the-world gate + dispatch config — #656)**:
   `LifecycleService::migrate_vm` is reachable directly, not only through the
   BFF/CLI, and previously accepted `pause_first=false` there. It now rejects

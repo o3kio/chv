@@ -10,7 +10,7 @@
 use crate::{StoreError, StorePool};
 
 /// A row from the `migrations` table, including the restart-recovery columns
-/// added by migration `0065`.
+/// added by migration `0065` and the agent-cancel bookkeeping added by `0070`.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
 pub struct MigrationRecord {
     pub migration_id: String,
@@ -27,6 +27,21 @@ pub struct MigrationRecord {
     pub reaper_resume_state: Option<String>,
     pub interrupted_from_phase: Option<String>,
     pub interrupted_at: Option<String>,
+    /// 1 while a detached source-agent migration task still needs to be
+    /// signalled through `MigrationControlService.CancelMigration` (#656).
+    pub agent_cancel_pending: i64,
+    /// When the agent confirmed the task was signalled (or was already gone).
+    pub agent_cancel_confirmed_at: Option<String>,
+}
+
+/// A terminal migration row whose detached agent task may still be alive.
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
+pub struct PendingAgentCancel {
+    pub migration_id: String,
+    pub operation_id: String,
+    pub source_node_id: String,
+    /// Failed drain attempts so far (reset when a cleared row is re-marked).
+    pub agent_cancel_attempts: i64,
 }
 
 /// Outcome of one guarded interrupt transition.
@@ -81,7 +96,8 @@ impl MigrationRepository {
             SELECT migration_id, operation_id, vm_id, source_node_id,
                    destination_node_id, phase, started_at, updated_at,
                    completed_at, error_message, cancel_requested_at,
-                   reaper_resume_state, interrupted_from_phase, interrupted_at
+                   reaper_resume_state, interrupted_from_phase, interrupted_at,
+                   agent_cancel_pending, agent_cancel_confirmed_at
             FROM migrations
             WHERE phase NOT IN ('Completed', 'Failed', 'RolledBack')
             ORDER BY started_at ASC, migration_id ASC
@@ -98,7 +114,8 @@ impl MigrationRepository {
             SELECT migration_id, operation_id, vm_id, source_node_id,
                    destination_node_id, phase, started_at, updated_at,
                    completed_at, error_message, cancel_requested_at,
-                   reaper_resume_state, interrupted_from_phase, interrupted_at
+                   reaper_resume_state, interrupted_from_phase, interrupted_at,
+                   agent_cancel_pending, agent_cancel_confirmed_at
             FROM migrations
             WHERE migration_id = ?
             "#,
@@ -129,6 +146,12 @@ impl MigrationRepository {
     /// "silence" would therefore be self-fulfilling. The resume bookkeeping is
     /// cleared so the reaper cannot act on a stale intent; an operator must
     /// inspect placement and resume explicitly.
+    ///
+    /// Terminalizing here also sets `agent_cancel_pending`: the detached
+    /// `MigrateVm` task on the source agent may still be alive, and the
+    /// control plane no longer has an owner for it. The migration reaper
+    /// drains that flag through `CancelMigration` (see
+    /// [`MigrationRepository::list_pending_agent_cancels`]).
     pub async fn reconcile_interrupted(
         &self,
         update: &InterruptedMigrationUpdate,
@@ -160,7 +183,8 @@ impl MigrationRepository {
                    interrupted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                    reaper_resume_state = NULL,
                    reaper_resume_attempts = 0,
-                   reaper_stalled_secs = NULL
+                   reaper_stalled_secs = NULL,
+                   agent_cancel_pending = 1
              WHERE migration_id = ?
                AND phase = ?
                AND updated_at = ?
@@ -248,6 +272,103 @@ impl MigrationRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Queue an idempotent agent-side cancel for a terminal migration row.
+    ///
+    /// Only `Failed`/`RolledBack` rows are eligible. A `Completed` migration's
+    /// source task has already finished, and a non-terminal row is still owned
+    /// by the in-process state machine, which cancels through the cooperative
+    /// `cancel_requested_at` path instead. Returns `true` when the row is (now)
+    /// marked.
+    pub async fn mark_agent_cancel_pending(&self, migration_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE migrations
+               SET agent_cancel_pending = 1,
+                   -- A row that was already queued keeps its retry history; a
+                   -- row re-marked after a confirmed cancel starts fresh.
+                   agent_cancel_attempts = CASE
+                       WHEN agent_cancel_pending = 1 THEN agent_cancel_attempts
+                       ELSE 0
+                   END,
+                   agent_cancel_last_attempt_at = CASE
+                       WHEN agent_cancel_pending = 1 THEN agent_cancel_last_attempt_at
+                       ELSE NULL
+                   END
+             WHERE migration_id = ?
+               AND phase IN ('Failed', 'RolledBack')
+            "#,
+        )
+        .bind(migration_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Terminal rows whose detached source-agent task has not been signalled.
+    ///
+    /// Oldest/least-recently-attempted first so a persistently unreachable
+    /// node cannot starve newer rows; the reaper bounds each tick.
+    pub async fn list_pending_agent_cancels(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingAgentCancel>, StoreError> {
+        let rows = sqlx::query_as::<_, PendingAgentCancel>(
+            r#"
+            SELECT migration_id, operation_id, source_node_id, agent_cancel_attempts
+            FROM migrations
+            WHERE agent_cancel_pending = 1
+            ORDER BY COALESCE(agent_cancel_last_attempt_at, '') ASC,
+                     updated_at ASC,
+                     migration_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Record one drain attempt, whether or not the agent answered.
+    ///
+    /// The timestamp rotates the row behind untouched pending rows, which is
+    /// what makes a bounded batch fair when one source node stays unreachable.
+    pub async fn record_agent_cancel_attempt(&self, migration_id: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            UPDATE migrations
+               SET agent_cancel_attempts = agent_cancel_attempts + 1,
+                   agent_cancel_last_attempt_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE migration_id = ?
+               AND agent_cancel_pending = 1
+            "#,
+        )
+        .bind(migration_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the pending flag after the agent accepted the cancel.
+    ///
+    /// A `not_tracked` response also lands here: it means the agent has no
+    /// task for this operation (already finished or the agent restarted), so
+    /// retrying can never succeed.
+    pub async fn confirm_agent_cancel(&self, migration_id: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            UPDATE migrations
+               SET agent_cancel_pending = 0,
+                   agent_cancel_confirmed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE migration_id = ?
+            "#,
+        )
+        .bind(migration_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -396,6 +517,10 @@ mod tests {
         assert_eq!(row.interrupted_from_phase.as_deref(), Some("PreCopyDisk"));
         assert!(row.interrupted_at.is_some());
         assert_eq!(row.reaper_resume_state, None);
+        assert_eq!(
+            row.agent_cancel_pending, 1,
+            "recovery leaves a detached agent task behind; the reaper must be able to cancel it"
+        );
 
         let (attempts, stalled_secs): (i64, Option<i64>) = sqlx::query_as(
             "SELECT reaper_resume_attempts, reaper_stalled_secs \
@@ -456,5 +581,97 @@ mod tests {
             .record_restart_observed("unresolved", "MemoryMigration", "2025-12-31T23:59:59Z")
             .await
             .expect("stale observation is a no-op"));
+    }
+
+    /// Only terminal (non-Completed) rows queue an agent cancel. Draining is
+    /// idempotent and confirmation clears the flag permanently.
+    #[tokio::test]
+    async fn pending_agent_cancel_is_terminal_only_and_drains_once() {
+        let test_db = TestDb::new().await;
+        let repo = MigrationRepository::new(test_db.pool.clone());
+        seed_migration(
+            &test_db.pool,
+            "running",
+            "ConvergingDisk",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        seed_migration(&test_db.pool, "failed", "Failed", "2026-01-01T00:00:00Z").await;
+        seed_migration(&test_db.pool, "done", "Completed", "2026-01-01T00:00:00Z").await;
+
+        // A row still owned by the in-process state machine (or a successful
+        // migration whose task already finished) is never queued.
+        assert!(!repo
+            .mark_agent_cancel_pending("running")
+            .await
+            .expect("non-terminal mark"));
+        assert!(!repo
+            .mark_agent_cancel_pending("done")
+            .await
+            .expect("completed mark"));
+        assert!(repo
+            .mark_agent_cancel_pending("failed")
+            .await
+            .expect("terminal mark"));
+
+        let pending = repo
+            .list_pending_agent_cancels(10)
+            .await
+            .expect("list pending cancels");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].migration_id, "failed");
+        assert_eq!(pending[0].operation_id, "op-failed");
+        assert_eq!(pending[0].source_node_id, "node-a");
+        assert_eq!(pending[0].agent_cancel_attempts, 0);
+
+        // Marking twice is harmless and still yields one drain entry.
+        assert!(repo
+            .mark_agent_cancel_pending("failed")
+            .await
+            .expect("idempotent mark"));
+        assert_eq!(
+            repo.list_pending_agent_cancels(10)
+                .await
+                .expect("list after re-mark")
+                .len(),
+            1
+        );
+
+        // An attempt rotates the row but keeps it pending; a re-mark while
+        // pending preserves that retry history.
+        repo.record_agent_cancel_attempt("failed")
+            .await
+            .expect("record attempt");
+        assert_eq!(
+            repo.list_pending_agent_cancels(10)
+                .await
+                .expect("list after attempt")[0]
+                .agent_cancel_attempts,
+            1
+        );
+        assert!(repo
+            .mark_agent_cancel_pending("failed")
+            .await
+            .expect("re-mark pending row"));
+        assert_eq!(
+            repo.list_pending_agent_cancels(10)
+                .await
+                .expect("list after pending re-mark")[0]
+                .agent_cancel_attempts,
+            1,
+            "an already-pending row must keep its retry history"
+        );
+
+        repo.confirm_agent_cancel("failed")
+            .await
+            .expect("confirm cancel");
+        assert!(repo
+            .list_pending_agent_cancels(10)
+            .await
+            .expect("list after confirm")
+            .is_empty());
+        let row = repo.get("failed").await.unwrap().unwrap();
+        assert_eq!(row.agent_cancel_pending, 0);
+        assert!(row.agent_cancel_confirmed_at.is_some());
     }
 }

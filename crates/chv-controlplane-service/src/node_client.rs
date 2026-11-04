@@ -183,6 +183,8 @@ where
 pub struct NodeClient {
     reconcile: proto::reconcile_service_client::ReconcileServiceClient<Channel>,
     lifecycle: proto::lifecycle_service_client::LifecycleServiceClient<Channel>,
+    migration_control:
+        proto::migration_control_service_client::MigrationControlServiceClient<Channel>,
     circuit_breaker: Arc<CircuitBreaker>,
     /// Control-plane agent bearer token attached to every RPC (#662). One
     /// value is shared by every agent this control plane serves. `None` is
@@ -240,7 +242,11 @@ impl NodeClient {
             reconcile: proto::reconcile_service_client::ReconcileServiceClient::new(
                 channel.clone(),
             ),
-            lifecycle: proto::lifecycle_service_client::LifecycleServiceClient::new(channel),
+            lifecycle: proto::lifecycle_service_client::LifecycleServiceClient::new(
+                channel.clone(),
+            ),
+            migration_control:
+                proto::migration_control_service_client::MigrationControlServiceClient::new(channel),
             circuit_breaker,
             auth_token: token
                 .map(str::trim)
@@ -1580,6 +1586,53 @@ impl NodeClient {
         let result = with_timeout(
             self.lifecycle
                 .migrate_vm(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
+                .instrument(span),
+            "agent",
+            method,
+        )
+        .await;
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(method),
+            Err(ChvError::BackendUnavailable { .. }) => self.circuit_breaker.record_failure(method),
+            Err(_) => {}
+        };
+        result
+    }
+
+    /// Ask the source agent to abort a detached migration task (#656).
+    ///
+    /// The response is meaningful even on success: `cancelled == false`
+    /// (`outcome == "not_tracked"`) means the agent has no task for this
+    /// operation, which is the expected agent-restart case and must be
+    /// treated as terminal by the caller. Only a transport error is retryable.
+    pub async fn cancel_migration(
+        &mut self,
+        node_id: &str,
+        operation_id: &str,
+        migration_id: &str,
+    ) -> Result<proto::CancelMigrationResponse, ChvError> {
+        let req = proto::CancelMigrationRequest {
+            meta: Some(proto::RequestMeta {
+                operation_id: operation_id.to_string(),
+                requested_by: "control-plane".to_string(),
+                target_node_id: node_id.to_string(),
+                desired_state_version: String::new(),
+                request_unix_ms: now_unix_ms(),
+            }),
+            node_id: node_id.to_string(),
+            operation_id: operation_id.to_string(),
+            migration_id: migration_id.to_string(),
+        };
+        let method = "cancel_migration";
+        let span = tracing::info_span!("cancel_migration", operation_id, migration_id);
+        self.circuit_breaker.check(method)?;
+        let result = with_timeout(
+            self.migration_control
+                .cancel_migration(with_operation_id_metadata(
                     req,
                     operation_id,
                     &self.auth_token,

@@ -1682,12 +1682,21 @@ async fn update_migration_phase(
     };
 
     if completed_at.is_some() {
+        // A terminal `Failed`/`RolledBack` transition ends control-plane
+        // ownership, but the source agent's detached `MigrateVm` task may
+        // still be alive. Queue a bounded cancel for the reaper to drain
+        // (#656). `Completed` never queues: its task has already finished.
         sqlx::query(
             r#"UPDATE migrations
                SET phase = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                   completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                   completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                   agent_cancel_pending = CASE
+                       WHEN ? IN ('Failed', 'RolledBack') THEN 1
+                       ELSE agent_cancel_pending
+                   END
                WHERE migration_id = ?"#,
         )
+        .bind(phase.as_str())
         .bind(phase.as_str())
         .bind(migration_id)
         .execute(pool)
@@ -1784,8 +1793,21 @@ pub async fn request_migration_cancel(
         None => return Ok(CancelMigrationOutcome::NotFound),
     };
 
-    // Once terminal, cancel is meaningless — do not flip the flag.
+    // Once terminal, cancel is meaningless — do not flip the flag. A
+    // `Failed`/`RolledBack` row, however, may still have a detached source
+    // agent task: queue the agent-side cancel so an operator-initiated
+    // cancel of an already-terminal migration can still abort it (#656).
     if matches!(phase.as_str(), "Completed" | "Failed" | "RolledBack") {
+        if phase != "Completed" {
+            chv_controlplane_store::MigrationRepository::new(pool.clone())
+                .mark_agent_cancel_pending(migration_id)
+                .await
+                .map_err(|e| ChvError::Internal {
+                    reason: format!(
+                        "failed to queue agent cancel for terminal migration {migration_id}: {e}"
+                    ),
+                })?;
+        }
         return Ok(CancelMigrationOutcome::AlreadyTerminal);
     }
 
@@ -2798,6 +2820,18 @@ mod tests {
             "cancelling an interrupted (already terminal) migration is a no-op"
         );
 
+        // Recovery already queued the agent-side cancel. The operator cancel
+        // of the terminal row must leave it queued, not clear it.
+        let (pending, confirmed): (i64, Option<String>) = sqlx::query_as(
+            "SELECT agent_cancel_pending, agent_cancel_confirmed_at FROM migrations \
+             WHERE migration_id = 'mig-cancel'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read agent cancel state");
+        assert_eq!(pending, 1);
+        assert!(confirmed.is_none());
+
         update_migration_progress(
             &test_db.pool,
             "node-a",
@@ -2822,6 +2856,41 @@ mod tests {
         assert_eq!(phase, "RolledBack");
         assert_eq!(round, 0, "late progress must not mutate a terminal row");
         assert_eq!(bytes, 0, "late progress must not mutate a terminal row");
+    }
+
+    /// A `Failed`/`RolledBack` transition ends control-plane ownership while
+    /// the agent may still hold the detached task, so it queues a cancel.
+    /// `Completed` does not: its task already finished.
+    #[tokio::test]
+    async fn terminal_transition_queues_agent_cancel_only_for_failure_paths() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "failed", "MemoryMigration", -10).await;
+        seed_migration_row(&test_db.pool, "rolled", "PreCopyDisk", -10).await;
+        seed_migration_row(&test_db.pool, "completed", "MemoryMigration", -10).await;
+
+        update_migration_phase(&test_db.pool, "mig-failed", MigrationPhase::Failed)
+            .await
+            .expect("fail transition");
+        update_migration_phase(&test_db.pool, "mig-rolled", MigrationPhase::RolledBack)
+            .await
+            .expect("rollback transition");
+        update_migration_phase(&test_db.pool, "mig-completed", MigrationPhase::Completed)
+            .await
+            .expect("complete transition");
+
+        for (id, expected) in [("mig-failed", 1), ("mig-rolled", 1), ("mig-completed", 0)] {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT agent_cancel_pending FROM migrations WHERE migration_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&test_db.pool)
+            .await
+            .expect("read agent cancel pending");
+            assert_eq!(
+                pending, expected,
+                "unexpected agent cancel queueing for {id}"
+            );
+        }
     }
 
     /// Unknown or future non-terminal phases fail closed: `Failed`, original
