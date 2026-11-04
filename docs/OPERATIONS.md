@@ -655,13 +655,15 @@ and neither is resumed automatically. Setting `pending` without the queued
 cancel is unsafe: `agent_cancel_pending` is 0, so the resume pass is not held by
 an outstanding cancel, and with no fresh confirmation the 30 s settle gate does
 not apply — the source could be resumed on the next tick. Even with a
-correctly queued cancel, automatic resume only applies to reaper-failed rows: a
-row whose `interrupted_at` observed `MemoryMigration`/`Paused` is never
-auto-resumed (whether recovered or reaper-failed), and a row blocked by a late
-`Completed` must stay blocked because the destination may own the VM. Let the
-requeued cancel confirm and settle, and only set `pending` once you have
-verified the destination does not own the VM; otherwise leave the row blocked
-and resume explicitly where the VM actually is.
+correctly queued cancel, the resume pass considers any row in
+`pending`/`resuming` — including a restart-recovered row you flip to `pending` —
+except rows whose `interrupted_at` observed `MemoryMigration`/`Paused` (never
+auto-resumed) and rows blocked by a late `Completed` (the destination may own
+the VM). For a requeued restart-recovered row the quiescence window runs from
+its recovery timestamp. Let the requeued cancel confirm and settle, and only
+set `pending` once you have verified the destination does not own the VM;
+otherwise leave the row blocked and resume explicitly where the VM actually
+is.
 
 A successful pause-first migration can leave the destination VM paused. When
 the source agent reports `Completed`, the control plane resumes the destination
