@@ -2163,7 +2163,7 @@ pub async fn update_migration_progress(
 /// Fetch the current generation for a VM from the desired state store.
 async fn get_vm_generation(pool: &StorePool, vm_id: &str) -> Result<String, ChvError> {
     let gen: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT generation FROM vm_desired_state WHERE vm_id = ?")
+        sqlx::query_as("SELECT desired_generation FROM vm_desired_state WHERE vm_id = ?")
             .bind(vm_id)
             .fetch_optional(pool)
             .await
@@ -3351,12 +3351,20 @@ mod tests {
     struct StubResumer {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         failure: Option<String>,
+        placement_at_resume: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     }
 
     #[async_trait::async_trait]
     impl DestinationResumer for StubResumer {
-        async fn resume(&self, _pool: &StorePool, _state: &MigrationState) -> Option<String> {
+        async fn resume(&self, pool: &StorePool, state: &MigrationState) -> Option<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let target: Option<String> =
+                sqlx::query_scalar("SELECT target_node_id FROM vm_desired_state WHERE vm_id = ?")
+                    .bind(&state.vm_id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("read placement at resume time");
+            *self.placement_at_resume.lock().unwrap() = target;
             self.failure.clone()
         }
     }
@@ -3386,9 +3394,11 @@ mod tests {
         .expect("seed placement");
 
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let placement_at_resume = std::sync::Arc::new(std::sync::Mutex::new(None));
         let resumer = StubResumer {
             calls: calls.clone(),
             failure: None,
+            placement_at_resume: placement_at_resume.clone(),
         };
         let mut state = migration_state_for("vm-finalize-ok");
         state.migration_id = "mig-finalize-ok".to_string();
@@ -3402,6 +3412,11 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the destination resume must run before placement moves"
+        );
+        assert_eq!(
+            placement_at_resume.lock().unwrap().as_deref(),
+            Some("node-a"),
+            "placement must still name the source while the destination is being resumed"
         );
         let (phase, target, error): (String, String, Option<String>) = sqlx::query_as(
             "SELECT m.phase, d.target_node_id, m.error_message \
@@ -3442,9 +3457,11 @@ mod tests {
         .expect("seed placement");
 
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let placement_at_resume = std::sync::Arc::new(std::sync::Mutex::new(None));
         let resumer = StubResumer {
             calls: calls.clone(),
             failure: Some("resume_vm failed: agent unreachable".to_string()),
+            placement_at_resume: placement_at_resume.clone(),
         };
         let mut state = migration_state_for("vm-finalize-fail");
         state.migration_id = "mig-finalize-fail".to_string();
@@ -3455,6 +3472,11 @@ mod tests {
             .expect("a resume failure must not fail finalization");
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            placement_at_resume.lock().unwrap().as_deref(),
+            Some("node-a"),
+            "the failed resume must still run before placement moves"
+        );
         let (phase, target, error): (String, String, Option<String>) = sqlx::query_as(
             "SELECT m.phase, d.target_node_id, m.error_message \
              FROM migrations m JOIN vm_desired_state d ON d.vm_id = m.vm_id \

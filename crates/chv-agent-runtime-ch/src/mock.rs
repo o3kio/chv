@@ -238,6 +238,11 @@ pub struct MockCloudHypervisorAdapter {
     /// `None` ⇒ the all-default counters (nothing measured, no epoch —
     /// the honest "VM just started / identity unknown" shape).
     pub counters_result: Arc<Mutex<Option<VmCounters>>>,
+    /// When true, `send_migration`/`receive_migration` return
+    /// `ChvError::Timeout` without touching the VM, modelling the agent's
+    /// bounded wait expiring while the VMM transfer may still run. Used to
+    /// pin the transfer-window seal (fail-closed cancellation) end to end.
+    pub migration_timeout: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
@@ -418,6 +423,12 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
         _destination_url: &str,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
+        if *self.migration_timeout.lock().unwrap() {
+            return Err(ChvError::Timeout {
+                operation: "send-migration (mock)".to_string(),
+                secs: 7200,
+            });
+        }
         Ok(())
     }
 
@@ -427,6 +438,12 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
         _receiver_url: &str,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
+        if *self.migration_timeout.lock().unwrap() {
+            return Err(ChvError::Timeout {
+                operation: "receive-migration (mock)".to_string(),
+                secs: 7200,
+            });
+        }
         Ok(())
     }
 

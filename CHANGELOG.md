@@ -53,7 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode leaves it paused), recording any resume failure in `error_message` and
   `chv_migration_destination_resume_failures_total` while still moving
   placement; a failed resume is operator-visible instead of silently losing
-  the VM.
+  the VM. The resume paths also read `desired_generation` (the actual column)
+  instead of a non-existent `generation`, which had made both the source and
+  destination resume lookups fail.
   Tests: agent UDS cancel service (tracked task aborted, cooperative
   cleanup before hard abort, stop-confirmation timeout, `not_tracked` retry,
   misrouted/empty-op refusal, missing-token refusal, core-managed refusal,
@@ -64,10 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotently and still moves placement),
   agent-reported terminal queueing, post-restart operator-cancel queueing,
   resume gating while a cancel is pending or permanently refused (and after a
-  late agent-reported `Completed` on a terminal row), the 30 s settle window,
-  destination resume before placement with a recorded resume failure, the
-  post-memory-migration decision, a sealed (outcome-unknown) transfer that can
-  never confirm a cancel, real
+  late agent-reported `Completed` on a terminal row), the 30 s settle window
+  (including a real UDS resume after it and reclaim of a stranded `resuming`
+  row), destination resume before placement with a recorded resume failure,
+  the post-memory-migration decision, a sealed (outcome-unknown) transfer that
+  can never confirm a cancel, real
   `NodeClient` invalid-argument preservation, and reaper drains for both
   endpoints, `not_tracked`, partial/unreachable retry (including a permanent
   refusal alongside a retryable endpoint), token attachment, bad token,

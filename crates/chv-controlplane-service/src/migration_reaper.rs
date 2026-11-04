@@ -542,7 +542,7 @@ impl MigrationReaper {
                         AS INTEGER
                     ) AS stalled_secs
             FROM migrations m
-            WHERE m.reaper_resume_state = 'pending'
+            WHERE m.reaper_resume_state IN ('pending', 'resuming')
             -- Rotate fairly through the backlog: a deferred row's
             -- `updated_at` is frozen at its reap time, so ordering only by
             -- age would starve every newly reaped migration behind the 64
@@ -574,9 +574,12 @@ impl MigrationReaper {
             // agent-reported `Completed` sets `reaper_resume_state = 'blocked'`
             // concurrently; whichever write wins serialises the decision, and
             // the resume pass will not act on a row it no longer owns.
+            // `resuming` is reclaimable: a CP crash (or a failed release write)
+            // between claim and release must not strand the row forever, and a
+            // late `blocked` still wins the conditional update below.
             let claimed = sqlx::query(
                 "UPDATE migrations SET reaper_resume_state = 'resuming' \
-                 WHERE migration_id = ? AND reaper_resume_state = 'pending'",
+                 WHERE migration_id = ? AND reaper_resume_state IN ('pending', 'resuming')",
             )
             .bind(&row.migration_id)
             .execute(&self.pool)
@@ -622,7 +625,20 @@ impl MigrationReaper {
                 }
                 Ok(ResumeOutcome::SkippedNotTerminal { .. }) => Some("cancelled"),
                 Ok(ResumeOutcome::SkippedMissing) => Some("missing"),
-                Ok(ResumeOutcome::SkippedResumeBlocked) => None,
+                Ok(outcome @ ResumeOutcome::SkippedResumeBlocked) => {
+                    metrics::counter!(
+                        "migration_reaper_resume_skipped_total",
+                        "reason" => outcome.reason()
+                    )
+                    .increment(1);
+                    warn!(
+                        migration_id = %row.migration_id,
+                        vm_id = %row.vm_id,
+                        source_node_id = %row.source_node_id,
+                        "migration reaper: refusing to auto-resume source VM because the row was blocked after it was selected; operator review required"
+                    );
+                    None
+                }
                 Ok(outcome @ ResumeOutcome::SkippedInterruptedAmbiguous { .. }) => {
                     metrics::counter!(
                         "migration_reaper_resume_skipped_total",
@@ -931,7 +947,7 @@ impl MigrationReaper {
 
         // Fetch the current VM generation from the desired state store.
         let generation: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT generation FROM vm_desired_state WHERE vm_id = ?")
+            sqlx::query_as("SELECT desired_generation FROM vm_desired_state WHERE vm_id = ?")
                 .bind(&row.vm_id)
                 .fetch_optional(&self.pool)
                 .await
@@ -1592,6 +1608,85 @@ mod tests {
         );
     }
 
+    /// A crash or a failed release write can leave a row in the in-flight
+    /// `resuming` state. The next tick must reclaim it (not strand it forever)
+    /// and release it to `pending` when it defers.
+    #[tokio::test]
+    async fn drain_reclaims_stranded_resuming_rows() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "stranded", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations SET reaper_resume_state = 'resuming', \
+             reaper_stalled_secs = 10_800 WHERE migration_id = 'stranded'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("strand the row in resuming");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        reaper
+            .drain_pending_resumes()
+            .await
+            .expect("a stranded row is reclaimable");
+
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT reaper_resume_state FROM migrations WHERE migration_id = 'stranded'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read resume state");
+        assert_eq!(
+            state.as_deref(),
+            Some("pending"),
+            "a deferred resume must be released back to pending, not stranded"
+        );
+    }
+
+    /// A late agent-reported `Completed` that sets `blocked` during the tick
+    /// must win over the resume pass's own release write.
+    #[tokio::test]
+    async fn late_block_wins_over_resume_release_write() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "block-race", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations SET reaper_resume_state = 'pending', \
+             reaper_stalled_secs = 10_800 WHERE migration_id = 'block-race'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("mark pending");
+        sqlx::query(
+            "CREATE TRIGGER block_resume_race \
+             BEFORE UPDATE OF reaper_resume_attempts ON migrations \
+             WHEN NEW.migration_id = 'block-race' \
+             BEGIN \
+                 UPDATE migrations SET reaper_resume_state = 'blocked' \
+                 WHERE migration_id = 'block-race'; \
+             END",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("install race trigger");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        reaper
+            .drain_pending_resumes()
+            .await
+            .expect("the race is not an error");
+
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT reaper_resume_state FROM migrations WHERE migration_id = 'block-race'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read resume state");
+        assert_eq!(
+            state.as_deref(),
+            Some("blocked"),
+            "the concurrent late-Completed block must not be clobbered"
+        );
+    }
+
     /// `fail_operation` must use the same terminal set as
     /// `OperationStatus::is_terminal()`: a cancelled operation stays cancelled,
     /// while an active `AwaitingOperatorInput` operation is failed (the
@@ -1736,6 +1831,98 @@ mod tests {
                 required_secs: 90,
             },
             "a settled cancel must fall through to the sender-silence gate"
+        );
+    }
+
+    /// Once the cancel has settled and the sender is silent, a real agent
+    /// resume succeeds end to end (`resume_vm` over UDS).
+    #[tokio::test]
+    async fn resume_source_vm_resumes_after_cancel_settles() {
+        use chv_agent_core::connectivity::ConnectivityState;
+        use chv_agent_core::state_machine::NodeState;
+        use chv_agent_core::{AgentAuth, AgentServer, NodeCache, VmRuntime};
+        use chv_agent_runtime_ch::mock::MockCloudHypervisorAdapter;
+        use std::os::unix::fs::MetadataExt;
+
+        const TOKEN: &str = "agent-token-0123456789abcdef0123456789";
+
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "settled-resume", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "INSERT INTO nodes (node_id, hostname, display_name) \
+             VALUES ('source-node', 'source-node', 'source-node')",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed source node");
+        sqlx::query(
+            "INSERT INTO vm_desired_state (vm_id, desired_generation, target_node_id) \
+             VALUES ('vm-settled-resume', 1, 'source-node')",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed placement");
+        sqlx::query(
+            "INSERT INTO node_observed_state \
+                 (node_id, observed_generation, observed_state, last_seen_at) \
+             VALUES ('source-node', 1, 'TenantReady', \
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed heartbeat");
+        sqlx::query(
+            "UPDATE migrations \
+             SET agent_cancel_pending = 0, \
+                 agent_cancel_confirmed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 seconds'), \
+                 reaper_resume_state = 'pending', reaper_stalled_secs = 10_800 \
+             WHERE migration_id = 'settled-resume'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("confirm cancel earlier");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("source.sock");
+        let mut cache = NodeCache::new("source-node");
+        cache.node_state = NodeState::TenantReady.as_str().to_string();
+        cache.connectivity_state = ConnectivityState::Connected;
+        let uid = std::fs::metadata("/proc/self").expect("read own uid").uid();
+        let agent = AgentServer::new(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(Arc::new(MockCloudHypervisorAdapter::default())),
+            dir.path().join("stord.sock"),
+            dir.path().join("nwd.sock"),
+            None,
+            dir.path().join("runtime"),
+        )
+        .with_agent_auth(AgentAuth::new(TOKEN, false, vec![uid]));
+        let serving = agent.clone();
+        let serving_socket = socket.clone();
+        tokio::spawn(async move {
+            let _ = serving.serve(&serving_socket).await;
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "agent socket was not bound");
+
+        let reaper = MigrationReaper::new(
+            test_db.pool.clone(),
+            NodeClientPool::new().with_auth_token(TOKEN),
+            socket.to_string_lossy().into_owned(),
+        );
+        let outcome = reaper
+            .resume_source_vm(&stuck_row("settled-resume"))
+            .await
+            .expect("a resume after the settle window succeeds");
+        assert_eq!(
+            outcome,
+            ResumeOutcome::Resumed,
+            "a settled, silent, live source node must be resumed"
         );
     }
 

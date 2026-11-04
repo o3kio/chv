@@ -895,12 +895,32 @@ pub async fn source_migration_with_disk_precopy(
                 error = %e,
                 "source agent: memory migration (send-migration) failed"
             );
-            // The VM is still paused from the final disk sync; resume it so
-            // the reconciler can drive it back to Running.
-            pause_guard.resume_if_paused().await;
+            // A normal failure means Cloud Hypervisor is no longer sending,
+            // so the VM must be resumed or the reconciler cannot run it. A
+            // timeout is different: the transfer outcome is unknown and CH
+            // may still be streaming, so leave the VM paused for the reaper /
+            // operator (the sealed window keeps the cancel unconfirmed).
+            if source_should_resume_after_send_failure(&e) {
+                pause_guard.resume_if_paused().await;
+            } else {
+                warn!(
+                    vm_id = %vm_id,
+                    operation_id = %operation_id,
+                    "source agent: send-migration timed out; leaving the VM paused \
+                     because the transfer outcome is unknown"
+                );
+            }
             Err(format!("memory migration failed: {e}"))
         }
     }
+}
+
+/// Whether a failed source-side `send-migration` leaves Cloud Hypervisor in a
+/// known-stopped state. A timeout does not: the VMM call was abandoned by the
+/// agent's bound while the transfer may still run, so unpausing the source
+/// would race a live sender. Every other error is a definitive failure.
+fn source_should_resume_after_send_failure(error: &ChvError) -> bool {
+    !matches!(error, ChvError::Timeout { .. })
 }
 
 /// Build a MigrationProgress proto message.
@@ -1467,5 +1487,55 @@ mod tests {
         // A resume call would flip the record to Running; staying "Created"
         // proves resume_vm was never invoked.
         assert_eq!(rt.get("vm-1").await.unwrap().runtime_status, "Created");
+    }
+
+    /// A timeout from the adapter must seal the transfer window (the VMM may
+    /// still be receiving) so a later cancel cannot be confirmed. This drives
+    /// the real `spawn_destination_migration` wiring.
+    #[tokio::test]
+    async fn destination_timeout_seals_transfer_window() {
+        let (rt, mock) = test_runtime();
+        *mock.migration_timeout.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+
+        let handle = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-timeout".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        );
+        let err = handle
+            .await
+            .expect("task joins")
+            .expect_err("the mock must time out");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            transfer.is_unknown(),
+            "a VMM timeout must seal the transfer as outcome-unknown"
+        );
+        assert!(transfer.in_progress());
+        assert!(
+            !transfer.try_begin(),
+            "a sealed transfer must not restart the VMM call"
+        );
+    }
+
+    /// Only a definitive send-migration failure may unpause the source. A
+    /// timeout leaves Cloud Hypervisor potentially streaming, so the VM stays
+    /// paused for the reaper/operator.
+    #[test]
+    fn source_resumes_only_on_definitive_send_failure() {
+        assert!(!source_should_resume_after_send_failure(
+            &ChvError::Timeout {
+                operation: "send-migration".to_string(),
+                secs: 7200,
+            }
+        ));
+        assert!(source_should_resume_after_send_failure(
+            &ChvError::Internal {
+                reason: "connection reset".to_string(),
+            }
+        ));
     }
 }

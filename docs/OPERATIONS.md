@@ -921,9 +921,10 @@ counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`)
 | `chv_migration_dirty_blocks` | Gauge | Remaining dirty blocks during convergence |
 | `chv_migration_restart_reconciled_total` | Counter | Rows reconciled at startup, labelled by `recovered_phase`; nonzero means a restart interrupted migrations |
 | `chv_migration_progress_dropped_total` | Counter | Late progress reports dropped after a terminal transition, labelled by `stored_phase` and `reported_phase`; `reported_phase="Completed"` after recovery is especially important |
-| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`agent_cancel_pending`, `agent_cancel_refused`, `sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
+| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`agent_cancel_pending`, `agent_cancel_settling`, `agent_cancel_refused`, `sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`, `resume_blocked`) |
 | `chv_migration_agent_cancel_total` | Counter | Detached agent migration tasks signalled, labelled by `outcome` (`cancelled`, `not_tracked`); `not_tracked` is success (agent restarted / task already finished) |
 | `chv_migration_agent_cancel_failures_total` | Counter | Agent cancel attempts that did not confirm, labelled by `reason` (`resolve_error`, `unreachable`, `connect_timeout`, `timeout`, `rpc_error`, `permanent`); `permanent` parks the row in `agent_cancel_last_error` |
+| `chv_migration_destination_resume_failures_total` | Counter | Destination VM resumes that failed after an agent-reported `Completed`; placement still moved, so the VM may be paused on the destination and `migrations.error_message` explains why |
 
 **Expected phase durations** (100GB disk, 16GB RAM):
 
