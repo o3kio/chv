@@ -72,6 +72,17 @@ changes it. The packages and `scripts/install.sh` leave the HTTP listener on
 SLIs are the measurable properties we use to assess service health. Each SLI is expressed
 as a PromQL expression that can be evaluated continuously.
 
+### Availability caveat (#702)
+
+> **Availability caveat ([#702](https://github.com/o3kio/chv/issues/702)).**
+> SLI-1 and SLI-2 are backed by `chv_vm_ops_total` /
+> `chv_vm_op_duration_seconds`. The shipped agent records those samples into
+> the global Prometheus registry but its `:9901` handler renders only the
+> hand-built `chv_agent_*` families, so packaged agents expose neither series.
+> Until #702 lands, SLI-1/SLI-2 have no data from agent scrapes and
+> `VmStartLatencyHighP99` / `VmOpFailureRateHigh` cannot fire. The
+> journal-based diagnosis in their runbooks works today.
+
 ### SLI-1: VM start latency (p99)
 
 **Definition:** 99th percentile of the time from `create_vm` invocation on the Cloud Hypervisor
@@ -182,6 +193,10 @@ check the recording rules (`chv:*:5m`) to see whether you are on track to exhaus
 
 ### VM lifecycle (`chv-agent-runtime-ch`)
 
+**Not exported by the shipped agent yet — see [SLI availability caveat](#availability-caveat-702)
+and [#702](https://github.com/o3kio/chv/issues/702).** The rows below describe
+the series' shape once the exporter renders the global registry.
+
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `chv_vm_ops_total` | counter | `op`, `result` | VM lifecycle operation count. `op` ∈ {create,start,stop,delete,pause,resume}; `result` ∈ {ok,err} |
@@ -258,33 +273,59 @@ CHV_LOG_FORMAT=pretty chv-agent ...   # or unset
 
 ### Filtering logs by operation
 
-Every operation carries an `operation_id` span field. To trace a specific operation:
+Operation-scoped events carry the operation id: the control plane and
+`chv-nwd` put it on an `operation_id` span field, and the Cloud Hypervisor
+adapter emits it as the `op` event field. `journalctl -o cat` prints the raw
+log line so `jq` can filter it; `journalctl -o json` wraps the line in
+journald's `MESSAGE` field and will not match these filters. Structured-field
+queries require the process to log JSON (`CHV_LOG_FORMAT=json`); the packaged
+units do not set it by default, so plain `grep` on `journalctl -o cat` is the
+fallback.
 
 ```bash
-# systemd journal
-journalctl -u chv-agent -o json | jq 'select(.operation_id == "abc123ef")'
+# systemd journal (requires CHV_LOG_FORMAT=json)
+journalctl -u chv-agent -o cat | jq 'select(.fields.op == "abc123ef")'
+journalctl -u chv-controlplane -o cat | jq 'select((.span.operation_id // .span.op_id // .fields.operation_id) == "abc123ef")'
 
 # File log
 grep '"operation_id":"abc123ef"' /var/log/chv/agent.log
 ```
 
 Every HTTP error response body includes a `request_id` field that matches the
-`x-correlation-id` response header. Use this to correlate a user-visible error back to
-server-side logs:
+`x-correlation-id` response header. The BFF stores that id on the durable
+audit row (`audit_log.correlation_id`), not on every log event; query the
+audit table for the route, actor, outcome, and `operation_id`, then filter
+logs by that operation id:
 
 ```bash
 # User reports: request_id = "x7k9p2"
-journalctl -u chv-controlplane -o json | jq 'select(.fields.correlation_id == "x7k9p2")'
+sqlite3 "file:/var/lib/chv/controlplane.db?mode=ro" \
+  "SELECT occurred_at_ms, status_code, method, path, outcome, operation_id
+   FROM audit_log WHERE correlation_id='x7k9p2'
+   ORDER BY occurred_at_ms DESC LIMIT 20;"
 ```
 
 ---
 
 ## Distributed tracing
 
-> **Note:** OTLP/OpenTelemetry export is not yet enabled in production (deferred — see finding C-12).
-> Trace IDs are present in logs as `correlation_id` / `request_id` fields and are propagated via the
-> `x-correlation-id` HTTP header. When OTLP support lands, this section will be updated with
-> collector configuration and trace query examples.
+**CHV does not emit OTLP/OpenTelemetry traces today.** There is no OTLP
+exporter, collector configuration, or trace-backend integration in the shipped
+binaries. Do not point an OpenTelemetry collector at CHV and expect spans.
+
+What exists instead:
+
+- Every operation record has an ID, and operation-scoped log events carry it
+  (`operation_id` span field in the control plane and `chv-nwd`; `op` event
+  field in the Cloud Hypervisor adapter). Filter structured logs by it as
+  shown in [Filtering logs by operation](#filtering-logs-by-operation).
+- Every HTTP error body includes a top-level `request_id` that matches the
+  `x-correlation-id` response header. An inbound `x-operation-id` seeds that
+  correlation ID; otherwise the BFF generates one.
+- Use the structured logs and the metrics in this document to follow a
+  request across the BFF, control plane, and agent. `operation_id` and the
+  correlation/`request_id` value are the join keys; there is no trace-ID
+  propagation beyond those fields today.
 
 ---
 
@@ -292,17 +333,18 @@ journalctl -u chv-controlplane -o json | jq 'select(.fields.correlation_id == "x
 
 | Alert | Severity | Runbook |
 |---|---|---|
-| `VmStartLatencyHighP99` | warning | `vm-start-slow.md` (runbook pending) |
-| `VmOpFailureRateHigh` | warning | `vm-op-failures.md` (runbook pending) |
+| `VmStartLatencyHighP99` | warning | [docs/runbooks/vm-start-slow.md](runbooks/vm-start-slow.md) |
+| `VmOpFailureRateHigh` | warning | [docs/runbooks/vm-op-failures.md](runbooks/vm-op-failures.md) |
 | `ControlPlaneGrpcErrorRateHigh` | warning | [docs/runbooks/control-plane-dr.md](runbooks/control-plane-dr.md) |
 | `ControlPlaneOpQueueGrowing` | warning | [docs/runbooks/control-plane-dr.md](runbooks/control-plane-dr.md) |
 | `ControlPlaneConvergenceSlow` | warning | [docs/runbooks/control-plane-dr.md](runbooks/control-plane-dr.md) |
 | `ControlPlaneDriftPersistent` | critical | [docs/runbooks/control-plane-dr.md](runbooks/control-plane-dr.md) |
 | `MigrationFailureRateHigh` | warning | [docs/runbooks/vm-snapshot-restore.md](runbooks/vm-snapshot-restore.md) |
-| `BffApiErrorRate` | warning | `bff-errors.md` (runbook pending) |
+| `BffApiErrorRate` | warning | [docs/runbooks/bff-errors.md](runbooks/bff-errors.md) |
 | `NodeDown` | critical | [docs/runbooks/full-site-recovery.md](runbooks/full-site-recovery.md) |
 
-Pending runbooks should be filed as follow-up issues before the first production deployment.
+All alert rules above reference a runbook. The runbook file is the operational
+procedure; this table is the index.
 
 ---
 

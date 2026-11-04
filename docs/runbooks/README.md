@@ -1,6 +1,6 @@
 # CHV Disaster Recovery Runbooks
 
-This directory contains operational runbooks for backup, restore, and disaster recovery scenarios. Each runbook is designed to be followed under pressure — steps are numbered, commands are copy-pasteable, and prerequisites are listed upfront.
+This directory contains operational runbooks for backup, restore, disaster recovery, and alert-driven troubleshooting scenarios. Each runbook is designed to be followed under pressure — steps are numbered, commands are copy-pasteable, and prerequisites are listed upfront.
 
 > **CHV does not back up tenant data.** There is no backup or restore engine:
 > the whole backup API is hard-fenced (`501 NOT_IMPLEMENTED`) and the WebUI
@@ -24,6 +24,9 @@ This directory contains operational runbooks for backup, restore, and disaster r
 | [Alerting and Notifications](alerting.md) | Alert rules, incidents, webhook/Slack delivery (configuration, secret rotation, dead-letter triage) | Automatic evaluation + manual configuration | 5–15 min |
 | [VM Monitoring vsock Transport](vm-monitoring-vsock.md) | Guest monitoring over the optional vsock device (opt-in, relay diagnosis, transport switch, batch enrollment) | Automatic relay rebind + manual diagnosis | 5–15 min |
 | [Monitoring Export](monitoring-export.md) | Optional remote-write export to an external backend (VictoriaMetrics/Prometheus) — configuration, degraded state, backfill bounds, readback | Automatic export + manual configuration | 5–15 min |
+| [VM Start Latency](vm-start-slow.md) | `VmStartLatencyHighP99`: starts succeed but p99 exceeds the 45 s alert / 30 s SLO | Automatic alerting + manual diagnosis | 10–30 min |
+| [VM Operation Failures](vm-op-failures.md) | `VmOpFailureRateHigh`: create/start/stop/delete errors exceed 5%, including InspectRequired operations | Automatic retry bound + manual diagnosis/resolution | 10–45 min |
+| [BFF API Errors](bff-errors.md) | `BffApiErrorRate`: BFF 5xx above 1%, login/UI errors, status/code triage and correlation-ID search | Automatic alerting + manual diagnosis | 5–30 min |
 | [Node Certificate Compromise](node-certificate-compromise.md) | Revoke a node certificate (denylist at the gRPC mTLS layer), verify rejection, recover rotation, re-enroll a compromised node | Manual revocation + verification (refresh ≤ 5 s) | 5–20 min |
 | [Agent Auth and Secret Rotation](agent-auth-and-secret-rotation.md) | Control-plane → agent authentication, per-purpose secret migration, key rotation | Manual configuration + restart | 10–20 min |
 

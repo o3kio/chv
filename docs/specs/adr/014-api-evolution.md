@@ -160,6 +160,8 @@ All list endpoints **must** use cursor-based pagination per [AIP-158](https://go
 - HTTP/JSON error bodies from the BFF include `message`, `code`, and `request_id` fields.
   The `request_id` matches the `x-correlation-id` response header and is injected by the
   correlation middleware so every error can be traced without the client needing to copy a header.
+  The HTTP-level versioning and deprecation policy is separate from proto evolution — see
+  [BFF HTTP API Versioning](../ops/bff-http-api-versioning.md).
 
 ## Alternatives Considered
 

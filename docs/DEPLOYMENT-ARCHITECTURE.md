@@ -248,6 +248,9 @@ Additional provisioning facts:
   `authority_mode = "core-managed"` (single durable CellHV Core authority).
   The reference-only `packaging/config/chv.yaml` now matches (`core-managed`,
   fixed via #424); no daemon consumes it for authority selection (§10).
+  See the [authority-mode feature matrix](specs/ops/mode-feature-matrix.md)
+  for what each mode composes and the maintainer target for removing
+  `legacy` (`2027-06-30`).
 - The optional legacy `chvbr0` host bridge/NAT bootstrap is opt-out
   (`INSTALL_CHV_NO_BRIDGE=1`). Qualified networks are created via the API and
   managed by `chv-nwd` as `br-<net_id>` (hashed to 15 characters when the id
