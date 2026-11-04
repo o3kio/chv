@@ -7,12 +7,12 @@
 //! REST API calls.
 
 use crate::daemon_clients::StordClient;
+use crate::migration_registry::TransferWindow;
 use crate::vm_runtime::VmRuntime;
 use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
 use std::net::TcpListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -102,7 +102,7 @@ pub fn spawn_destination_migration(
     vm_id: String,
     operation_id: String,
     receiver_url: String,
-    transfer_active: Arc<AtomicBool>,
+    transfer: Arc<TransferWindow>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         info!(
@@ -112,14 +112,26 @@ pub fn spawn_destination_migration(
             "destination agent: starting receive-migration"
         );
 
-        // Mark the non-cancellable window: dropping this future does not stop
-        // the Cloud Hypervisor receive, so the registry must not force-abort it
-        // and `CancelMigration` must not report a confirmed cancel.
-        transfer_active.store(true, Ordering::SeqCst);
+        // Enter the non-cancellable window atomically: if a cancel was armed
+        // first, do not start the VMM receive at all (dropping this future
+        // would not stop it).
+        if !transfer.try_begin() {
+            warn!(
+                vm_id = %vm_id,
+                operation_id = %operation_id,
+                "destination agent: migration cancelled before receive-migration"
+            );
+            return Err("migration cancelled before receive-migration".to_string());
+        }
         let result = vm_runtime
             .receive_migration(&vm_id, &receiver_url, Some(&operation_id))
             .await;
-        transfer_active.store(false, Ordering::SeqCst);
+        match &result {
+            // The agent stopped waiting but Cloud Hypervisor may still be
+            // receiving. Seal the window so a cancel can never be confirmed.
+            Err(ChvError::Timeout { .. }) => transfer.seal_unknown(),
+            _ => transfer.end(),
+        }
 
         match result {
             Ok(()) => {
@@ -650,7 +662,7 @@ pub async fn source_migration_with_disk_precopy(
     disk_config: DiskPrecopyConfig,
     progress_reporter: Option<ProgressReporter>,
     cancel_token: CancellationToken,
-    transfer_active: Arc<AtomicBool>,
+    transfer: Arc<TransferWindow>,
 ) -> Result<(), String> {
     info!(
         vm_id = %vm_id,
@@ -830,17 +842,27 @@ pub async fn source_migration_with_disk_precopy(
         cb(progress);
     }
 
-    let send_result = {
-        // Mark the non-cancellable window: dropping this future does not stop
-        // the Cloud Hypervisor send, so the registry must not force-abort it
-        // and `CancelMigration` must not report a confirmed cancel.
-        transfer_active.store(true, Ordering::SeqCst);
-        let result = vm_runtime
-            .send_migration(&vm_id, &destination_url, Some(&operation_id))
-            .await;
-        transfer_active.store(false, Ordering::SeqCst);
-        result
-    };
+    // Enter the non-cancellable window atomically. If a cancel was armed
+    // first, do not start send-migration; resume a VM paused for the disk
+    // phase and surface the cancellation.
+    if !transfer.try_begin() {
+        warn!(
+            vm_id = %vm_id,
+            operation_id = %operation_id,
+            "source agent: migration cancelled before send-migration"
+        );
+        pause_guard.resume_if_paused().await;
+        return Err("migration cancelled before memory migration".to_string());
+    }
+    let send_result = vm_runtime
+        .send_migration(&vm_id, &destination_url, Some(&operation_id))
+        .await;
+    match &send_result {
+        // The agent stopped waiting but Cloud Hypervisor may still be
+        // sending. Seal the window so a cancel can never be confirmed.
+        Err(ChvError::Timeout { .. }) => transfer.seal_unknown(),
+        _ => transfer.end(),
+    }
     match send_result {
         Ok(()) => {
             if let Some(ref reporter) = progress_reporter {

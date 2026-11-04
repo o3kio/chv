@@ -994,27 +994,23 @@ pub async fn execute_migration(
         // The source agent reports `Completed` only after the Cloud
         // Hypervisor send-migration succeeded, so the authoritative VM state is
         // already on the destination and there is no safe rollback from here.
-        // Finalize placement idempotently and skip the legacy pause/resume
-        // handshake: a failure in that handshake must not resume a stale
-        // source VM, and `update_migration_phase` now refuses to overwrite the
-        // agent-verified Completed row.
-        let reported_phase: Option<String> =
-            sqlx::query_scalar("SELECT phase FROM migrations WHERE migration_id = ?")
-                .bind(&state.migration_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| ChvError::Internal {
-                    reason: format!(
-                        "failed to re-read migration {} after memory migration: {e}",
-                        state.migration_id
-                    ),
-                })?;
-        if reported_phase.as_deref() == Some("Completed") {
+        // Pause-first mode (the only supported mode since #656) can leave the
+        // destination VM paused, so resume it before moving placement, then
+        // finalize idempotently. A failure in this handshake must never resume
+        // a stale source VM.
+        if post_memory_migration_action(pool, &state.migration_id).await?
+            == PostMemoryMigration::AgentReportedCompleted
+        {
             info!(
                 migration_id = %state.migration_id,
                 "source agent reported Completed; finalizing destination placement without rollback"
             );
-            complete_migration_atomically(pool, state).await?;
+            let resumer = NodeClientDestinationResumer {
+                node_client_pool,
+                agent_socket_pattern,
+                paused_timeout_secs: timeouts.paused_secs,
+            };
+            finalize_agent_reported_completion(pool, state, &resumer).await?;
             notify_overlay_after_migration(pool, node_client_pool, agent_socket_pattern, state)
                 .await;
             return Ok(());
@@ -2127,28 +2123,29 @@ pub async fn update_migration_progress(
         // migration failed. The reaper must not auto-resume the source under
         // that ambiguity; leave it blocked for operator review.
         if phase_str == "Completed" && matches!(current_phase.as_str(), "Failed" | "RolledBack") {
-            if let Err(e) = sqlx::query(
+            // If this write fails, return the error: the agent's at-least-once
+            // queue retries the idempotent report, and acked-but-not-blocked
+            // would let the reaper auto-resume the source under a destination
+            // that may already own the VM.
+            sqlx::query(
                 "UPDATE migrations SET reaper_resume_state = 'blocked' \
                  WHERE migration_id = ? AND phase IN ('Failed', 'RolledBack')",
             )
             .bind(&migration_id)
             .execute(pool)
             .await
-            {
-                warn!(
-                    migration_id = %migration_id,
-                    error = %e,
-                    "failed to block source resume after a late agent-reported Completed"
-                );
-            } else {
-                warn!(
-                    migration_id = %migration_id,
-                    operation_id = %operation_id,
-                    stored_phase = %current_phase,
-                    "agent reported Completed after the control plane terminalized the row; \
-                     blocking automatic source resume for operator review"
-                );
-            }
+            .map_err(|e| ChvError::Internal {
+                reason: format!(
+                    "failed to block source resume after a late agent-reported Completed for {migration_id}: {e}"
+                ),
+            })?;
+            warn!(
+                migration_id = %migration_id,
+                operation_id = %operation_id,
+                stored_phase = %current_phase,
+                "agent reported Completed after the control plane terminalized the row; \
+                 blocking automatic source resume for operator review"
+            );
         }
         return Ok(());
     }
@@ -2211,6 +2208,174 @@ fn migration_bridge_name(net_id: &str) -> String {
     // One definition for the agent runtime, legacy reconcile, nwd teardown,
     // migration, and dnsmasq: truncate+hash ids that exceed IFNAMSIZ.
     chv_common::bridge_name_for_network(net_id)
+}
+
+/// What the control plane should do after the agent-side memory migration
+/// stops reporting progress.
+#[derive(Debug, PartialEq, Eq)]
+enum PostMemoryMigration {
+    /// The source agent reported `Completed`: Cloud Hypervisor has already
+    /// moved the VM, so finalize placement (after resuming the destination in
+    /// pause-first mode) instead of running the legacy pause/resume handshake.
+    AgentReportedCompleted,
+    /// The row is still `Paused` (or another non-terminal phase): run the
+    /// legacy pause/cancel/rollback handshake.
+    NeedsLegacyHandshake,
+}
+
+/// Decide the post-memory-migration path from the row's current phase.
+///
+/// Kept separate from `execute_migration` so the decision that skips the
+/// legacy rollback (and, in the supported pause-first mode, *must* resume the
+/// destination) has a direct regression test.
+async fn post_memory_migration_action(
+    pool: &StorePool,
+    migration_id: &str,
+) -> Result<PostMemoryMigration, ChvError> {
+    let reported_phase: Option<String> =
+        sqlx::query_scalar("SELECT phase FROM migrations WHERE migration_id = ?")
+            .bind(migration_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ChvError::Internal {
+                reason: format!(
+                    "failed to re-read migration {migration_id} after memory migration: {e}"
+                ),
+            })?;
+    Ok(if reported_phase.as_deref() == Some("Completed") {
+        PostMemoryMigration::AgentReportedCompleted
+    } else {
+        PostMemoryMigration::NeedsLegacyHandshake
+    })
+}
+
+/// Seam over the destination resume so the finalize ordering (resume before
+/// placement move, failure recorded without blocking placement) is testable.
+#[async_trait::async_trait]
+trait DestinationResumer: Send + Sync {
+    /// Returns `None` on success, or a human-readable failure reason.
+    async fn resume(&self, pool: &StorePool, state: &MigrationState) -> Option<String>;
+}
+
+struct NodeClientDestinationResumer<'a> {
+    node_client_pool: &'a NodeClientPool,
+    agent_socket_pattern: &'a str,
+    paused_timeout_secs: u64,
+}
+
+#[async_trait::async_trait]
+impl DestinationResumer for NodeClientDestinationResumer<'_> {
+    async fn resume(&self, pool: &StorePool, state: &MigrationState) -> Option<String> {
+        resume_destination_after_migration(
+            pool,
+            state,
+            self.node_client_pool,
+            self.agent_socket_pattern,
+            self.paused_timeout_secs,
+        )
+        .await
+    }
+}
+
+/// Finish a migration whose source agent already reported `Completed`.
+///
+/// The report is sent only after `send-migration` succeeds, so the
+/// authoritative VM state is on the destination. In the supported pause-first
+/// mode Cloud Hypervisor can leave the destination VM paused, so resume it
+/// first (bounded retries) and only then move placement. A resume failure is
+/// recorded on the row and as a metric, but placement still moves: the VM
+/// state is on the destination, and resuming the stale source would risk
+/// split-brain. The operator can resume the paused VM on the destination.
+async fn finalize_agent_reported_completion(
+    pool: &StorePool,
+    state: &mut MigrationState,
+    resumer: &dyn DestinationResumer,
+) -> Result<(), ChvError> {
+    if let Some(reason) = resumer.resume(pool, state).await {
+        error!(
+            migration_id = %state.migration_id,
+            vm_id = %state.vm_id,
+            dest_node_id = %state.dest_node_id,
+            reason = %reason,
+            "destination VM resume failed after the source agent reported Completed; \
+             placement will still move to the destination, but the VM may be paused there"
+        );
+        metrics::counter!("chv_migration_destination_resume_failures_total").increment(1);
+        // `Completed` is already terminal; store the failure for the operator
+        // without changing the phase or resurrecting the row.
+        sqlx::query(
+            "UPDATE migrations SET error_message = ? \
+             WHERE migration_id = ? AND phase = 'Completed' AND error_message IS NULL",
+        )
+        .bind(&reason)
+        .bind(&state.migration_id)
+        .execute(pool)
+        .await
+        .map_err(|e| ChvError::Internal {
+            reason: format!(
+                "failed to record destination-resume failure for migration {}: {e}",
+                state.migration_id
+            ),
+        })?;
+    }
+
+    complete_migration_atomically(pool, state).await
+}
+
+/// Best-effort resume of the destination VM after an agent-reported
+/// `Completed`. Returns `None` on success and a human-readable reason on
+/// failure. Never fails the migration on its own; the caller records it.
+async fn resume_destination_after_migration(
+    pool: &StorePool,
+    state: &MigrationState,
+    node_client_pool: &NodeClientPool,
+    agent_socket_pattern: &str,
+    paused_timeout_secs: u64,
+) -> Option<String> {
+    const ATTEMPTS: u64 = 3;
+
+    let socket = match resolve_agent_socket(agent_socket_pattern, &state.dest_node_id) {
+        Ok(socket) => socket,
+        Err(e) => return Some(format!("cannot resolve destination agent socket: {e}")),
+    };
+    let mut client = match node_client_pool
+        .get_or_connect(&state.dest_node_id, &socket)
+        .await
+    {
+        Ok(client) => client,
+        Err(e) => return Some(format!("cannot connect to destination agent: {e}")),
+    };
+    let generation = match get_vm_generation(pool, &state.vm_id).await {
+        Ok(generation) => generation,
+        Err(e) => return Some(format!("cannot read VM generation: {e}")),
+    };
+
+    let op_id = format!("agent-completed-resume-{}", state.migration_id);
+    let mut last_error = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let result = tokio::time::timeout(
+            Duration::from_secs(paused_timeout_secs),
+            client.resume_vm(
+                &state.dest_node_id,
+                &state.vm_id,
+                &generation,
+                &op_id,
+                Some("control-plane"),
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => return None,
+            Ok(Err(e)) => last_error = format!("resume_vm failed: {e}"),
+            Err(_) => {
+                last_error = format!("resume_vm timed out after {paused_timeout_secs}s");
+            }
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(attempt)).await;
+        }
+    }
+    Some(last_error)
 }
 
 /// Atomically mark migration as Completed AND update VM placement.
@@ -3157,6 +3322,156 @@ mod tests {
         assert_eq!(
             target, "node-b",
             "placement must move to the destination even when the agent already reported Completed"
+        );
+        assert_eq!(state.phase, MigrationPhase::Completed);
+    }
+
+    /// The post-memory-migration decision must finalize an agent-reported
+    /// `Completed` row and fall through to the legacy handshake otherwise.
+    #[tokio::test]
+    async fn post_memory_migration_action_distinguishes_agent_completion() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "decision-done", "Completed", -10).await;
+        seed_migration_row(&test_db.pool, "decision-paused", "Paused", -10).await;
+
+        assert_eq!(
+            post_memory_migration_action(&test_db.pool, "mig-decision-done")
+                .await
+                .expect("read phase"),
+            PostMemoryMigration::AgentReportedCompleted
+        );
+        assert_eq!(
+            post_memory_migration_action(&test_db.pool, "mig-decision-paused")
+                .await
+                .expect("read phase"),
+            PostMemoryMigration::NeedsLegacyHandshake
+        );
+    }
+
+    struct StubResumer {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        failure: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl DestinationResumer for StubResumer {
+        async fn resume(&self, _pool: &StorePool, _state: &MigrationState) -> Option<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.failure.clone()
+        }
+    }
+
+    /// Finalizing an agent-reported `Completed` migration must resume the
+    /// destination *before* moving placement. Without the resume every
+    /// pause-first migration would leave the destination VM paused.
+    #[tokio::test]
+    async fn finalize_agent_completion_resumes_destination_before_placement() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "finalize-ok", "Completed", -10).await;
+        for node in ["node-a", "node-b"] {
+            sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES (?, ?, ?)")
+                .bind(node)
+                .bind(node)
+                .bind(node)
+                .execute(&test_db.pool)
+                .await
+                .expect("seed node");
+        }
+        sqlx::query(
+            "INSERT INTO vm_desired_state (vm_id, desired_generation, target_node_id) \
+             VALUES ('vm-finalize-ok', 1, 'node-a')",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed placement");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resumer = StubResumer {
+            calls: calls.clone(),
+            failure: None,
+        };
+        let mut state = migration_state_for("vm-finalize-ok");
+        state.migration_id = "mig-finalize-ok".to_string();
+        state.operation_id = "op-finalize-ok".to_string();
+
+        finalize_agent_reported_completion(&test_db.pool, &mut state, &resumer)
+            .await
+            .expect("finalize succeeds when the resume succeeds");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the destination resume must run before placement moves"
+        );
+        let (phase, target, error): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT m.phase, d.target_node_id, m.error_message \
+             FROM migrations m JOIN vm_desired_state d ON d.vm_id = m.vm_id \
+             WHERE m.migration_id = 'mig-finalize-ok'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Completed");
+        assert_eq!(target, "node-b", "placement must move to the destination");
+        assert!(error.is_none());
+        assert_eq!(state.phase, MigrationPhase::Completed);
+    }
+
+    /// A destination resume failure is recorded for the operator (and counted)
+    /// but must not block placement: the VM state is on the destination, so
+    /// leaving it on the source would split-brain.
+    #[tokio::test]
+    async fn finalize_agent_completion_records_resume_failure_and_still_moves_placement() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "finalize-fail", "Completed", -10).await;
+        for node in ["node-a", "node-b"] {
+            sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES (?, ?, ?)")
+                .bind(node)
+                .bind(node)
+                .bind(node)
+                .execute(&test_db.pool)
+                .await
+                .expect("seed node");
+        }
+        sqlx::query(
+            "INSERT INTO vm_desired_state (vm_id, desired_generation, target_node_id) \
+             VALUES ('vm-finalize-fail', 1, 'node-a')",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed placement");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resumer = StubResumer {
+            calls: calls.clone(),
+            failure: Some("resume_vm failed: agent unreachable".to_string()),
+        };
+        let mut state = migration_state_for("vm-finalize-fail");
+        state.migration_id = "mig-finalize-fail".to_string();
+        state.operation_id = "op-finalize-fail".to_string();
+
+        finalize_agent_reported_completion(&test_db.pool, &mut state, &resumer)
+            .await
+            .expect("a resume failure must not fail finalization");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (phase, target, error): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT m.phase, d.target_node_id, m.error_message \
+             FROM migrations m JOIN vm_desired_state d ON d.vm_id = m.vm_id \
+             WHERE m.migration_id = 'mig-finalize-fail'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Completed");
+        assert_eq!(
+            target, "node-b",
+            "placement must still move when only the resume failed"
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("resume_vm failed: agent unreachable"),
+            "the operator must see why the destination is still paused"
         );
         assert_eq!(state.phase, MigrationPhase::Completed);
     }

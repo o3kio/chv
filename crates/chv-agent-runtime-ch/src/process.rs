@@ -66,6 +66,15 @@ use crate::ch_api::{parse_http_status, CloudHypervisorApiClient};
 const CONSOLE_SCROLLBACK_BYTES: usize = 256 * 1024;
 const CONSOLE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Upper bound on a Cloud Hypervisor `send-migration`/`receive-migration`
+/// call. The transfer itself is bounded by the control plane's phase
+/// timeouts; this adapter bound exists only so a wedged HTTP read cannot hold
+/// the agent task forever. It must be generous enough not to cut a legitimate
+/// transfer (the previous 10-minute cap could trip on a large VM while Cloud
+/// Hypervisor kept transferring). When it does fire, the caller treats the
+/// VMM outcome as unknown and must not confirm a cancellation.
+const MIGRATION_VMM_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+
 struct AliveGuard(Arc<AtomicBool>);
 
 impl Drop for AliveGuard {
@@ -4958,12 +4967,18 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
                 }
                 Ok::<(), ChvError>(())
             };
-            // Migration can take minutes; allow up to 10 minutes for this blocking call.
-            tokio::time::timeout(std::time::Duration::from_secs(600), read_fut)
-                .await
-                .map_err(|_| ChvError::Internal {
-                    reason: format!("send-migration timed out for vm {}", vm_id),
-                })??;
+            // The transfer can take a long time; only cut it when the HTTP
+            // call is genuinely wedged. A timeout is reported distinctly so
+            // the caller can fail closed (the VMM transfer may still run).
+            tokio::time::timeout(
+                std::time::Duration::from_secs(MIGRATION_VMM_TIMEOUT_SECS),
+                read_fut,
+            )
+            .await
+            .map_err(|_| ChvError::Timeout {
+                operation: format!("send-migration for vm {vm_id}"),
+                secs: MIGRATION_VMM_TIMEOUT_SECS,
+            })??;
 
             let raw = String::from_utf8_lossy(&buf);
             let status_code = parse_http_status(raw.as_bytes()).unwrap_or(0);
@@ -5054,12 +5069,18 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
                 }
                 Ok::<(), ChvError>(())
             };
-            // Migration can take minutes; allow up to 10 minutes.
-            tokio::time::timeout(std::time::Duration::from_secs(600), read_fut)
-                .await
-                .map_err(|_| ChvError::Internal {
-                    reason: format!("receive-migration timed out for vm {}", vm_id),
-                })??;
+            // Same bound as send-migration: generous enough not to cut a
+            // legitimate transfer, distinct on expiry so cancellation cannot
+            // be falsely confirmed.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(MIGRATION_VMM_TIMEOUT_SECS),
+                read_fut,
+            )
+            .await
+            .map_err(|_| ChvError::Timeout {
+                operation: format!("receive-migration for vm {vm_id}"),
+                secs: MIGRATION_VMM_TIMEOUT_SECS,
+            })??;
 
             let raw = String::from_utf8_lossy(&buf);
             let status_code = parse_http_status(raw.as_bytes()).unwrap_or(0);

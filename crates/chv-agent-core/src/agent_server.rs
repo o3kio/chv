@@ -1,6 +1,6 @@
 use crate::cache::{NodeCache, VmNicAttachment};
 use crate::control_plane::ControlPlaneClient;
-use crate::migration_registry::MigrationTaskRegistry;
+use crate::migration_registry::{MigrationTaskRegistry, TransferWindow};
 use crate::reconcile::{bridge_name_for_network, cleanup_vm_resources, vm_runtime_dir};
 use crate::state_machine::NodeState;
 use crate::vm_runtime::VmRuntime;
@@ -10,7 +10,6 @@ use control_plane_node_api::control_plane_node_api as proto;
 use futures_util::StreamExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
@@ -3504,8 +3503,8 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                 // this, the JoinHandle was dropped on the floor and the agent
                 // had no way to abort, reap, or surface terminal failure.
                 let cancel_token = CancellationToken::new();
-                let transfer_active = Arc::new(AtomicBool::new(false));
-                let transfer_for_task = transfer_active.clone();
+                let transfer = Arc::new(TransferWindow::default());
+                let transfer_for_task = transfer.clone();
                 let registry = self.migration_tasks.clone();
                 let op_id_for_task = operation_id.clone();
                 let op_id_for_log = operation_id.clone();
@@ -3526,11 +3525,11 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     .await
                 });
                 let abort_handle = handle.abort_handle();
-                self.migration_tasks.insert_with_transfer_flag(
+                self.migration_tasks.insert_with_transfer_window(
                     operation_id.clone(),
                     abort_handle,
                     cancel_token,
-                    transfer_active,
+                    transfer,
                 );
 
                 // Reaper: await the task, log terminal status, remove from registry.
@@ -3577,13 +3576,13 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     "destination agent: ACKing migrate_vm, spawning receive-migration task"
                 );
 
-                // Destination side has no cooperative cancel-aware variant
-                // yet (CH receive-migration is a single blocking call). The
-                // cancel token is still tracked so the abort_handle path
-                // force-drops the future at its next .await point.
+                // Destination side has no cooperative cancel-aware variant yet
+                // (CH receive-migration is a single blocking call). The task
+                // still marks the transfer window so a cancel during the VMM
+                // transfer is not confirmed or force-dropped.
                 let cancel_token = CancellationToken::new();
-                let transfer_active = Arc::new(AtomicBool::new(false));
-                let transfer_for_task = transfer_active.clone();
+                let transfer = Arc::new(TransferWindow::default());
+                let transfer_for_task = transfer.clone();
                 let registry = self.migration_tasks.clone();
                 let op_id_for_log = operation_id.clone();
                 let handle = crate::migration::spawn_destination_migration(
@@ -3594,11 +3593,11 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     transfer_for_task,
                 );
                 let abort_handle = handle.abort_handle();
-                self.migration_tasks.insert_with_transfer_flag(
+                self.migration_tasks.insert_with_transfer_window(
                     operation_id.clone(),
                     abort_handle,
                     cancel_token,
-                    transfer_active,
+                    transfer,
                 );
 
                 let reap_op = operation_id.clone();
@@ -4200,9 +4199,10 @@ mod tests {
         server
             .migration_tasks
             .set_cancel_grace(Duration::from_secs(60));
-        let transfer = Arc::new(AtomicBool::new(true));
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(transfer.try_begin());
         let task = tokio::spawn(std::future::pending::<()>());
-        server.migration_tasks.insert_with_transfer_flag(
+        server.migration_tasks.insert_with_transfer_window(
             "op-transfer".to_string(),
             task.abort_handle(),
             CancellationToken::new(),

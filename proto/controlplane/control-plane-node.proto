@@ -754,8 +754,10 @@ message CancelMigrationRequest {
 message CancelMigrationResponse {
   // true: a tracked task was found and signalled. false: no task was
   // tracked (already finished, or the agent restarted). Both outcomes mean
-  // the control plane can stop retrying; only a transport failure is
-  // retryable.
+  // the control plane can stop retrying. A task inside a Cloud Hypervisor
+  // send/receive transfer is not force-dropped; that case returns
+  // `UNAVAILABLE`, which (like a transport failure) keeps the durable cancel
+  // queued for a later retry.
   bool cancelled = 1;
   // "cancelled" | "not_tracked" — stable machine-readable outcome.
   string outcome = 2;

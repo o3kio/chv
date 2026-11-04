@@ -32,7 +32,7 @@
 //!   tracked task — the agent's "graceful shutdown" entry point.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
@@ -63,11 +63,84 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 struct TrackedTask {
     abort: AbortHandle,
     cancel_token: CancellationToken,
-    /// Set by the task while it is inside a Cloud Hypervisor send/receive
-    /// migration call. Dropping the agent future does not stop that VMM
-    /// transfer, so the registry must not force-abort it and the RPC must not
-    /// report a confirmed cancel while it is true.
-    transfer_active: Arc<AtomicBool>,
+    /// Coordinates the cancel signal with the non-cancellable Cloud Hypervisor
+    /// send/receive window.
+    transfer: Arc<TransferWindow>,
+}
+
+/// Serialises the cooperative cancel signal with entry into the
+/// non-cancellable VMM transfer window.
+///
+/// Dropping the agent future does not stop a Cloud Hypervisor
+/// `send-migration`/`receive-migration` call, so the registry must not abort a
+/// task inside that window and `CancelMigration` must not report it as
+/// confirmed. A plain check-then-abort is racy: the task can enter the window
+/// after the check. Arming the cancel and entering the window therefore share
+/// one atomic state — once a cancel is armed, no new transfer can begin, and
+/// the delayed abort only acts when no transfer is active.
+#[derive(Default)]
+pub struct TransferWindow {
+    state: AtomicU8,
+}
+
+const TRANSFER_CANCEL_ARMED: u8 = 0b01;
+const TRANSFER_ACTIVE: u8 = 0b10;
+/// The VMM call was abandoned by the agent's own wait timeout but Cloud
+/// Hypervisor may still be transferring. Once set it is never cleared: the
+/// outcome is unknown, so a cancellation can never be confirmed for this task.
+const TRANSFER_UNKNOWN: u8 = 0b100;
+
+impl TransferWindow {
+    /// Enter the transfer window. Returns `false` if a cancel was already
+    /// armed or a previous transfer's outcome is unknown, in which case the
+    /// caller must not start the VMM transfer.
+    pub fn try_begin(&self) -> bool {
+        loop {
+            let state = self.state.load(Ordering::SeqCst);
+            if state & (TRANSFER_CANCEL_ARMED | TRANSFER_UNKNOWN) != 0 {
+                return false;
+            }
+            match self.state.compare_exchange(
+                state,
+                state | TRANSFER_ACTIVE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Leave the transfer window after the VMM call returns (or is dropped).
+    pub fn end(&self) {
+        self.state.fetch_and(!TRANSFER_ACTIVE, Ordering::SeqCst);
+    }
+
+    /// The VMM call outlived the agent's bounded wait. Dropping the future did
+    /// not stop Cloud Hypervisor, so keep the window permanently active: no
+    /// cancel may be confirmed and no new transfer may start for this task.
+    pub fn seal_unknown(&self) {
+        self.state
+            .fetch_or(TRANSFER_ACTIVE | TRANSFER_UNKNOWN, Ordering::SeqCst);
+    }
+
+    /// Whether the transfer outcome is unknown (the agent's wait expired).
+    pub fn is_unknown(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & TRANSFER_UNKNOWN != 0
+    }
+
+    /// Arm cancellation. Returns whether a transfer was active at that moment.
+    /// No transfer can begin after this call.
+    fn arm_cancel(&self) -> bool {
+        self.state.fetch_or(TRANSFER_CANCEL_ARMED, Ordering::SeqCst) & TRANSFER_ACTIVE != 0
+    }
+
+    /// Whether the VMM transfer is currently in progress (or its outcome is
+    /// unknown). `CancelMigration` must not report a confirmed cancel then.
+    pub fn in_progress(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & (TRANSFER_ACTIVE | TRANSFER_UNKNOWN) != 0
+    }
 }
 
 #[derive(Default)]
@@ -142,22 +215,22 @@ impl MigrationTaskRegistry {
     /// `operation_id` (and aborts the displaced task — duplicate operation_ids
     /// would otherwise leak the older handle).
     pub fn insert(&self, op_id: String, abort: AbortHandle, cancel_token: CancellationToken) {
-        self.insert_with_transfer_flag(
+        self.insert_with_transfer_window(
             op_id,
             abort,
             cancel_token,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TransferWindow::default()),
         );
     }
 
-    /// Insert a tracked task together with the flag its future uses to mark an
-    /// in-flight, non-cancellable VMM transfer.
-    pub fn insert_with_transfer_flag(
+    /// Insert a tracked task together with the window its future uses to mark
+    /// an in-flight, non-cancellable VMM transfer.
+    pub fn insert_with_transfer_window(
         &self,
         op_id: String,
         abort: AbortHandle,
         cancel_token: CancellationToken,
-        transfer_active: Arc<AtomicBool>,
+        transfer: Arc<TransferWindow>,
     ) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(prev) = guard.tasks.insert(
@@ -165,21 +238,29 @@ impl MigrationTaskRegistry {
             TrackedTask {
                 abort,
                 cancel_token,
-                transfer_active,
+                transfer,
             },
         ) {
             prev.cancel_token.cancel();
-            prev.abort.abort();
+            // Do not force-drop a displaced task that is inside a VMM
+            // transfer; the cooperative signal is all we can safely deliver.
+            if !prev.transfer.arm_cancel() {
+                prev.abort.abort();
+            }
         }
 
         // A cancel may have arrived while this `MigrateVm` was still in flight
         // (the control plane timed out that RPC but the handler later
         // registered the task). Honour it now rather than leaking an unowned
-        // migration.
+        // migration. Arming the cancel first guarantees the task cannot enter
+        // the transfer window after this point, so the abort is safe unless it
+        // has already begun.
         if guard.take_fresh_cancelled(&op_id) {
             if let Some(task) = guard.tasks.get(&op_id) {
                 task.cancel_token.cancel();
-                task.abort.abort();
+                if !task.transfer.arm_cancel() {
+                    task.abort.abort();
+                }
             }
         }
     }
@@ -187,6 +268,21 @@ impl MigrationTaskRegistry {
     /// Remove the entry for `op_id` (called by the reaper when the task ends).
     pub fn remove(&self, op_id: &str) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // A VMM call whose outcome is unknown (the agent's HTTP wait expired
+        // while Cloud Hypervisor may still be transferring) must keep the
+        // entry: otherwise the next `CancelMigration` would report
+        // `not_tracked` and let the control plane resume the source VM.
+        if guard
+            .tasks
+            .get(op_id)
+            .is_some_and(|task| task.transfer.is_unknown())
+        {
+            tracing::warn!(
+                operation_id = %op_id,
+                "keeping migration task tracked: VMM transfer outcome is unknown"
+            );
+            return;
+        }
         guard.tasks.remove(op_id);
     }
 
@@ -213,7 +309,11 @@ impl MigrationTaskRegistry {
         };
         task.cancel_token.cancel();
         let abort = task.abort.clone();
-        let transfer_active = task.transfer_active.clone();
+        let transfer = task.transfer.clone();
+        // Arm the cancel while holding the registry lock: no new VMM transfer
+        // can begin after this point, so the delayed abort below cannot race a
+        // task entering the window.
+        let was_transferring = transfer.arm_cancel();
         drop(guard);
 
         let grace = self.cancel_grace();
@@ -221,7 +321,7 @@ impl MigrationTaskRegistry {
             Ok(runtime) => {
                 runtime.spawn(async move {
                     tokio::time::sleep(grace).await;
-                    if !transfer_active.load(Ordering::SeqCst) {
+                    if !transfer.in_progress() {
                         abort.abort();
                     }
                 });
@@ -230,7 +330,7 @@ impl MigrationTaskRegistry {
             // behavior unless the task is inside a VMM transfer; the
             // cooperative signal has already been sent.
             Err(_) => {
-                if !transfer_active.load(Ordering::SeqCst) {
+                if !was_transferring {
                     abort.abort();
                 }
             }
@@ -247,7 +347,7 @@ impl MigrationTaskRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .tasks
             .get(op_id)
-            .is_some_and(|task| task.transfer_active.load(Ordering::SeqCst))
+            .is_some_and(|task| task.transfer.in_progress())
     }
 
     /// Wait until `op_id` is no longer tracked, up to `timeout`.
@@ -581,9 +681,10 @@ mod tests {
         let registry = Arc::new(MigrationTaskRegistry::new());
         registry.set_cancel_grace(Duration::from_millis(50));
 
-        let transfer = Arc::new(AtomicBool::new(true));
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(transfer.try_begin(), "the task enters the transfer window");
         let handle = tokio::spawn(std::future::pending::<()>());
-        registry.insert_with_transfer_flag(
+        registry.insert_with_transfer_window(
             "op-transfer".to_string(),
             handle.abort_handle(),
             CancellationToken::new(),
@@ -592,16 +693,20 @@ mod tests {
         assert!(registry.transfer_in_progress("op-transfer"));
 
         assert!(registry.cancel("op-transfer"));
+        assert!(
+            !transfer.try_begin(),
+            "a transfer must not start after the cancel is armed"
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !handle.is_finished(),
             "a task inside the VMM transfer must not be force-aborted"
         );
 
-        transfer.store(false, Ordering::SeqCst);
+        transfer.end();
         assert!(
             !registry.transfer_in_progress("op-transfer"),
-            "the flag must clear when the transfer returns"
+            "the window must close when the transfer returns"
         );
         assert!(registry.cancel("op-transfer"));
         assert!(handle
@@ -609,6 +714,46 @@ mod tests {
             .expect_err("the retry must hard-abort once the transfer is over")
             .is_cancelled());
         registry.remove("op-transfer");
+    }
+
+    /// When the adapter's bounded wait expires, Cloud Hypervisor may still be
+    /// transferring. Sealing the window must keep the task tracked and make
+    /// every cancel retry unconfirmable (fail closed) even after the future
+    /// has finished and the completion reaper calls `remove`.
+    #[tokio::test]
+    async fn sealed_transfer_stays_tracked_and_never_confirms_cancel() {
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        registry.set_cancel_grace(Duration::from_millis(20));
+
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(transfer.try_begin());
+        let handle = tokio::spawn(async {});
+        registry.insert_with_transfer_window(
+            "op-unknown".to_string(),
+            handle.abort_handle(),
+            CancellationToken::new(),
+            transfer.clone(),
+        );
+        transfer.seal_unknown();
+        let _ = handle.await;
+
+        assert!(registry.transfer_in_progress("op-unknown"));
+
+        assert!(registry.cancel("op-unknown"));
+        assert!(
+            !registry
+                .wait_until_stopped("op-unknown", Duration::from_millis(100))
+                .await,
+            "an unknown VMM outcome must never look stopped"
+        );
+
+        // The completion reaper's `remove` must not drop the protection.
+        registry.remove("op-unknown");
+        assert!(
+            registry.contains("op-unknown"),
+            "a sealed task must stay tracked so cancels keep failing closed"
+        );
+        assert!(registry.transfer_in_progress("op-unknown"));
     }
 
     /// The tombstone is both bounded and time-limited.

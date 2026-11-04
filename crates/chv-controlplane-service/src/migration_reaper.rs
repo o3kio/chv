@@ -46,6 +46,12 @@ const PENDING_CANCEL_BATCH: i64 = 8;
 /// wedged-but-listening agent socket cannot stall the whole reap loop.
 const PENDING_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a confirmed agent cancel must settle before the source VM may be
+/// auto-resumed. The agent reports `Completed` through a best-effort pending
+/// queue drained on its ~5 s tick, so an immediate resume in the same reaper
+/// tick could race a terminal report that would have blocked it.
+const AGENT_CANCEL_SETTLE_SECS: i64 = 30;
+
 /// Background task that reaps migrations which have stopped making progress.
 pub struct MigrationReaper {
     pool: StorePool,
@@ -306,6 +312,13 @@ impl MigrationReaper {
                     // At least one endpoint still owes an attempt (it was
                     // unreachable/timed out). Parking now would abandon a
                     // detached task that a later attempt could still cancel.
+                    // Keep the refusal observable even though it is not yet
+                    // terminal.
+                    metrics::counter!(
+                        "chv_migration_agent_cancel_failures_total",
+                        "reason" => "permanent"
+                    )
+                    .increment(1);
                     warn!(
                         migration_id = %row.migration_id,
                         operation_id = %row.operation_id,
@@ -557,6 +570,30 @@ impl MigrationReaper {
         let pending = self.pending_resumes().await?;
 
         for row in &pending {
+            // Claim the row atomically before doing any async work. A late
+            // agent-reported `Completed` sets `reaper_resume_state = 'blocked'`
+            // concurrently; whichever write wins serialises the decision, and
+            // the resume pass will not act on a row it no longer owns.
+            let claimed = sqlx::query(
+                "UPDATE migrations SET reaper_resume_state = 'resuming' \
+                 WHERE migration_id = ? AND reaper_resume_state = 'pending'",
+            )
+            .bind(&row.migration_id)
+            .execute(&self.pool)
+            .await;
+            match claimed {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(
+                        migration_id = %row.migration_id,
+                        error = %e,
+                        "migration reaper: failed to claim pending resume"
+                    );
+                    continue;
+                }
+            }
+
             if let Err(e) = sqlx::query(
                 "UPDATE migrations SET reaper_resume_attempts = reaper_resume_attempts + 1 \
                  WHERE migration_id = ?",
@@ -619,6 +656,7 @@ impl MigrationReaper {
                 }
                 Ok(
                     outcome @ (ResumeOutcome::SkippedAgentCancelPending
+                    | ResumeOutcome::SkippedCancelSettling { .. }
                     | ResumeOutcome::SkippedSenderActive { .. }
                     | ResumeOutcome::SkippedSourceNodeNotReporting { .. }),
                 ) => {
@@ -648,23 +686,22 @@ impl MigrationReaper {
                 }
             };
 
-            if let Some(state) = state {
-                if let Err(e) = sqlx::query(
-                    "UPDATE migrations SET reaper_resume_state = ? \
-                     WHERE migration_id = ? AND reaper_resume_state = 'pending'",
-                )
-                .bind(state)
-                .bind(&row.migration_id)
-                .execute(&self.pool)
-                .await
-                {
-                    warn!(
-                        migration_id = %row.migration_id,
-                        state,
-                        error = %e,
-                        "migration reaper: failed to persist resume state"
-                    );
-                }
+            let final_state = state.unwrap_or("pending");
+            if let Err(e) = sqlx::query(
+                "UPDATE migrations SET reaper_resume_state = ? \
+                 WHERE migration_id = ? AND reaper_resume_state = 'resuming'",
+            )
+            .bind(final_state)
+            .bind(&row.migration_id)
+            .execute(&self.pool)
+            .await
+            {
+                warn!(
+                    migration_id = %row.migration_id,
+                    state = final_state,
+                    error = %e,
+                    "migration reaper: failed to persist resume state"
+                );
             }
         }
 
@@ -774,9 +811,12 @@ impl MigrationReaper {
         // 1. Confirm the reaper's transition actually won (or the migration was
         // already rolled back). Never resume a Completed migration: VM state
         // lives on the destination in that case.
-        let state: Option<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT phase, agent_cancel_pending, agent_cancel_last_error, reaper_resume_state \
-             FROM migrations WHERE migration_id = ?",
+        let state: Option<ResumeGateRow> = sqlx::query_as(
+            "SELECT phase, agent_cancel_pending, agent_cancel_last_error, \
+                        reaper_resume_state, \
+                        CAST((julianday('now') - julianday(agent_cancel_confirmed_at)) * 86400 \
+                             AS INTEGER) \
+                 FROM migrations WHERE migration_id = ?",
         )
         .bind(&row.migration_id)
         .fetch_optional(&self.pool)
@@ -787,15 +827,25 @@ impl MigrationReaper {
                 row.migration_id
             ),
         })?;
-        let (phase, agent_cancel_pending, agent_cancel_last_error, resume_state) = match state {
+        let (
+            phase,
+            agent_cancel_pending,
+            agent_cancel_last_error,
+            resume_state,
+            cancel_settle_secs,
+        ) = match state {
             Some(state) => state,
             None => return Ok(ResumeOutcome::SkippedMissing),
         };
         // A late agent-reported `Completed` (or another safety rule) may have
         // blocked this row after the resume snapshot was taken. Never resume
-        // underneath that decision. A NULL state is left to the caller's
-        // explicit eligibility check.
-        if matches!(resume_state.as_deref(), Some(state) if state != "pending") {
+        // underneath that decision. `pending` and `resuming` are the states
+        // this pass owns; a NULL state is left to the caller's explicit
+        // eligibility check.
+        if matches!(
+            resume_state.as_deref(),
+            Some(state) if state != "pending" && state != "resuming"
+        ) {
             return Ok(ResumeOutcome::SkippedResumeBlocked);
         }
         match phase.as_str() {
@@ -814,6 +864,18 @@ impl MigrationReaper {
         // at the earliest.
         if agent_cancel_pending != 0 {
             return Ok(ResumeOutcome::SkippedAgentCancelPending);
+        }
+        // Let the confirmed cancel settle for at least one report interval.
+        // The agent may still have a terminal progress report in its pending
+        // queue; resuming in the same tick would race it, and a late
+        // `Completed` would have blocked the resume.
+        if let Some(age) = cancel_settle_secs {
+            if age < AGENT_CANCEL_SETTLE_SECS {
+                return Ok(ResumeOutcome::SkippedCancelSettling {
+                    age_secs: age,
+                    required_secs: AGENT_CANCEL_SETTLE_SECS,
+                });
+            }
         }
         // A permanent refusal clears the pending flag (so the drain stops
         // retrying) but it is *not* a confirmation. The agent may still be
@@ -972,6 +1034,12 @@ enum ResumeOutcome {
     /// A detached agent task may still exist; the durable cancel has not been
     /// confirmed yet.
     SkippedAgentCancelPending,
+    /// The cancel is confirmed but has not settled long enough for the agent's
+    /// queued terminal report to arrive.
+    SkippedCancelSettling {
+        age_secs: i64,
+        required_secs: i64,
+    },
     /// The agent permanently refused the cancel, so confirmation is
     /// impossible. The task may still exist; block for operator review.
     SkippedAgentCancelRefused {
@@ -1000,12 +1068,18 @@ enum ResumeOutcome {
     SkippedMissing,
 }
 
+/// Gate inputs re-read at resume time: `(phase, agent_cancel_pending,
+/// agent_cancel_last_error, reaper_resume_state, seconds since the cancel was
+/// confirmed)`.
+type ResumeGateRow = (String, i64, Option<String>, Option<String>, Option<i64>);
+
 impl ResumeOutcome {
     fn reason(&self) -> &'static str {
         match self {
             Self::Resumed => "resumed",
             Self::SkippedNotTerminal { .. } => "not_terminal",
             Self::SkippedAgentCancelPending => "agent_cancel_pending",
+            Self::SkippedCancelSettling { .. } => "agent_cancel_settling",
             Self::SkippedAgentCancelRefused { .. } => "agent_cancel_refused",
             Self::SkippedSenderActive { .. } => "sender_active",
             Self::SkippedSourceNodeNotReporting { .. } => "source_node_not_reporting",
@@ -1102,6 +1176,22 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert migration");
+    }
+
+    fn stuck_row(id: &str) -> StuckMigrationRow {
+        StuckMigrationRow {
+            migration_id: id.to_string(),
+            operation_id: format!("op-{id}"),
+            vm_id: format!("vm-{id}"),
+            source_node_id: "source-node".to_string(),
+            phase: "Failed".to_string(),
+            started_at: "ignored".to_string(),
+            last_progress_at: "ignored".to_string(),
+            interrupted_from_phase: None,
+            interrupted_at: None,
+            started_age_secs: 10_800,
+            stalled_secs: 10_800,
+        }
     }
 
     async fn migration_phase(pool: &StorePool, id: &str) -> String {
@@ -1576,6 +1666,76 @@ mod tests {
                 required_secs: 90,
             },
             "the reaper must not resume while the sender may still be streaming"
+        );
+    }
+
+    /// A confirmed agent cancel must settle for one report interval before the
+    /// source may be resumed: the agent can still have a terminal progress
+    /// report queued, and a late `Completed` would have blocked the resume.
+    #[tokio::test]
+    async fn resume_source_vm_refuses_until_agent_cancel_settles() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "cancel-settling", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations \
+             SET agent_cancel_pending = 0, \
+                 agent_cancel_confirmed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), \
+                 reaper_resume_state = 'pending', reaper_stalled_secs = 10_800 \
+             WHERE migration_id = 'cancel-settling'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("confirm cancel just now");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let row = stuck_row("cancel-settling");
+        let outcome = reaper
+            .resume_source_vm(&row)
+            .await
+            .expect("a skipped resume is not an error");
+        assert!(
+            matches!(
+                outcome,
+                ResumeOutcome::SkippedCancelSettling {
+                    required_secs: 30,
+                    ..
+                }
+            ),
+            "a just-confirmed cancel must not be resumed in the same tick: {outcome:?}"
+        );
+    }
+
+    /// Once the settle window elapses the gate must fall through to the normal
+    /// safety checks (it must not block the resume forever).
+    #[tokio::test]
+    async fn resume_source_vm_proceeds_after_agent_cancel_settles() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "cancel-settled", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations \
+             SET agent_cancel_pending = 0, \
+                 agent_cancel_confirmed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 seconds'), \
+                 reaper_resume_state = 'pending', reaper_stalled_secs = 10_800 \
+             WHERE migration_id = 'cancel-settled'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("confirm cancel earlier");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let mut row = stuck_row("cancel-settled");
+        row.stalled_secs = 5;
+        let outcome = reaper
+            .resume_source_vm(&row)
+            .await
+            .expect("a skipped resume is not an error");
+        assert_eq!(
+            outcome,
+            ResumeOutcome::SkippedSenderActive {
+                last_progress_age_secs: 5,
+                required_secs: 90,
+            },
+            "a settled cancel must fall through to the sender-silence gate"
         );
     }
 

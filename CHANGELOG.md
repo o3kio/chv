@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a bounded grace if it has not exited. A task inside a Cloud Hypervisor
   send/receive transfer is not force-dropped (that would not stop the VMM
   transfer) and the RPC reports `Unavailable` so the control plane retries
-  instead of confirming. The reply confirms the task actually stopped
+  instead of confirming; the agent's own migration-call bound is now two hours
+  (was ten minutes, which could cut a legitimate large-VM transfer), and if
+  that bound does expire while Cloud Hypervisor may still be transferring, the
+  task is sealed as "outcome unknown" and stays tracked so a cancellation can
+  never be falsely confirmed. The reply confirms the task actually stopped
   (`Unavailable` keeps the row pending otherwise). A bounded
   registry tombstone aborts a delayed `MigrateVm` that registers after a
   `not_tracked` reply. The control plane queues cancellation durably in
@@ -42,7 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal keeps it paused for operator review). A `Completed` report that
   arrives after the row was terminalized `Failed`/`RolledBack` also blocks
   auto-resume: the detached agent may have finished the transfer, so the
-  destination could own the VM.
+  destination could own the VM. Even a confirmed cancel must settle for 30 s
+  (the agent's report interval) before the source is auto-resumed, so a queued
+  terminal report cannot race the resume. An agent-reported `Completed`
+  migration is finalized by resuming the destination VM first (pause-first
+  mode leaves it paused), recording any resume failure in `error_message` and
+  `chv_migration_destination_resume_failures_total` while still moving
+  placement; a failed resume is operator-visible instead of silently losing
+  the VM.
   Tests: agent UDS cancel service (tracked task aborted, cooperative
   cleanup before hard abort, stop-confirmation timeout, `not_tracked` retry,
   misrouted/empty-op refusal, missing-token refusal, core-managed refusal,
@@ -53,7 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotently and still moves placement),
   agent-reported terminal queueing, post-restart operator-cancel queueing,
   resume gating while a cancel is pending or permanently refused (and after a
-  late agent-reported `Completed` on a terminal row), real
+  late agent-reported `Completed` on a terminal row), the 30 s settle window,
+  destination resume before placement with a recorded resume failure, the
+  post-memory-migration decision, a sealed (outcome-unknown) transfer that can
+  never confirm a cancel, real
   `NodeClient` invalid-argument preservation, and reaper drains for both
   endpoints, `not_tracked`, partial/unreachable retry (including a permanent
   refusal alongside a retryable endpoint), token attachment, bad token,

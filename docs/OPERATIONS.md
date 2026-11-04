@@ -622,18 +622,31 @@ agents aborted their detached task (or reported `not_tracked` because the agent
 restarted). A cancel that arrives while a task is inside the Cloud Hypervisor
 send/receive transfer cannot be confirmed immediately: the agent does not
 force-drop that future and returns `Unavailable`, leaving the row pending for a
-later drain. A non-NULL `agent_cancel_last_error` means the agent refused
+later drain. If the agent's own VMM call bound expires while Cloud Hypervisor
+may still be transferring, the task is sealed as "outcome unknown" and remains
+tracked, so cancellation stays unconfirmable until the agent is restarted and
+an operator verifies the VM (`agent_cancel_pending = 1`). A non-NULL
+`agent_cancel_last_error` means the agent refused
 permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
 invalid request); the detached task may still exist, so verify placement and
 the agent process before resuming the source VM. The
 reaper will not auto-resume a source VM while `agent_cancel_pending = 1`, nor
 when `agent_cancel_last_error` records a permanent refusal (the task may still
-be running). It also refuses when a late `Completed` report arrived after the
+be running). A confirmed cancel must also settle for 30 s before the resume
+pass acts, so a terminal progress report still queued on the agent cannot race
+the resume. It also refuses when a late `Completed` report arrived after the
 row was terminalized `Failed`/`RolledBack` (`reaper_resume_state = 'blocked'`):
 the detached agent may have completed the transfer, so the destination could
 own the VM. Only requeue (`agent_cancel_pending = 1`,
 `agent_cancel_last_error = NULL`) after the node has been upgraded or verified
 idle.
+
+A successful pause-first migration can leave the destination VM paused. When
+the source agent reports `Completed`, the control plane resumes the destination
+before moving placement. If every resume attempt fails, placement still moves
+(the VM state is on the destination) but `migrations.error_message` records the
+failure and `chv_migration_destination_resume_failures_total` increments;
+resume that VM on the destination manually rather than on the source.
 
 The startup log line `migration restart recovery completed` reports
 `reconciled`, `already_terminal`, and `unresolved` counts; reconciliation also
