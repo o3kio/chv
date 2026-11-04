@@ -302,28 +302,42 @@ impl MigrationReaper {
             }
 
             if let Some(reason) = permanent {
-                // Keep the reason operator-visible, but never claim success:
-                // `agent_cancel_confirmed_at` is deliberately left NULL.
-                if let Err(e) = repo.abandon_agent_cancel(&row.migration_id, &reason).await {
+                if retry {
+                    // At least one endpoint still owes an attempt (it was
+                    // unreachable/timed out). Parking now would abandon a
+                    // detached task that a later attempt could still cancel.
                     warn!(
                         migration_id = %row.migration_id,
-                        error = %e,
-                        "migration reaper: failed to park permanently refused agent cancel"
+                        operation_id = %row.operation_id,
+                        attempts = row.agent_cancel_attempts + 1,
+                        reason = %reason,
+                        "migration reaper: one agent permanently refused the cancel but another endpoint is retryable; keeping the row pending"
                     );
+                } else {
+                    // Keep the reason operator-visible, but never claim
+                    // success: `agent_cancel_confirmed_at` is deliberately
+                    // left NULL.
+                    if let Err(e) = repo.abandon_agent_cancel(&row.migration_id, &reason).await {
+                        warn!(
+                            migration_id = %row.migration_id,
+                            error = %e,
+                            "migration reaper: failed to park permanently refused agent cancel"
+                        );
+                    }
+                    metrics::counter!(
+                        "chv_migration_agent_cancel_failures_total",
+                        "reason" => "permanent"
+                    )
+                    .increment(1);
+                    warn!(
+                        migration_id = %row.migration_id,
+                        operation_id = %row.operation_id,
+                        attempts = row.agent_cancel_attempts + 1,
+                        reason = %reason,
+                        "migration reaper: agent permanently refused the cancel; parking row for operator review"
+                    );
+                    continue;
                 }
-                metrics::counter!(
-                    "chv_migration_agent_cancel_failures_total",
-                    "reason" => "permanent"
-                )
-                .increment(1);
-                warn!(
-                    migration_id = %row.migration_id,
-                    operation_id = %row.operation_id,
-                    attempts = row.agent_cancel_attempts + 1,
-                    reason = %reason,
-                    "migration reaper: agent permanently refused the cancel; parking row for operator review"
-                );
-                continue;
             }
 
             if retry {
@@ -1173,6 +1187,18 @@ mod tests {
         assert_eq!(stalled_secs, Some(3_600));
         assert!(attempts >= 1, "the reap tick must attempt the resume");
 
+        // The reap ends control-plane ownership, so both detached agent tasks
+        // must be queued for cancellation. The test socket is absent, so the
+        // drain keeps the row pending rather than claiming a false success.
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT agent_cancel_pending FROM migrations WHERE migration_id = ?",
+        )
+        .bind("stalled")
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read agent cancel pending");
+        assert_eq!(pending, 1, "the reaper must queue the agent-side cancel");
+
         reaper
             .reap_stuck_migrations()
             .await
@@ -1887,6 +1913,42 @@ mod tests {
         source_server.abort();
     }
 
+    /// A permanent refusal on one endpoint must not short-circuit the other
+    /// endpoint's retry: that task may still be cancellable, so the row stays
+    /// pending until every endpoint has either confirmed or refused.
+    #[tokio::test]
+    async fn drain_keeps_pending_when_other_endpoint_is_still_retryable() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "partial-permanent").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pattern, source_socket, _dest_socket) = per_node_pattern(dir.path());
+        let source_state = Arc::new(FakeCancelState {
+            unimplemented: true,
+            ..FakeCancelState::default()
+        });
+        let source_server = spawn_cancel_agent(&source_socket, source_state);
+        let reaper = MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern);
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("drain is best-effort");
+
+        let (pending, confirmed_at, _attempts, last_error) =
+            cancel_state(&test_db.pool, "partial-permanent").await;
+        assert_eq!(
+            pending, 1,
+            "a retryable endpoint still owes an attempt; the row must stay queued"
+        );
+        assert!(confirmed_at.is_none());
+        assert!(
+            last_error.is_none(),
+            "the row must not be parked while an endpoint can still be retried"
+        );
+        source_server.abort();
+    }
+
     /// A permanent refusal (`Unimplemented`: core-managed or pre-#656 agent)
     /// must not retry forever or masquerade as a confirmed cancel.
     #[tokio::test]
@@ -2097,11 +2159,25 @@ mod tests {
 
         let cancel_token = CancellationToken::new();
         let task = tokio::spawn(std::future::pending::<()>());
+        agent
+            .migration_tasks
+            .set_cancel_grace(Duration::from_millis(50));
         agent.migration_tasks.insert(
             "op-e2e".to_string(),
             task.abort_handle(),
             cancel_token.clone(),
         );
+
+        // Model the production completion reaper: the registry entry is
+        // removed only after the future resolves. The served RPC waits for
+        // that before confirming, so the drain must succeed promptly.
+        let registry = agent.migration_tasks.clone();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = task.await;
+            registry.remove("op-e2e");
+            let _ = finished_tx.send(result);
+        });
 
         let reaper = MigrationReaper::new(
             test_db.pool.clone(),
@@ -2122,8 +2198,9 @@ mod tests {
         assert_eq!(attempts, 1);
         assert!(last_error.is_none());
         assert!(cancel_token.is_cancelled());
-        assert!(task
+        assert!(finished_rx
             .await
+            .expect("completion reaper")
             .expect_err("tracked task must be aborted")
             .is_cancelled());
     }

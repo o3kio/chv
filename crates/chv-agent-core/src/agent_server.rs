@@ -3839,6 +3839,12 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
     }
 }
 
+/// How long `CancelMigration` waits for the task to actually exit before it
+/// reports failure. The control plane's per-call bound is 5 s, so stay below
+/// it; the registry's own grace window is shorter, leaving time for the
+/// task's completion reaper to remove the entry.
+const MIGRATION_CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// `MigrateVm` is fire-and-forget: the agent ACKs immediately and runs the
 /// migration on a detached task. When the control plane loses ownership
 /// (restart, reaper, rollback, operator cancel) it has no other way to abort
@@ -3884,6 +3890,28 @@ impl proto::migration_control_service_server::MigrationControlService for AgentS
         // task already finished, or this agent restarted. Both are success
         // for the caller: there is nothing left to cancel.
         let cancelled = self.cancel_migration(&inner.operation_id);
+        if cancelled
+            && !self
+                .migration_tasks
+                .wait_until_stopped(&inner.operation_id, MIGRATION_CANCEL_CONFIRM_TIMEOUT)
+                .await
+        {
+            // Do not report a cancel the caller could act on (the control
+            // plane unpauses the source VM only after a confirmed cancel)
+            // while the detached task may still be alive. The durable retry
+            // queue will call again.
+            warn!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                timeout_secs = MIGRATION_CANCEL_CONFIRM_TIMEOUT.as_secs(),
+                "migration cancel signalled but the task did not stop in time"
+            );
+            return Err(Status::unavailable(format!(
+                "migration task {} did not stop within {}s",
+                inner.operation_id,
+                MIGRATION_CANCEL_CONFIRM_TIMEOUT.as_secs()
+            )));
+        }
         let outcome = if cancelled {
             "cancelled"
         } else {
@@ -4035,6 +4063,12 @@ mod tests {
         ))
         .await;
 
+        // Keep the test fast while still exercising the cooperative-grace
+        // path; the production value is 2 s.
+        server
+            .migration_tasks
+            .set_cancel_grace(Duration::from_millis(50));
+
         let cancel_token = CancellationToken::new();
         let task = tokio::spawn(std::future::pending::<()>());
         server.migration_tasks.insert(
@@ -4042,6 +4076,17 @@ mod tests {
             task.abort_handle(),
             cancel_token.clone(),
         );
+
+        // Model the production completion reaper: the registry entry is
+        // removed only after the future resolves. `CancelMigration` waits for
+        // that, so `cancelled=true` means the task actually exited.
+        let registry = server.migration_tasks.clone();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = task.await;
+            registry.remove("op-live");
+            let _ = finished_tx.send(result);
+        });
 
         let mut client = connect_migration_control(&socket).await;
         let response = client
@@ -4055,15 +4100,11 @@ mod tests {
         assert!(response.cancelled);
         assert_eq!(response.outcome, "cancelled");
         assert!(cancel_token.is_cancelled());
-        assert!(task
+        assert!(finished_rx
             .await
+            .expect("completion reaper")
             .expect_err("tracked task must be aborted")
             .is_cancelled());
-
-        // The production reaper removes the registry entry when the task's
-        // future ends. This test inserted the entry directly, so model that
-        // completion here; the retry then exercises the agent-restart case.
-        server.migration_tasks.remove("op-live");
 
         // A retry must be a benign `not_tracked`, not an error (the agent
         // restart case: the task is already gone).

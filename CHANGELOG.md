@@ -14,10 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale row, the state machine rolls back, or an operator cancels an
   already-terminal row. Nothing could abort those orphans. The wire now has
   `MigrationControlService.CancelMigration` (agent-served; rejects a request
-  naming another node and refuses core-managed mode), which signals the task's
-  cancellation token and abort handle by `operation_id`. A bounded registry
-  tombstone aborts a delayed `MigrateVm` that registers after a `not_tracked`
-  reply. The control plane queues cancellation durably in
+  naming another node and refuses core-managed mode), which flips the task's
+  cancellation token so it can resume a paused source VM, then force-aborts it
+  after a bounded grace if it has not exited. The reply confirms the task
+  actually stopped (`Unavailable` keeps the row pending otherwise). A bounded
+  registry tombstone aborts a delayed `MigrateVm` that registers after a
+  `not_tracked` reply. The control plane queues cancellation durably in
   `migrations.agent_cancel_pending` (migration `0070`; plus
   `agent_cancel_confirmed_at`, `agent_cancel_attempts`,
   `agent_cancel_last_attempt_at`, `agent_cancel_last_error`) on every terminal
@@ -32,16 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued and rotate it behind untouched rows via the attempt timestamp. A
   permanent refusal (`Unimplemented` on a core-managed/pre-#656 agent,
   `InvalidArgument` for a misroute) is parked in `agent_cancel_last_error`
-  instead of retrying forever, and the source VM is not auto-resumed until the
-  cancel is confirmed (a parked refusal keeps it paused for operator review).
-  Tests: agent UDS cancel service (tracked task aborted,
-  `not_tracked` retry, misrouted/empty-op refusal, missing-token refusal,
-  core-managed refusal, late-registration tombstone), store queue/confirm/
-  attempt/batch/fairness semantics, terminal-transition and terminal-race
-  queueing, agent-reported terminal queueing, post-restart operator-cancel
-  queueing, resume gating while a cancel is pending, and reaper drains for both
-  endpoints, `not_tracked`, partial/unreachable retry, token attachment, bad
-  token, timeout, connect stall, and permanent refusal. Refs #656.
+  once no endpoint remains retryable, instead of retrying forever, and the
+  source VM is not auto-resumed until the cancel is confirmed (a parked
+  refusal keeps it paused for operator review).
+  Tests: agent UDS cancel service (tracked task aborted, cooperative
+  cleanup before hard abort, stop-confirmation timeout, `not_tracked` retry,
+  misrouted/empty-op refusal, missing-token refusal, core-managed refusal,
+  late-registration tombstone), store queue/confirm/attempt/batch/fairness
+  semantics and parked-error reset, terminal-transition and terminal-race
+  queueing, completion refusal for terminal/cancel-pending rows,
+  agent-reported terminal queueing, post-restart operator-cancel queueing,
+  resume gating while a cancel is pending or permanently refused, real
+  `NodeClient` invalid-argument preservation, and reaper drains for both
+  endpoints, `not_tracked`, partial/unreachable retry (including a permanent
+  refusal alongside a retryable endpoint), token attachment, bad token,
+  timeout, connect stall, and permanent refusal. Refs #656.
 - **migration (direct-gRPC stop-the-world gate + dispatch config — #656)**:
   `LifecycleService::migrate_vm` is reachable directly, not only through the
   BFF/CLI, and previously accepted `pause_first=false` there. It now rejects

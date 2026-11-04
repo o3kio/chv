@@ -620,8 +620,9 @@ WHERE migration_id = '<MIGRATION_ID>';
 cancel yet. `agent_cancel_confirmed_at IS NOT NULL` with a NULL error means both
 agents aborted their detached task (or reported `not_tracked` because the agent
 restarted). A non-NULL `agent_cancel_last_error` means the agent refused
-permanently (core-managed or pre-#656 agent); the detached task may still exist,
-so verify placement and the agent process before resuming the source VM. The
+permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
+invalid request); the detached task may still exist, so verify placement and
+the agent process before resuming the source VM. The
 reaper will not auto-resume a source VM while `agent_cancel_pending = 1`, nor
 when `agent_cancel_last_error` records a permanent refusal (the task may still
 be running). Only requeue (`agent_cancel_pending = 1`,
@@ -903,7 +904,7 @@ counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`)
 | `chv_migration_progress_dropped_total` | Counter | Late progress reports dropped after a terminal transition, labelled by `stored_phase` and `reported_phase`; `reported_phase="Completed"` after recovery is especially important |
 | `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`agent_cancel_pending`, `agent_cancel_refused`, `sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
 | `chv_migration_agent_cancel_total` | Counter | Detached agent migration tasks signalled, labelled by `outcome` (`cancelled`, `not_tracked`); `not_tracked` is success (agent restarted / task already finished) |
-| `chv_migration_agent_cancel_failures_total` | Counter | Agent cancel attempts that did not confirm, labelled by `reason` (`unreachable`, `connect_timeout`, `timeout`, `rpc_error`, `permanent`); `permanent` parks the row in `agent_cancel_last_error` |
+| `chv_migration_agent_cancel_failures_total` | Counter | Agent cancel attempts that did not confirm, labelled by `reason` (`resolve_error`, `unreachable`, `connect_timeout`, `timeout`, `rpc_error`, `permanent`); `permanent` parks the row in `agent_cancel_last_error` |
 
 **Expected phase durations** (100GB disk, 16GB RAM):
 

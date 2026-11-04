@@ -2166,12 +2166,18 @@ async fn complete_migration_atomically(
         reason: format!("failed to begin transaction for migration completion: {e}"),
     })?;
 
-    sqlx::query(
+    // Only the current non-terminal owner may complete the migration. A
+    // reaper/operator/recovery terminal transition (or a queued agent cancel)
+    // means another actor ended control-plane ownership; resurrecting the row
+    // would hide that outcome and strand the cancellation.
+    let updated = sqlx::query(
         r#"UPDATE migrations
            SET phase = 'Completed',
                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-           WHERE migration_id = ?"#,
+           WHERE migration_id = ?
+             AND phase NOT IN ('Completed', 'Failed', 'RolledBack')
+             AND agent_cancel_pending = 0"#,
     )
     .bind(&state.migration_id)
     .execute(&mut *tx)
@@ -2179,6 +2185,14 @@ async fn complete_migration_atomically(
     .map_err(|e| ChvError::Internal {
         reason: format!("failed to mark migration completed: {e}"),
     })?;
+    if updated.rows_affected() != 1 {
+        return Err(ChvError::Internal {
+            reason: format!(
+                "migration {} is no longer owned by this task (terminal or cancel pending); refusing to mark it Completed",
+                state.migration_id
+            ),
+        });
+    }
 
     sqlx::query("UPDATE vm_desired_state SET target_node_id = ? WHERE vm_id = ?")
         .bind(&state.dest_node_id)
@@ -2945,6 +2959,75 @@ mod tests {
         );
     }
 
+    /// A terminal (or cancel-pending) row must not be marked `Completed`:
+    /// another actor owns the outcome, and flipping it would hide the failure
+    /// and strand the queued agent cancel. Placement must stay untouched.
+    #[tokio::test]
+    async fn completion_refuses_terminal_or_cancel_pending_rows() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "complete-failed", "Failed", -10).await;
+        seed_migration_row(&test_db.pool, "complete-pending", "ConvergingDisk", -10).await;
+        sqlx::query(
+            "UPDATE migrations SET agent_cancel_pending = 1 WHERE migration_id = 'mig-complete-pending'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("queue agent cancel");
+        for node in ["node-a", "node-b"] {
+            sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES (?, ?, ?)")
+                .bind(node)
+                .bind(node)
+                .bind(node)
+                .execute(&test_db.pool)
+                .await
+                .expect("seed node");
+        }
+
+        for (suffix, expected_phase) in [
+            ("complete-failed", "Failed"),
+            ("complete-pending", "ConvergingDisk"),
+        ] {
+            let vm_id = format!("vm-{suffix}");
+            sqlx::query(
+                "INSERT INTO vm_desired_state (vm_id, desired_generation, target_node_id) \
+                 VALUES (?, 1, 'node-a')",
+            )
+            .bind(&vm_id)
+            .execute(&test_db.pool)
+            .await
+            .expect("seed placement");
+
+            let mut state = migration_state_for(&vm_id);
+            state.migration_id = format!("mig-{suffix}");
+            state.operation_id = format!("op-{suffix}");
+            state.dest_node_id = "node-b".to_string();
+
+            complete_migration_atomically(&test_db.pool, &mut state)
+                .await
+                .expect_err("a non-owned row must not complete");
+
+            let (phase, target): (String, String) = sqlx::query_as(
+                "SELECT m.phase, d.target_node_id \
+                 FROM migrations m JOIN vm_desired_state d ON d.vm_id = m.vm_id \
+                 WHERE m.migration_id = ?",
+            )
+            .bind(format!("mig-{suffix}"))
+            .fetch_one(&test_db.pool)
+            .await
+            .expect("read phase and placement");
+            assert_eq!(phase, expected_phase, "the terminal row must not change");
+            assert_eq!(
+                target, "node-a",
+                "placement must not move for a row this task does not own"
+            );
+            assert_eq!(
+                state.phase,
+                MigrationPhase::Pending,
+                "the in-memory state must not claim completion"
+            );
+        }
+    }
+
     /// An operator cancel of a fresh terminal `Failed`/`RolledBack` row queues
     /// the detached-task cancel even when restart recovery did not run.
     /// `Completed` stays a true no-op.
@@ -2982,6 +3065,56 @@ mod tests {
             .expect("read agent cancel pending");
             assert_eq!(pending, expected, "unexpected queueing for {id}");
         }
+    }
+
+    /// If the migration reaches a terminal failure between the operator
+    /// cancel's phase read and its flag update, the cancel is still queued for
+    /// the detached agent task. A regression that only returned
+    /// `AlreadyTerminal` would strand the task.
+    #[tokio::test]
+    async fn operator_cancel_losing_to_terminal_transition_still_queues_agent_cancel() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "cancel-race", "ConvergingDisk", -10).await;
+
+        // Make the row terminal at the exact moment the cancel tries to set
+        // `cancel_requested_at`, then ignore that flag write (the same
+        // RAISE(IGNORE) pattern as `simulate_progress_race`).
+        sqlx::query(
+            r#"CREATE TRIGGER simulate_terminal_cancel_race
+               BEFORE UPDATE OF cancel_requested_at ON migrations
+               WHEN OLD.migration_id = 'mig-cancel-race'
+               BEGIN
+                   UPDATE migrations
+                      SET phase = 'Failed',
+                          completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                    WHERE migration_id = OLD.migration_id;
+                   SELECT RAISE(IGNORE);
+               END"#,
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("create terminal-race trigger");
+
+        assert_eq!(
+            request_migration_cancel(&test_db.pool, "mig-cancel-race")
+                .await
+                .expect("cancel race"),
+            CancelMigrationOutcome::AlreadyTerminal
+        );
+
+        let (phase, pending, confirmed): (String, i64, Option<String>) = sqlx::query_as(
+            "SELECT phase, agent_cancel_pending, agent_cancel_confirmed_at \
+             FROM migrations WHERE migration_id = 'mig-cancel-race'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read raced row");
+        assert_eq!(phase, "Failed");
+        assert_eq!(
+            pending, 1,
+            "losing the race to a terminal transition must still queue the agent cancel"
+        );
+        assert!(confirmed.is_none(), "queueing is not a confirmation");
     }
 
     /// A terminal phase reported by the agent itself also ends control-plane

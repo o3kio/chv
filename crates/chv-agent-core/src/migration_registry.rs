@@ -23,14 +23,16 @@
 //! - Each tracked migration registers an `AbortHandle` keyed by `operation_id`.
 //! - A reaper task removes the entry when the future completes, regardless of
 //!   `Ok` / `Err` / panic / abort.
-//! - `cancel(op_id)` triggers the `AbortHandle`. The `CancellationToken`
-//!   companion (passed into the migration future) gives the future a chance
-//!   to unwind cleanly at phase boundaries before the abort hits an `.await`.
+//! - `cancel(op_id)` flips the `CancellationToken` first, waits a bounded
+//!   grace window, then triggers the `AbortHandle`. The grace lets the future
+//!   unwind at a phase boundary (and resume a VM it paused) instead of being
+//!   dropped mid-cleanup.
 //! - The registry is stored as `Arc<MigrationTaskRegistry>` inside `AgentServer`.
 //!   When the last `AgentServer` clone drops, the inner `Drop` aborts every
 //!   tracked task — the agent's "graceful shutdown" entry point.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
@@ -45,6 +47,17 @@ const CANCELLED_OP_TOMBSTONE_TTL: Duration = Duration::from_secs(600);
 
 /// Bound the tombstone map so a misbehaving caller cannot grow it forever.
 const MAX_CANCELLED_OP_TOMBSTONES: usize = 256;
+
+/// How long a cancelled task gets to observe the cancellation token and run
+/// its cleanup (notably `PausedVmGuard::resume_if_paused`) before the registry
+/// force-drops the future. Aborting immediately would strand a VM paused for
+/// the disk pre-copy handshake, because the guard lives inside the task.
+const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+/// How often `wait_until_stopped` re-checks the registry. The production
+/// reaper removes the entry in a separate task after the future resolves, so a
+/// short poll is simpler (and race-free) than a completion primitive.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A handle for a single tracked migration.
 struct TrackedTask {
@@ -88,15 +101,36 @@ impl RegistryState {
 }
 
 /// Tracks the abort/cancel handles of every in-flight migration task.
-#[derive(Default)]
 pub struct MigrationTaskRegistry {
     inner: Mutex<RegistryState>,
+    /// Cooperative-cleanup window before the hard abort (millis). Tests set a
+    /// short value; production keeps [`DEFAULT_CANCEL_GRACE`].
+    cancel_grace_millis: AtomicU64,
+}
+
+impl Default for MigrationTaskRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(RegistryState::default()),
+            cancel_grace_millis: AtomicU64::new(DEFAULT_CANCEL_GRACE.as_millis() as u64),
+        }
+    }
 }
 
 impl MigrationTaskRegistry {
     /// Create a new, empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Override the cooperative-cleanup window (tests only).
+    pub fn set_cancel_grace(&self, grace: Duration) {
+        self.cancel_grace_millis
+            .store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn cancel_grace(&self) -> Duration {
+        Duration::from_millis(self.cancel_grace_millis.load(Ordering::Relaxed))
     }
 
     /// Insert a tracked task. Replaces any existing entry with the same
@@ -135,9 +169,10 @@ impl MigrationTaskRegistry {
 
     /// Cancel the migration task associated with `op_id`.
     ///
-    /// Triggers both the `CancellationToken` (so the future can unwind at the
-    /// next phase boundary) and the `AbortHandle` (so the future is force-dropped
-    /// at the next `.await` if it doesn't honor the token quickly).
+    /// Flips the `CancellationToken` first so a cancel-aware future can unwind
+    /// at its next phase boundary (and, on the source, best-effort resume a VM
+    /// it paused). After [`DEFAULT_CANCEL_GRACE`] the `AbortHandle` force-drops
+    /// the future so a future that ignores the token cannot run forever.
     ///
     /// Returns `true` if a task was found and signalled. When no task exists a
     /// bounded tombstone is recorded so a late registration is aborted too;
@@ -145,12 +180,44 @@ impl MigrationTaskRegistry {
     pub fn cancel(&self, op_id: &str) -> bool {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.remember_cancelled(op_id);
-        if let Some(task) = guard.tasks.get(op_id) {
-            task.cancel_token.cancel();
-            task.abort.abort();
-            true
-        } else {
-            false
+        let Some(task) = guard.tasks.get(op_id) else {
+            return false;
+        };
+        task.cancel_token.cancel();
+        let abort = task.abort.clone();
+        drop(guard);
+
+        let grace = self.cancel_grace();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(grace).await;
+                    abort.abort();
+                });
+            }
+            // No runtime (sync caller/test utility): keep the old hard-abort
+            // behavior; the cooperative signal has already been sent.
+            Err(_) => abort.abort(),
+        }
+        true
+    }
+
+    /// Wait until `op_id` is no longer tracked, up to `timeout`.
+    ///
+    /// `CancelMigration` uses this so a `cancelled=true` response means the
+    /// task actually exited (including its cleanup), not merely that a signal
+    /// was queued. The production reaper removes the entry after the future
+    /// resolves; aborted futures resolve promptly, so this is bounded.
+    pub async fn wait_until_stopped(&self, op_id: &str, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !self.contains(op_id) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(STOP_POLL_INTERVAL).await;
         }
     }
 
@@ -390,6 +457,98 @@ mod tests {
             registry.insert("op-poison-test".to_string(), abort_handle, ct);
             assert_eq!(registry.len(), 1);
         });
+    }
+
+    /// The cancellation token must be observed before the hard abort, so a
+    /// future can run its cleanup (e.g. `PausedVmGuard::resume_if_paused`).
+    #[tokio::test]
+    async fn cancel_runs_cooperative_cleanup_before_hard_abort() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        // Long enough that the hard abort cannot race this test.
+        registry.set_cancel_grace(Duration::from_secs(30));
+
+        let token = CancellationToken::new();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let token_for_task = token.clone();
+        let cleaned_for_task = cleaned.clone();
+        let handle = tokio::spawn(async move {
+            token_for_task.cancelled().await;
+            cleaned_for_task.store(true, Ordering::SeqCst);
+        });
+        registry.insert("op-coop".to_string(), handle.abort_handle(), token.clone());
+
+        let reg_for_reap = registry.clone();
+        tokio::spawn(async move {
+            let _ = handle.await;
+            reg_for_reap.remove("op-coop");
+        });
+
+        assert!(registry.cancel("op-coop"));
+        assert!(
+            registry
+                .wait_until_stopped("op-coop", Duration::from_secs(2))
+                .await,
+            "cooperative exit must be observed"
+        );
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup must run before any force-abort"
+        );
+    }
+
+    /// A future that ignores the token must not keep `CancelMigration`
+    /// waiting forever: `wait_until_stopped` is bounded and returns false.
+    #[tokio::test]
+    async fn wait_until_stopped_times_out_for_unresponsive_task() {
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        registry.set_cancel_grace(Duration::from_secs(60));
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        registry.insert(
+            "op-wedged".to_string(),
+            handle.abort_handle(),
+            CancellationToken::new(),
+        );
+        assert!(registry.cancel("op-wedged"));
+        assert!(
+            !registry
+                .wait_until_stopped("op-wedged", Duration::from_millis(100))
+                .await,
+            "a still-running task must report a timeout"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        registry.remove("op-wedged");
+    }
+
+    /// The tombstone is both bounded and time-limited.
+    #[test]
+    fn tombstone_is_bounded_and_expires() {
+        let mut state = RegistryState::default();
+        for i in 0..300 {
+            state.remember_cancelled(&format!("op-{i}"));
+        }
+        assert!(
+            state.cancelled.len() <= MAX_CANCELLED_OP_TOMBSTONES,
+            "tombstone map must stay bounded: {}",
+            state.cancelled.len()
+        );
+
+        let stale = Instant::now()
+            .checked_sub(CANCELLED_OP_TOMBSTONE_TTL + Duration::from_secs(1))
+            .expect("platform clock supports the test TTL");
+        state.cancelled.insert("op-stale".to_string(), stale);
+        assert!(
+            !state.take_fresh_cancelled("op-stale"),
+            "an expired tombstone must not abort a late registration"
+        );
+
+        state.remember_cancelled("op-fresh");
+        assert!(state.take_fresh_cancelled("op-fresh"));
+        assert!(!state.take_fresh_cancelled("op-fresh"));
     }
 
     /// A cancel that arrives before a delayed `MigrateVm` registers its task

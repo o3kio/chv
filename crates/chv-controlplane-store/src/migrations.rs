@@ -821,5 +821,16 @@ mod tests {
             last_error.as_deref(),
             Some("agent does not implement CancelMigration")
         );
+
+        // An operator requeue after abandonment is a fresh cancel: the parked
+        // error must clear, otherwise the resume gate would stay blocked even
+        // after a retry confirms.
+        assert!(repo
+            .mark_agent_cancel_pending("row-00")
+            .await
+            .expect("requeue abandoned row"));
+        let row = repo.get("row-00").await.unwrap().unwrap();
+        assert_eq!(row.agent_cancel_pending, 1);
+        assert!(row.agent_cancel_last_error.is_none());
     }
 }

@@ -593,10 +593,12 @@ service LifecycleService {
     returns (AckResponse);
 }
 
-// Control-plane → source-agent cancellation of a detached migration task.
+// Control-plane → agent cancellation of a detached migration task.
 //
-// `MigrateVm` is fire-and-forget: the agent ACKs immediately and runs the
-// migration on a detached task. When the control-plane state machine goes
+// `MigrateVm` is fire-and-forget: the source agent ACKs immediately and runs
+// the migration on a detached task, while the destination agent runs a
+// matching receive task. Either can outlive control-plane ownership, so the
+// reaper signals both endpoints. When the control-plane state machine goes
 // away (restart) or terminalizes a row without the agent task stopping, this
 // RPC is the only way to abort the surviving task. It is best-effort and
 // idempotent: `cancelled=false` means no task was tracked (for example the
@@ -737,9 +739,9 @@ message MigrationVolumeAuthorization {
 
 message CancelMigrationRequest {
   RequestMeta meta = 1;
-  // Source node the migration task runs on. The agent rejects a request that
-  // names a different node, so a misrouted cancel cannot abort another node's
-  // task.
+  // Agent the migration task may run on (source or destination). The agent
+  // rejects a request that names a different node, so a misrouted cancel
+  // cannot abort another node's task.
   string node_id = 2;
   // The `operation_id` from the original `MigrateVm` request: the agent keys
   // detached migration tasks by it.

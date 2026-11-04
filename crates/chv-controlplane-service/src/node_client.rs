@@ -166,14 +166,21 @@ where
             // explanation (e.g. "snapshot_volume is unsupported in
             // core-managed mode") still rides the error. Every other tonic
             // code flattens exactly as before.
-            if e.code() == tonic::Code::Unimplemented {
-                ChvError::Unimplemented {
+            match e.code() {
+                tonic::Code::Unimplemented => ChvError::Unimplemented {
                     reason: format!("{method} failed: {e}"),
-                }
-            } else {
-                ChvError::Internal {
+                },
+                // A misrouted/rejected request is permanent too. The
+                // migration reaper parks such a cancel instead of retrying
+                // forever, which only works if the code survives the
+                // flattening below.
+                tonic::Code::InvalidArgument => ChvError::InvalidArgument {
+                    field: method.to_string(),
                     reason: format!("{method} failed: {e}"),
-                }
+                },
+                _ => ChvError::Internal {
+                    reason: format!("{method} failed: {e}"),
+                },
             }
         })
         .map(|r| r.into_inner())
@@ -1917,6 +1924,56 @@ mod tests {
             .metadata()
             .get(chv_common::NODE_AUTH_METADATA_KEY)
             .is_none());
+    }
+
+    /// The reaper parks a cancel that the agent rejects as `InvalidArgument`
+    /// instead of retrying it forever. That branch is only reachable if
+    /// `with_timeout` preserves the tonic code through the real client stack.
+    #[tokio::test]
+    async fn cancel_migration_preserves_invalid_argument_refusal() {
+        use control_plane_node_api::control_plane_node_api as proto;
+        use tonic::transport::Server;
+
+        struct InvalidCancel;
+
+        #[tonic::async_trait]
+        impl proto::migration_control_service_server::MigrationControlService for InvalidCancel {
+            async fn cancel_migration(
+                &self,
+                _request: tonic::Request<proto::CancelMigrationRequest>,
+            ) -> Result<tonic::Response<proto::CancelMigrationResponse>, tonic::Status>
+            {
+                Err(tonic::Status::invalid_argument(
+                    "this node is not the migration target",
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind agent uds");
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(
+                    proto::migration_control_service_server::MigrationControlServiceServer::new(
+                        InvalidCancel,
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+        });
+
+        let mut client = super::NodeClient::connect(&socket)
+            .await
+            .expect("connect to mock agent");
+        let err = client
+            .cancel_migration("node-1", "op-1", "mig-1")
+            .await
+            .expect_err("invalid argument must surface as an error");
+        assert!(
+            matches!(err, chv_errors::ChvError::InvalidArgument { .. }),
+            "a permanent refusal must not flatten to Internal: {err:?}"
+        );
     }
 
     /// #513 PR 1 (DP2/DP3, the dispatch-carrier producer): the create
