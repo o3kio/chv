@@ -69,7 +69,7 @@ jobs:
     name: Host diagnostic (branch-only)
     runs-on: [self-hosted, linux, x64, chv-kvm]
     timeout-minutes: 15
-    if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only == 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only == true
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
@@ -95,7 +95,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, chv-kvm]
     timeout-minutes: 240
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.diagnose_only != 'true' && inputs.lane == 'chaos') ||
+      (github.event_name == 'workflow_dispatch' && inputs.diagnose_only != true && inputs.lane == 'chaos') ||
       (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
     env:
       CHV_QUAL_ROOT: /var/lib/chv/qual
@@ -188,7 +188,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, chv-kvm]
     timeout-minutes: 720
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.diagnose_only != 'true' && inputs.lane == 'full') ||
+      (github.event_name == 'workflow_dispatch' && inputs.diagnose_only != true && inputs.lane == 'full') ||
       (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1')
     env:
       CHV_QUAL_ROOT: /var/lib/chv/qual
