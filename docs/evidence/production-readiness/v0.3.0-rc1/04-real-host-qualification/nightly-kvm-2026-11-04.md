@@ -367,6 +367,12 @@ Branch `fix/659-qual-auth` (based on `a4da490d`):
     and still assert the transport-failure text, zero bytes, and no
     destination volume; the older accepted-then-`FAILED` shape remains
     accepted.
+13. **Workspace ownership before checkout.** Both lanes now `chown` the
+    workspace back to the runner user before `actions/checkout`, so
+    root-owned residue from an interrupted root build (a legacy
+    `target/.rustc_info.json` in run 41932222532) cannot fail the lane
+    before preflight. Current builds target `CHV_QUAL_ROOT/target`; this is
+    recovery for older residue.
 
 Product findings filed separately (not fixed in this slice): **#709**
 (first-enrollment bootstrap result) and **#711** (detached-open stord
@@ -391,6 +397,7 @@ sessions after delete-following-agent-restart).
 | [41911127447](https://github.com/o3kio/chv/actions/runs/41911127447) | chaos (m4.7) | `4e2cb37b` | **pass** — rc=0, 380 s, 0 errors, 6 documented warnings |
 | [41912418366](https://github.com/o3kio/chv/actions/runs/41912418366) | full (m4.3–m4.8) | `4e2cb37b` | fail — m4.7 pass; m4.3/m4.4/m4.5/m4.8 stale stop/delete waits, m4.6 stale refusal shape (fix 8) |
 | [41926076717](https://github.com/o3kio/chv/actions/runs/41926076717) | full subset (m4.3–m4.6) | `b50747c1` | fail — stop/delete fixes hold; stale prior-lane bridge broke m4.4 reachability, plus adopted-VMM force-kill, quoted log field, and sync negative-TLS refusals (§2.5, fixes 9–12) |
+| [41932222532](https://github.com/o3kio/chv/actions/runs/41932222532) | full subset (m4.3–m4.6) | `7fdd0946` | fail — **Checkout**, 14 s, no scenario ran: root-owned `target/` from a pre-isolation build blocked `actions/checkout` cleanup (fix 13) |
 | _targeted re-run_ | full subset (m4.3–m4.6) | _this commit_ | _pending_ |
 | _full lane_ | full (m4.3–m4.8) | _final fix commit_ | _pending_ |
 

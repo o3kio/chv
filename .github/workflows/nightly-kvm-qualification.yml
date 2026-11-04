@@ -91,6 +91,17 @@ jobs:
             exit 1
           fi
 
+      - name: Restore workspace ownership
+        # A lane that dies mid-build can leave root-owned files in the
+        # workspace (observed: target/.rustc_info.json from a pre-isolation
+        # build). actions/checkout then cannot clean the tree and the run
+        # fails before preflight ("Unable to clean or reset the repository").
+        # The runner is dedicated to this lane, so hand the workspace back
+        # to the runner user before checkout. Current builds target
+        # CHV_QUAL_ROOT/target, so this is recovery for older residue.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE:-$PWD}" 2>/dev/null || true
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
 
@@ -181,6 +192,12 @@ jobs:
             echo "::error::Nightly KVM qualification requires passwordless sudo with env preservation (-E) on the self-hosted chv-kvm runner."
             exit 1
           fi
+
+      - name: Restore workspace ownership
+        # Same recovery as the chaos lane: an interrupted root build must not
+        # block checkout on the next run.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE:-$PWD}" 2>/dev/null || true
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)

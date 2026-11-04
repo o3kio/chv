@@ -213,6 +213,13 @@ grep -q 'QUAL_SCENARIOS' .github/workflows/nightly-kvm-qualification.yml \
     && pass "workflow exposes a manual scenario-subset input" \
     || fail "workflow lost the manual scenario-subset input"
 
+# A prior root build in the workspace blocks actions/checkout (run 41932222532
+# failed at Checkout on a root-owned target/). Both lanes must restore the
+# workspace ownership before checkout.
+[ "$(grep -c 'name: Restore workspace ownership' .github/workflows/nightly-kvm-qualification.yml)" -eq 2 ] \
+    && pass "both lanes restore workspace ownership before checkout" \
+    || fail "a lane can fail checkout on root-owned residue"
+
 # ---------------------------------------------------------------------------
 # 5. second-round full-lane lessons (run 41926076717)
 # ---------------------------------------------------------------------------
