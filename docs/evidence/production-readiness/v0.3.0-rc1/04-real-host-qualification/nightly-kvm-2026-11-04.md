@@ -206,6 +206,15 @@ a token minted by the shell helper verified in a temporary
 `chv-common` integration test (destination, volume, size, and 300 s lifetime
 all matched) before the lane was re-dispatched.
 
+That rerun then cleared F5's startup, interruption, restart, and
+no-zombie-task checks, and exposed one more **harness expectation** mismatch
+(not a candidate defect): when the destination refuses a migration before
+readiness — the existing-partial-volume create_new refusal — the source now
+returns that error **synchronously** instead of accepting a task that later
+transitions to `FAILED`. N9 and F5 accept either shape and assert the same
+refusal text ("refusing to truncate"), so the contract is unchanged and the
+evidence records which shape the candidate produced.
+
 ---
 
 ## 3. Fixes

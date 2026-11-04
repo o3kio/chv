@@ -1008,20 +1008,29 @@ close_volume_quiet() {
     return 1
 }
 
-# try_trigger_migration SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] — non-asserting
-# trigger (the F5 recovery branch needs to observe a refusal without
-# double-reporting): prints the migration_id or empty. A fresh authorization
-# is minted per call — the receiver consumes the nonce once, so recovery
-# retries reuse the volume but must never reuse the token (issue #663).
-try_trigger_migration() {
+# trigger_migration_raw SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → raw grpcurl
+# output (stdout+stderr). A fresh authorization is minted per call — the
+# receiver consumes the nonce once, so recovery retries reuse the volume but
+# must never reuse the token (issue #663). Negative legs inspect the raw text
+# because a receiver that refuses before readiness returns its error
+# synchronously (no migration_id to poll).
+trigger_migration_raw() {
     local sock="$1" volid="$2" handle="$3" endpoint="$4"
     local size="${5:-$VOL_SIZE_BYTES}"
-    local auth json resp status mid
-    auth="$(mint_migration_authorization "$volid" "$size")" || { printf ''; return 1; }
+    local auth json
+    auth="$(mint_migration_authorization "$volid" "$size")" || return 1
     json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\",\"migrationAuthorization\":\"${auth}\"}"
-    resp="$(stord_rpc "$sock" TriggerDiskMigration "$json" 2>&1)" || { printf ''; return 1; }
-    status="$(printf '%s' "$resp" | jq -r '.result.status // empty')"
-    mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty')"
+    stord_rpc "$sock" TriggerDiskMigration "$json" 2>&1
+}
+
+# try_trigger_migration — non-asserting trigger (the F5 recovery branch
+# needs to observe a refusal without double-reporting): prints the
+# migration_id or empty.
+try_trigger_migration() {
+    local resp status mid
+    resp="$(trigger_migration_raw "$@")" || { printf ''; return 1; }
+    status="$(printf '%s' "$resp" | jq -r '.result.status // empty' 2>/dev/null)"
+    mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty' 2>/dev/null)"
     if [ "$status" = "OK" ] && [ -n "$mid" ]; then
         printf '%s' "$mid"
         return 0
@@ -1827,15 +1836,23 @@ else
 fi
 
 # create_new semantics from the source-death direction: re-trigger while
-# the partial receiving volume still exists → refusal.
-F5_MIDB="$(trigger_migration "$SRC_SOCK" "$F5_VOL" "$F5_HANDLE" "https://127.0.0.1:${DST_PORT}")" \
-    || qual_die "aborting (F5 recovery)"
-if wait_phase "$SRC_SOCK" "$F5_MIDB" FAILED "$MIG_RPC_TIMEOUT"; then
-    qual_pass "F5: re-trigger against the partial volume FAILED (create_new refusal)"
+# the partial receiving volume still exists → refusal. The receiver rejects
+# before readiness, and the source surfaces that destination error
+# synchronously (no migration task), so accept either that shape or a task
+# that then FAILs; both must name the existing volume.
+F5B_RESP="$(trigger_migration_raw "$SRC_SOCK" "$F5_VOL" "$F5_HANDLE" "https://127.0.0.1:${DST_PORT}")"
+F5B_MID="$(printf '%s' "$F5B_RESP" | jq -r '.migrationId // empty' 2>/dev/null)"
+if [ -n "$F5B_MID" ]; then
+    if wait_phase "$SRC_SOCK" "$F5B_MID" FAILED "$MIG_RPC_TIMEOUT"; then
+        qual_pass "F5: re-trigger against the partial volume FAILED (create_new refusal)"
+    else
+        qual_error "F5: re-trigger against the partial volume never failed (phase: $(migration_field "$SRC_SOCK" "$F5B_MID" phase))"
+    fi
+    F5B_ERR="$(migration_field "$SRC_SOCK" "$F5B_MID" errorMessage)"
 else
-    qual_error "F5: re-trigger against the partial volume never failed (phase: $(migration_field "$SRC_SOCK" "$F5_MIDB" phase))"
+    F5B_ERR="$F5B_RESP"
+    qual_pass "F5: re-trigger against the partial volume refused synchronously (no migration task created)"
 fi
-F5B_ERR="$(migration_field "$SRC_SOCK" "$F5_MIDB" errorMessage)"
 assert_contains "F5: refusal names the existing receiving volume (create_new semantics)" \
     "$F5B_ERR" "refusing to truncate"
 assert_file_exists "F5: partial receiving volume still on disk (not clobbered by the retry)" \

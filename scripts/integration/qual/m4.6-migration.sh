@@ -283,28 +283,40 @@ close_volume() {
     return 1
 }
 
-# trigger_migration SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → migration_id on
-# stdout. Mints a fresh, short-lived authorization for exactly this
+# trigger_migration_raw SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → raw grpcurl
+# output (stdout+stderr). Mints a fresh authorization for exactly this
 # destination/volume/size (issue #663): the direct stord RPC below bypasses
 # the control plane that would normally mint it. A fresh token per trigger is
 # required — the receiver consumes the nonce once, so recovery retries reuse
 # the volume but must not reuse the authorization.
-trigger_migration() {
+#
+# Kept separate from trigger_migration because negative legs expect a
+# *rejection*: a receiver that refuses before readiness (e.g. an existing
+# partial volume) now returns its error synchronously, so there is no
+# migration_id to poll.
+trigger_migration_raw() {
     local sock="$1" volid="$2" handle="$3" endpoint="$4"
     local size="${5:-$VOL_SIZE_BYTES}"
-    local auth json resp status mid
+    local auth json
     auth="$(mint_migration_authorization "$volid" "$size")" \
         || { qual_error "minting migration authorization failed for ${volid}"; return 1; }
     json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\",\"migrationAuthorization\":\"${auth}\"}"
-    resp="$(stord_rpc "$sock" TriggerDiskMigration "$json")" \
-        || { qual_error "TriggerDiskMigration RPC failed for ${volid}"; return 1; }
-    status="$(printf '%s' "$resp" | jq -r '.result.status // empty')"
-    mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty')"
+    stord_rpc "$sock" TriggerDiskMigration "$json" 2>&1
+}
+
+# trigger_migration SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → migration_id on
+# stdout. Asserts the trigger was accepted.
+trigger_migration() {
+    local resp status mid
+    resp="$(trigger_migration_raw "$@")" \
+        || { qual_error "TriggerDiskMigration RPC failed for $2: $(printf '%s' "$resp" | head -c 300)"; return 1; }
+    status="$(printf '%s' "$resp" | jq -r '.result.status // empty' 2>/dev/null)"
+    mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty' 2>/dev/null)"
     if [ "$status" = "OK" ] && [ -n "$mid" ]; then
         printf '%s' "$mid"
         return 0
     fi
-    qual_error "TriggerDiskMigration for ${volid} not accepted (status=${status}): $(printf '%s' "$resp" | head -c 300)"
+    qual_error "TriggerDiskMigration for $2 not accepted (status=${status}): $(printf '%s' "$resp" | head -c 300)"
     return 1
 }
 
@@ -1144,15 +1156,26 @@ assert_file_contains "N9: restarted DST re-bound the receiver listener" \
 # First retry hits the create_new refusal: the partial receiving volume
 # exists and the receiver REFUSES to truncate it (documented operator step:
 # remove the partial volume; there is no in-place resume).
-MID9B="$(trigger_migration "$SRC_SOCK" "$VOL9_ID" "$HANDLE9" "https://127.0.0.1:${DST_PORT}")" \
-    || qual_die "aborting (Leg N9 recovery)"
-wait_for "N9: retry FAILED — receiver refuses to truncate the partial receiving volume" \
-    "$RPC_TIMEOUT" phase_is "$SRC_SOCK" "$MID9B" "FAILED" \
-    || qual_error "N9: retry against the partial volume never failed"
-N9B_ERR="$(migration_field "$SRC_SOCK" "$MID9B" errorMessage)"
+#
+# The receiver rejects before readiness, and the source surfaces that
+# destination error synchronously — so the expected shape is EITHER a
+# migration_id whose task then FAILs (older behavior) OR a direct rejection
+# with no task. Both prove the same contract; assert the refusal text.
+N9B_RESP="$(trigger_migration_raw "$SRC_SOCK" "$VOL9_ID" "$HANDLE9" "https://127.0.0.1:${DST_PORT}")"
+N9B_MID="$(printf '%s' "$N9B_RESP" | jq -r '.migrationId // empty' 2>/dev/null)"
+if [ -n "$N9B_MID" ]; then
+    wait_for "N9: retry FAILED — receiver refuses to truncate the partial receiving volume" \
+        "$RPC_TIMEOUT" phase_is "$SRC_SOCK" "$N9B_MID" "FAILED" \
+        || qual_error "N9: retry against the partial volume never failed"
+    N9B_ERR="$(migration_field "$SRC_SOCK" "$N9B_MID" errorMessage)"
+else
+    N9B_ERR="$N9B_RESP"
+    qual_pass "N9: retry refused synchronously (no migration task created)"
+fi
 assert_contains "N9: refusal names the existing receiving volume (create_new semantics)" \
     "$N9B_ERR" "refusing to truncate"
-record_migration_error "leg-N9 retry against the partial receiving volume" "$SRC_SOCK" "$MID9B"
+[ -z "$N9B_MID" ] \
+    || record_migration_error "leg-N9 retry against the partial receiving volume" "$SRC_SOCK" "$N9B_MID"
 assert_file_exists "N9: partial receiving volume still on disk (not clobbered)" "${DST_DIR}/${VOL9_ID}.img"
 
 # Deterministic recovery: remove the partial volume, re-trigger (a THIRD
