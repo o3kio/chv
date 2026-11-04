@@ -210,8 +210,9 @@ async fn has_pending_migrations(
 /// pre-migration backup must never be group/world readable. On Unix the
 /// destination is created `0600` and then set explicitly to `0600` because an
 /// existing file may carry broader bits from an earlier run. Any failure to
-/// enforce the mode removes the partial file and returns the error, so the
-/// caller skips the backup instead of leaving a readable copy.
+/// enforce the mode attempts to remove the partial file (best effort; if the
+/// removal itself fails, the file is empty and contains no data) and returns
+/// the error, so the caller skips the backup.
 #[cfg(unix)]
 fn copy_database_backup(db_path: &Path, backup_path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};

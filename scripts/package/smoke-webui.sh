@@ -27,10 +27,13 @@
 #       password change — the old token's claim stays set)
 #   6c. GET /api/v1/auth/me      -> 200 + admin identity
 #   6d. POST /v1/overview        -> 200 JSON (BFF API through the edge)
-#   9. /ws/vms/<node>/<vm>/console?token=<invalid>
+#   9. /ws/vms/<node>/<vm>/console
 #                                 -> agent-sourced response (4xx or
 #                                    101), never an edge 502 — proves
-#                                    the /ws/ proxy reaches the agent
+#                                    the /ws/ proxy reaches the agent.
+#                                    The console token travels as a
+#                                    Sec-WebSocket-Protocol value; the
+#                                    query-string form is ignored.
 #
 # All requests run from INSIDE the stack container (engine exec,
 # 127.0.0.1:80): host-side port publishing is unreliable on locked-down
@@ -355,15 +358,17 @@ if [ -n "${TOKEN2}" ]; then
 fi
 
 # 9. /ws/ console proxy reaches the agent --------------------------------------
-# A websocket upgrade attempt with an invalid token: the AGENT must
+# A websocket upgrade attempt with an invalid console token: the AGENT must
 # answer (401/403/400/404 for the bogus token/VM, or 101 if a console
 # existed) — an nginx 502/504 would mean the edge cannot reach the
-# agent, which is the failure this assertion exists to catch.
-do_request "http://127.0.0.1:80/ws/vms/smoke-node/smoke-vm/console?token=invalid-smoke-token" \
+# agent, which is the failure this assertion exists to catch. The token is
+# sent as the negotiated subprotocol (#660); a query-string token is ignored.
+do_request "http://127.0.0.1:80/ws/vms/smoke-node/smoke-vm/console" \
     -H 'Connection: Upgrade' \
     -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' \
-    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    -H 'Sec-WebSocket-Protocol: invalid-smoke-token'
 WS_STATUS="$(head -n1 "${TMP}/h" | tr -d '\r' | awk '{print $2}')"
 case "${WS_STATUS}" in
     101|400|401|403|404)
