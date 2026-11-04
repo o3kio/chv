@@ -22,10 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config it needs; the previous post-hoc UPDATE could leave a `Pending`
   operation with a NULL correlation id, a state neither the claim loop nor
   the reaper revisits. A caller-id replay is only re-accepted when it names
-  the same configuration and the existing operation is `Pending`/`Accepted`.
-  Tests: 7 migration-path rows (both gate variants with zero journaling, the
-  positive correlation round-trip, placement/self-migration/delimiter
-  rejections, and replay redirect refusal). Refs #656.
+  the same operation type, VM, and configuration, and the existing operation
+  is still `Pending`/`Accepted`; the re-accept is conditioned on that state so
+  a concurrent claim cannot be resurrected. Tests: 9 migration-path rows (both
+  gate variants with zero journaling, the positive correlation round-trip,
+  placement/self-migration/delimiter/unplaced rejections, replay redirect
+  refusal, and terminal replay refusal). Refs #656.
 - **resource IDs (128-bit, #664)**: persistent resource and operation IDs are
   now 128-bit (32 lowercase hex characters via `chv_common::gen_resource_id()`)
   instead of 32-bit, and the eBPF `vm_key` / `struct rule_key.id` width was

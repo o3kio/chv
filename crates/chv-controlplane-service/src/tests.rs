@@ -2639,6 +2639,100 @@ async fn test_lifecycle_migrate_vm_replay_rejects_changed_configuration() {
     );
 }
 
+/// A VM with no recorded placement cannot be migrated from any source.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_rejects_unplaced_vm() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    for node_id in ["node-656-a", "node-656-b"] {
+        sqlx::query(
+            "INSERT OR IGNORE INTO nodes (node_id, hostname, display_name) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .bind(node_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO vms (vm_id, node_id, display_name) VALUES ('vm-656', NULL, 'vm-656')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let err = service
+        .migrate_vm(migrate_vm_request(
+            "node-656-a",
+            Some(proto::MigrationConfig {
+                pause_first: true,
+                ..Default::default()
+            }),
+        ))
+        .await
+        .expect_err("an unplaced VM cannot be migrated");
+    assert!(
+        matches!(err, ControlPlaneServiceError::NotFound(_)),
+        "expected NotFound for an unplaced VM, got {err:?}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "an unplaced migration must not journal an operation"
+    );
+}
+
+/// A replay of the same configuration must not resurrect a terminal or
+/// running operation.
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_replay_rejects_terminal_operation() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut request = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    request.meta.as_mut().unwrap().operation_id = "op-migrate-terminal".into();
+    service
+        .migrate_vm(request.clone())
+        .await
+        .expect("first request is accepted");
+
+    sqlx::query("UPDATE operations SET status = 'Succeeded' WHERE operation_type = 'MigrateVm'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = service
+        .migrate_vm(request)
+        .await
+        .expect_err("a terminal operation must not be re-accepted");
+    match err {
+        ControlPlaneServiceError::Conflict(msg) => {
+            assert!(msg.contains("terminal/running"), "got: {msg}");
+        }
+        other => panic!("expected Conflict for a terminal replay, got {other:?}"),
+    }
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM operations WHERE operation_type = 'MigrateVm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "Succeeded", "the replay must not change the status");
+}
+
 /// The operation's start event and idempotency key are scoped to
 /// `node_id`, so a direct caller must not name a node other than the
 /// migration source.

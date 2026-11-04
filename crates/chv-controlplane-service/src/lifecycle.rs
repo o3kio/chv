@@ -2148,8 +2148,14 @@ impl LifecycleService for LifecycleServiceImplementation {
             // replay may only re-accept the same migration; a different
             // source/dest/config or a terminal/running operation must not be
             // silently resurrected or redirected.
-            let (status, persisted_correlation_id): (String, Option<String>) = sqlx::query_as(
-                "SELECT status, correlation_id FROM operations WHERE operation_id = ?",
+            let (status, persisted_correlation_id, operation_type, resource_id): (
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT status, correlation_id, operation_type, resource_id \
+                 FROM operations WHERE operation_id = ?",
             )
             .bind(operation_id.as_str())
             .fetch_one(self.operation_repo.pool())
@@ -2160,6 +2166,21 @@ impl LifecycleService for LifecycleServiceImplementation {
                     operation_id, e
                 ))
             })?;
+            // A caller-supplied operation id is looked up by an
+            // operation-type-agnostic idempotency key. Without these checks a
+            // `MigrateVm` replay could name an operation journaled by a
+            // different RPC and receive an OK without a migration existing.
+            if operation_type != "MigrateVm" || resource_id.as_deref() != Some(vm_id.as_str()) {
+                return Err(ControlPlaneServiceError::Conflict(format!(
+                    "operation {} already exists for {}{}, not this MigrateVm",
+                    operation_id,
+                    operation_type,
+                    resource_id
+                        .as_deref()
+                        .map(|id| format!(" {id}"))
+                        .unwrap_or_default()
+                )));
+            }
             if persisted_correlation_id.as_deref() != Some(correlation_id.as_str()) {
                 return Err(ControlPlaneServiceError::Conflict(format!(
                     "operation {} already exists with a different migration configuration",
@@ -2172,9 +2193,37 @@ impl LifecycleService for LifecycleServiceImplementation {
                     operation_id, status
                 )));
             }
-        }
 
-        self.accept_operation(&operation_id).await?;
+            // `accept_operation` has no status predicate. On the replay path
+            // the orchestrator may claim the row between the guard read and
+            // the write, so condition the update on the states we just
+            // validated; otherwise a Failed/Running row could be resurrected
+            // into Accepted and re-dispatched.
+            let updated = sqlx::query(
+                "UPDATE operations \
+                 SET status = 'Accepted', \
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', ? / 1000.0, 'unixepoch') \
+                 WHERE operation_id = ? AND status IN ('Pending', 'Accepted')",
+            )
+            .bind(Self::now_ms())
+            .bind(operation_id.as_str())
+            .execute(self.operation_repo.pool())
+            .await
+            .map_err(|e| {
+                ControlPlaneServiceError::Internal(format!(
+                    "failed to re-accept replayed MigrateVm operation {}: {}",
+                    operation_id, e
+                ))
+            })?;
+            if updated.rows_affected() == 0 {
+                return Err(ControlPlaneServiceError::Conflict(format!(
+                    "operation {} changed state while being replayed",
+                    operation_id
+                )));
+            }
+        } else {
+            self.accept_operation(&operation_id).await?;
+        }
 
         Ok(Self::ok_ack(&operation_id, "migrate vm accepted"))
     }
