@@ -12,6 +12,7 @@ use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -101,6 +102,7 @@ pub fn spawn_destination_migration(
     vm_id: String,
     operation_id: String,
     receiver_url: String,
+    transfer_active: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         info!(
@@ -110,10 +112,16 @@ pub fn spawn_destination_migration(
             "destination agent: starting receive-migration"
         );
 
-        match vm_runtime
+        // Mark the non-cancellable window: dropping this future does not stop
+        // the Cloud Hypervisor receive, so the registry must not force-abort it
+        // and `CancelMigration` must not report a confirmed cancel.
+        transfer_active.store(true, Ordering::SeqCst);
+        let result = vm_runtime
             .receive_migration(&vm_id, &receiver_url, Some(&operation_id))
-            .await
-        {
+            .await;
+        transfer_active.store(false, Ordering::SeqCst);
+
+        match result {
             Ok(()) => {
                 info!(
                     vm_id = %vm_id,
@@ -642,6 +650,7 @@ pub async fn source_migration_with_disk_precopy(
     disk_config: DiskPrecopyConfig,
     progress_reporter: Option<ProgressReporter>,
     cancel_token: CancellationToken,
+    transfer_active: Arc<AtomicBool>,
 ) -> Result<(), String> {
     info!(
         vm_id = %vm_id,
@@ -821,10 +830,18 @@ pub async fn source_migration_with_disk_precopy(
         cb(progress);
     }
 
-    match vm_runtime
-        .send_migration(&vm_id, &destination_url, Some(&operation_id))
-        .await
-    {
+    let send_result = {
+        // Mark the non-cancellable window: dropping this future does not stop
+        // the Cloud Hypervisor send, so the registry must not force-abort it
+        // and `CancelMigration` must not report a confirmed cancel.
+        transfer_active.store(true, Ordering::SeqCst);
+        let result = vm_runtime
+            .send_migration(&vm_id, &destination_url, Some(&operation_id))
+            .await;
+        transfer_active.store(false, Ordering::SeqCst);
+        result
+    };
+    match send_result {
         Ok(()) => {
             if let Some(ref reporter) = progress_reporter {
                 let progress = build_progress(

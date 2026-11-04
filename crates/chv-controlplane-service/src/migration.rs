@@ -991,6 +991,35 @@ pub async fn execute_migration(
             }
         }
 
+        // The source agent reports `Completed` only after the Cloud
+        // Hypervisor send-migration succeeded, so the authoritative VM state is
+        // already on the destination and there is no safe rollback from here.
+        // Finalize placement idempotently and skip the legacy pause/resume
+        // handshake: a failure in that handshake must not resume a stale
+        // source VM, and `update_migration_phase` now refuses to overwrite the
+        // agent-verified Completed row.
+        let reported_phase: Option<String> =
+            sqlx::query_scalar("SELECT phase FROM migrations WHERE migration_id = ?")
+                .bind(&state.migration_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| ChvError::Internal {
+                    reason: format!(
+                        "failed to re-read migration {} after memory migration: {e}",
+                        state.migration_id
+                    ),
+                })?;
+        if reported_phase.as_deref() == Some("Completed") {
+            info!(
+                migration_id = %state.migration_id,
+                "source agent reported Completed; finalizing destination placement without rollback"
+            );
+            complete_migration_atomically(pool, state).await?;
+            notify_overlay_after_migration(pool, node_client_pool, agent_socket_pattern, state)
+                .await;
+            return Ok(());
+        }
+
         // Phase 4: Paused - final sync, VM is paused
         // Cooperative cancel check before we explicitly pause the source. After
         // memory migration succeeded, CH holds VM state on the destination, so
@@ -2091,6 +2120,35 @@ pub async fn update_migration_progress(
                 "dropped migration progress report for a terminal migration; \
                  an agent-side task may still be running"
             );
+        }
+        // A `Completed` report after the control plane terminalized the row as
+        // `Failed`/`RolledBack` means the detached agent finished the transfer:
+        // the VM may now live on the destination even though the row says the
+        // migration failed. The reaper must not auto-resume the source under
+        // that ambiguity; leave it blocked for operator review.
+        if phase_str == "Completed" && matches!(current_phase.as_str(), "Failed" | "RolledBack") {
+            if let Err(e) = sqlx::query(
+                "UPDATE migrations SET reaper_resume_state = 'blocked' \
+                 WHERE migration_id = ? AND phase IN ('Failed', 'RolledBack')",
+            )
+            .bind(&migration_id)
+            .execute(pool)
+            .await
+            {
+                warn!(
+                    migration_id = %migration_id,
+                    error = %e,
+                    "failed to block source resume after a late agent-reported Completed"
+                );
+            } else {
+                warn!(
+                    migration_id = %migration_id,
+                    operation_id = %operation_id,
+                    stored_phase = %current_phase,
+                    "agent reported Completed after the control plane terminalized the row; \
+                     blocking automatic source resume for operator review"
+                );
+            }
         }
         return Ok(());
     }
@@ -3677,5 +3735,49 @@ mod tests {
         .expect("read migration");
         assert_eq!(phase, "Failed");
         assert_eq!(round, 0);
+    }
+
+    /// A `Completed` report that loses to a terminal `Failed` state means the
+    /// detached agent finished the transfer after the control plane gave up:
+    /// the VM may live on the destination, so automatic source resume must be
+    /// blocked for operator review.
+    #[tokio::test]
+    async fn late_completed_blocks_automatic_source_resume() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_for_progress(&test_db.pool, "Failed").await;
+        sqlx::query(
+            "UPDATE migrations SET reaper_resume_state = 'pending' \
+             WHERE migration_id = 'mig-progress'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed pending resume");
+
+        update_migration_progress(
+            &test_db.pool,
+            "node-a",
+            "vm-progress",
+            "op-progress",
+            proto::MigrationPhase::Completed as i32,
+            0,
+            0,
+            0,
+            0,
+        )
+        .await
+        .expect("a late Completed report is acknowledged and dropped");
+
+        let (phase, resume_state): (String, Option<String>) = sqlx::query_as(
+            "SELECT phase, reaper_resume_state FROM migrations WHERE migration_id = 'mig-progress'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Failed", "the terminal phase must not change");
+        assert_eq!(
+            resume_state.as_deref(),
+            Some("blocked"),
+            "a late Completed report must block automatic source resume"
+        );
     }
 }

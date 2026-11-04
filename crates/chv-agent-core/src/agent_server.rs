@@ -10,6 +10,7 @@ use control_plane_node_api::control_plane_node_api as proto;
 use futures_util::StreamExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
@@ -3503,6 +3504,8 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                 // this, the JoinHandle was dropped on the floor and the agent
                 // had no way to abort, reap, or surface terminal failure.
                 let cancel_token = CancellationToken::new();
+                let transfer_active = Arc::new(AtomicBool::new(false));
+                let transfer_for_task = transfer_active.clone();
                 let registry = self.migration_tasks.clone();
                 let op_id_for_task = operation_id.clone();
                 let op_id_for_log = operation_id.clone();
@@ -3518,12 +3521,17 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                         disk_config,
                         Some(progress_reporter),
                         cancel_for_task,
+                        transfer_for_task,
                     )
                     .await
                 });
                 let abort_handle = handle.abort_handle();
-                self.migration_tasks
-                    .insert(operation_id.clone(), abort_handle, cancel_token);
+                self.migration_tasks.insert_with_transfer_flag(
+                    operation_id.clone(),
+                    abort_handle,
+                    cancel_token,
+                    transfer_active,
+                );
 
                 // Reaper: await the task, log terminal status, remove from registry.
                 let reap_op = operation_id.clone();
@@ -3574,6 +3582,8 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                 // cancel token is still tracked so the abort_handle path
                 // force-drops the future at its next .await point.
                 let cancel_token = CancellationToken::new();
+                let transfer_active = Arc::new(AtomicBool::new(false));
+                let transfer_for_task = transfer_active.clone();
                 let registry = self.migration_tasks.clone();
                 let op_id_for_log = operation_id.clone();
                 let handle = crate::migration::spawn_destination_migration(
@@ -3581,10 +3591,15 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     vm_id,
                     operation_id.clone(),
                     receiver_url,
+                    transfer_for_task,
                 );
                 let abort_handle = handle.abort_handle();
-                self.migration_tasks
-                    .insert(operation_id.clone(), abort_handle, cancel_token);
+                self.migration_tasks.insert_with_transfer_flag(
+                    operation_id.clone(),
+                    abort_handle,
+                    cancel_token,
+                    transfer_active,
+                );
 
                 let reap_op = operation_id.clone();
                 tokio::spawn(async move {
@@ -3891,6 +3906,25 @@ impl proto::migration_control_service_server::MigrationControlService for AgentS
         // for the caller: there is nothing left to cancel.
         let cancelled = self.cancel_migration(&inner.operation_id);
         if cancelled
+            && self
+                .migration_tasks
+                .transfer_in_progress(&inner.operation_id)
+        {
+            // The task is inside the Cloud Hypervisor send/receive call.
+            // Dropping the future would not stop that VMM transfer, so a
+            // `cancelled` reply would let the control plane resume the source
+            // VM while the destination is still receiving memory. Keep the
+            // durable cancel queued and report a retryable failure instead.
+            warn!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                "migration cancel signalled during an in-flight VMM transfer; not confirming"
+            );
+            return Err(Status::unavailable(
+                "migration is inside a non-cancellable VMM transfer; retry after it completes",
+            ));
+        }
+        if cancelled
             && !self
                 .migration_tasks
                 .wait_until_stopped(&inner.operation_id, MIGRATION_CANCEL_CONFIRM_TIMEOUT)
@@ -4154,6 +4188,43 @@ mod tests {
         task.abort();
         let _ = task.await;
         server.migration_tasks.remove("op-wedged");
+    }
+
+    /// A cancel during an in-flight Cloud Hypervisor transfer must not be
+    /// confirmed: dropping the future does not stop the transfer, and the
+    /// control plane would resume the source VM while the destination still
+    /// receives memory. It must stay tracked and report `Unavailable`.
+    #[tokio::test]
+    async fn migration_control_refuses_cancel_during_vmm_transfer() {
+        let server = test_server();
+        server
+            .migration_tasks
+            .set_cancel_grace(Duration::from_secs(60));
+        let transfer = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(std::future::pending::<()>());
+        server.migration_tasks.insert_with_transfer_flag(
+            "op-transfer".to_string(),
+            task.abort_handle(),
+            CancellationToken::new(),
+            transfer.clone(),
+        );
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-transfer", "node-1")),
+            )
+            .await
+            .expect_err("a transfer must not be reported as cancelled");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            server.migration_tasks.contains("op-transfer"),
+            "the task must stay tracked while the VMM transfer runs"
+        );
+
+        task.abort();
+        let _ = task.await;
+        server.migration_tasks.remove("op-transfer");
     }
 
     /// A cancel naming another node, or missing the operation id, is refused

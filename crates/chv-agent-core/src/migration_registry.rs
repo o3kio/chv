@@ -32,8 +32,8 @@
 //!   tracked task — the agent's "graceful shutdown" entry point.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
@@ -63,6 +63,11 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 struct TrackedTask {
     abort: AbortHandle,
     cancel_token: CancellationToken,
+    /// Set by the task while it is inside a Cloud Hypervisor send/receive
+    /// migration call. Dropping the agent future does not stop that VMM
+    /// transfer, so the registry must not force-abort it and the RPC must not
+    /// report a confirmed cancel while it is true.
+    transfer_active: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -137,12 +142,30 @@ impl MigrationTaskRegistry {
     /// `operation_id` (and aborts the displaced task — duplicate operation_ids
     /// would otherwise leak the older handle).
     pub fn insert(&self, op_id: String, abort: AbortHandle, cancel_token: CancellationToken) {
+        self.insert_with_transfer_flag(
+            op_id,
+            abort,
+            cancel_token,
+            Arc::new(AtomicBool::new(false)),
+        );
+    }
+
+    /// Insert a tracked task together with the flag its future uses to mark an
+    /// in-flight, non-cancellable VMM transfer.
+    pub fn insert_with_transfer_flag(
+        &self,
+        op_id: String,
+        abort: AbortHandle,
+        cancel_token: CancellationToken,
+        transfer_active: Arc<AtomicBool>,
+    ) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(prev) = guard.tasks.insert(
             op_id.clone(),
             TrackedTask {
                 abort,
                 cancel_token,
+                transfer_active,
             },
         ) {
             prev.cancel_token.cancel();
@@ -174,6 +197,11 @@ impl MigrationTaskRegistry {
     /// it paused). After [`DEFAULT_CANCEL_GRACE`] the `AbortHandle` force-drops
     /// the future so a future that ignores the token cannot run forever.
     ///
+    /// The force-abort is skipped if the future has marked itself as inside a
+    /// non-cancellable VMM transfer: dropping the future would not stop the
+    /// transfer, and reporting the task as gone would let the control plane
+    /// resume the source VM while the destination still receives memory.
+    ///
     /// Returns `true` if a task was found and signalled. When no task exists a
     /// bounded tombstone is recorded so a late registration is aborted too;
     /// `false` still means "the agent has no task right now" to the caller.
@@ -185,6 +213,7 @@ impl MigrationTaskRegistry {
         };
         task.cancel_token.cancel();
         let abort = task.abort.clone();
+        let transfer_active = task.transfer_active.clone();
         drop(guard);
 
         let grace = self.cancel_grace();
@@ -192,14 +221,33 @@ impl MigrationTaskRegistry {
             Ok(runtime) => {
                 runtime.spawn(async move {
                     tokio::time::sleep(grace).await;
-                    abort.abort();
+                    if !transfer_active.load(Ordering::SeqCst) {
+                        abort.abort();
+                    }
                 });
             }
             // No runtime (sync caller/test utility): keep the old hard-abort
-            // behavior; the cooperative signal has already been sent.
-            Err(_) => abort.abort(),
+            // behavior unless the task is inside a VMM transfer; the
+            // cooperative signal has already been sent.
+            Err(_) => {
+                if !transfer_active.load(Ordering::SeqCst) {
+                    abort.abort();
+                }
+            }
         }
         true
+    }
+
+    /// Whether the tracked task for `op_id` is inside a Cloud Hypervisor
+    /// send/receive migration call. `CancelMigration` must not report a
+    /// confirmed cancel in that window.
+    pub fn transfer_in_progress(&self, op_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .get(op_id)
+            .is_some_and(|task| task.transfer_active.load(Ordering::SeqCst))
     }
 
     /// Wait until `op_id` is no longer tracked, up to `timeout`.
@@ -522,6 +570,45 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         registry.remove("op-wedged");
+    }
+
+    /// A task inside a non-cancellable VMM transfer must not be force-aborted
+    /// at the grace deadline: dropping the future does not stop the transfer,
+    /// and the delayed abort must re-check the flag at fire time. Once the
+    /// transfer leaves the window a retry can confirm normally.
+    #[tokio::test]
+    async fn transfer_in_progress_blocks_hard_abort() {
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        registry.set_cancel_grace(Duration::from_millis(50));
+
+        let transfer = Arc::new(AtomicBool::new(true));
+        let handle = tokio::spawn(std::future::pending::<()>());
+        registry.insert_with_transfer_flag(
+            "op-transfer".to_string(),
+            handle.abort_handle(),
+            CancellationToken::new(),
+            transfer.clone(),
+        );
+        assert!(registry.transfer_in_progress("op-transfer"));
+
+        assert!(registry.cancel("op-transfer"));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handle.is_finished(),
+            "a task inside the VMM transfer must not be force-aborted"
+        );
+
+        transfer.store(false, Ordering::SeqCst);
+        assert!(
+            !registry.transfer_in_progress("op-transfer"),
+            "the flag must clear when the transfer returns"
+        );
+        assert!(registry.cancel("op-transfer"));
+        assert!(handle
+            .await
+            .expect_err("the retry must hard-abort once the transfer is over")
+            .is_cancelled());
+        registry.remove("op-transfer");
     }
 
     /// The tombstone is both bounded and time-limited.

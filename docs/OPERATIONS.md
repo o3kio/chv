@@ -619,13 +619,19 @@ WHERE migration_id = '<MIGRATION_ID>';
 `agent_cancel_pending = 1` means at least one endpoint has not confirmed the
 cancel yet. `agent_cancel_confirmed_at IS NOT NULL` with a NULL error means both
 agents aborted their detached task (or reported `not_tracked` because the agent
-restarted). A non-NULL `agent_cancel_last_error` means the agent refused
+restarted). A cancel that arrives while a task is inside the Cloud Hypervisor
+send/receive transfer cannot be confirmed immediately: the agent does not
+force-drop that future and returns `Unavailable`, leaving the row pending for a
+later drain. A non-NULL `agent_cancel_last_error` means the agent refused
 permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
 invalid request); the detached task may still exist, so verify placement and
 the agent process before resuming the source VM. The
 reaper will not auto-resume a source VM while `agent_cancel_pending = 1`, nor
 when `agent_cancel_last_error` records a permanent refusal (the task may still
-be running). Only requeue (`agent_cancel_pending = 1`,
+be running). It also refuses when a late `Completed` report arrived after the
+row was terminalized `Failed`/`RolledBack` (`reaper_resume_state = 'blocked'`):
+the detached agent may have completed the transfer, so the destination could
+own the VM. Only requeue (`agent_cancel_pending = 1`,
 `agent_cancel_last_error = NULL`) after the node has been upgraded or verified
 idle.
 

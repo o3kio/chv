@@ -585,6 +585,7 @@ impl MigrationReaper {
                 }
                 Ok(ResumeOutcome::SkippedNotTerminal { .. }) => Some("cancelled"),
                 Ok(ResumeOutcome::SkippedMissing) => Some("missing"),
+                Ok(ResumeOutcome::SkippedResumeBlocked) => None,
                 Ok(outcome @ ResumeOutcome::SkippedInterruptedAmbiguous { .. }) => {
                     metrics::counter!(
                         "migration_reaper_resume_skipped_total",
@@ -649,7 +650,8 @@ impl MigrationReaper {
 
             if let Some(state) = state {
                 if let Err(e) = sqlx::query(
-                    "UPDATE migrations SET reaper_resume_state = ? WHERE migration_id = ?",
+                    "UPDATE migrations SET reaper_resume_state = ? \
+                     WHERE migration_id = ? AND reaper_resume_state = 'pending'",
                 )
                 .bind(state)
                 .bind(&row.migration_id)
@@ -772,8 +774,8 @@ impl MigrationReaper {
         // 1. Confirm the reaper's transition actually won (or the migration was
         // already rolled back). Never resume a Completed migration: VM state
         // lives on the destination in that case.
-        let state: Option<(String, i64, Option<String>)> = sqlx::query_as(
-            "SELECT phase, agent_cancel_pending, agent_cancel_last_error \
+        let state: Option<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT phase, agent_cancel_pending, agent_cancel_last_error, reaper_resume_state \
              FROM migrations WHERE migration_id = ?",
         )
         .bind(&row.migration_id)
@@ -785,10 +787,17 @@ impl MigrationReaper {
                 row.migration_id
             ),
         })?;
-        let (phase, agent_cancel_pending, agent_cancel_last_error) = match state {
+        let (phase, agent_cancel_pending, agent_cancel_last_error, resume_state) = match state {
             Some(state) => state,
             None => return Ok(ResumeOutcome::SkippedMissing),
         };
+        // A late agent-reported `Completed` (or another safety rule) may have
+        // blocked this row after the resume snapshot was taken. Never resume
+        // underneath that decision. A NULL state is left to the caller's
+        // explicit eligibility check.
+        if matches!(resume_state.as_deref(), Some(state) if state != "pending") {
+            return Ok(ResumeOutcome::SkippedResumeBlocked);
+        }
         match phase.as_str() {
             "Failed" | "RolledBack" => {}
             other => {
@@ -984,6 +993,9 @@ enum ResumeOutcome {
     SkippedInterruptedAmbiguous {
         phase: String,
     },
+    /// A late agent-reported `Completed` (or another safety rule) marked the
+    /// row blocked after this resume attempt was selected; leave it blocked.
+    SkippedResumeBlocked,
     /// The migration row disappeared between the scan and the resume.
     SkippedMissing,
 }
@@ -998,6 +1010,7 @@ impl ResumeOutcome {
             Self::SkippedSenderActive { .. } => "sender_active",
             Self::SkippedSourceNodeNotReporting { .. } => "source_node_not_reporting",
             Self::SkippedInterruptedAmbiguous { .. } => "interrupted_ambiguous",
+            Self::SkippedResumeBlocked => "resume_blocked",
             Self::SkippedMissing => "missing",
         }
     }
@@ -1650,6 +1663,44 @@ mod tests {
                 reason: "agent does not implement CancelMigration".to_string()
             }
         );
+    }
+
+    /// A late agent-reported `Completed` marks the row blocked (the destination
+    /// may own the VM). Even if the resume pass already selected it, the
+    /// re-read must refuse to resume.
+    #[tokio::test]
+    async fn resume_source_vm_refuses_after_late_completed_block() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "late-complete", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations \
+             SET reaper_resume_state = 'blocked', reaper_stalled_secs = 10_800 \
+             WHERE migration_id = 'late-complete'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("block resume");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let row = StuckMigrationRow {
+            migration_id: "late-complete".to_string(),
+            operation_id: "op-late-complete".to_string(),
+            vm_id: "vm-late-complete".to_string(),
+            source_node_id: "source-node".to_string(),
+            phase: "Failed".to_string(),
+            started_at: "ignored".to_string(),
+            last_progress_at: "ignored".to_string(),
+            interrupted_from_phase: None,
+            interrupted_at: None,
+            started_age_secs: 10_800,
+            stalled_secs: 10_800,
+        };
+
+        let outcome = reaper
+            .resume_source_vm(&row)
+            .await
+            .expect("a blocked resume is not an error");
+        assert_eq!(outcome, ResumeOutcome::SkippedResumeBlocked);
     }
 
     // ---------------------------------------------------------------------

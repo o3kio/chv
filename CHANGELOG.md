@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MigrationControlService.CancelMigration` (agent-served; rejects a request
   naming another node and refuses core-managed mode), which flips the task's
   cancellation token so it can resume a paused source VM, then force-aborts it
-  after a bounded grace if it has not exited. The reply confirms the task
-  actually stopped (`Unavailable` keeps the row pending otherwise). A bounded
+  after a bounded grace if it has not exited. A task inside a Cloud Hypervisor
+  send/receive transfer is not force-dropped (that would not stop the VMM
+  transfer) and the RPC reports `Unavailable` so the control plane retries
+  instead of confirming. The reply confirms the task actually stopped
+  (`Unavailable` keeps the row pending otherwise). A bounded
   registry tombstone aborts a delayed `MigrateVm` that registers after a
   `not_tracked` reply. The control plane queues cancellation durably in
   `migrations.agent_cancel_pending` (migration `0070`; plus
@@ -36,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `InvalidArgument` for a misroute) is parked in `agent_cancel_last_error`
   once no endpoint remains retryable, instead of retrying forever, and the
   source VM is not auto-resumed until the cancel is confirmed (a parked
-  refusal keeps it paused for operator review).
+  refusal keeps it paused for operator review). A `Completed` report that
+  arrives after the row was terminalized `Failed`/`RolledBack` also blocks
+  auto-resume: the detached agent may have finished the transfer, so the
+  destination could own the VM.
   Tests: agent UDS cancel service (tracked task aborted, cooperative
   cleanup before hard abort, stop-confirmation timeout, `not_tracked` retry,
   misrouted/empty-op refusal, missing-token refusal, core-managed refusal,
@@ -46,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancel-pending rows (an agent-reported `Completed` row completes
   idempotently and still moves placement),
   agent-reported terminal queueing, post-restart operator-cancel queueing,
-  resume gating while a cancel is pending or permanently refused, real
+  resume gating while a cancel is pending or permanently refused (and after a
+  late agent-reported `Completed` on a terminal row), real
   `NodeClient` invalid-argument preservation, and reaper drains for both
   endpoints, `not_tracked`, partial/unreachable retry (including a permanent
   refusal alongside a retryable endpoint), token attachment, bad token,
