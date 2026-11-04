@@ -4552,6 +4552,83 @@ mod tests {
         assert!(server.migration_tasks.transfer_in_progress("op-1"));
     }
 
+    /// The source `migrate_vm` handler must register the spawned disk+memory
+    /// task with the exact `TransferWindow` the task uses. A fresh default
+    /// window would let `CancelMigration` confirm and force-drop a source still
+    /// sending after its memory phase sealed as outcome-unknown.
+    #[tokio::test]
+    async fn migrate_vm_source_shares_transfer_window_and_retains_sealed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stord.sock");
+        {
+            let uds = tokio::net::UnixListener::bind(&socket).unwrap();
+            tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(
+                        chv_stord_api::chv_stord_api::storage_service_server::StorageServiceServer::new(
+                            MockStord::default(),
+                        ),
+                    )
+                    .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds))
+                    .await
+                    .ok();
+            });
+        }
+
+        let mock = Arc::new(MockCloudHypervisorAdapter::default());
+        *mock.migration_timeout.lock().unwrap() = true;
+        let mut cache = NodeCache::new("node-1");
+        cache.node_state = crate::state_machine::NodeState::TenantReady
+            .as_str()
+            .to_string();
+        cache.connectivity_state = crate::connectivity::ConnectivityState::Connected;
+        let server = AgentServer::new(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(mock),
+            socket,
+            std::path::PathBuf::from("/run/chv/nwd/api.sock"),
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let req = proto::MigrateVmRequest {
+            meta: Some(test_meta("1")),
+            node_id: "node-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            source_node_id: "node-1".to_string(),
+            destination_node_id: "node-2".to_string(),
+            config: None,
+        };
+        proto::lifecycle_service_server::LifecycleService::migrate_vm(&server, Request::new(req))
+            .await
+            .expect("the source must ACK the migration");
+
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "the source task must be registered before the ACK"
+        );
+
+        // No attached volumes: the disk phase skips stord triggers and goes
+        // straight to the memory phase, where the mock timeout seals the
+        // transfer window. The registry entry only observes that state if it
+        // shares the same `TransferWindow`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !server.migration_tasks.transfer_in_progress("op-1") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the registry must observe the task's sealed transfer window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        server.migration_tasks.remove("op-1");
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "a sealed source task must stay tracked after remove"
+        );
+        assert!(server.migration_tasks.transfer_in_progress("op-1"));
+    }
+
     #[tokio::test]
     async fn apply_vm_desired_state_updates_generation_and_fragment() {
         let server = test_server();
