@@ -810,7 +810,7 @@ pub async fn netbox_export(
     // itself; here only the version reference is persisted.
     let version_id = resolve_applied_version_id(&state, &id).await?;
 
-    let run_id = NetboxProjectionRunId::new(chv_common::gen_short_id())
+    let run_id = NetboxProjectionRunId::new(chv_common::gen_resource_id())
         .map_err(|e| BffError::Internal(format!("failed to mint netbox run id: {e}")))?;
     let run = state
         .netbox_runs

@@ -73,7 +73,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let request_id = chv_common::gen_short_id();
+        let request_id = chv_common::gen_resource_id();
         let body = json!({
             "error": {
                 "code": self.code,
@@ -303,7 +303,7 @@ async fn ingest(
                 "error": {
                     "code": "rate_limited",
                     "message": "per-agent rate or concurrency limit exceeded",
-                    "request_id": chv_common::gen_short_id(),
+                    "request_id": chv_common::gen_resource_id(),
                 }
             }));
             (
@@ -388,7 +388,7 @@ async fn rotate(
 }
 
 fn internal(e: crate::error::ControlPlaneServiceError) -> Response {
-    let request_id = chv_common::gen_short_id();
+    let request_id = chv_common::gen_resource_id();
     tracing::warn!(error = %e, %request_id, "guest monitoring route internal error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,

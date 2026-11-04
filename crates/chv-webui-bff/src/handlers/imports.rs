@@ -79,7 +79,7 @@ pub async fn import_vm(
                     }
                     let tmp_file = state
                         .agent_runtime_dir
-                        .join(format!(".import-tmp-{}", chv_common::gen_short_id()));
+                        .join(format!(".import-tmp-{}", chv_common::gen_resource_id()));
                     let mut f = tokio::fs::File::create(&tmp_file).await.map_err(|e| {
                         BffError::Internal(format!("failed to create temp file: {}", e))
                     })?;
@@ -122,7 +122,7 @@ pub async fn import_vm(
         }
     };
 
-    let vm_id = chv_common::gen_short_id();
+    let vm_id = chv_common::gen_resource_id();
     let vm_dir = state.agent_runtime_dir.join("vms").join(&vm_id);
     let disk_path = vm_dir.join("disk.qcow2");
 
@@ -157,8 +157,8 @@ pub async fn import_vm(
     .map_err(|e| BffError::Internal(format!("failed to query nodes: {}", e)))?
     .ok_or_else(|| BffError::BadRequest("no healthy nodes available".into()))?;
 
-    let volume_id = chv_common::gen_short_id();
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let volume_id = chv_common::gen_resource_id();
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
 
     let mut tx = state
         .pool

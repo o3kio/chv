@@ -67,12 +67,16 @@ Node A                                          Node B
 ### VXLAN Interface Management
 
 ```bash
+# {bridge} is chv_common::bridge_name_for_network(net_id): br-{net_id} while
+# the name fits IFNAMSIZ (15 chars), otherwise br-{first8}{fnv16} — 128-bit
+# ids (#664) always take the hashed form.
+
 # Create VXLAN interface (per VNI, per namespace)
 ip link add vxlan{VNI} type vxlan id {VNI} local {VTEP_IP} dstport 4789 nolearning
 
 # Move to namespace and attach to bridge
 ip link set vxlan{VNI} netns {namespace}
-ip netns exec {namespace} ip link set vxlan{VNI} master br-{net_id}
+ip netns exec {namespace} ip link set vxlan{VNI} master {bridge}
 ip netns exec {namespace} ip link set vxlan{VNI} up
 ```
 
@@ -92,8 +96,8 @@ ip netns exec {namespace} bridge fdb replace {MAC} dev vxlan{VNI} dst {NEW_VTEP_
 ### Gratuitous ARP (post-migration)
 
 ```bash
-# Send from bridge interface within namespace
-ip netns exec {namespace} arping -U -c 3 -I br-{net_id} {VM_IP}
+# Send from bridge interface within namespace ({bridge} per the note above)
+ip netns exec {namespace} arping -U -c 3 -I {bridge} {VM_IP}
 # Also send from vxlan interface to propagate to remote peers
 ip netns exec {namespace} arping -A -c 3 -I vxlan{VNI} {VM_IP}
 ```

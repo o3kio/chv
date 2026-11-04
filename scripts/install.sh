@@ -40,8 +40,9 @@
 #   INSTALL_CHV_NO_SEED         - Set to "1" to skip default network + test VM creation
 #   INSTALL_CHV_NO_BRIDGE       - Set to "1" to skip the legacy host bridge/NAT
 #                                 bootstrap (qualified networks are created via
-#                                 the API and managed by chv-nwd as br-<net_id>;
-#                                 the pre-created chvbr0 is a dev convenience)
+#                                 the API and managed by chv-nwd as br-<id>
+#                                 or br-<first8><hash> past 15 chars; the
+#                                 pre-created chvbr0 is a dev convenience)
 #   INSTALL_CHV_WIPE            - Set to "1" to wipe the previous deployment first,
 #                                 including existing VMs and the control-plane database
 
@@ -1299,8 +1300,9 @@ generate_certs() {
 setup_network() {
     # The legacy dev bootstrap: pre-create chvbr0 + NAT so the seeded default
     # network has external connectivity. Qualified networks are created via
-    # the API and managed by chv-nwd (br-<net_id>); hosts that do not want
-    # this convenience bridge can skip it with INSTALL_CHV_NO_BRIDGE=1.
+    # the API and managed by chv-nwd (br-<id>, hashed past 15 chars); hosts
+    # that do not want this convenience bridge can skip it with
+    # INSTALL_CHV_NO_BRIDGE=1.
     if [ "$INSTALL_CHV_NO_BRIDGE" = "1" ]; then
         warn "Skipping legacy bridge/NAT bootstrap (INSTALL_CHV_NO_BRIDGE=1)."
         return 0

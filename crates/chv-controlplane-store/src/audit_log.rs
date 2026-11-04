@@ -133,13 +133,7 @@ impl AuditLogRepository {
     /// at any realistic volume); a PRIMARY KEY collision is a loud
     /// store error (never silently overwritten).
     pub async fn insert(&self, input: &AuditLogInsert) -> Result<String, StoreError> {
-        let audit_id = format!(
-            "{}{}{}{}",
-            chv_common::gen_short_id(),
-            chv_common::gen_short_id(),
-            chv_common::gen_short_id(),
-            chv_common::gen_short_id()
-        );
+        let audit_id = chv_common::gen_resource_id();
         sqlx::query(INSERT_SQL)
             .bind(&audit_id)
             .bind(input.occurred_at_ms)

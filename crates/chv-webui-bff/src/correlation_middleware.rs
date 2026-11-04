@@ -29,7 +29,7 @@ pub async fn extract_correlation_id(req: Request, next: Next) -> impl IntoRespon
         .get("x-operation-id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(chv_common::gen_short_id);
+        .unwrap_or_else(chv_common::gen_resource_id);
     let mut req = req;
     req.extensions_mut().insert(Some(correlation_id.clone()));
 

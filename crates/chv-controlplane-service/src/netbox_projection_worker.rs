@@ -340,7 +340,7 @@ impl NetboxProjectionWorker {
                 }
             }
 
-            let run_id = match NetboxProjectionRunId::new(chv_common::gen_short_id()) {
+            let run_id = match NetboxProjectionRunId::new(chv_common::gen_resource_id()) {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(

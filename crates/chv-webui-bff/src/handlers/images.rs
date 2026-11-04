@@ -151,7 +151,7 @@ pub async fn import_image(
         }
     }
 
-    let image_id = chv_common::gen_short_id();
+    let image_id = chv_common::gen_resource_id();
 
     sqlx::query(
         r#"INSERT INTO images

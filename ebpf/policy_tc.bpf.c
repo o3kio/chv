@@ -44,17 +44,18 @@ typedef unsigned long long __u64;
 #define MAX_RULES_PER_VM 64
 
 // Fixed-size map key derived from the vm_id's raw bytes. Distinct vm_ids up
-// to 16 bytes produce distinct keys, unlike the previous FNV-1a u32 hash
-// which could collide and let one VM's policy overwrite another's.
+// to 32 bytes produce distinct keys, unlike the previous FNV-1a u32 hash
+// which could collide and let one VM's policy overwrite another's. 32 bytes
+// is exactly a 128-bit hex resource id (#664).
 struct rule_key {
-    __u8 id[16]; // vm_id ASCII bytes, zero-padded (truncated to 16 by userspace)
+    __u8 id[32]; // vm_id ASCII bytes, zero-padded; longer ids are rejected by userspace
 };
 
 // ---------------------------------------------------------------------------
 // Map definitions
 // ---------------------------------------------------------------------------
 
-// Key: struct rule_key (16-byte zero-padded vm_id)
+// Key: struct rule_key (32-byte zero-padded vm_id)
 // Value: array of rules for that VM
 struct rule_entry {
     __u8  direction;    // 0=both, 1=ingress, 2=egress
@@ -84,7 +85,7 @@ struct {
     __type(value, struct rule_set);
 } rule_map __section(".maps");
 
-// Key: struct rule_key (16-byte zero-padded vm_id)
+// Key: struct rule_key (32-byte zero-padded vm_id)
 // Value: rate limit parameters
 struct rate_entry {
     __u64 rate_bps;       // bytes per second
@@ -118,7 +119,7 @@ struct {
     __type(value, struct stats_entry);
 } stats_map __section(".maps");
 
-// Key: struct rule_key (16-byte zero-padded vm_id)
+// Key: struct rule_key (32-byte zero-padded vm_id)
 // Value: default action (u8: 0=deny, 1=allow)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -315,7 +316,7 @@ int policy_tc(struct __sk_buff *skb)
     // Determine VM identity from the interface index.
     //
     // NOTE: `skb->ifindex` is only a placeholder. The keys the control
-    // plane stores in rule_map/defaults_map/rate_map are 16-byte
+    // plane stores in rule_map/defaults_map/rate_map are 32-byte
     // build_vm_key(vm_id) values (the zero-padded vm_id), NOT raw
     // ifindexes, so lookups keyed on the ifindex can never match until an
     // ifindex -> rule_key mapping is implemented (e.g. a separate

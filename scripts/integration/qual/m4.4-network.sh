@@ -69,7 +69,7 @@
 # Non-claims (inherited from prompt 01, restated): coexistence with
 # Kubernetes/CNI, Docker-forwarded traffic, or multiple bridge-owning
 # network stacks is NOT claimed. Single node, single default bridge
-# family (chvbr0 / br-<network_id>) only.
+# family (chvbr0 / br-<id>, hashed past 15 chars) only.
 #
 # Timing notes (same host class as M4.3): guest boots to logind in
 # ~10-60 s; graceful stop needs up to ~35 s; the agent supervisor
@@ -282,12 +282,41 @@ net_id_by_name() {
         "SELECT network_id FROM networks WHERE display_name='$1' ORDER BY network_id LIMIT 1" 2>/dev/null | head -1
 }
 
-# bridge_for_network NETWORK_ID — nwd's bridge name for a network id
-# ('default' → chvbr0, anything else → br-<network_id>). Driven by the
-# VM's ACTUAL network_id, never by the vm-create reference (N1/#354).
+# bridge_for_network NETWORK_ID — nwd's bridge name for a network id.
+# Mirrors chv_common::bridge_name_for_network exactly: 'default' → chvbr0,
+# 'br-<id>' while that fits IFNAMSIZ (15), otherwise 'br-<first 8><fnv16>'.
+# 128-bit ids (#664) always take the hashed branch. Driven by the VM's
+# ACTUAL network_id, never by the vm-create reference (N1/#354).
 bridge_for_network() {
-    if [ "$1" = "default" ]; then echo "chvbr0"; else echo "br-$1"; fi
+    local id="$1" candidate h ch i
+    local LC_ALL=C
+    [ "$id" = "default" ] && { echo "chvbr0"; return; }
+    candidate="br-${id}"
+    if [ "${#candidate}" -le 15 ]; then
+        echo "$candidate"; return
+    fi
+    # FNV-1a low 16 bits, byte-wise, 32-bit wrap — the Rust helper's
+    # exact loop (`h = h.wrapping_mul(0x01000193) ^ byte`).
+    h=2166136261
+    for ((i = 0; i < ${#id}; i++)); do
+        printf -v ch '%d' "'${id:i:1}"
+        h=$(( ((h * 16777619) & 0xffffffff) ^ ch ))
+    done
+    printf 'br-%s%04x\n' "${id:0:8}" "$((h & 0xffff))"
 }
+
+# Pin the derivation against chv_common: a drift here false-fails M4.4.
+assert_bridge_derivation() {
+    local got
+    got="$(bridge_for_network 0123456789abcdef0123456789abcdef)"
+    [ "$got" = "br-012345674d15" ] \
+        || qual_die "bridge_for_network drifted for 128-bit ids: got '${got}'"
+    [ "$(bridge_for_network 0123abcd)" = "br-0123abcd" ] \
+        || qual_die "bridge_for_network drifted for legacy ids"
+    [ "$(bridge_for_network default)" = "chvbr0" ] \
+        || qual_die "bridge_for_network drifted for the default network"
+}
+assert_bridge_derivation
 
 ping_ok() {
     local ip="$1" iface="${2:-}"

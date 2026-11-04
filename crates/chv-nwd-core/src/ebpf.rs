@@ -157,7 +157,7 @@ fn serialize_rate_limit_value(rate_limit: &EbpfRateLimit) -> [u8; 32] {
 /// Represents a security rule entry for the eBPF rule_map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfRule {
-    /// Fixed 16-byte BPF map key derived from the vm_id.
+    /// Fixed 32-byte BPF map key derived from the vm_id.
     pub vm_key: [u8; VM_KEY_LEN],
     /// 0=both, 1=ingress, 2=egress
     pub direction: u8,
@@ -179,7 +179,7 @@ pub struct EbpfRule {
 /// Rate limit entry for the eBPF rate_map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfRateLimit {
-    /// Fixed 16-byte BPF map key derived from the vm_id.
+    /// Fixed 32-byte BPF map key derived from the vm_id.
     pub vm_key: [u8; VM_KEY_LEN],
     pub rate_bps: u64,
     pub burst_bytes: u64,
@@ -223,13 +223,13 @@ pub trait EbpfManager: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 /// Length in bytes of the fixed BPF map key built from a vm_id.
-/// Must match `struct rule_key { __u8 id[16]; }` in ebpf/policy_tc.bpf.c.
-pub const VM_KEY_LEN: usize = 16;
+/// Must match `struct rule_key { __u8 id[32]; }` in ebpf/policy_tc.bpf.c.
+pub const VM_KEY_LEN: usize = 32;
 
-/// Build the fixed 16-byte BPF map key for a vm_id.
+/// Build the fixed 32-byte BPF map key for a vm_id.
 ///
 /// The key holds the vm_id's raw ASCII bytes, zero-padded to `VM_KEY_LEN`.
-/// Distinct vm_ids that fit in 16 bytes therefore produce distinct keys.
+/// Distinct vm_ids that fit in 32 bytes therefore produce distinct keys.
 /// vm_ids longer than `VM_KEY_LEN` bytes are rejected rather than
 /// truncated: truncation would let two distinct vm_ids collide and one
 /// VM's policy overwrite the other's. This replaces the previous FNV-1a
@@ -721,23 +721,23 @@ mod tests {
 
     #[test]
     fn build_vm_key_rejects_long_ids_instead_of_truncating() {
-        // An overlong vm_id must be rejected: truncating to the first 16
+        // An overlong vm_id must be rejected: truncating to the first 32
         // bytes would let distinct ids collide in the BPF maps.
-        let vm_id = "abcdefghijklmnopqrstuvwxyz";
+        let vm_id = "abcdefghijklmnopqrstuvwxyz0123456";
         assert!(matches!(
             build_vm_key(vm_id),
             Err(ChvError::InvalidArgument { .. })
         ));
 
-        // Exactly 16 bytes is accepted and stored verbatim.
-        let exact = build_vm_key("abcdefghijklmnop").unwrap();
-        assert_eq!(&exact[..], b"abcdefghijklmnop");
+        // Exactly 32 bytes is accepted and stored verbatim.
+        let exact = build_vm_key("abcdefghijklmnopqrstuvwxyz012345").unwrap();
+        assert_eq!(&exact[..], b"abcdefghijklmnopqrstuvwxyz012345");
     }
 
     /// Regression test: "bkq56sy7yl" and "7rw963dz3" collide under the old
     /// FNV-1a-truncated-to-u32 key (both hash to 0xe7a4f6a2 in the low 32
     /// bits), so one VM's policy could overwrite the other's. The fixed
-    /// 16-byte key must keep them distinct.
+    /// 32-byte key must keep them distinct.
     #[test]
     fn build_vm_key_distinguishes_former_fnv_collisions() {
         let a = "bkq56sy7yl";

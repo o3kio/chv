@@ -107,7 +107,7 @@ pub async fn create_user(
         BffError::Internal("failed to hash password".into())
     })?;
 
-    let user_id = chv_common::gen_short_id();
+    let user_id = chv_common::gen_resource_id();
 
     sqlx::query(
         "INSERT INTO users (user_id, username, password_hash, role, display_name, email) VALUES (?, ?, ?, ?, ?, ?)",

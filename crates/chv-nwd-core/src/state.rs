@@ -63,7 +63,7 @@ mod tests {
         TopologyState {
             network_id: network_id.to_string(),
             tenant_id: "t1".to_string(),
-            bridge_name: format!("br-{}", network_id),
+            bridge_name: chv_common::bridge_name_for_network(network_id),
             namespace_name: format!("ns-{}", network_id),
             subnet_cidr: "10.0.0.0/24".to_string(),
             gateway_ip: "10.0.0.1".to_string(),

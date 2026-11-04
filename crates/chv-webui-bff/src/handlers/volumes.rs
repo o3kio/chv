@@ -425,8 +425,8 @@ pub async fn create_volume(
     // DP3: server-minted id (no client-supplied volume_id — the clone
     // path's caller-supplied id exists for replay semantics this
     // surface doesn't need).
-    let volume_id = chv_common::gen_short_id();
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let volume_id = chv_common::gen_resource_id();
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
     let requested_by = claims.sub.clone();
     tracing::info!(%volume_id, %operation_id, %node_id, "create_volume: generated IDs, continuing transaction");
 
@@ -1028,7 +1028,7 @@ pub async fn delete_volume(
     .await
     .map_err(|e| BffError::Internal(format!("failed to read generation: {}", e)))?;
 
-    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_short_id);
+    let operation_id = correlation_id.unwrap_or_else(chv_common::gen_resource_id);
     // The Accepted operation the PR 1 arm dispatches. resource_kind
     // 'volume' (lowercase) — the BFF's volume display surfaces read
     // that exact spelling, and the orchestrator's claim query resolves

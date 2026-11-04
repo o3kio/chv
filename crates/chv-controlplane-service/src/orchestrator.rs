@@ -649,7 +649,7 @@ impl Orchestrator {
 
             let attempt = row.redrive_count + 1;
             let operation_id =
-                OperationId::new(format!("RecreateVm-{}", chv_common::gen_short_id())).map_err(
+                OperationId::new(format!("RecreateVm-{}", chv_common::gen_resource_id())).map_err(
                     |e| ChvError::Internal {
                         reason: format!("invalid operation_id: {e}"),
                     },
@@ -705,10 +705,12 @@ impl Orchestrator {
         let resource_id = ResourceId::new(vm_id.to_owned()).map_err(|e| ChvError::Internal {
             reason: format!("invalid resource_id: {e}"),
         })?;
-        let operation_id = OperationId::new(format!("RecreateVm-{}", chv_common::gen_short_id()))
-            .map_err(|e| ChvError::Internal {
-            reason: format!("invalid operation_id: {e}"),
-        })?;
+        let operation_id =
+            OperationId::new(format!("RecreateVm-{}", chv_common::gen_resource_id())).map_err(
+                |e| ChvError::Internal {
+                    reason: format!("invalid operation_id: {e}"),
+                },
+            )?;
         let receipt = self
             .operation_repo
             .create_or_get(&OperationCreateInput {

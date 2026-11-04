@@ -611,8 +611,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         {
             Ok((namespace_handle, tap_handle)) => {
                 // Auto-load eBPF programs on the new tap interface — MANDATORY for tenant isolation
-                let bridge_name =
-                    format!("br-{}", nic.network_id.chars().take(8).collect::<String>());
+                let bridge_name = state.bridge_name.clone();
                 if let Err(e) = self.ebpf.load_policy_program(&tap_handle).await {
                     tracing::error!(tap = %tap_handle, error = %e, "eBPF policy load failed — refusing NIC attach (default-deny)");
                     self.ebpf_load_failures.fetch_add(1, Ordering::Relaxed);

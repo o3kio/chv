@@ -129,7 +129,7 @@ pub async fn create_snapshot(
             .as_deref()
             .is_some_and(|s| matches!(s, "Running" | "Starting" | "Resuming"));
 
-    let snapshot_id = chv_common::gen_short_id();
+    let snapshot_id = chv_common::gen_resource_id();
     let snapshot_path = state
         .agent_runtime_dir
         .join("vms")

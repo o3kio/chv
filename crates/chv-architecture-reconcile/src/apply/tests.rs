@@ -787,7 +787,7 @@ async fn apply_plan_failure_preserves_started_at() {
     // Build a plan with a Create change so the happy path enqueues an
     // operation. Then, force the operations table to error on insert by
     // pre-inserting an op with the same operation_id — ahem, the
-    // operation_id is a fresh `gen_short_id`, so we cannot collide on
+    // operation_id is a fresh `gen_resource_id`, so we cannot collide on
     // it. Instead, drop the operations table to provoke a hard failure.
     let plan = plan_with(
         vec![change(PlanAction::Create, ResourceType::Instance, "vm-1")],

@@ -193,8 +193,9 @@ cleanup() {
     pkill -9 -f "(^|/)chv-nwd( |$).*${TEST_DIR}" 2>/dev/null || true
 
     # Remove nwd-owned links this deployment created (bridges and taps —
-    # see chv-nwd-core state.rs/executor.rs naming: 'br-<network_id>' and
-    # 'tap-*', PLUS 'chvbr0' for the default network — see
+    # see chv-common bridge_name_for_network: 'br-<id>' or
+    # 'br-<first8><hash>' past 15 chars, and 'tap-*', PLUS 'chvbr0' for the
+    # default network — see
     # chv-hypervisor-api resources.rs default_network_bridge_name; run 4's
     # teardown left chvbr0 behind because the pattern only covered br-/tap-).
     # Scoped by the baseline diff so pre-existing host links are never

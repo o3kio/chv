@@ -250,8 +250,8 @@ Additional provisioning facts:
   fixed via #424); no daemon consumes it for authority selection (§10).
 - The optional legacy `chvbr0` host bridge/NAT bootstrap is opt-out
   (`INSTALL_CHV_NO_BRIDGE=1`). Qualified networks are created via the API and
-  managed by `chv-nwd` as `br-<net_id>`; the pre-created `chvbr0` is a dev
-  convenience.
+  managed by `chv-nwd` as `br-<net_id>` (hashed to 15 characters when the id
+  does not fit); the pre-created `chvbr0` is a dev convenience.
 - `--wipe` tears down the deployment **but preserves persistent agent
   authority state by design** (`scripts/install.sh:1651-1691`).
 
@@ -590,7 +590,7 @@ deploy them; do not file evidence against them.
 |---|---|---|
 | `docker-compose.yml`, `docker-compose.prod.yml` | `docker-compose.yml`: Legacy / DEV-ONLY; `docker-compose.prod.yml`: Legacy / UNMAINTAINED (both explicit in-repo banners) | **The image builds on amd64; the stacks remain unsupported.** Neither compose file provisions TLS/mTLS material or a bootstrap token, and the control plane fails closed without them by design, so the stacks do not run end-to-end as configured. Use the `.deb`/`.rpm` packages or `scripts/install.sh`. |
 | `Dockerfile`, `deploy/entrypoint.sh` | DEV / LAB convenience only (explicit in-repo banner) | The image builds on amd64 (Rust 1.98.1 pin, protoc/cmake, `VERSION`, digest-verified Cloud Hypervisor v53.0); non-amd64 builds fail fast because the pinned VMM assets are x86_64-only. It is useful for local iteration and image-build smoke checks, but it is not a supported deployment path. |
-| Legacy `chvbr0` host bridge/NAT bootstrap | Opt-out dev convenience (`INSTALL_CHV_NO_BRIDGE=1`) | Qualified networks are API-created and `chv-nwd`-managed (`br-<net_id>`). |
+| Legacy `chvbr0` host bridge/NAT bootstrap | Opt-out dev convenience (`INSTALL_CHV_NO_BRIDGE=1`) | Qualified networks are API-created and `chv-nwd`-managed (`br-<net_id>` or its 15-char hashed form). |
 | `authority_mode = "legacy"` | Compatibility adapter only | Explicit opt-in; the agent logs a warning. Qualified posture is core-managed everywhere. |
 | `packaging/config/chv.yaml` (`/etc/chv/chv.yaml` in `chv-node`) | Reference-only | Ships `authority_mode: core-managed` (aligned with the shipped `.toml` configs via #424). No daemon consumes it for authority selection. |
 | `docs/examples/bootstrap.sh` | Manual helper | Points operators to `scripts/install.sh`; not a supported install path. |

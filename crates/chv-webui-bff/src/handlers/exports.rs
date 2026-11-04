@@ -101,7 +101,7 @@ pub async fn export_vm(
         disk_paths.push(canonical);
     }
 
-    let export_id = chv_common::gen_short_id();
+    let export_id = chv_common::gen_resource_id();
     let export_dir = state.agent_runtime_dir.join("exports").join(&export_id);
     tokio::fs::create_dir_all(&export_dir)
         .await

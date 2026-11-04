@@ -169,7 +169,7 @@ async fn build_state() -> AppState {
 
     let agent_runtime_dir = std::env::temp_dir().join(format!(
         "chv-bff-csrf-import-{}",
-        chv_common::gen_short_id()
+        chv_common::gen_resource_id()
     ));
     tokio::fs::create_dir_all(&agent_runtime_dir)
         .await
