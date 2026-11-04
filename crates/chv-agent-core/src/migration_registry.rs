@@ -756,6 +756,114 @@ mod tests {
         assert!(registry.transfer_in_progress("op-unknown"));
     }
 
+    /// A duplicate registration must cancel the displaced task's token, but
+    /// must not force-drop it while it is inside a non-cancellable VMM
+    /// transfer (the transfer would keep running). Outside the window the old
+    /// hard-abort behavior must remain.
+    #[tokio::test]
+    async fn duplicate_registration_respects_displaced_transfer_window() {
+        let registry = Arc::new(MigrationTaskRegistry::new());
+
+        // Inside a live transfer: signal only.
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(transfer.try_begin(), "the displaced task is transferring");
+        let token = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.insert_with_transfer_window(
+            "op-dup".to_string(),
+            task.abort_handle(),
+            token.clone(),
+            transfer.clone(),
+        );
+        let replacement = tokio::spawn(std::future::pending::<()>());
+        registry.insert(
+            "op-dup".to_string(),
+            replacement.abort_handle(),
+            CancellationToken::new(),
+        );
+        assert!(token.is_cancelled(), "the displaced task must be signalled");
+        assert!(
+            !transfer.try_begin(),
+            "the displaced task's window must be armed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "a task inside its VMM transfer must not be force-dropped"
+        );
+        task.abort();
+        let _ = task.await;
+        replacement.abort();
+        let _ = replacement.await;
+        registry.remove("op-dup");
+
+        // Outside the window: the displaced task is force-aborted.
+        let token = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.insert("op-dup-2".to_string(), task.abort_handle(), token.clone());
+        let replacement = tokio::spawn(std::future::pending::<()>());
+        registry.insert(
+            "op-dup-2".to_string(),
+            replacement.abort_handle(),
+            CancellationToken::new(),
+        );
+        assert!(token.is_cancelled());
+        assert!(
+            task.await
+                .expect_err("a displaced task outside the transfer must be aborted")
+                .is_cancelled(),
+            "the displaced task must be force-aborted"
+        );
+        replacement.abort();
+        let _ = replacement.await;
+        registry.remove("op-dup-2");
+    }
+
+    /// A cancel issued without an ambient Tokio runtime (sync caller) must
+    /// hard-abort a task outside the transfer window, and must leave a task
+    /// inside it alone until the window closes.
+    #[test]
+    fn cancel_without_runtime_hard_aborts_unless_transferring() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let registry = Arc::new(MigrationTaskRegistry::new());
+
+        let task = rt.spawn(std::future::pending::<()>());
+        let token = CancellationToken::new();
+        registry.insert("op-sync".to_string(), task.abort_handle(), token.clone());
+        assert!(registry.cancel("op-sync"));
+        assert!(token.is_cancelled());
+        assert!(rt
+            .block_on(task)
+            .expect_err("a sync cancel must hard-abort")
+            .is_cancelled());
+        registry.remove("op-sync");
+
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(transfer.try_begin());
+        let task = rt.spawn(std::future::pending::<()>());
+        let token = CancellationToken::new();
+        registry.insert_with_transfer_window(
+            "op-sync-transfer".to_string(),
+            task.abort_handle(),
+            token.clone(),
+            transfer.clone(),
+        );
+        assert!(registry.cancel("op-sync-transfer"));
+        assert!(token.is_cancelled());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !task.is_finished(),
+            "a sync cancel must not drop a task inside its VMM transfer"
+        );
+        transfer.end();
+        assert!(registry.cancel("op-sync-transfer"));
+        assert!(rt
+            .block_on(task)
+            .expect_err("the retry must hard-abort once the transfer is over")
+            .is_cancelled());
+        registry.remove("op-sync-transfer");
+    }
+
     /// The tombstone is both bounded and time-limited.
     #[test]
     fn tombstone_is_bounded_and_expires() {
