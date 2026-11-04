@@ -243,6 +243,11 @@ pub struct MockCloudHypervisorAdapter {
     /// bounded wait expiring while the VMM transfer may still run. Used to
     /// pin the transfer-window seal (fail-closed cancellation) end to end.
     pub migration_timeout: Arc<Mutex<bool>>,
+    /// When true, `send_migration`/`receive_migration` return
+    /// `ChvError::OutcomeUnknown` without touching the VM, modelling a VMM
+    /// reply lost after the request was delivered. Must seal exactly like a
+    /// timeout (the transfer may still run).
+    pub migration_outcome_unknown: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
@@ -429,6 +434,12 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
                 secs: 7200,
             });
         }
+        if *self.migration_outcome_unknown.lock().unwrap() {
+            return Err(ChvError::OutcomeUnknown {
+                operation: "send-migration (mock)".to_string(),
+                reason: "reply lost after delivery".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -442,6 +453,12 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
             return Err(ChvError::Timeout {
                 operation: "receive-migration (mock)".to_string(),
                 secs: 7200,
+            });
+        }
+        if *self.migration_outcome_unknown.lock().unwrap() {
+            return Err(ChvError::OutcomeUnknown {
+                operation: "receive-migration (mock)".to_string(),
+                reason: "reply lost after delivery".to_string(),
             });
         }
         Ok(())

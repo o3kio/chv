@@ -1572,6 +1572,27 @@ mod tests {
             "a sealed task must stay tracked after remove so cancels keep failing closed"
         );
         task.abort();
+
+        // A lost VMM reply is the same outcome class as a timeout and must
+        // seal through the same production call site.
+        let (rt, mock) = test_runtime();
+        *mock.migration_outcome_unknown.lock().unwrap() = true;
+        let lost = Arc::new(TransferWindow::default());
+        let err = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-lost-reply".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            lost.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect_err("the mock must report a lost reply");
+        assert!(err.contains("outcome unknown"), "{err}");
+        assert!(
+            lost.is_unknown(),
+            "a lost VMM reply must seal the transfer as outcome-unknown"
+        );
     }
 
     /// Only a definitive send-migration failure may unpause the source. A
@@ -1609,17 +1630,22 @@ mod tests {
         guard.pause_vm().await.expect("pause the VM");
         assert_eq!(rt.get("vm-1").await.unwrap().runtime_status, "Paused");
 
-        settle_paused_source_after_send_failure(
-            &ChvError::Timeout {
+        for unknown in [
+            ChvError::OutcomeUnknown {
+                operation: "send-migration".to_string(),
+                reason: "connection closed mid-response".to_string(),
+            },
+            ChvError::Timeout {
                 operation: "send-migration".to_string(),
                 secs: 7200,
             },
-            &mut guard,
-            "vm-1",
-            "op-1",
-        )
-        .await;
-        assert!(guard.is_paused(), "the guard must still consider it paused");
+        ] {
+            settle_paused_source_after_send_failure(&unknown, &mut guard, "vm-1", "op-1").await;
+            assert!(
+                guard.is_paused(),
+                "the guard must still consider it paused after {unknown:?}"
+            );
+        }
         assert_eq!(
             rt.get("vm-1").await.unwrap().runtime_status,
             "Paused",

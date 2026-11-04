@@ -5808,6 +5808,7 @@ mod tests {
     use super::cloud_init_meta_data;
     use super::parse_http_status;
     use super::persisted_serial_transport;
+    use super::read_migration_http_response;
     use super::ConsoleFanout;
     use super::ConsoleLogMode;
     use super::ProcessCloudHypervisorAdapter;
@@ -8382,6 +8383,86 @@ mod tests {
             proc.child.kill(&proc.api_socket, None);
             proc.child.wait().await;
         }
+    }
+
+    async fn serve_migration_response_once(path: &std::path::Path, response: &'static [u8]) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = conn.write_all(response).await;
+        });
+    }
+
+    /// Real micro_http (the pinned Cloud Hypervisor API layer) frames an empty
+    /// 204 body without `Content-Length` and keeps the connection alive. That
+    /// must still count as a complete response.
+    #[tokio::test]
+    async fn migration_response_reader_accepts_real_204_without_content_length() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let sock = dir.path().join("migration-204.sock");
+        serve_migration_response_once(&sock, b"HTTP/1.1 204 \r\nConnection: keep-alive\r\n\r\n")
+            .await;
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (status, body) = read_migration_http_response(&mut stream, "send-migration")
+            .await
+            .expect("a real 204 shape must be accepted");
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
+    }
+
+    /// Losing the reply before the headers finish must be outcome-unknown, not
+    /// a definitive migration failure.
+    #[tokio::test]
+    async fn migration_response_reader_treats_truncated_headers_as_unknown() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let sock = dir.path().join("migration-short-headers.sock");
+        serve_migration_response_once(&sock, b"HTTP/1.1 200 OK\r\nContent-Len").await;
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let err = read_migration_http_response(&mut stream, "send-migration")
+            .await
+            .expect_err("a truncated header block must not be accepted");
+        assert!(
+            matches!(err, ChvError::OutcomeUnknown { .. }),
+            "lost reply must be outcome-unknown, got {err:?}"
+        );
+    }
+
+    /// A body shorter than the declared `Content-Length` must not be parsed as
+    /// a successful response.
+    #[tokio::test]
+    async fn migration_response_reader_treats_short_body_as_unknown() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let sock = dir.path().join("migration-short-body.sock");
+        serve_migration_response_once(&sock, b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
+            .await;
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let err = read_migration_http_response(&mut stream, "receive-migration")
+            .await
+            .expect_err("a short body must not be accepted");
+        assert!(
+            matches!(err, ChvError::OutcomeUnknown { .. }),
+            "short body must be outcome-unknown, got {err:?}"
+        );
+    }
+
+    /// An unparseable status line is also outcome-unknown: the request was
+    /// delivered, so the VMM may still be migrating.
+    #[tokio::test]
+    async fn migration_response_reader_treats_unparseable_status_as_unknown() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let sock = dir.path().join("migration-bad-status.sock");
+        serve_migration_response_once(&sock, b"NOT-HTTP\r\n\r\n").await;
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let err = read_migration_http_response(&mut stream, "send-migration")
+            .await
+            .expect_err("an unparseable status must not be accepted");
+        assert!(
+            matches!(err, ChvError::OutcomeUnknown { .. }),
+            "unparseable status must be outcome-unknown, got {err:?}"
+        );
     }
 
     /// Resuming a VM that is already running is a no-op. This is what lets the
