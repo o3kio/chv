@@ -628,9 +628,12 @@ transferring, the task is sealed as "outcome unknown" and remains tracked, so
 cancellation stays unconfirmable for that agent process; a restart is the only
 mechanical clear (`agent_cancel_pending = 1`) and the paused source VM is left
 paused. After the restart the next drain reports `not_tracked`, which counts as
-success and re-enables the ordinary resume gate, so an operator who cannot rule
-out a completed destination transfer must verify the VM and set
-`reaper_resume_state = 'blocked'` before restarting the agent. A non-NULL
+success. That re-enables the ordinary resume gate only for a reaper-failed row
+already queued for resume (`reaper_resume_state = 'pending'` and no ambiguous
+interrupted phase); rows terminalized by restart recovery (NULL) and blocked
+rows stay operator-only. An operator who cannot rule out a completed
+destination transfer must verify the VM and set `reaper_resume_state =
+'blocked'` before restarting the agent for a reaper-owned row. A non-NULL
 `agent_cancel_last_error` means the agent refused
 permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
 invalid request); the detached task may still exist, so verify placement and
@@ -651,10 +654,14 @@ reaper-failed row `blocked`, while a restart-recovered row keeps the state NULL,
 and neither is resumed automatically. Setting `pending` without the queued
 cancel is unsafe: `agent_cancel_pending` is 0, so the resume pass is not held by
 an outstanding cancel, and with no fresh confirmation the 30 s settle gate does
-not apply — the source could be resumed on the next tick. Let the requeued
-cancel confirm (then settle) before expecting an automatic resume, and only
-once you have verified the destination does not own the VM; otherwise leave the
-row blocked and resume explicitly where the VM actually is.
+not apply — the source could be resumed on the next tick. Even with a
+correctly queued cancel, automatic resume only applies to reaper-failed rows: a
+row whose `interrupted_at` observed `MemoryMigration`/`Paused` is never
+auto-resumed (whether recovered or reaper-failed), and a row blocked by a late
+`Completed` must stay blocked because the destination may own the VM. Let the
+requeued cancel confirm and settle, and only set `pending` once you have
+verified the destination does not own the VM; otherwise leave the row blocked
+and resume explicitly where the VM actually is.
 
 A successful pause-first migration can leave the destination VM paused. When
 the source agent reports `Completed`, the control plane resumes the destination
