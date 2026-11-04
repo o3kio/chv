@@ -12,16 +12,29 @@ export async function loginAsAdmin(page: Page) {
 	]);
 }
 
+/**
+ * Wait until SvelteKit has hydrated the current page. The root layout's
+ * `onMount` sets `data-theme` on <html>; that hook cannot run until the
+ * component tree is interactive, so it is a reliable readiness signal for
+ * tests that click immediately after `goto`. Without it, a click can land on
+ * the server-rendered button before its handler is attached and be dropped.
+ */
+export async function waitForHydration(page: Page) {
+	await page.waitForFunction(() => document.documentElement.dataset.theme !== undefined);
+}
+
 export async function mockApiResponse(
 	page: Page,
 	urlPattern: string | RegExp,
 	json: unknown,
-	status = 200
+	status = 200,
+	headers: Record<string, string> = {}
 ) {
 	await page.route(urlPattern, async (route) => {
 		await route.fulfill({
 			status,
 			contentType: 'application/json',
+			headers,
 			body: JSON.stringify(json)
 		});
 	});

@@ -31,7 +31,7 @@ All controls from 1.2 to 1.10 are enforced by the active `protect-main` ruleset 
 |---|---------|--------|-----|
 | 2.1 | Workflows have minimal explicit permissions | ✅ | `permissions: contents: read` in all workflows that do not publish; elevated permissions only in publishing jobs |
 | 2.2 | `GITHUB_TOKEN` has restricted default permissions | **(admin)** | Settings → Actions → Workflow permissions → Read repository contents and packages |
-| 2.3 | Only actions from GitHub-verified creators are allowed | **(admin)** | Settings → Actions → Allow kubedoio, and select non-GitHub-verified actions (review monthly) |
+| 2.3 | Only actions from GitHub-verified creators are allowed | **(admin)** | Settings → Actions → Allow o3kio, and select non-GitHub-verified actions (review monthly) |
 | 2.4 | Self-hosted runner labels are restricted | **(admin)** | `integration-kvm.yml` uses `chv-kvm`; ensure only trusted runners advertise this label |
 | 2.5 | Workflow `workflow_dispatch` inputs are validated | ✅ | `release.yml` validates version format; `package-nightly.yml` has dry-run mode |
 
@@ -54,8 +54,8 @@ All controls from 1.2 to 1.10 are enforced by the active `protect-main` ruleset 
 | # | Control | Status | How |
 |---|---------|--------|-----|
 | 3.1 | Only tags trigger releases | ✅ | `release.yml` triggers on `push: tags:`; manual `workflow_dispatch` without a version builds without releasing |
-| 3.2 | Version tags (`v*`) are protected | **(admin)** | Tag protection rule or ruleset |
-| 3.3 | Release publishing requires environment approval | ✅ | `release` job uses `environment: production` or `rc`; configure required reviewers in Settings → Environments |
+| 3.2 | Version tags (`v*`) are protected | ✅ | Active `protect-tags` ruleset restricts creation, update, and deletion of `refs/tags/v*` with zero bypass actors; cutting a release therefore requires an admin to grant bypass or pause the ruleset (recorded in `GOVERNANCE.md`). Verify with `apply-tag-protection.sh --audit`. |
+| 3.3 | Release publishing requires environment approval | **(admin)** | The `release`/`sign` jobs declare `environment: production`/`rc` (✅), but no environment has a required-reviewer `protection_rule` yet (`protection_rules: []`). Configure reviewers in Settings → Environments; see `docs/release/release-process.md`. Until then the environment gates by name only. |
 | 3.4 | Package repo publishing requires separate environment | ✅ | `publish-repo` job uses `production-repo` or `rc-repo` |
 | 3.5 | Changelog is required for stable releases | ✅ | `release.yml` validates CHANGELOG.md before building |
 | 3.6 | Smoke and lifecycle tests gate publishing | ✅ | `release.yml` package job runs smoke/lifecycle tests before release job starts |
@@ -163,20 +163,23 @@ Escalate a suspected exploitable vulnerability through the private channel in
 |---|---------|--------|-----|
 | 6.1 | CODEOWNERS file exists and is valid | ✅ | `.github/CODEOWNERS` |
 | 6.2 | CODEOWNERS review requirement is enabled | ✅ | `protect-main` ruleset requires code-owner review |
-| 6.3 | CODEOWNERS owners have write access | **(admin)** | Current entries list individual users (`@zoorpha`, `@senolcolak`); the `kubedoio` teams below are the planned migration |
-| 6.4 | Admin-only paths (`.github/`, `SECURITY.md`) require review by a code owner | ✅ | `.github/CODEOWNERS` (individual owners; no team references) |
+| 6.3 | CODEOWNERS owners have write access | **(admin)** | Current entries list individual users (`@zoorpha`, `@senolcolak`); the `o3kio` teams API returned no teams (checked 2026-11-03), so team handles are not in use. Migration plan: [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md) |
+| 6.4 | Admin-only paths (`.github/`, `SECURITY.md`, governance records) require review by a code owner | ✅ | `.github/CODEOWNERS` (individual owners; no team references) |
 
 ### Team inventory
 
-CODEOWNERS enforcement is active with individual-user owners. Create these teams in the `kubedoio` organization when migrating from individual users:
+CODEOWNERS enforcement is active with individual-user owners. These teams are
+intended for the `o3kio` organization but **do not exist yet**; do not put these
+handles in CODEOWNERS until [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md)
+confirms they are visible and have write access.
 
 | Team | Purpose | Approximate size |
 |------|---------|-----------------|
-| `chv-admins` | Repository governance, CI, security policy | 2–3 |
-| `chv-maintainers` | Rust backend, control plane, protobuf | 3–5 |
-| `chv-frontend` | SvelteKit UI, backend-for-frontend (BFF) integration | 2–3 |
-| `chv-ops` | Deployment, packaging, install scripts | 2–3 |
-| `chv-architecture` | ADRs, specs, design docs | 2–3 |
+| `@o3kio/chv-admins` | Repository governance, CI, security policy | 2–3 |
+| `@o3kio/chv-maintainers` | Rust backend, control plane, protobuf | 3–5 |
+| `@o3kio/chv-frontend` | SvelteKit UI, backend-for-frontend (BFF) integration | 2–3 |
+| `@o3kio/chv-ops` | Deployment, packaging, install scripts | 2–3 |
+| `@o3kio/chv-architecture` | ADRs, specs, design docs | 2–3 |
 
 ---
 
@@ -192,9 +195,11 @@ CODEOWNERS enforcement is active with individual-user owners. Create these teams
 
 ## Quick Start for Admins
 
-1. Create the GitHub teams listed above.
+1. Create the GitHub teams listed above (see
+   [`CODEOWNERS_TEAMS.md`](./CODEOWNERS_TEAMS.md) for the required visibility
+   and access checks).
 2. Branch protection is already enforced (`protect-main`, active since 2026-10-03). Re-apply the ruleset definition with `./scripts/github-setup/apply-branch-protection.sh`.
-3. Apply tag protection: run `./scripts/github-setup/apply-tag-protection.sh`.
+3. Verify tag protection: run `./scripts/github-setup/apply-tag-protection.sh --audit`. The ruleset is already active; re-apply without `--audit` only to repair drift, and remember it has no bypass actors.
 4. Enable secret scanning and push protection in repository settings.
 5. Restrict default `GITHUB_TOKEN` permissions to read-only.
 6. Verify: run `./scripts/github-setup/verify-settings.sh`.

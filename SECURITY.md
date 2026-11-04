@@ -44,6 +44,11 @@ Open a private advisory via the repository's **Security → Advisories → Repor
 
 We will keep you informed at each stage. If we cannot meet a target, we will tell you and explain why.
 
+The weekly primary and backup maintainer assignments are in
+[`docs/governance/SECURITY_TRIAGE_ROTA.md`](docs/governance/SECURITY_TRIAGE_ROTA.md).
+The rota schedules the maintainers; the targets in this document remain the
+source of truth.
+
 ## Disclosure Timeline
 
 CHV follows a **90-day coordinated disclosure** policy, aligned with industry norms (Project Zero, distros@):

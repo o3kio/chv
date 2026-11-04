@@ -1,18 +1,20 @@
 # CHV CODEOWNERS
 #
 # This file defines required reviewers for changes to specific paths.
-# GitHub enforces these rules when branch protection requires CODEOWNERS
-# review (Settings → Branches → Add rule → Require review from CODEOWNERS).
+# GitHub enforces these rules when the `protect-main` ruleset requires
+# code-owner review (see docs/governance/BRANCH_PROTECTION.md).
 #
 # PREREQUISITE: The users listed below must have write access to this
 # repository. If they do not, GitHub silently ignores these entries.
 #
-# As the project grows, migrate from individual users to GitHub teams:
-#   - @kubedoio/chv-admins        — Repository admins, CI/security changes
-#   - @kubedoio/chv-maintainers   — Rust backend maintainers
-#   - @kubedoio/chv-frontend      — UI / SvelteKit maintainers
-#   - @kubedoio/chv-ops           — Deployment, install, release engineering
-#   - @kubedoio/chv-architecture  — ADRs, specs, component contracts
+# GitHub teams are NOT active for this repository. The o3kio organization
+# returned no teams when checked on 2026-11-03. A team must be created, made
+# visible to the repository (not secret), and granted write access before it
+# can enforce review. Until then, the individual handles below remain the
+# effective owners: replacing them with non-existent @o3kio/... handles would
+# silently remove review enforcement. The intended handles, ownership map, and
+# verification steps are in docs/governance/CODEOWNERS_TEAMS.md. Do not claim
+# the team migration is complete until that verification passes.
 #
 # ---------------------------------------------------------------------------
 # Default ownership — every file not matched below
@@ -26,7 +28,12 @@
 /.github/workflows/           @zoorpha @senolcolak
 /.github/CODEOWNERS           @zoorpha @senolcolak
 /.github/dependabot.yml       @zoorpha @senolcolak
+/.github/ISSUE_TEMPLATE/      @zoorpha @senolcolak
+/.github/PULL_REQUEST_TEMPLATE.md  @zoorpha @senolcolak
 /SECURITY.md                  @zoorpha @senolcolak
+/GOVERNANCE.md                @zoorpha @senolcolak
+/MAINTAINERS.md               @zoorpha @senolcolak
+/docs/governance/             @zoorpha @senolcolak
 
 # ---------------------------------------------------------------------------
 # Rust backend / control plane

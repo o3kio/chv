@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/o3kio/chv/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue. See SECURITY.md for scope and timelines.
+  - name: Read the contributing guide
+    url: https://github.com/o3kio/chv/blob/main/CONTRIBUTING.md
+    about: Read the development setup, code style, high-risk change guidance, and pull request process.
