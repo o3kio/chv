@@ -226,9 +226,16 @@ regenerated on upgrade.
   under the old key read as missing, not corrupted. Re-entering guest-backup
   S3 credentials requires a backup implementation; it is not an operator
   action in this release.
-- If the file is absent (or the key is present but empty), the control
-  plane logs a warning and stores S3 credentials in **plaintext** — do
-  not run production deployments that way.
+- If no usable key is configured (no `[secrets] credential_encryption` in
+  `controlplane.toml`, and either the environment file is absent with no
+  legacy `CHV_JWT_SECRET` fallback or `CHV_ENCRYPTION_KEY` is present but
+  empty), the control plane logs a warning and rejects credential writes
+  (fail-closed): backup S3 and NetBox credentials are never stored in
+  **plaintext**. The explicit config value takes precedence over the
+  environment (DEPLOYMENT.md §8). A backup schedule that carries S3
+  credentials cannot be created or updated until a key is configured.
+  Existing plaintext rows remain readable; previously encrypted rows still
+  require the original key.
 - **Upgrading a pre-#335 host:** the postinst mints the key, but a
   *running* control plane does not re-read `EnvironmentFile` until
   restarted — `systemctl restart chv-controlplane` after the upgrade to

@@ -691,10 +691,14 @@ sudo sh -c 'umask 077; printf "CHV_ENCRYPTION_KEY=%s\n" "$(openssl rand -hex 32)
 sudo chmod 0600 /etc/chv/encryption.env
 ```
 
-`chv-controlplane.service` loads it via `EnvironmentFile`. If the file is
-absent (or the key empty), the control plane logs a warning at startup and
-stores S3 credentials in **plaintext** — see OPERATIONS.md
-"Credential encryption key" for backup and rotation semantics.
+`chv-controlplane.service` loads it via `EnvironmentFile`. If no usable key
+is configured (either the environment file is absent with no legacy
+`CHV_JWT_SECRET` fallback or `CHV_ENCRYPTION_KEY` is present but empty,
+and `[secrets] credential_encryption` is unset), the control plane logs a
+warning at startup and **rejects credential writes** (fail-closed): S3
+backup and NetBox credentials are never stored in plaintext. See
+OPERATIONS.md "Credential encryption key" for backup and rotation
+semantics.
 
 ### 9. systemd Services
 
