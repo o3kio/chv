@@ -9,7 +9,7 @@ use chv_controlplane_store::{
     AuditLogInsert, AuditLogRepository, AUDIT_ANONYMOUS_ACTOR_ID, AUDIT_ANONYMOUS_ROLE,
     AUDIT_ANONYMOUS_USERNAME, AUDIT_OUTCOME_DENIED, AUDIT_OUTCOME_FAILED, AUDIT_OUTCOME_SUCCESS,
 };
-use chv_controlplane_types::domain::NodeId;
+use chv_controlplane_types::domain::{NodeId, ResourceKind};
 use control_plane_node_api::control_plane_node_api as proto;
 use serde_json::json;
 use std::sync::Arc;
@@ -1559,20 +1559,15 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         request: Request<proto::AcknowledgeDesiredStateVersionRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
         let fragment = &request.get_ref();
-        let kind = match fragment.fragment_kind.as_str() {
-            "node" => Some("node"),
-            "vm" => Some("vm"),
-            "volume" => Some("volume"),
-            "network" => Some("network"),
-            _ => None,
-        };
-        let resource_id = non_empty(&fragment.fragment_id).or_else(|| {
-            if fragment.fragment_id.is_empty() {
-                non_empty(&fragment.node_id)
-            } else {
-                None
-            }
-        });
+        // `ResourceKind::from_str` is the same parser the service uses and
+        // accepts both `vm` and `Vm`; mirror it so an accepted capitalized
+        // kind does not silently lose the audit row's resource kind.
+        let kind = fragment
+            .fragment_kind
+            .parse::<ResourceKind>()
+            .ok()
+            .map(ResourceKind::as_str);
+        let resource_id = non_empty(&fragment.fragment_id).or_else(|| non_empty(&fragment.node_id));
         audited_service_call!(
             self,
             request,

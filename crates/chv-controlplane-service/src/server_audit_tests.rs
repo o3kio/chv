@@ -671,3 +671,38 @@ async fn server_audit_reconcile_apply_node_desired_state_writes_row() {
     assert_eq!(row.status_code, 200);
     assert_metadata_is_allowlisted(&row.metadata, "mtls");
 }
+
+#[tokio::test]
+async fn server_audit_reconcile_acknowledge_accepts_capitalized_kind() {
+    let db = TestDb::new().await;
+    let server = ReconcileServer::new(Arc::new(MockReconcile))
+        .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let request = peer_request(
+        proto::AcknowledgeDesiredStateVersionRequest {
+            meta: Some(meta("op-ack")),
+            node_id: "node-a".into(),
+            fragment_kind: "Vm".into(),
+            fragment_id: "vm-ack".into(),
+            observed_generation: "2".into(),
+            apply_status: "applied".into(),
+        },
+        "node-a",
+    );
+    server
+        .acknowledge_desired_state_version(request)
+        .await
+        .expect("acknowledge succeeds");
+
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.action, "AcknowledgeDesiredStateVersion");
+    assert_eq!(
+        row.resource_kind.as_deref(),
+        Some("vm"),
+        "the audit kind must mirror the service's accepted parser"
+    );
+    assert_eq!(row.resource_id.as_deref(), Some("vm-ack"));
+    assert_eq!(row.outcome, "success");
+}

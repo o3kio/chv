@@ -50,9 +50,9 @@ Excluded:
 
 ### gRPC surfaces
 
-Recorded: every gRPC mutation on the node-facing control-plane listener
-(`chv.controlplane.node.v1.*`). The wrapper is applied to the server
-adapters, not the service traits, so in-process BFF calls into
+Recorded: every gRPC mutation on the three mutable node-facing services
+below (listener `chv.controlplane.node.v1.*`). The wrapper is applied to
+the server adapters, not the service traits, so in-process BFF calls into
 `LifecycleService` are not double-audited: only the wire surface emits.
 
 - `LifecycleService` — all RPCs except `PingVmm`, including the three
@@ -73,21 +73,26 @@ Excluded:
   `Unimplemented` without reading node state;
 - the agent-side `LifecycleService` (a different process and trust
   boundary);
-- the machine-to-machine telemetry and inventory services (high-rate,
-  not privileged mutations).
+- the read-shaped `InventoryService` and `TelemetryService` (high-rate
+  machine reporting, not privileged mutations);
+- `MonitoringService` (`IngestNodeMetricBatch`) — machine-to-machine
+  metric ingest on the same listener, high-rate and not a privileged
+  mutation.
 
 **Denial boundary (honest limit).** The steady-state mTLS interceptor
-rejects a missing/unparseable client certificate and a revoked serial
-*before* the handler runs, so those rejections produce the
-`chv_revoked_peer_rejected_total` counter and a `warn` log, **not** an
-`audit_log` row. Handler-level denials (peer/node mismatch, revoked
-peer on `RotateNodeCertificate`) are inside the audited block and are
-recorded. Post-revocation attempts against the lifecycle surface are
-therefore visible in metrics/logs, not in the durable trail; an
-investigator must check both. Missing-certificate denial rows would
-require emitting from the interceptor (which lacks the gRPC method
-name) or moving revocation into each audited handler; both are
-follow-up work, not claims of this emitter.
+rejects requests *before* the handler runs: a revoked serial increments
+`chv_revoked_peer_rejected_total` and emits a `warn` log; a
+missing/unparseable certificate (or a certificate with no comparable
+serial) emits only a `warn` log. Neither produces an `audit_log` row.
+Handler-level denials (peer/node mismatch, revoked peer on
+`RotateNodeCertificate` and `ReportBootstrapResult`) are inside the
+audited block and are recorded. Post-revocation attempts against the
+lifecycle surface are therefore visible only in metrics/logs, and
+certificate-less probes only in logs; an investigator must check both.
+Denial rows for interceptor rejections would require emitting from the
+interceptor (which lacks the gRPC method name) or moving revocation into
+each audited handler; both are follow-up work, not claims of this
+emitter.
 
 ## Mounting
 
