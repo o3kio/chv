@@ -204,6 +204,46 @@ async fn has_pending_migrations(
     Ok(false)
 }
 
+/// Copies the database to `backup_path` as an owner-only (`0600`) file.
+///
+/// The database contains encrypted (and legacy plaintext) credentials, so a
+/// pre-migration backup must never be group/world readable. On Unix the
+/// destination is created `0600` and then set explicitly to `0600` because an
+/// existing file may carry broader bits from an earlier run. Any failure to
+/// enforce the mode removes the partial file and returns the error, so the
+/// caller skips the backup instead of leaving a readable copy.
+#[cfg(unix)]
+fn copy_database_backup(db_path: &Path, backup_path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut source = std::fs::File::open(db_path)?;
+    let mut backup = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(backup_path)?;
+
+    if let Err(error) = backup.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        drop(backup);
+        let _ = std::fs::remove_file(backup_path);
+        return Err(error);
+    }
+
+    if let Err(error) = std::io::copy(&mut source, &mut backup) {
+        drop(backup);
+        let _ = std::fs::remove_file(backup_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_database_backup(db_path: &Path, backup_path: &Path) -> std::io::Result<()> {
+    std::fs::copy(db_path, backup_path).map(|_| ())
+}
+
 fn rotate_backups(backup_dir: &Path, db_filename: &str, keep: usize) -> Result<(), std::io::Error> {
     let prefix = format!("{}.", db_filename);
     let suffix = ".bak";
@@ -311,7 +351,7 @@ pub async fn run_migrations(
                         let backup_path =
                             backup_dir.join(format!("{}.{}.bak", db_filename, timestamp));
 
-                        match std::fs::copy(db_path, &backup_path) {
+                        match copy_database_backup(Path::new(db_path), &backup_path) {
                             Ok(_) => {
                                 tracing::info!(
                                     backup_path = %backup_path.display(),
@@ -341,4 +381,50 @@ pub async fn run_migrations(
 
     migrator.run(pool).await?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn pre_migration_backup_is_owner_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("controlplane.db");
+        std::fs::write(&source, b"encrypted credential rows").expect("write source");
+        // A typical SQLite file created under the process umask.
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644))
+            .expect("widen source mode");
+
+        let backup = dir.path().join("controlplane.db.20260101000000.bak");
+        copy_database_backup(&source, &backup).expect("copy backup");
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "a newly created pre-migration backup must be owner-only"
+        );
+
+        // An existing backup with broader bits must be tightened too.
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644))
+            .expect("widen backup mode");
+        copy_database_backup(&source, &backup).expect("overwrite backup");
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "an existing pre-migration backup must be tightened to owner-only"
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("read backup"),
+            b"encrypted credential rows"
+        );
+    }
 }

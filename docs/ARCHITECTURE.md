@@ -79,10 +79,20 @@ Observed state streamed back ──► SQLite ──► Web UI polling
 ### Serial Console
 
 ```
-Browser ──► WebSocket /ws/vms/{id} ──► BFF ──► gRPC ──► chv-agent ──► PTY ──► Cloud Hypervisor API
+Browser ──► WebSocket <BFF-issued console URL> ──► chv-agent console server ──► PTY ──► Cloud Hypervisor API
+                 │                                 (HTTP/WS, default 127.0.0.1:8444)
+                 └─ proxied mode: edge proxies /ws/ to the agent
 ```
 
-Console access is gated by short-lived JWT tokens with one-time-use replay prevention.
+The BFF mints a 60-second JWT with `aud = "chv:console"` and returns it
+separately from the console URL; the UI offers it as the
+`Sec-WebSocket-Protocol` header, never as a URL query parameter. The
+`chv-agent` console server terminates the WebSocket, validates the token
+and audience, and enforces one-time-use replay prevention before bridging
+to the VM PTY. There is no gRPC hop on this path. In proxied mode the BFF
+returns `/ws/vms/{node_id}/{vm_id}/console` and an edge must forward `/ws/`
+to the agent listener; in direct mode it returns
+`ws(s)://{agent_ws_address}/vms/{vm_id}/console`.
 
 ## State Machines
 
