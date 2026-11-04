@@ -70,6 +70,14 @@ pub enum ChvError {
     #[error("timed out after {secs}s: {operation}")]
     Timeout { operation: String, secs: u64 },
 
+    /// The request was fully delivered, but no definitive response was read
+    /// (the connection failed or closed mid-response). The remote side may
+    /// still be acting on it, so callers must not treat this as a definitive
+    /// failure — in particular they must not unpause a VM that a possibly-live
+    /// migration transfer is still using.
+    #[error("outcome unknown for {operation}: {reason}")]
+    OutcomeUnknown { operation: String, reason: String },
+
     #[error("internal error: {reason}")]
     Internal { reason: String },
 }
@@ -95,6 +103,7 @@ impl ErrorCode {
     pub const CONTROL_PLANE_UNAVAILABLE: &str = "CONTROL_PLANE_UNAVAILABLE";
     pub const IO: &str = "IO_ERROR";
     pub const TIMEOUT: &str = "TIMEOUT";
+    pub const OUTCOME_UNKNOWN: &str = "OUTCOME_UNKNOWN";
     pub const INTERNAL: &str = "INTERNAL_ERROR";
 }
 
@@ -117,6 +126,7 @@ impl ChvError {
             ChvError::ControlPlaneUnavailable { .. } => ErrorCode::CONTROL_PLANE_UNAVAILABLE,
             ChvError::Io { .. } => ErrorCode::IO,
             ChvError::Timeout { .. } => ErrorCode::TIMEOUT,
+            ChvError::OutcomeUnknown { .. } => ErrorCode::OUTCOME_UNKNOWN,
             ChvError::Internal { .. } => ErrorCode::INTERNAL,
         }
     }
@@ -181,6 +191,7 @@ impl From<ChvError> for tonic::Status {
             ChvError::Timeout { operation, secs } => {
                 tonic::Status::deadline_exceeded(format!("{operation} timed out after {secs}s"))
             }
+            ChvError::OutcomeUnknown { .. } => tonic::Status::internal("operation outcome unknown"),
             ChvError::Io { .. } | ChvError::Internal { .. } => {
                 tonic::Status::internal("internal error")
             }

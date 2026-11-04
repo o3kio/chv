@@ -20,10 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send/receive transfer is not force-dropped (that would not stop the VMM
   transfer) and the RPC reports `Unavailable` so the control plane retries
   instead of confirming; the agent's own migration-call bound is now two hours
-  (was ten minutes, which could cut a legitimate large-VM transfer), and if
-  that bound does expire while Cloud Hypervisor may still be transferring, the
-  task is sealed as "outcome unknown" and stays tracked so a cancellation can
-  never be falsely confirmed. The reply confirms the task actually stopped
+  (was ten minutes, which could cut a legitimate large-VM transfer); if that
+  bound expires, or the VMM reply is lost after the request was delivered,
+  while Cloud Hypervisor may still be transferring, the task is sealed as
+  "outcome unknown" and stays tracked so a cancellation can never be falsely
+  confirmed, and the source VM stays paused for operator verification. The reply confirms the task actually stopped
   (`Unavailable` keeps the row pending otherwise). A bounded
   registry tombstone aborts a delayed `MigrateVm` that registers after a
   `not_tracked` reply. The control plane queues cancellation durably in
@@ -70,7 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (including a real UDS resume after it and reclaim of a stranded `resuming`
   row), destination resume before placement with a recorded resume failure,
   the post-memory-migration decision, a sealed (outcome-unknown) transfer that
-  can never confirm a cancel, real
+  can never confirm a cancel (including a lost VMM reply), an
+  already-running resume treated as a no-op so a reclaimed `resuming` row
+  converges, a paused source kept paused on an unknown send outcome, real
   `NodeClient` invalid-argument preservation, and reaper drains for both
   endpoints, `not_tracked`, partial/unreachable retry (including a permanent
   refusal alongside a retryable endpoint), token attachment, bad token,

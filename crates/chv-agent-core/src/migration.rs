@@ -127,9 +127,10 @@ pub fn spawn_destination_migration(
             .receive_migration(&vm_id, &receiver_url, Some(&operation_id))
             .await;
         match &result {
-            // The agent stopped waiting but Cloud Hypervisor may still be
-            // receiving. Seal the window so a cancel can never be confirmed.
-            Err(ChvError::Timeout { .. }) => transfer.seal_unknown(),
+            // The agent stopped waiting, or lost the VMM reply, while Cloud
+            // Hypervisor may still be receiving. Seal the window so a cancel
+            // can never be confirmed.
+            Err(e) if is_outcome_unknown(e) => transfer.seal_unknown(),
             _ => transfer.end(),
         }
 
@@ -858,9 +859,10 @@ pub async fn source_migration_with_disk_precopy(
         .send_migration(&vm_id, &destination_url, Some(&operation_id))
         .await;
     match &send_result {
-        // The agent stopped waiting but Cloud Hypervisor may still be
-        // sending. Seal the window so a cancel can never be confirmed.
-        Err(ChvError::Timeout { .. }) => transfer.seal_unknown(),
+        // The agent stopped waiting, or lost the VMM reply, while Cloud
+        // Hypervisor may still be sending. Seal the window so a cancel can
+        // never be confirmed.
+        Err(e) if is_outcome_unknown(e) => transfer.seal_unknown(),
         _ => transfer.end(),
     }
     match send_result {
@@ -896,31 +898,55 @@ pub async fn source_migration_with_disk_precopy(
                 "source agent: memory migration (send-migration) failed"
             );
             // A normal failure means Cloud Hypervisor is no longer sending,
-            // so the VM must be resumed or the reconciler cannot run it. A
-            // timeout is different: the transfer outcome is unknown and CH
-            // may still be streaming, so leave the VM paused for the reaper /
-            // operator (the sealed window keeps the cancel unconfirmed).
-            if source_should_resume_after_send_failure(&e) {
-                pause_guard.resume_if_paused().await;
-            } else {
-                warn!(
-                    vm_id = %vm_id,
-                    operation_id = %operation_id,
-                    "source agent: send-migration timed out; leaving the VM paused \
-                     because the transfer outcome is unknown"
-                );
-            }
+            // so the VM must be resumed or the reconciler cannot run it. An
+            // unknown outcome is different: CH may still be streaming, so
+            // leave the VM paused for the reaper / operator (the sealed window
+            // keeps the cancel unconfirmed).
+            settle_paused_source_after_send_failure(&e, &mut pause_guard, &vm_id, &operation_id)
+                .await;
             Err(format!("memory migration failed: {e}"))
         }
     }
 }
 
+/// Whether an error from a migration VMM call leaves Cloud Hypervisor in a
+/// known-stopped state. A timeout or a lost response does not: the request was
+/// delivered and the transfer may still run, so unpausing the source would
+/// race a live sender (and a cancel must never be confirmed).
+fn is_outcome_unknown(error: &ChvError) -> bool {
+    matches!(
+        error,
+        ChvError::Timeout { .. } | ChvError::OutcomeUnknown { .. }
+    )
+}
+
 /// Whether a failed source-side `send-migration` leaves Cloud Hypervisor in a
-/// known-stopped state. A timeout does not: the VMM call was abandoned by the
-/// agent's bound while the transfer may still run, so unpausing the source
-/// would race a live sender. Every other error is a definitive failure.
+/// known-stopped state, i.e. the paused VM is safe to resume.
 fn source_should_resume_after_send_failure(error: &ChvError) -> bool {
-    !matches!(error, ChvError::Timeout { .. })
+    !is_outcome_unknown(error)
+}
+
+/// Apply the send-failure policy to the paused source VM.
+///
+/// A definitive failure resumes it so the reconciler can drive it back to
+/// Running; an unknown outcome leaves it paused for the reaper/operator so a
+/// possibly-live memory sender is never resumed underneath.
+async fn settle_paused_source_after_send_failure(
+    error: &ChvError,
+    pause_guard: &mut PausedVmGuard,
+    vm_id: &str,
+    operation_id: &str,
+) {
+    if source_should_resume_after_send_failure(error) {
+        pause_guard.resume_if_paused().await;
+    } else {
+        warn!(
+            vm_id = %vm_id,
+            operation_id = %operation_id,
+            "source agent: send-migration outcome is unknown; leaving the VM paused \
+             because the transfer may still be running"
+        );
+    }
 }
 
 /// Build a MigrationProgress proto message.
@@ -956,6 +982,7 @@ pub const DEFAULT_MIGRATION_PORT: u16 = 49152;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration_registry::MigrationTaskRegistry;
 
     #[test]
     fn determine_role_source() {
@@ -1519,11 +1546,37 @@ mod tests {
             !transfer.try_begin(),
             "a sealed transfer must not restart the VMM call"
         );
+
+        // Connect the adapter timeout to the registry: the tracked task must
+        // stay tracked (and its cancel never confirm) after the completion
+        // reaper's `remove`.
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        registry.set_cancel_grace(std::time::Duration::from_millis(20));
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.insert_with_transfer_window(
+            "op-timeout".to_string(),
+            task.abort_handle(),
+            CancellationToken::new(),
+            transfer.clone(),
+        );
+        assert!(registry.cancel("op-timeout"));
+        assert!(
+            !registry
+                .wait_until_stopped("op-timeout", std::time::Duration::from_millis(100))
+                .await,
+            "a timed-out transfer must never look stopped"
+        );
+        registry.remove("op-timeout");
+        assert!(
+            registry.contains("op-timeout"),
+            "a sealed task must stay tracked after remove so cancels keep failing closed"
+        );
+        task.abort();
     }
 
     /// Only a definitive send-migration failure may unpause the source. A
-    /// timeout leaves Cloud Hypervisor potentially streaming, so the VM stays
-    /// paused for the reaper/operator.
+    /// timeout or a lost response leaves Cloud Hypervisor potentially
+    /// streaming, so the VM stays paused for the reaper/operator.
     #[test]
     fn source_resumes_only_on_definitive_send_failure() {
         assert!(!source_should_resume_after_send_failure(
@@ -1532,10 +1585,60 @@ mod tests {
                 secs: 7200,
             }
         ));
+        assert!(!source_should_resume_after_send_failure(
+            &ChvError::OutcomeUnknown {
+                operation: "send-migration".to_string(),
+                reason: "connection closed mid-response".to_string(),
+            }
+        ));
         assert!(source_should_resume_after_send_failure(
             &ChvError::Internal {
                 reason: "connection reset".to_string(),
             }
         ));
+    }
+
+    /// The fail-closed branch must hold when applied to a real paused VM, not
+    /// just in the predicate: an unknown outcome keeps the guard and the VM
+    /// paused, while a definitive failure resumes it.
+    #[tokio::test]
+    async fn unknown_send_outcome_keeps_source_paused_but_definitive_failure_resumes() {
+        let (rt, _mock) = test_runtime();
+        create_vm_record(&rt).await;
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+        assert_eq!(rt.get("vm-1").await.unwrap().runtime_status, "Paused");
+
+        settle_paused_source_after_send_failure(
+            &ChvError::Timeout {
+                operation: "send-migration".to_string(),
+                secs: 7200,
+            },
+            &mut guard,
+            "vm-1",
+            "op-1",
+        )
+        .await;
+        assert!(guard.is_paused(), "the guard must still consider it paused");
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Paused",
+            "an unknown transfer outcome must not unpause the source"
+        );
+
+        settle_paused_source_after_send_failure(
+            &ChvError::Internal {
+                reason: "connection reset".to_string(),
+            },
+            &mut guard,
+            "vm-1",
+            "op-1",
+        )
+        .await;
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Running",
+            "a definitive failure must resume the source"
+        );
     }
 }

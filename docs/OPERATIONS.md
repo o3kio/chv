@@ -622,10 +622,12 @@ agents aborted their detached task (or reported `not_tracked` because the agent
 restarted). A cancel that arrives while a task is inside the Cloud Hypervisor
 send/receive transfer cannot be confirmed immediately: the agent does not
 force-drop that future and returns `Unavailable`, leaving the row pending for a
-later drain. If the agent's own VMM call bound expires while Cloud Hypervisor
-may still be transferring, the task is sealed as "outcome unknown" and remains
-tracked, so cancellation stays unconfirmable until the agent is restarted and
-an operator verifies the VM (`agent_cancel_pending = 1`). A non-NULL
+later drain. If the agent's own VMM call bound expires, or the VMM reply is
+lost after the request was delivered, while Cloud Hypervisor may still be
+transferring, the task is sealed as "outcome unknown" and remains tracked, so
+cancellation stays unconfirmable until the agent is restarted and an operator
+verifies the VM (`agent_cancel_pending = 1`). The paused source VM is left
+paused in that case. A non-NULL
 `agent_cancel_last_error` means the agent refused
 permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
 invalid request); the detached task may still exist, so verify placement and

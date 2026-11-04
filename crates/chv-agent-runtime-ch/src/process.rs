@@ -75,6 +75,75 @@ const CONSOLE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// VMM outcome as unknown and must not confirm a cancellation.
 const MIGRATION_VMM_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 
+/// Whether `buf` holds a complete HTTP response (status line, headers, and the
+/// body declared by `Content-Length`). Used by the migration calls: once the
+/// request has been written, an incomplete response means the VMM may still be
+/// executing the operation, so the caller must treat the outcome as unknown.
+fn http_response_complete(buf: &[u8]) -> bool {
+    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]);
+    let content_length = headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    match content_length {
+        Some(len) => buf.len() >= header_end + 4 + len,
+        // No declared length: the peer closes the stream to delimit the body,
+        // so complete headers are the best signal available.
+        None => true,
+    }
+}
+
+/// Read one HTTP response from a Cloud Hypervisor migration call.
+///
+/// The request has already been written when this runs, so any read failure or
+/// a close before a complete response is returned as `OutcomeUnknown`: the VMM
+/// may still be sending/receiving memory even though the agent lost the reply.
+/// Callers must not resume a paused VM on that class of error.
+async fn read_migration_http_response(
+    stream: &mut tokio::net::UnixStream,
+    operation: &str,
+) -> Result<(u16, String), ChvError> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| ChvError::OutcomeUnknown {
+                operation: operation.to_string(),
+                reason: format!("response read failed after the request was sent: {e}"),
+            })?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if http_response_complete(&buf) {
+            break;
+        }
+    }
+    if !http_response_complete(&buf) {
+        return Err(ChvError::OutcomeUnknown {
+            operation: operation.to_string(),
+            reason: "connection closed before a complete response was read".to_string(),
+        });
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let status_code =
+        parse_http_status(raw.as_bytes()).ok_or_else(|| ChvError::OutcomeUnknown {
+            operation: operation.to_string(),
+            reason: "response had no parseable HTTP status".to_string(),
+        })?;
+    let resp_body = raw
+        .find("\r\n\r\n")
+        .map(|idx| raw[idx + 4..].to_string())
+        .unwrap_or_default();
+    Ok((status_code, resp_body))
+}
+
 struct AliveGuard(Arc<AtomicBool>);
 
 impl Drop for AliveGuard {
@@ -4773,6 +4842,22 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
         let mut __guard = VmOpGuard::new("resume");
         let api_socket = self.get_vm_socket(vm_id).await?;
 
+        // Resuming an already-running VM is a no-op, not an error. This keeps
+        // the reaper's reclaim of a crashed `resuming` row convergent: a resume
+        // whose release write was lost must not fail forever on a VM that is
+        // already running.
+        if let Ok(state) = self.get_vm_state(vm_id).await {
+            if state.eq_ignore_ascii_case("running") {
+                info!(
+                    vm_id = %vm_id,
+                    op = operation_id.unwrap_or("-"),
+                    "vm is already running; treating resume as a no-op"
+                );
+                __guard.succeeded = true;
+                return Ok(());
+            }
+        }
+
         info!(vm_id = %vm_id, op = operation_id.unwrap_or("-"), "resuming vm via ch api");
 
         let status = Self::ch_api_request(&api_socket, "PUT", "/api/v1/vm.resume", None).await?;
@@ -4938,56 +5023,21 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
                     source: e,
                 })?;
 
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            let read_fut = async {
-                loop {
-                    let n = stream.read(&mut tmp).await.map_err(|e| ChvError::Io {
-                        path: api_socket.to_string_lossy().to_string(),
-                        source: e,
-                    })?;
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let header_bytes = &buf[..header_end];
-                        let headers = String::from_utf8_lossy(header_bytes);
-                        let content_length = headers
-                            .lines()
-                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-                            .and_then(|l| l.split_once(':').map(|x| x.1))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        let body_start = header_end + 4;
-                        if buf.len() >= body_start + content_length {
-                            break;
-                        }
-                    }
-                }
-                Ok::<(), ChvError>(())
-            };
             // The transfer can take a long time; only cut it when the HTTP
-            // call is genuinely wedged. A timeout is reported distinctly so
-            // the caller can fail closed (the VMM transfer may still run).
+            // call is genuinely wedged. Both a timeout and a lost/incomplete
+            // reply are reported distinctly so the caller can fail closed
+            // (the VMM transfer may still run).
+            let operation = format!("send-migration for vm {vm_id}");
+            let read_fut = read_migration_http_response(&mut stream, &operation);
             tokio::time::timeout(
                 std::time::Duration::from_secs(MIGRATION_VMM_TIMEOUT_SECS),
                 read_fut,
             )
             .await
             .map_err(|_| ChvError::Timeout {
-                operation: format!("send-migration for vm {vm_id}"),
+                operation: operation.clone(),
                 secs: MIGRATION_VMM_TIMEOUT_SECS,
-            })??;
-
-            let raw = String::from_utf8_lossy(&buf);
-            let status_code = parse_http_status(raw.as_bytes()).unwrap_or(0);
-            let resp_body = if let Some(idx) = raw.find("\r\n\r\n") {
-                raw[idx + 4..].to_string()
-            } else {
-                String::new()
-            };
-            (status_code, resp_body)
+            })??
         };
 
         if status != 200 && status != 204 {
@@ -5040,56 +5090,20 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
                     source: e,
                 })?;
 
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            let read_fut = async {
-                loop {
-                    let n = stream.read(&mut tmp).await.map_err(|e| ChvError::Io {
-                        path: api_socket.to_string_lossy().to_string(),
-                        source: e,
-                    })?;
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let header_bytes = &buf[..header_end];
-                        let headers = String::from_utf8_lossy(header_bytes);
-                        let content_length = headers
-                            .lines()
-                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-                            .and_then(|l| l.split_once(':').map(|x| x.1))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        let body_start = header_end + 4;
-                        if buf.len() >= body_start + content_length {
-                            break;
-                        }
-                    }
-                }
-                Ok::<(), ChvError>(())
-            };
             // Same bound as send-migration: generous enough not to cut a
-            // legitimate transfer, distinct on expiry so cancellation cannot
-            // be falsely confirmed.
+            // legitimate transfer. A timeout or a lost/incomplete reply is
+            // reported distinctly so cancellation cannot be falsely confirmed.
+            let operation = format!("receive-migration for vm {vm_id}");
+            let read_fut = read_migration_http_response(&mut stream, &operation);
             tokio::time::timeout(
                 std::time::Duration::from_secs(MIGRATION_VMM_TIMEOUT_SECS),
                 read_fut,
             )
             .await
             .map_err(|_| ChvError::Timeout {
-                operation: format!("receive-migration for vm {vm_id}"),
+                operation: operation.clone(),
                 secs: MIGRATION_VMM_TIMEOUT_SECS,
-            })??;
-
-            let raw = String::from_utf8_lossy(&buf);
-            let status_code = parse_http_status(raw.as_bytes()).unwrap_or(0);
-            let resp_body = if let Some(idx) = raw.find("\r\n\r\n") {
-                raw[idx + 4..].to_string()
-            } else {
-                String::new()
-            };
-            (status_code, resp_body)
+            })??
         };
 
         if status != 200 && status != 204 {
@@ -8368,6 +8382,37 @@ mod tests {
             proc.child.kill(&proc.api_socket, None);
             proc.child.wait().await;
         }
+    }
+
+    /// Resuming a VM that is already running is a no-op. This is what lets the
+    /// migration reaper's reclaim of a crashed `resuming` row converge instead
+    /// of failing forever on an already-resumed VM.
+    #[tokio::test]
+    async fn resume_vm_is_noop_when_vm_already_running() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-resume-idempotent");
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        // One accepted connection is enough: if the adapter (incorrectly)
+        // issues vm.resume, the listener is gone and the call fails.
+        let mock = MockChApiHandle::spawn(&vm_dir.join("vm.sock"), 1);
+        mock.set_vm_info_state("Running");
+        let _console_peer =
+            insert_watchdog_vm(&adapter, "vm-resume-idempotent", &vm_dir, "", 0).await;
+
+        adapter
+            .resume_vm("vm-resume-idempotent", Some("op-resume"))
+            .await
+            .expect("resuming an already-running VM must succeed");
+
+        assert_eq!(mock.vm_info_requests(), 1, "state must be probed once");
+        assert!(
+            !mock
+                .requests()
+                .iter()
+                .any(|r| r.starts_with("PUT /api/v1/vm.resume")),
+            "an already-running VM must not receive vm.resume"
+        );
+        teardown_watchdog_vm(&adapter, "vm-resume-idempotent").await;
     }
 
     #[test]
