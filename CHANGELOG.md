@@ -23,8 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (was ten minutes, which could cut a legitimate large-VM transfer); if that
   bound expires, or the VMM reply is lost after the request was delivered,
   while Cloud Hypervisor may still be transferring, the task is sealed as
-  "outcome unknown" and stays tracked so a cancellation can never be falsely
-  confirmed, and the source VM stays paused for operator verification. The reply confirms the task actually stopped
+  "outcome unknown" and stays tracked so that agent process can never falsely
+  confirm a cancellation, and the source VM stays paused. A restart is the only
+  mechanical clear; the next drain then reports `not_tracked` and the ordinary
+  resume gate applies, so verify the VM and set `reaper_resume_state = 'blocked'`
+  before restarting if the destination may own it. The reply confirms the task actually stopped
   (`Unavailable` keeps the row pending otherwise). A bounded
   registry tombstone signals a delayed `MigrateVm` that registers after a
   `not_tracked` reply, and force-aborts it unless it has already entered a

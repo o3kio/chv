@@ -625,9 +625,12 @@ force-drop that future and returns `Unavailable`, leaving the row pending for a
 later drain. If the agent's own VMM call bound expires, or the VMM reply is
 lost after the request was delivered, while Cloud Hypervisor may still be
 transferring, the task is sealed as "outcome unknown" and remains tracked, so
-cancellation stays unconfirmable until the agent restarts (the only mechanical
-clear); an operator must verify the VM before resuming it
-(`agent_cancel_pending = 1`). The paused source VM is left paused in that case. A non-NULL
+cancellation stays unconfirmable for that agent process; a restart is the only
+mechanical clear (`agent_cancel_pending = 1`) and the paused source VM is left
+paused. After the restart the next drain reports `not_tracked`, which counts as
+success and re-enables the ordinary resume gate, so an operator who cannot rule
+out a completed destination transfer must verify the VM and set
+`reaper_resume_state = 'blocked'` before restarting the agent. A non-NULL
 `agent_cancel_last_error` means the agent refused
 permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
 invalid request); the detached task may still exist, so verify placement and
