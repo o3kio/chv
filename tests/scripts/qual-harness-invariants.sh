@@ -213,4 +213,42 @@ grep -q 'QUAL_SCENARIOS' .github/workflows/nightly-kvm-qualification.yml \
     && pass "workflow exposes a manual scenario-subset input" \
     || fail "workflow lost the manual scenario-subset input"
 
+# ---------------------------------------------------------------------------
+# 5. second-round full-lane lessons (run 41926076717)
+# ---------------------------------------------------------------------------
+# m4.6's negative TLS legs now fail synchronously at TriggerDiskMigration
+# (the sender dials inside the RPC); the harness must accept that shape as
+# well as the older accepted-then-FAILED task.
+grep -q 'synchronous trigger refusal is a transport-level mTLS failure' "${QUAL}/m4.6-migration.sh" \
+    && pass "m4.6 accepts the synchronous TLS-refusal shape" \
+    || fail "m4.6 only accepts the async migration-refusal shape"
+grep -q 'synchronous refusal' "${QUAL}/m4.6-migration.sh" \
+    && pass "m4.6 records the synchronous N8 refusal in the evidence" \
+    || fail "m4.6 drops the synchronous N8 refusal evidence"
+# tracing quotes string fields: backend_type="lvm", not backend_type=lvm.
+grep -q 'backend_type\.\*"lvm"' "${QUAL}/m4.5-storage.sh" \
+    && pass "m4.5 matches the quoted backend_type log field" \
+    || fail "m4.5 greps a log form tracing never emits"
+# A graceful stop of an adopted VMM can fall back to force-kill (#345).
+grep -q 'force-kill fallback' "${QUAL}/m4.3-lifecycle.sh" \
+    && pass "m4.3 records the adopted-VMM force-kill fallback as a warning" \
+    || fail "m4.3 treats the known #345 force-kill fallback as a hard failure"
+# m4.4 tap residue must be scoped to this deployment's taps, not the host.
+grep -q 'TAPS_UNDER_TEST' "${QUAL}/m4.4-network.sh" \
+    && pass "m4.4 scopes tap residue to the scenario's own taps" \
+    || fail "m4.4 counts every host tap (stale lanes become false failures)"
+grep -q 'orphaned bridge from a previous lane' "${QUAL}/m4.4-network.sh" \
+    && pass "m4.4 diagnoses a stale bridge holding the network route" \
+    || fail "m4.4 cannot distinguish a stale route from a policy defect"
+# Lane hygiene: orphaned links/tables from a killed run, and per-run evidence.
+grep -q 'orphaned CHV host links' "${QUAL}/nightly-run.sh" \
+    && pass "nightly lane sweeps orphaned CHV host links" \
+    || fail "nightly lane leaves stale bridges/taps from a killed run"
+grep -q 'orphaned CHV nft tables' "${QUAL}/nightly-run.sh" \
+    && pass "nightly lane sweeps orphaned CHV nft tables" \
+    || fail "nightly lane leaves stale nft tables from a killed run"
+grep -q 'rm -rf -- "\$evidence_src"' "${QUAL}/nightly-run.sh" \
+    && pass "nightly lane clears per-run scenario evidence" \
+    || fail "nightly lane mixes evidence from previous runs"
+
 exit "$rc"

@@ -181,7 +181,32 @@ sweep_stale_qual_state() {
         rm -rf -- "$d"
     done
     # nwd hardcodes its dnsmasq runtime here; a killed nwd can leave it behind.
+    # Kill its dnsmasq children first: removing the runtime dir does not stop
+    # a daemon that still references the deleted config file.
+    pkill -9 -f 'dnsmasq .*--conf-file=/run/chv/nwd/' 2>/dev/null || true
     rm -rf /run/chv/nwd 2>/dev/null || true
+
+    # Orphaned HOST state (links, nft tables) from a lane killed before its
+    # teardown. This is not cosmetic: a stale `br-<network>` keeps a route
+    # for the network CIDR, and Linux picks the first route — run
+    # 41926076717's m4.4 could not reach any guest because a DOWN bridge
+    # from a previous lane still owned 10.200.0.0/24, so every ping/ARP
+    # looked like a policy failure. Names are CHV-specific (`br-`/`tap-`
+    # plus hex, `chv-<network_id>` table) and the lane holds the
+    # single-lane lock, so nothing else on this dedicated runner owns them.
+    local stale_links stale_tables l t
+    stale_links="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+        | awk '{print $1}' | grep -E '^(br|tap)-[0-9a-f]{8,}$' || true)"
+    if [ -n "$stale_links" ]; then
+        echo "::warning::nightly-run: removing orphaned CHV host links from a previous lane: $(echo "$stale_links" | tr '\n' ' ')" >&2
+        for l in $stale_links; do ip link delete "$l" 2>/dev/null || true; done
+    fi
+    stale_tables="$(nft list tables 2>/dev/null \
+        | awk '$2=="inet" && $3 ~ /^chv-[0-9a-f]{16,}$/ {print $3}' || true)"
+    if [ -n "$stale_tables" ]; then
+        echo "::warning::nightly-run: removing orphaned CHV nft tables from a previous lane: $(echo "$stale_tables" | tr '\n' ' ')" >&2
+        for t in $stale_tables; do nft delete table inet "$t" 2>/dev/null || true; done
+    fi
 }
 
 require_qual_ports_free() {
@@ -312,6 +337,12 @@ for scenario in $SCENARIOS; do
     if [ ! -f "$script" ]; then
         fail "scenario script not found: ${script}"
     fi
+
+    # EVIDENCE_DIR lives under the persistent CHV_QUAL_ROOT, so without
+    # this a run inherits the previous lane's screenshots/nft dumps and the
+    # uploaded artifact cannot be read as one run's evidence (observed in
+    # 41926076717: three runs' snapshots in one host-state.txt).
+    rm -rf -- "$evidence_src"
 
     echo "[qual-nightly] running ${scenario}"
     started="$(date +%s)"

@@ -247,6 +247,51 @@ expectations, with no candidate regression:
 Both changes keep the same safety property: no VM may still own a session,
 and the residue class is disclosed in the artifact instead of hidden.
 
+### 2.4 Fifth failure: the full lane found the same drifted assumptions in
+every remaining scenario
+
+Run [41912418366](https://github.com/o3kio/chv/actions/runs/41912418366)
+(`4e2cb37b`, the commit that made the chaos lane green) ran the full
+sequence. **m4.7 passed** — the stop/delete contract fix was correct — but
+m4.3, m4.4, m4.5, m4.6, and m4.8 failed. Every failure was the same class of
+harness drift in scenarios that had not yet been updated, not a candidate
+regression:
+
+| Scenario | Failure | Actual cause |
+|---|---|---|
+| m4.3 | `Leg F after delete: FORBIDDEN — 1 cloud-hypervisor process(es) remain` | The assertion ran immediately after the delete RPC returned; reaping the retained VMM is asynchronous (m4.8's delete converged in ~2.1 s, and teardown found no CH). |
+| m4.4 | Leg A host→guest ping failed; `policy attempt broke guest connectivity`; stop timed out at 240 s; 2 CH processes after stop | Empty ruleset is DHCP/DNS/conntrack + default-deny post-#355 PR3 (6 chains; `counter ... drop` observed). The journaled policy fan-out had not materialized when a fixed sleep elapsed. The stop wait still expected CH exit. |
+| m4.4 | `guest-3 unreachable even forced via br-…` | The second network also starts default-deny; its ICMP allow was never applied, so a policy drop looked like the N1 routing defect. |
+| m4.5 | `guest did not stop within 240s` (Legs B/D/G) | Same CH-exit-after-stop wait. |
+| m4.6 | `TriggerDiskMigration RPC failed … this node has no migration client identity configured` | Since #483 the deployed stord (migration disabled) refuses synchronously; the scenario only accepted the older accepted-then-`FAILED` task shape. |
+| m4.8 | `guest did not stop within 240s` | Same stop wait; the soak's own delete path was already correct. |
+
+The fixes are item 8 in §3. They do not change any candidate assertion: the
+scenarios still require the guest to stop, the VMM to be gone after delete,
+the policy to be enforced in both directions, and the migration to fail
+closed — they now wait for the product's actual convergence signals instead
+of assuming a fixed ordering.
+
+### 2.5 Sixth failure: prior-lane host residue and three stale contractual
+expectations
+
+Targeted run [41926076717](https://github.com/o3kio/chv/actions/runs/41926076717)
+(`b50747c1`, subset m4.3–m4.6) confirmed item 8 worked — every stop now
+converges, every delete reaps its VMM, and m4.6's synchronous N1a refusal is
+accepted — then exposed four more issues, none in the candidate:
+
+| Scenario | Failure | Actual cause |
+|---|---|---|
+| m4.4 | every 10.200.0.0/24 ping/ARP failed, including after the policy allow; a stale `tap-d96d8bbc` was reported as residue; `host-state.txt` held three runs' snapshots | A **previous lane's bridge** (`br-7cc72b592a91`) and nft table survived a killed run. The stale bridge kept `10.200.0.0/24 ... src 10.200.0.1 linkdown` FIRST in the route table, so the host transmitted into a dead bridge. Guest-3 on 10.99.0.0/24 was reachable, proving the candidate path was healthy. |
+| m4.3 | `Leg F guest terminal state` timed out; `expected 1 CH process, found 0` | Leg F stops an **adopted** VMM (after the Leg E cold restart). The guest did not process the power button within the agent's 60 s window, so the documented force-kill fallback ran and the VMM exited. The harness waited for `vm.info` on a dead socket instead of accepting the fallback and recording the known #345-class residual. |
+| m4.5 | `no backend_type=lvm startup line in agent.log` while every LVM assertion around it passed | `tracing` renders string fields quoted (`backend_type="lvm"`) and inserts ANSI escapes; the literal `backend_type=lvm` grep cannot match. Same run shows the LVM backend provisioning and serving the volume. |
+| m4.6 | N2/N3/N4/N7/N8 `TriggerDiskMigration RPC failed` (Unavailable/Unknown, the expected TLS error) | The sender now dials the peer inside the trigger, so the negative legs fail **synchronously** at the handshake; the harness still required an accepted task that later became `FAILED` (same drift as N1a). |
+
+The fixes are item 9–12 in §3. The candidate behavior in every case is the
+desired one: the stale-state failure proves the lane needs host-state
+hygiene, and the other three are harness expectations that lag the shipped
+contracts. No candidate change is made by this branch.
+
 ---
 
 ## 3. Fixes
@@ -287,6 +332,41 @@ Branch `fix/659-qual-auth` (based on `a4da490d`):
    VMM is the same pid (only delete must exit CH); the final sweep fails on
    any session still attached to a VM and records detached-open rows as the
    documented M2.2a handle-persistence residual (#711).
+8. **Every scenario now shares that stop/delete contract.** Run
+   [41912418366](https://github.com/o3kio/chv/actions/runs/41912418366)
+   showed m4.4/m4.5/m4.8 still waiting for CH exit after a graceful stop
+   (240 s timeouts each) and m4.3 checking CH absence immediately after
+   `vm delete`. They now use a shared `wait_vm_guest_stopped` (terminal
+   guest state, wedge-aware) and wait for the VMM to be reaped after
+   delete. m4.4 also proves the empty-ruleset default-deny baseline before
+   applying both-direction ICMP allows through the BFF (polling for
+   asynchronous materialization instead of a fixed sleep); m4.6 accepts
+   the synchronous no-client-identity refusal that the deployed stord has
+   returned since #483, as well as the older async task-failure shape.
+   The workflow gained a manual `scenarios` subset input for targeted
+   re-qualification.
+9. **Host-state hygiene across lanes.** `nightly-run.sh` now removes
+   orphaned CHV `br-*`/`tap-*` links, `inet chv-*` nft tables, and
+   nwd-spawned dnsmasq processes left by a lane killed before teardown, and
+   clears each scenario's persistent evidence directory before it runs.
+   Without this, a stale bridge can own the network CIDR and make every
+   reachability assertion fail for a reason unrelated to the candidate
+   (run 41926076717). m4.4 also fails early, with the actual cause, when
+   more than one host route exists for its CIDR, and scopes tap-residue to
+   this deployment's taps instead of every `tap-*` on the host.
+10. **Adopted-VMM stop fallback.** m4.3's final stop (after the cold
+    restart) accepts the agent's force-kill fallback as a completed stop and
+    records the known #345-class residual as a warning, instead of waiting
+    for `vm.info` on a VMM that has already exited. The retained-VMM
+    assertions still run whenever the VMM survives.
+11. **Quoted `backend_type` log field.** m4.5 matches
+    `backend_type="lvm"` (tracing's quoted string form), which is what the
+    LVM stord actually logs; the previous unquoted grep could never match.
+12. **Synchronous negative-TLS refusals.** m4.6 N2/N3/N4/N7/N8 accept the
+    synchronous handshake refusal now produced inside `TriggerDiskMigration`
+    and still assert the transport-failure text, zero bytes, and no
+    destination volume; the older accepted-then-`FAILED` shape remains
+    accepted.
 
 Product findings filed separately (not fixed in this slice): **#709**
 (first-enrollment bootstrap result) and **#711** (detached-open stord
@@ -308,7 +388,10 @@ sessions after delete-following-agent-restart).
 | [41906413327](https://github.com/o3kio/chv/actions/runs/41906413327) | chaos (m4.7) | `66aaed0b` | fail — F5/F6 DST startup: no migration signing secret (#663, §2.2) |
 | [41907950799](https://github.com/o3kio/chv/actions/runs/41907950799) | chaos (m4.7) | `f3642aca` | fail — F5 recovery: sync create_new refusal treated as a dead trigger (§2.2) |
 | [41908930893](https://github.com/o3kio/chv/actions/runs/41908930893) | chaos (m4.7) | `f8ca4491` | fail — F7: wrong graceful-stop expectation + detached-open session residue (§2.3) |
-| _chaos re-run_ | chaos (m4.7) | _this commit_ | _pending_ |
+| [41911127447](https://github.com/o3kio/chv/actions/runs/41911127447) | chaos (m4.7) | `4e2cb37b` | **pass** — rc=0, 380 s, 0 errors, 6 documented warnings |
+| [41912418366](https://github.com/o3kio/chv/actions/runs/41912418366) | full (m4.3–m4.8) | `4e2cb37b` | fail — m4.7 pass; m4.3/m4.4/m4.5/m4.8 stale stop/delete waits, m4.6 stale refusal shape (fix 8) |
+| [41926076717](https://github.com/o3kio/chv/actions/runs/41926076717) | full subset (m4.3–m4.6) | `b50747c1` | fail — stop/delete fixes hold; stale prior-lane bridge broke m4.4 reachability, plus adopted-VMM force-kill, quoted log field, and sync negative-TLS refusals (§2.5, fixes 9–12) |
+| _targeted re-run_ | full subset (m4.3–m4.6) | _this commit_ | _pending_ |
 | _full lane_ | full (m4.3–m4.8) | _final fix commit_ | _pending_ |
 
 Only a row with `pass` and present per-scenario evidence is accepted; each

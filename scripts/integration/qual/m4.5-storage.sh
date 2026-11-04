@@ -1058,9 +1058,12 @@ STORD_CFG_G="$(stord_config_path)"
 [ "$STORD_CFG_G" = "$STORD_TOML" ] \
     && qual_pass "LVM stord execs the operator config (${STORD_CFG_G})" \
     || qual_error "LVM stord is NOT the operator config: ${STORD_CFG_G:-unresolved}"
-grep -aq 'backend_type=lvm' "${QUAL_LOGS_DIR}/agent.log" \
-    && qual_pass "stord initialized the LVM backend (backend_type=lvm in agent.log)" \
-    || qual_error "no backend_type=lvm startup line in agent.log — the respawned stord is not the LVM daemon"
+# tracing renders a string field as backend_type="lvm" and interleaves ANSI
+# escapes around the key/value, so match the quoted value with a wildcard
+# rather than the literal backend_type=lvm form (which never matches).
+grep -aqE 'backend_type.*"lvm"' "${QUAL_LOGS_DIR}/agent.log" \
+    && qual_pass "stord initialized the LVM backend (backend_type=\"lvm\" in agent.log)" \
+    || qual_error "no backend_type=\"lvm\" startup line in agent.log — the respawned stord is not the LVM daemon"
 
 # DP4: the node's inventory must report the REAL backend class.
 node_reports_lvm() {

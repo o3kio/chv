@@ -424,6 +424,18 @@ save_console_evidence "$VM1_ID" "leg-a"
 [ -n "$(bridge_addr "$VM1_BRIDGE")" ] \
     && qual_pass "bridge ${VM1_BRIDGE} exists ($(bridge_addr "$VM1_BRIDGE"))" \
     || qual_error "FORBIDDEN: bridge ${VM1_BRIDGE} missing after attach"
+# One route per CIDR. A second route means an orphaned bridge from an
+# earlier lane still owns the prefix; Linux would use the FIRST route, so
+# every reachability assertion below would fail for a reason unrelated to
+# the candidate. Fail with the real cause instead (the nightly lane now
+# sweeps such links before preflight).
+CIDR_ROUTE_COUNT="$(ip -o route show 2>/dev/null \
+    | awk -v c="$QUAL_NETWORK_CIDR" '$1 == c' | wc -l)"
+if [ "$CIDR_ROUTE_COUNT" -le 1 ]; then
+    qual_pass "exactly one host route for ${QUAL_NETWORK_CIDR} (no stale bridge)"
+else
+    qual_error "FORBIDDEN: ${CIDR_ROUTE_COUNT} host routes for ${QUAL_NETWORK_CIDR} — an orphaned bridge from a previous lane still owns the prefix: $(ip route show | grep "$QUAL_NETWORK_CIDR" | tr '\n' ';')"
+fi
 VM1_TAP="$(tap_of "$VM1_ID")"
 if [ -n "$VM1_TAP" ]; then
     qual_pass "vm tap ${VM1_TAP} present in CH payload"
@@ -752,6 +764,7 @@ VM3_IP="$(nic_field "$VM3_ID" ip_address)"
 VM3_NET="$(nic_field "$VM3_ID" network_id)"
 [ -n "$VM3_NET" ] || qual_die "no network_id in vm_nic_desired_state for ${VM3_ID}"
 VM3_BRIDGE="$(bridge_for_network "$VM3_NET")"
+VM3_TAP="$(tap_of "$VM3_ID")"
 qual_info "network ref '${SECOND_NET}' → network_id '${VM3_NET}' (bridge ${VM3_BRIDGE})"
 
 # The operator's network is what the VM must attach to; the frozen
@@ -839,17 +852,25 @@ done
 # the chvctl call returning (run-1 lesson: an immediate check raced the
 # removal) — poll up to 30 s before asserting. Bridges/dnsmasq are
 # network-scoped and must persist until the network itself is deleted.
+# Scope the assertion to THIS deployment's taps: a stale tap from a
+# previous lane is swept at lane start, and a global tap- count would
+# report an unrelated interface as this scenario's residue.
+TAPS_UNDER_TEST=" ${VM1_TAP:-} ${VM2_TAP:-} ${VM3_TAP:-} "
 taps_gone=0
 LEFTOVER_TAPS=""
 for _ in $(seq 1 15); do
-    LEFTOVER_TAPS="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | grep '^tap-' || true)"
+    LEFTOVER_TAPS=""
+    for t in $TAPS_UNDER_TEST; do
+        [ -n "$t" ] || continue
+        ip link show "$t" >/dev/null 2>&1 && LEFTOVER_TAPS="${LEFTOVER_TAPS} ${t}"
+    done
     [ -z "$LEFTOVER_TAPS" ] && { taps_gone=1; break; }
     sleep 2
 done
 if [ "$taps_gone" -eq 1 ]; then
-    qual_pass "all taps removed by vm delete"
+    qual_pass "all scenario taps removed by vm delete"
 else
-    qual_error "FORBIDDEN: taps remain 30s after vm deletes: $(echo "$LEFTOVER_TAPS" | tr '\n' ' ')"
+    qual_error "FORBIDDEN: scenario taps remain 30s after vm deletes:${LEFTOVER_TAPS}"
 fi
 
 # N5 flip (#356 part 2 / PR #362): the last-detach host teardown fires on
