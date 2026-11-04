@@ -1,11 +1,21 @@
 # Privileged-mutation audit log (#658)
 
-The BFF keeps a durable, append-only record of every privileged
-mutation. Emission is centralized in middleware wrapped around the
-whole HTTP surface that carries privileged mutations; handlers do not
-call an audit function.
+The control plane keeps one durable, append-only record of every
+privileged mutation, written to `audit_log` by two emitters:
+
+1. **HTTP (BFF)** — centralized in middleware wrapped around the whole
+   HTTP surface; handlers do not call an audit function.
+2. **gRPC (node-facing)** — centralized in the tonic server adapters in
+   `crates/chv-controlplane-service/src/server.rs`; handlers do not call
+   an audit function. Coverage and its explicit exclusions are below.
+
+The two emitters share the schema, retention, and admin read surface,
+but use different `action`/`method`/`path` vocabularies (documented in
+the Row contract).
 
 ## Scope
+
+### HTTP surfaces
 
 Recorded: every non-safe HTTP method on an audited surface that is not
 an explicitly read-shaped POST. Audited surfaces:
@@ -37,6 +47,52 @@ Excluded:
   `POST /v1/cloud-init-templates/:id/render` (pure substitution, no
   write), and the guest-agent inventory list
   `POST /v1/monitoring/agents`.
+
+### gRPC surfaces
+
+Recorded: every gRPC mutation on the three mutable node-facing services
+below (listener `chv.controlplane.node.v1.*`). The wrapper is applied to
+the server adapters, not the service traits, so in-process BFF calls into
+`LifecycleService` are not double-audited: only the wire surface emits.
+
+- `LifecycleService` — all RPCs except `PingVmm`, including the three
+  `Unimplemented` shims (`CreateVolume`, `DeleteVolume`,
+  `ApplyNetworkPolicy`) so probing an unsupported mutation leaves a
+  trace;
+- `EnrollmentService` — `EnrollNode`, `RotateNodeCertificate`, and
+  `ReportBootstrapResult`;
+- `ReconcileService` — `ApplyNodeDesiredState`, `ApplyVmDesiredState`,
+  `ApplyVolumeDesiredState`, `ApplyNetworkDesiredState`, and
+  `AcknowledgeDesiredStateVersion`. Desired-state convergence is a
+  privileged node mutation: a compromised node changing its own desired
+  state must be visible.
+
+Excluded:
+
+- `PingVmm` — unconditional read-shaped probe that returns
+  `Unimplemented` without reading node state;
+- the agent-side `LifecycleService` (a different process and trust
+  boundary);
+- the read-shaped `InventoryService` and `TelemetryService` (high-rate
+  machine reporting, not privileged mutations);
+- `MonitoringService` (`IngestNodeMetricBatch`) — machine-to-machine
+  metric ingest on the same listener, high-rate and not a privileged
+  mutation.
+
+**Denial boundary (honest limit).** The steady-state mTLS interceptor
+rejects requests *before* the handler runs: a revoked serial increments
+`chv_revoked_peer_rejected_total` and emits a `warn` log; a
+missing/unparseable certificate (or a certificate with no comparable
+serial) emits only a `warn` log. Neither produces an `audit_log` row.
+Handler-level denials (peer/node mismatch, revoked peer on
+`RotateNodeCertificate` and `ReportBootstrapResult`) are inside the
+audited block and are recorded. Post-revocation attempts against the
+lifecycle surface are therefore visible only in metrics/logs, and
+certificate-less probes only in logs; an investigator must check both.
+Denial rows for interceptor rejections would require emitting from the
+interceptor (which lacks the gRPC method name) or moving revocation into
+each audited handler; both are follow-up work, not claims of this
+emitter.
 
 ## Mounting
 
@@ -75,15 +131,15 @@ Layer order (outermost first) and why:
 | `audit_id` | Server-minted 128-bit id (primary key). |
 | `occurred_at_ms` | Epoch-millisecond completion timestamp. |
 | `actor_id`, `actor_username`, `actor_role` | Verified claims, or the explicit anonymous marker. |
-| `action` | Stable dotted action derived from method/path, e.g. `vm.create`. |
-| `method`, `path` | Request shape; never the query string. |
-| `resource_kind`, `resource_id` | Best-effort path-derived resource. Body ids are intentionally not read. |
-| `outcome` | `success` (2xx/3xx), `denied` (401/403), `failed` (other 4xx/5xx). |
-| `status_code` | Final HTTP status. |
-| `correlation_id` | Correlation id assigned by the correlation middleware, capped at 128 chars. |
-| `operation_id` | Inbound `x-operation-id` when supplied, capped at 128 chars. |
-| `source_ip` | Transport peer address (see below), or a validated forwarding hop. |
-| `metadata` | Allowlisted redacted JSON object; currently only `auth_source`. |
+| `action` | Stable action. HTTP: dotted, derived from method/path, e.g. `vm.create`. gRPC: the protobuf RPC name, e.g. `StartVm`. |
+| `method`, `path` | Request shape; never the query string. HTTP: verb + matched route. gRPC: `gRPC` + `<fully-qualified service>/<RpcName>`. |
+| `resource_kind`, `resource_id` | Best-effort resource. HTTP: path-derived; bodies are intentionally not read. gRPC: request fields (capped), with `EnrollNode` using the issued node id on success. |
+| `outcome` | `success` (2xx/3xx), `denied` (401/403), `failed` (other 4xx/5xx). gRPC status codes are mapped to the HTTP equivalents (200/400/401/403/404/409/412/429/499/500/501/503/504). |
+| `status_code` | Final HTTP status, or the gRPC code's HTTP equivalent. |
+| `correlation_id` | Correlation id assigned by the correlation middleware (HTTP), capped at 128 chars. gRPC rows leave it NULL; `operation_id` is the join key for agent traffic. |
+| `operation_id` | Inbound `x-operation-id` when supplied (HTTP or gRPC metadata), capped at 128 chars. |
+| `source_ip` | Transport peer address (see below), or a validated forwarding hop. On gRPC this is always the direct TCP peer, never a metadata header. |
+| `metadata` | Allowlisted redacted JSON object. HTTP: `auth_source`. gRPC: `transport: "grpc"` and `auth_source` ∈ `mtls` \| `insecure` \| `bootstrap_token`. |
 
 Client-controlled identifier strings (`operation_id`,
 `correlation_id`) are capped at 128 characters so a hostile or buggy
@@ -132,6 +188,24 @@ The insert happens **after** the handler returns. If the insert fails:
 - if the response was already a 4xx/5xx (including 401/403), the
   original response is preserved and the missing row is logged.
 
+**gRPC emitter.** The same contract applies at the handler boundary:
+
+- one row per RPC, including validation denials, peer mismatch, revoked
+  peers rejected inside a handler, handler errors, and the
+  `Unimplemented` shims;
+- the insert happens after the handler returns. On insert failure the
+  `chv_grpc_audit_write_failures_total` counter is incremented and an
+  `error` log is emitted under target `audit`;
+- a successful mutation whose row cannot be written returns gRPC
+  `INTERNAL` with a greppable `AUDIT_LOG_WRITE_FAILED` message; a
+  handler failure keeps its original status;
+- `EnrollNode` fails closed the same way. Because its bootstrap token is
+  single-use and already consumed, a retry after an
+  `AUDIT_LOG_WRITE_FAILED` cannot succeed: the operator must issue a new
+  one-time token (or remove the half-enrolled node) before the node can
+  re-enroll. This is the deliberate fail-closed tradeoff, not automatic
+  recovery.
+
 Residual risk: the mutation has already happened when the insert is
 attempted. A 500 `AUDIT_LOG_WRITE_FAILED` therefore does not roll the
 mutation back; it tells the caller the audit trail is incomplete.
@@ -151,6 +225,16 @@ no valid credential (401) is recorded with the literal actor
 `anonymous` / `anonymous` / `anonymous`; the BFF never infers an actor
 from an unverified body or header.
 
+On gRPC the actor comes only from the mTLS `PeerNodeId` extension
+inserted by the interceptor; a wire-asserted `node_id` is never used
+for attribution. `EnrollNode` is token-authenticated rather than
+certificate-authenticated, so it forces the anonymous actor and labels
+`auth_source: "bootstrap_token"`. When the interceptor ran in insecure
+dev mode (`CHV_ALLOW_INSECURE=1`), the handler sees `InsecurePeer`, the
+row is anonymous, and `auth_source` is `insecure`. Interceptor-level
+certificate rejections are outside the handler and therefore have no
+row (see the denial boundary above).
+
 ## Redaction contract
 
 The audit row never stores:
@@ -161,11 +245,15 @@ The audit row never stores:
 - request bodies or query strings;
 - arbitrary handler payloads.
 
-`metadata` is constructed from an explicit allowlist in
-`crates/chv-webui-bff/src/audit.rs` (auth mechanism only). A future
-field must be added deliberately to that allowlist and must be safe to
-retain for the full retention period. The repository exposes no
-free-form metadata path from request data.
+`metadata` is constructed from an explicit allowlist — `auth_source`
+on the HTTP emitter (`crates/chv-webui-bff/src/audit.rs`) and
+`transport` + `auth_source` on the gRPC emitter
+(`crates/chv-controlplane-service/src/server.rs`). A future field must
+be added deliberately to the relevant allowlist and must be safe to
+retain for the full retention period. Neither repository path exposes
+free-form metadata from request data. The gRPC emitter also caps every
+request-derived string before insert and never records a bootstrap
+token, certificate, or handler error detail.
 
 ## Admin API
 

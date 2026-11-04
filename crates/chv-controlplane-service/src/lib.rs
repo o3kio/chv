@@ -80,6 +80,9 @@ pub use telemetry::{TelemetryService, TelemetryServiceImplementation};
 mod tests;
 
 #[cfg(test)]
+mod server_audit_tests;
+
+#[cfg(test)]
 mod integration_tests;
 
 #[cfg(test)]

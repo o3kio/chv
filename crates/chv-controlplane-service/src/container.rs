@@ -7,7 +7,7 @@ use crate::peer_identity::PeerIdentityInterceptor;
 use crate::reconcile::ReconcileServiceImplementation;
 use crate::revocation::run_refresh_loop;
 use crate::telemetry::TelemetryServiceImplementation;
-use chv_controlplane_store::{CertificateRevocationRepository, StorePool};
+use chv_controlplane_store::{AuditLogRepository, CertificateRevocationRepository, StorePool};
 use control_plane_node_api::control_plane_node_api as proto;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -264,7 +264,8 @@ impl ControlPlaneService {
                 crate::server::EnrollmentServer::new(Arc::new(
                     self.components.enrollment_service.clone(),
                 ))
-                .with_revocation(revocation.clone()),
+                .with_revocation(revocation.clone())
+                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
                 make_enrollment_intercept(),
             );
 
@@ -288,7 +289,8 @@ impl ControlPlaneService {
             proto::reconcile_service_server::ReconcileServiceServer::with_interceptor(
                 crate::server::ReconcileServer::new(Arc::new(
                     self.components.reconcile_service.clone(),
-                )),
+                ))
+                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
                 make_intercept(),
             );
 
@@ -296,7 +298,8 @@ impl ControlPlaneService {
             proto::lifecycle_service_server::LifecycleServiceServer::with_interceptor(
                 crate::server::LifecycleServer::new(Arc::new(
                     self.components.lifecycle_service.clone(),
-                )),
+                ))
+                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
                 make_intercept(),
             );
 
