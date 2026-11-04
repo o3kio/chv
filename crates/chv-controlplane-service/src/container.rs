@@ -289,7 +289,8 @@ impl ControlPlaneService {
             proto::reconcile_service_server::ReconcileServiceServer::with_interceptor(
                 crate::server::ReconcileServer::new(Arc::new(
                     self.components.reconcile_service.clone(),
-                )),
+                ))
+                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
                 make_intercept(),
             );
 

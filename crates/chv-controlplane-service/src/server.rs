@@ -18,6 +18,7 @@ use tracing::Instrument;
 
 const LIFECYCLE_SERVICE_PATH: &str = "chv.controlplane.node.v1.LifecycleService";
 const ENROLLMENT_SERVICE_PATH: &str = "chv.controlplane.node.v1.EnrollmentService";
+const RECONCILE_SERVICE_PATH: &str = "chv.controlplane.node.v1.ReconcileService";
 
 /// Bound the stored identifier fields (same limits as the BFF trail) so a
 /// hostile request cannot inflate audit rows.
@@ -73,11 +74,21 @@ impl GrpcAuditContext {
         service: &'static str,
         resource_kind: Option<&'static str>,
         resource_id: Option<String>,
-        force_anonymous: bool,
+        anonymous_auth_source: Option<&'static str>,
     ) -> Self {
         let peer = request.extensions().get::<PeerNodeId>();
-        let (actor_id, actor_username, actor_role, auth_source) =
-            match peer.filter(|_| !force_anonymous) {
+        // `EnrollNode` is authenticated by a one-time bootstrap token, not by
+        // the peer certificate, so it forces the anonymous actor with its own
+        // `auth_source` label. Labelling it `insecure` (the no-peer branch)
+        // would falsely claim the deployment ran without mTLS.
+        let (actor_id, actor_username, actor_role, auth_source) = match anonymous_auth_source {
+            Some(auth_source) => (
+                AUDIT_ANONYMOUS_ACTOR_ID.to_string(),
+                AUDIT_ANONYMOUS_USERNAME.to_string(),
+                AUDIT_ANONYMOUS_ROLE,
+                auth_source,
+            ),
+            None => match peer {
                 Some(peer) => (
                     capped_audit_field(peer.as_node_id().to_string()),
                     capped_audit_field(peer.as_node_id().to_string()),
@@ -90,7 +101,8 @@ impl GrpcAuditContext {
                     AUDIT_ANONYMOUS_ROLE,
                     "insecure",
                 ),
-            };
+            },
+        };
 
         Self {
             action,
@@ -227,17 +239,17 @@ async fn finish_audited<T>(
     }
 }
 
-/// Wrap the standard peer-pinned lifecycle shape (validate node identity,
+/// Wrap the standard peer-pinned service shape (validate node identity,
 /// call the service) in one audited result.
-macro_rules! audited_lifecycle_call {
-    ($self:ident, $request:ident, $action:literal, $span:literal, $method:ident, $kind:expr, $resource_id:expr) => {{
+macro_rules! audited_service_call {
+    ($self:ident, $request:ident, $action:literal, $service_path:expr, $span:literal, $method:ident, $kind:expr, $resource_id:expr) => {{
         let context = GrpcAuditContext::new(
             &$request,
             $action,
-            LIFECYCLE_SERVICE_PATH,
+            $service_path,
             $kind,
             $resource_id,
-            false,
+            None,
         );
         let op_id = extract_op_id(&$request).unwrap_or_default();
         let result = async {
@@ -254,6 +266,21 @@ macro_rules! audited_lifecycle_call {
         .await;
         finish_audited($self.audit.as_ref(), &context, result).await
     }};
+}
+
+macro_rules! audited_lifecycle_call {
+    ($self:ident, $request:ident, $action:literal, $span:literal, $method:ident, $kind:expr, $resource_id:expr) => {
+        audited_service_call!(
+            $self,
+            $request,
+            $action,
+            LIFECYCLE_SERVICE_PATH,
+            $span,
+            $method,
+            $kind,
+            $resource_id
+        )
+    };
 }
 
 /// Pin the wire-asserted `node_id` to the peer's mTLS-derived identity.
@@ -409,7 +436,7 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             ENROLLMENT_SERVICE_PATH,
             Some("node"),
             inventory_node_id,
-            true,
+            Some("bootstrap_token"),
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
         let _span = tracing::info_span!("enroll_node", %op_id);
@@ -443,7 +470,7 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             ENROLLMENT_SERVICE_PATH,
             Some("node"),
             non_empty(&request.get_ref().node_id),
-            false,
+            None,
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
         let result = async {
@@ -492,7 +519,7 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             ENROLLMENT_SERVICE_PATH,
             Some("node"),
             non_empty(&request.get_ref().node_id),
-            false,
+            None,
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
         let result = async {
@@ -793,11 +820,11 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
     /// CP-side shim stays closed until/unless lifecycle journaling is
     /// ever adopted for the create.
     ///
-    /// Authz note: this handler never reads the request or touches node
-    /// state — it always returns `Unimplemented` before `into_inner()`.
-    /// There is no authority to bind to a peer identity, so it is
-    /// intentionally exempt from `enforce_peer_node_id`; the denied
-    /// attempt is still audited as a failed mutation.
+    /// Authz note: this handler never calls `into_inner()` or touches node
+    /// state — it always returns `Unimplemented`. Request fields are read
+    /// only to build the audit row's resource id; there is no authority to
+    /// bind to a peer identity, so it remains exempt from
+    /// `enforce_peer_node_id`. The denied attempt is still audited.
     async fn create_volume(
         &self,
         request: Request<proto::CreateVolumeRequest>,
@@ -812,7 +839,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
                 .volume
                 .as_ref()
                 .and_then(|volume| non_empty(&volume.volume_id)),
-            false,
+            None,
         );
         let result: Result<Response<proto::AckResponse>, Status> = Err(Status::unimplemented(
             "create_volume is not served by the control plane lifecycle; the standalone volume \
@@ -828,8 +855,9 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
     /// dispatch carrier the orchestrator dispatches to agents) is a
     /// different surface; this CP-side shim stays closed.
     ///
-    /// Authz note: unconditional `Unimplemented`, no request/state access;
-    /// exempt for the same reason as `create_volume`, still audited.
+    /// Authz note: unconditional `Unimplemented`; request fields are read
+    /// only for the audit row, no node state is touched, and it is exempt
+    /// for the same reason as `create_volume`. Still audited.
     async fn delete_volume(
         &self,
         request: Request<proto::DeleteVolumeRequest>,
@@ -840,7 +868,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             LIFECYCLE_SERVICE_PATH,
             Some("volume"),
             non_empty(&request.get_ref().volume_id),
-            false,
+            None,
         );
         let result: Result<Response<proto::AckResponse>, Status> = Err(Status::unimplemented(
             "delete_volume is not served by the control plane lifecycle; the volume delete \
@@ -856,8 +884,9 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
     /// carrier the orchestrator fans out to agents) is a different
     /// surface; this CP-side shim stays closed.
     ///
-    /// Authz note: unconditional `Unimplemented`, no request/state access;
-    /// exempt for the same reason as `create_volume`, still audited.
+    /// Authz note: unconditional `Unimplemented`; request fields are read
+    /// only for the audit row, no node state is touched, and it is exempt
+    /// for the same reason as `create_volume`. Still audited.
     async fn apply_network_policy(
         &self,
         request: Request<proto::ApplyNetworkPolicyRequest>,
@@ -868,7 +897,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             LIFECYCLE_SERVICE_PATH,
             Some("network"),
             non_empty(&request.get_ref().network_id),
-            false,
+            None,
         );
         let result: Result<Response<proto::AckResponse>, Status> = Err(Status::unimplemented(
             "apply_network_policy is not served by the control plane lifecycle; the network \
@@ -1411,7 +1440,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             LIFECYCLE_SERVICE_PATH,
             Some("vm"),
             non_empty(&request.get_ref().vm_id),
-            false,
+            None,
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
         let result = async {
@@ -1437,11 +1466,25 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
 
 pub struct ReconcileServer {
     service: Arc<dyn ReconcileService>,
+    audit: Option<AuditLogRepository>,
 }
 
 impl ReconcileServer {
     pub fn new(service: Arc<dyn ReconcileService>) -> Self {
-        Self { service }
+        Self {
+            service,
+            audit: None,
+        }
+    }
+
+    /// Enable durable audit emission for desired-state mutations.
+    ///
+    /// Production constructs every node-facing server in `container.rs` with
+    /// `with_audit`; the optional form exists for narrow test fixtures and
+    /// embedders.
+    pub fn with_audit(mut self, audit: AuditLogRepository) -> Self {
+        self.audit = Some(audit);
+        self
     }
 }
 
@@ -1451,100 +1494,95 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         &self,
         request: Request<proto::ApplyNodeDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
+        audited_service_call!(
+            self,
+            request,
+            "ApplyNodeDesiredState",
+            RECONCILE_SERVICE_PATH,
             "apply_node_desired_state",
-        )?;
-        let _span = tracing::info_span!("apply_node_desired_state", %op_id);
-        let resp = self
-            .service
-            .apply_node_desired_state(request.into_inner())
-            .instrument(_span)
-            .await
-            .map_err(tonic::Status::from)?;
-        Ok(Response::new(resp))
+            apply_node_desired_state,
+            Some("node"),
+            non_empty(&request.get_ref().node_id)
+        )
     }
 
     async fn apply_vm_desired_state(
         &self,
         request: Request<proto::ApplyVmDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
+        audited_service_call!(
+            self,
+            request,
+            "ApplyVmDesiredState",
+            RECONCILE_SERVICE_PATH,
             "apply_vm_desired_state",
-        )?;
-        let _span = tracing::info_span!("apply_vm_desired_state", %op_id);
-        let resp = self
-            .service
-            .apply_vm_desired_state(request.into_inner())
-            .instrument(_span)
-            .await
-            .map_err(tonic::Status::from)?;
-        Ok(Response::new(resp))
+            apply_vm_desired_state,
+            Some("vm"),
+            non_empty(&request.get_ref().vm_id)
+        )
     }
 
     async fn apply_volume_desired_state(
         &self,
         request: Request<proto::ApplyVolumeDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
+        audited_service_call!(
+            self,
+            request,
+            "ApplyVolumeDesiredState",
+            RECONCILE_SERVICE_PATH,
             "apply_volume_desired_state",
-        )?;
-        let _span = tracing::info_span!("apply_volume_desired_state", %op_id);
-        let resp = self
-            .service
-            .apply_volume_desired_state(request.into_inner())
-            .instrument(_span)
-            .await
-            .map_err(tonic::Status::from)?;
-        Ok(Response::new(resp))
+            apply_volume_desired_state,
+            Some("volume"),
+            non_empty(&request.get_ref().volume_id)
+        )
     }
 
     async fn apply_network_desired_state(
         &self,
         request: Request<proto::ApplyNetworkDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
+        audited_service_call!(
+            self,
+            request,
+            "ApplyNetworkDesiredState",
+            RECONCILE_SERVICE_PATH,
             "apply_network_desired_state",
-        )?;
-        let _span = tracing::info_span!("apply_network_desired_state", %op_id);
-        let resp = self
-            .service
-            .apply_network_desired_state(request.into_inner())
-            .instrument(_span)
-            .await
-            .map_err(tonic::Status::from)?;
-        Ok(Response::new(resp))
+            apply_network_desired_state,
+            Some("network"),
+            non_empty(&request.get_ref().network_id)
+        )
     }
 
     async fn acknowledge_desired_state_version(
         &self,
         request: Request<proto::AcknowledgeDesiredStateVersionRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        let op_id = extract_op_id(&request).unwrap_or_default();
-        enforce_peer_node_id(
-            &request,
-            &request.get_ref().node_id,
+        let fragment = &request.get_ref();
+        let kind = match fragment.fragment_kind.as_str() {
+            "node" => Some("node"),
+            "vm" => Some("vm"),
+            "volume" => Some("volume"),
+            "network" => Some("network"),
+            _ => None,
+        };
+        let resource_id = non_empty(&fragment.fragment_id).or_else(|| {
+            if fragment.fragment_id.is_empty() {
+                non_empty(&fragment.node_id)
+            } else {
+                None
+            }
+        });
+        audited_service_call!(
+            self,
+            request,
+            "AcknowledgeDesiredStateVersion",
+            RECONCILE_SERVICE_PATH,
             "acknowledge_desired_state_version",
-        )?;
-        let _span = tracing::info_span!("acknowledge_desired_state_version", %op_id);
-        let resp = self
-            .service
-            .acknowledge_desired_state_version(request.into_inner())
-            .instrument(_span)
-            .await
-            .map_err(tonic::Status::from)?;
-        Ok(Response::new(resp))
+            acknowledge_desired_state_version,
+            kind,
+            resource_id
+        )
     }
 }
 
