@@ -135,14 +135,20 @@ These still require a human, credentials, or infrastructure outside CI and are
 
 ## Unverified in the change that introduced these tiers
 
-The PR that added the ratchet and nightly/real-BFF lanes ran on a development
-container, not the GitHub-hosted or self-hosted fleets. Specifically:
+This section records the state at introduction and is updated when new
+evidence lands. As of 2026-11-04:
 
-- `nightly-kvm-qualification.yml` has still **not been executed** — no runner
-  with `/dev/kvm` and the `chv-kvm` label was available. Its YAML was parsed
-  locally. After merge, the first real signal must be a manual
-  `workflow_dispatch` run of the **chaos** lane (m4.7) before relying on the
-  schedule; the scheduled lanes remain unverified until that run reports.
+- `nightly-kvm-qualification.yml` **has executed** on the self-hosted runner
+  (schedule and `workflow_dispatch`). Its first live runs
+  ([41836073033](https://github.com/o3kio/chv/actions/runs/41836073033),
+  [41894243197](https://github.com/o3kio/chv/actions/runs/41894243197))
+  failed every scenario for **harness configuration drift**, not a candidate
+  defect: `deploy.sh` did not share the #693 agent-auth master with the agent,
+  and the two-stord scenarios reused the post-#687 default metrics port. Both
+  are fixed, with an offline invariant test
+  (`tests/scripts/qual-harness-invariants.sh`) in PR CI so the config contract
+  cannot rot again. Root cause, fixes, and the re-qualification run are in
+  [nightly-kvm-2026-11-04.md](../evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md).
 - The real-BFF harness and Playwright spec were exercised locally against a
   `chv-controlplane` built with `--features dev` (disposable SQLite, seeded
   admin): all 3 tests passed, and the spec skipped cleanly with
@@ -151,5 +157,9 @@ container, not the GitHub-hosted or self-hosted fleets. Specifically:
   commit in
   [run 41696156512](https://github.com/o3kio/chv/actions/runs/41696156512/job/126127119260)
   (4m35s).
+- The lane is a **tripwire, not an installer test**: it generates its own
+  deployment shape. Any change to the config/secret/port contract must be
+  reflected in `deploy.sh` and the scenario generators, which is what the new
+  invariant test checks.
 - No claim is made that the self-hosted scenarios are green on the current
-  candidate until the nightly lane reports on that candidate.
+  candidate until the nightly lane reports green on that candidate.

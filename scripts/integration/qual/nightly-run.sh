@@ -125,8 +125,15 @@ sweep_stale_qual_state() {
         sleep 1
     fi
     # Only the throwaway trees: the persistent root holds staged binaries,
-    # firmware, and guest images and must survive.
-    find /tmp -maxdepth 1 -type d -name 'chv-qual-*' -exec rm -rf {} + 2>/dev/null || true
+    # firmware, and guest images and must survive. Never touch the artifact
+    # root, even when a manual invocation puts it under /tmp.
+    local d
+    for d in /tmp/chv-qual-*; do
+        [ -d "$d" ] || continue
+        case "${QUAL_ARTIFACT_ROOT}/" in "$d"/*) continue ;; esac
+        case "$d/" in "${QUAL_ARTIFACT_ROOT}"/*) continue ;; esac
+        rm -rf -- "$d"
+    done
     # nwd hardcodes its dnsmasq runtime here; a killed nwd can leave it behind.
     rm -rf /run/chv/nwd 2>/dev/null || true
 }
