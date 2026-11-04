@@ -4120,6 +4120,42 @@ mod tests {
         assert_eq!(response.outcome, "not_tracked");
     }
 
+    /// A cancel that cannot stop the task must not be reported as confirmed:
+    /// the control plane keeps the durable cancel queued and retries rather
+    /// than auto-resuming a source VM under a live sender.
+    #[tokio::test]
+    async fn migration_control_returns_unavailable_when_task_keeps_running() {
+        let server = test_server();
+        // Prevent the delayed hard abort so the task is still tracked when
+        // the confirmation deadline expires.
+        server
+            .migration_tasks
+            .set_cancel_grace(Duration::from_secs(60));
+        let task = tokio::spawn(std::future::pending::<()>());
+        server.migration_tasks.insert(
+            "op-wedged".to_string(),
+            task.abort_handle(),
+            CancellationToken::new(),
+        );
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-wedged", "node-1")),
+            )
+            .await
+            .expect_err("an unresponsive task must not be reported as cancelled");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            server.migration_tasks.contains("op-wedged"),
+            "the task must still be tracked; the retry queue owns it"
+        );
+
+        task.abort();
+        let _ = task.await;
+        server.migration_tasks.remove("op-wedged");
+    }
+
     /// A cancel naming another node, or missing the operation id, is refused
     /// before it can touch this agent's registry.
     #[tokio::test]

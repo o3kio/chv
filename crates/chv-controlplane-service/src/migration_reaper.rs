@@ -1664,6 +1664,7 @@ mod tests {
     struct FakeCancelState {
         cancelled: bool,
         unimplemented: bool,
+        invalid_argument: bool,
         delay: Option<Duration>,
         expected_token: Option<String>,
         requests: Mutex<Vec<proto::CancelMigrationRequest>>,
@@ -1690,6 +1691,11 @@ mod tests {
             }
             if self.state.unimplemented {
                 return Err(tonic::Status::unimplemented("cancel_migration unsupported"));
+            }
+            if self.state.invalid_argument {
+                return Err(tonic::Status::invalid_argument(
+                    "this node is not the migration target",
+                ));
             }
             if let Some(delay) = self.state.delay {
                 tokio::time::sleep(delay).await;
@@ -1991,6 +1997,54 @@ mod tests {
             .await
             .expect("second drain");
         assert_eq!(cancel_state(&test_db.pool, "unsupported").await.2, 1);
+        source_server.abort();
+        dest_server.abort();
+    }
+
+    /// `InvalidArgument` is permanent too: a misrouted or malformed cancel
+    /// must be parked, not retried forever (the same safety as `Unimplemented`).
+    #[tokio::test]
+    async fn drain_parks_invalid_argument_refusal() {
+        let test_db = TestDb::new().await;
+        seed_pending_cancel(&test_db.pool, "misrouted").await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pattern, source_socket, dest_socket) = per_node_pattern(dir.path());
+        let source_state = Arc::new(FakeCancelState {
+            invalid_argument: true,
+            ..FakeCancelState::default()
+        });
+        let dest_state = Arc::new(FakeCancelState {
+            invalid_argument: true,
+            ..FakeCancelState::default()
+        });
+        let source_server = spawn_cancel_agent(&source_socket, source_state);
+        let dest_server = spawn_cancel_agent(&dest_socket, dest_state);
+        let reaper = MigrationReaper::new(test_db.pool.clone(), NodeClientPool::new(), pattern);
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("drain is best-effort");
+
+        let (pending, confirmed_at, attempts, last_error) =
+            cancel_state(&test_db.pool, "misrouted").await;
+        assert_eq!(pending, 0, "a permanent refusal must be parked");
+        assert!(confirmed_at.is_none(), "refusal is not a cancellation");
+        assert_eq!(attempts, 1);
+        assert!(last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rejected cancel")));
+
+        reaper
+            .drain_pending_agent_cancels()
+            .await
+            .expect("second drain");
+        assert_eq!(
+            cancel_state(&test_db.pool, "misrouted").await.2,
+            1,
+            "a parked row must not be retried"
+        );
         source_server.abort();
         dest_server.abort();
     }

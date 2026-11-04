@@ -2169,14 +2169,17 @@ async fn complete_migration_atomically(
     // Only the current non-terminal owner may complete the migration. A
     // reaper/operator/recovery terminal transition (or a queued agent cancel)
     // means another actor ended control-plane ownership; resurrecting the row
-    // would hide that outcome and strand the cancellation.
+    // would hide that outcome and strand the cancellation. An already
+    // `Completed` row is idempotent success: the source agent reports
+    // `Completed` *before* the control plane resumes placement, so this path
+    // must still move `vm_desired_state` to the destination.
     let updated = sqlx::query(
         r#"UPDATE migrations
            SET phase = 'Completed',
                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-               completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+               completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
            WHERE migration_id = ?
-             AND phase NOT IN ('Completed', 'Failed', 'RolledBack')
+             AND phase NOT IN ('Failed', 'RolledBack')
              AND agent_cancel_pending = 0"#,
     )
     .bind(&state.migration_id)
@@ -3028,6 +3031,78 @@ mod tests {
         }
     }
 
+    /// The source agent reports `Completed` before the control plane moves
+    /// placement. That row is already terminal by the time the state machine
+    /// calls `complete_migration_atomically`, so completion must be
+    /// idempotent and still move `vm_desired_state` to the destination.
+    #[tokio::test]
+    async fn completion_accepts_agent_reported_completed_and_moves_placement() {
+        let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+        seed_migration_row(&test_db.pool, "agent-completed", "MemoryMigration", -10).await;
+        for node in ["node-a", "node-b"] {
+            sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES (?, ?, ?)")
+                .bind(node)
+                .bind(node)
+                .bind(node)
+                .execute(&test_db.pool)
+                .await
+                .expect("seed node");
+        }
+        sqlx::query(
+            "INSERT INTO vm_desired_state (vm_id, desired_generation, target_node_id) \
+             VALUES ('vm-agent-completed', 1, 'node-a')",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed placement");
+
+        update_migration_progress(
+            &test_db.pool,
+            "node-a",
+            "vm-agent-completed",
+            "op-agent-completed",
+            proto::MigrationPhase::Completed as i32,
+            0,
+            0,
+            0,
+            0,
+        )
+        .await
+        .expect("agent-reported completion");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT phase FROM migrations WHERE migration_id = 'mig-agent-completed'",
+            )
+            .fetch_one(&test_db.pool)
+            .await
+            .expect("read reported phase"),
+            "Completed"
+        );
+
+        let mut state = migration_state_for("vm-agent-completed");
+        state.migration_id = "mig-agent-completed".to_string();
+        state.operation_id = "op-agent-completed".to_string();
+        state.dest_node_id = "node-b".to_string();
+        complete_migration_atomically(&test_db.pool, &mut state)
+            .await
+            .expect("an already-Completed row must complete idempotently");
+
+        let (phase, target): (String, String) = sqlx::query_as(
+            "SELECT m.phase, d.target_node_id \
+             FROM migrations m JOIN vm_desired_state d ON d.vm_id = m.vm_id \
+             WHERE m.migration_id = 'mig-agent-completed'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read migration");
+        assert_eq!(phase, "Completed");
+        assert_eq!(
+            target, "node-b",
+            "placement must move to the destination even when the agent already reported Completed"
+        );
+        assert_eq!(state.phase, MigrationPhase::Completed);
+    }
+
     /// An operator cancel of a fresh terminal `Failed`/`RolledBack` row queues
     /// the detached-task cancel even when restart recovery did not run.
     /// `Completed` stays a true no-op.
@@ -3125,6 +3200,15 @@ mod tests {
         let test_db = chv_controlplane_store::test_util::TestDb::new().await;
         seed_migration_row(&test_db.pool, "reported-failed", "MemoryMigration", -10).await;
         seed_migration_row(&test_db.pool, "reported-completed", "MemoryMigration", -10).await;
+        // A stale marker from an earlier cancel must be cleared by a
+        // Completed report; seed it so the assertion below is not vacuous.
+        sqlx::query(
+            "UPDATE migrations SET agent_cancel_pending = 1 \
+             WHERE migration_id = 'mig-reported-completed'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed stale pending marker");
 
         update_migration_progress(
             &test_db.pool,
@@ -3174,6 +3258,15 @@ mod tests {
         seed_migration_row(&test_db.pool, "failed", "MemoryMigration", -10).await;
         seed_migration_row(&test_db.pool, "rolled", "PreCopyDisk", -10).await;
         seed_migration_row(&test_db.pool, "completed", "MemoryMigration", -10).await;
+        // A stale marker from an earlier cancel must be cleared by the
+        // Completed transition; seed it so the assertion below is not vacuous.
+        sqlx::query(
+            "UPDATE migrations SET agent_cancel_pending = 1 \
+             WHERE migration_id = 'mig-completed'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed stale pending marker");
 
         update_migration_phase(&test_db.pool, "mig-failed", MigrationPhase::Failed)
             .await

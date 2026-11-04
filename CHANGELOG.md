@@ -42,7 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   misrouted/empty-op refusal, missing-token refusal, core-managed refusal,
   late-registration tombstone), store queue/confirm/attempt/batch/fairness
   semantics and parked-error reset, terminal-transition and terminal-race
-  queueing, completion refusal for terminal/cancel-pending rows,
+  queueing, completion refusal for `Failed`/`RolledBack` and
+  cancel-pending rows (an agent-reported `Completed` row completes
+  idempotently and still moves placement),
   agent-reported terminal queueing, post-restart operator-cancel queueing,
   resume gating while a cancel is pending or permanently refused, real
   `NodeClient` invalid-argument preservation, and reaper drains for both
