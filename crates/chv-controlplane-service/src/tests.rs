@@ -2733,6 +2733,62 @@ async fn test_lifecycle_migrate_vm_replay_rejects_terminal_operation() {
     assert_eq!(status, "Succeeded", "the replay must not change the status");
 }
 
+/// A caller-supplied operation id is matched by an operation-type-agnostic
+/// idempotency key. A `MigrateVm` replay must not accept an operation
+/// journaled by a different RPC (and report OK without a migration).
+#[tokio::test]
+async fn test_lifecycle_migrate_vm_replay_rejects_foreign_operation() {
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    seed_migration_fixture(&pool, "node-656-a").await;
+    sqlx::query(
+        "INSERT INTO operations \
+            (operation_id, idempotency_key, resource_kind, resource_id, \
+             operation_type, status) \
+         VALUES ('StartVm-foreign', 'request:op-foreign', 'vm', 'vm-656', \
+                 'StartVm', 'Pending')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = lifecycle_service_for_migration_test(&pool);
+
+    let mut request = migrate_vm_request(
+        "node-656-a",
+        Some(proto::MigrationConfig {
+            pause_first: true,
+            ..Default::default()
+        }),
+    );
+    request.meta.as_mut().unwrap().operation_id = "op-foreign".into();
+    let err = service
+        .migrate_vm(request)
+        .await
+        .expect_err("a foreign operation id must not be re-accepted as a migration");
+    match err {
+        ControlPlaneServiceError::Conflict(msg) => {
+            assert!(msg.contains("not this MigrateVm"), "got: {msg}");
+        }
+        other => panic!("expected Conflict for a foreign operation, got {other:?}"),
+    }
+
+    let migrations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM operations WHERE operation_type = 'MigrateVm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        migrations, 0,
+        "no migration may be journaled for the foreign replay"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM operations WHERE operation_id = 'StartVm-foreign'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "Pending", "the foreign operation must be untouched");
+}
+
 /// The operation's start event and idempotency key are scoped to
 /// `node_id`, so a direct caller must not name a node other than the
 /// migration source.
