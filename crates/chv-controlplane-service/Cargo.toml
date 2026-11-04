@@ -90,6 +90,12 @@ netbox-demo = [
 
 [dev-dependencies]
 tempfile = "3"
+# End-to-end cancel test: real NodeClient → real AgentServer auth/registry.
+# Neither crate depends on chv-controlplane-service, so this cannot create a
+# package cycle.
+chv-agent-core = { path = "../chv-agent-core" }
+chv-agent-runtime-ch = { path = "../chv-agent-runtime-ch" }
+tokio-util = "0.7"
 # Golden-bytes tests for the remote-write export body (hex literals).
 hex = { workspace = true }
 chv-controlplane-store = { path = "../chv-controlplane-store", features = ["test-util"] }

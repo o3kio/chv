@@ -602,8 +602,76 @@ Do **not** mark an interrupted row `Completed` to make it disappear: `Completed`
 means the destination owns the VM and placement was atomically updated.
 Interrupted migrations are not retried automatically; start a new migration only
 after confirming placement and cleaning up any partial destination volume.
-A cancel request for an interrupted row returns `already_terminal` because the
-migration task no longer exists; cancel only affects a live task.
+A cancel request for an interrupted row returns `already_terminal`: the
+control-plane state machine is gone, so there is nothing to roll back. Recovery
+already queued `migrations.agent_cancel_pending` for the detached agent task;
+for a terminal `Failed`/`RolledBack` row an operator cancel also (re-)queues it.
+The migration reaper drains the flag through the source and destination agents'
+`CancelMigration` RPC. Inspect the row with:
+
+```sql
+SELECT migration_id, phase, agent_cancel_pending, agent_cancel_confirmed_at,
+       agent_cancel_attempts, agent_cancel_last_attempt_at, agent_cancel_last_error
+FROM migrations
+WHERE migration_id = '<MIGRATION_ID>';
+```
+
+`agent_cancel_pending = 1` means at least one endpoint has not confirmed the
+cancel yet. `agent_cancel_confirmed_at IS NOT NULL` with a NULL error means both
+agents aborted their detached task (or reported `not_tracked` because the agent
+restarted). A cancel that arrives while a task is inside the Cloud Hypervisor
+send/receive transfer cannot be confirmed immediately: the agent does not
+force-drop that future and returns `Unavailable`, leaving the row pending for a
+later drain. If the agent's own VMM call bound expires, or the VMM reply is
+lost after the request was delivered, while Cloud Hypervisor may still be
+transferring, the task is sealed as "outcome unknown" and remains tracked, so
+cancellation stays unconfirmable for that agent process; a restart is the only
+mechanical clear (`agent_cancel_pending = 1`) and the paused source VM is left
+paused. After the restart the next drain reports `not_tracked`, which counts as
+success. That re-enables the ordinary resume gate only for a row already queued
+for resume (`reaper_resume_state` `pending`/`resuming` and no ambiguous
+interrupted phase); rows left NULL (terminalized by restart recovery) or
+`blocked` stay operator-only until explicitly requeued. An operator who cannot
+rule out a completed destination transfer must verify the VM and set
+`reaper_resume_state = 'blocked'` before restarting the agent if the row is
+queued for resume. A non-NULL
+`agent_cancel_last_error` means the agent refused
+permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
+invalid request); the detached task may still exist, so verify placement and
+the agent process before resuming the source VM. The
+reaper will not auto-resume a source VM while `agent_cancel_pending = 1`, nor
+when `agent_cancel_last_error` records a permanent refusal (the task may still
+be running). A confirmed cancel must also settle for 30 s before the resume
+pass acts, so a terminal progress report still queued on the agent cannot race
+the resume. It also refuses when a late `Completed` report arrived after the
+row was terminalized `Failed`/`RolledBack` (`reaper_resume_state = 'blocked'`):
+the detached agent may have completed the transfer, so the destination could
+own the VM. Only requeue after the node has been upgraded or verified idle, and write all
+three columns in one statement:
+`agent_cancel_pending = 1, agent_cancel_last_error = NULL,
+reaper_resume_state = 'pending'`. The resume pass re-selects a row only when
+`reaper_resume_state` is `pending` or `resuming`; a permanent refusal leaves a
+reaper-failed row `blocked`, while a restart-recovered row keeps the state NULL,
+and neither is resumed automatically. Setting `pending` without the queued
+cancel is unsafe: `agent_cancel_pending` is 0, so the resume pass is not held by
+an outstanding cancel, and with no fresh confirmation the 30 s settle gate does
+not apply — the source could be resumed on the next tick. Even with a
+correctly queued cancel, the resume pass considers any row in
+`pending`/`resuming` — including a restart-recovered row you flip to `pending` —
+except rows whose `interrupted_at` observed `MemoryMigration`/`Paused` (never
+auto-resumed) and rows blocked by a late `Completed` (the destination may own
+the VM). For a requeued restart-recovered row the quiescence window runs from
+its recovery timestamp. Let the requeued cancel confirm and settle, and only
+set `pending` once you have verified the destination does not own the VM;
+otherwise leave the row blocked and resume explicitly where the VM actually
+is.
+
+A successful pause-first migration can leave the destination VM paused. When
+the source agent reports `Completed`, the control plane resumes the destination
+before moving placement. If every resume attempt fails, placement still moves
+(the VM state is on the destination) but `migrations.error_message` records the
+failure and `chv_migration_destination_resume_failures_total` increments;
+resume that VM on the destination manually rather than on the source.
 
 The startup log line `migration restart recovery completed` reports
 `reconciled`, `already_terminal`, and `unresolved` counts; reconciliation also
@@ -878,7 +946,10 @@ counted under `chv_stord_migration_errors_total{reason="finalize_ack_timeout"}`)
 | `chv_migration_dirty_blocks` | Gauge | Remaining dirty blocks during convergence |
 | `chv_migration_restart_reconciled_total` | Counter | Rows reconciled at startup, labelled by `recovered_phase`; nonzero means a restart interrupted migrations |
 | `chv_migration_progress_dropped_total` | Counter | Late progress reports dropped after a terminal transition, labelled by `stored_phase` and `reported_phase`; `reported_phase="Completed"` after recovery is especially important |
-| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`) |
+| `migration_reaper_resume_skipped_total` | Counter | Source-VM resume attempts skipped, labelled by `reason` (`agent_cancel_pending`, `agent_cancel_settling`, `agent_cancel_refused`, `sender_active`, `source_node_not_reporting`, `interrupted_ambiguous`, `resume_blocked`) |
+| `chv_migration_agent_cancel_total` | Counter | Detached agent migration tasks signalled, labelled by `outcome` (`cancelled`, `not_tracked`); `not_tracked` is success (agent restarted / task already finished) |
+| `chv_migration_agent_cancel_failures_total` | Counter | Agent cancel attempts that did not confirm, labelled by `reason` (`resolve_error`, `unreachable`, `connect_timeout`, `timeout`, `rpc_error`, `permanent`); `permanent` parks the row in `agent_cancel_last_error` |
+| `chv_migration_destination_resume_failures_total` | Counter | Destination VM resumes that failed after an agent-reported `Completed`; placement still moved, so the VM may be paused on the destination and `migrations.error_message` explains why |
 
 **Expected phase durations** (100GB disk, 16GB RAM):
 

@@ -593,6 +593,20 @@ service LifecycleService {
     returns (AckResponse);
 }
 
+// Control-plane → agent cancellation of a detached migration task.
+//
+// `MigrateVm` is fire-and-forget: the source agent ACKs immediately and runs
+// the migration on a detached task, while the destination agent runs a
+// matching receive task. Either can outlive control-plane ownership, so the
+// reaper signals both endpoints. When the control-plane state machine goes
+// away (restart) or terminalizes a row without the agent task stopping, this
+// RPC is the only way to abort the surviving task. It is best-effort and
+// idempotent: `cancelled=false` means no task was tracked (for example the
+// agent restarted and the task is already gone), which is still success.
+service MigrationControlService {
+  rpc CancelMigration(CancelMigrationRequest) returns (CancelMigrationResponse);
+}
+
 service TelemetryService {
   rpc ReportNodeState(NodeStateReport) returns (AckResponse);
   rpc ReportVmState(VmStateReport) returns (AckResponse);
@@ -721,6 +735,32 @@ message MigrationConfig {
 message MigrationVolumeAuthorization {
   string volume_id = 1;
   string token = 2;
+}
+
+message CancelMigrationRequest {
+  RequestMeta meta = 1;
+  // Agent the migration task may run on (source or destination). The agent
+  // rejects a request that names a different node, so a misrouted cancel
+  // cannot abort another node's task.
+  string node_id = 2;
+  // The `operation_id` from the original `MigrateVm` request: the agent keys
+  // detached migration tasks by it.
+  string operation_id = 3;
+  // Migration row id, for audit/log correlation only. The task registry is
+  // keyed by `operation_id`.
+  string migration_id = 4;
+}
+
+message CancelMigrationResponse {
+  // true: a tracked task was found and signalled. false: no task was
+  // tracked (already finished, or the agent restarted). Both outcomes mean
+  // the control plane can stop retrying. A task inside a Cloud Hypervisor
+  // send/receive transfer is not force-dropped; that case returns
+  // `UNAVAILABLE`, which (like a transport failure) keeps the durable cancel
+  // queued for a later retry.
+  bool cancelled = 1;
+  // "cancelled" | "not_tracked" — stable machine-readable outcome.
+  string outcome = 2;
 }
 
 message MigrationProgress {

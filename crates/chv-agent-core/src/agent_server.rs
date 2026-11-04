@@ -1,6 +1,6 @@
 use crate::cache::{NodeCache, VmNicAttachment};
 use crate::control_plane::ControlPlaneClient;
-use crate::migration_registry::MigrationTaskRegistry;
+use crate::migration_registry::{MigrationTaskRegistry, TransferWindow};
 use crate::reconcile::{bridge_name_for_network, cleanup_vm_resources, vm_runtime_dir};
 use crate::state_machine::NodeState;
 use crate::vm_runtime::VmRuntime;
@@ -389,7 +389,10 @@ impl AgentServer {
             .layer(chv_observability::GrpcMetricsLayer::new())
             .layer(InterceptorLayer::new(self.auth.clone()))
             .add_service(proto::reconcile_service_server::ReconcileServiceServer::new(self.clone()))
-            .add_service(proto::lifecycle_service_server::LifecycleServiceServer::new(self))
+            .add_service(proto::lifecycle_service_server::LifecycleServiceServer::new(self.clone()))
+            .add_service(
+                proto::migration_control_service_server::MigrationControlServiceServer::new(self),
+            )
             .serve_with_incoming(uds_stream)
             .await
             .map_err(|e| ChvError::Internal {
@@ -3500,6 +3503,8 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                 // this, the JoinHandle was dropped on the floor and the agent
                 // had no way to abort, reap, or surface terminal failure.
                 let cancel_token = CancellationToken::new();
+                let transfer = Arc::new(TransferWindow::default());
+                let transfer_for_task = transfer.clone();
                 let registry = self.migration_tasks.clone();
                 let op_id_for_task = operation_id.clone();
                 let op_id_for_log = operation_id.clone();
@@ -3515,12 +3520,17 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                         disk_config,
                         Some(progress_reporter),
                         cancel_for_task,
+                        transfer_for_task,
                     )
                     .await
                 });
                 let abort_handle = handle.abort_handle();
-                self.migration_tasks
-                    .insert(operation_id.clone(), abort_handle, cancel_token);
+                self.migration_tasks.insert_with_transfer_window(
+                    operation_id.clone(),
+                    abort_handle,
+                    cancel_token,
+                    transfer,
+                );
 
                 // Reaper: await the task, log terminal status, remove from registry.
                 let reap_op = operation_id.clone();
@@ -3566,11 +3576,13 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     "destination agent: ACKing migrate_vm, spawning receive-migration task"
                 );
 
-                // Destination side has no cooperative cancel-aware variant
-                // yet (CH receive-migration is a single blocking call). The
-                // cancel token is still tracked so the abort_handle path
-                // force-drops the future at its next .await point.
+                // Destination side has no cooperative cancel-aware variant yet
+                // (CH receive-migration is a single blocking call). The task
+                // still marks the transfer window so a cancel during the VMM
+                // transfer is not confirmed or force-dropped.
                 let cancel_token = CancellationToken::new();
+                let transfer = Arc::new(TransferWindow::default());
+                let transfer_for_task = transfer.clone();
                 let registry = self.migration_tasks.clone();
                 let op_id_for_log = operation_id.clone();
                 let handle = crate::migration::spawn_destination_migration(
@@ -3578,10 +3590,15 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     vm_id,
                     operation_id.clone(),
                     receiver_url,
+                    transfer_for_task,
                 );
                 let abort_handle = handle.abort_handle();
-                self.migration_tasks
-                    .insert(operation_id.clone(), abort_handle, cancel_token);
+                self.migration_tasks.insert_with_transfer_window(
+                    operation_id.clone(),
+                    abort_handle,
+                    cancel_token,
+                    transfer,
+                );
 
                 let reap_op = operation_id.clone();
                 tokio::spawn(async move {
@@ -3836,6 +3853,124 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
     }
 }
 
+/// How long `CancelMigration` waits for the task to actually exit before it
+/// reports failure. The control plane's per-call bound is 5 s, so stay below
+/// it; the registry's own grace window is shorter, leaving time for the
+/// task's completion reaper to remove the entry.
+const MIGRATION_CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// `MigrateVm` is fire-and-forget: the agent ACKs immediately and runs the
+/// migration on a detached task. When the control plane loses ownership
+/// (restart, reaper, rollback, operator cancel) it has no other way to abort
+/// that surviving task. This service is the bounded, idempotent cancel path.
+#[tonic::async_trait]
+impl proto::migration_control_service_server::MigrationControlService for AgentServer {
+    async fn cancel_migration(
+        &self,
+        req: Request<proto::CancelMigrationRequest>,
+    ) -> Result<Response<proto::CancelMigrationResponse>, Status> {
+        // Mirror `migrate_vm`: legacy live migration cannot run behind the
+        // Core authority, so a cancel for it is not addressable either.
+        if self.core_authority.is_some() {
+            return Err(Status::unimplemented(
+                "cancel_migration is unsupported in core-managed mode",
+            ));
+        }
+
+        let inner = req.into_inner();
+        if inner.operation_id.trim().is_empty() {
+            return Err(Status::invalid_argument("operation_id is required"));
+        }
+
+        // A misrouted cancel must never abort another node's task. The
+        // control plane resolves the source agent socket per row, so an empty
+        // or mismatched id is a routing bug, not a wildcard.
+        let my_node_id = self.cache.lock().await.node_id.clone();
+        if inner.node_id != my_node_id {
+            // Do not echo node ids back to the caller (or into CP logs): the
+            // caller already knows the value it sent, and a mismatch is a
+            // routing bug, not a lookup service.
+            tracing::warn!(
+                requested_node_id = %inner.node_id,
+                operation_id = %inner.operation_id,
+                "refusing migration cancel addressed to another node"
+            );
+            return Err(Status::invalid_argument(
+                "node_id does not match this agent's migration source identity",
+            ));
+        }
+
+        // `false` means the registry has no task for this operation — the
+        // task already finished, or this agent restarted. Both are success
+        // for the caller: there is nothing left to cancel.
+        let cancelled = self.cancel_migration(&inner.operation_id);
+        if cancelled
+            && self
+                .migration_tasks
+                .transfer_in_progress(&inner.operation_id)
+        {
+            // The task is inside the Cloud Hypervisor send/receive call.
+            // Dropping the future would not stop that VMM transfer, so a
+            // `cancelled` reply would let the control plane resume the source
+            // VM while the destination is still receiving memory. Keep the
+            // durable cancel queued and report a retryable failure instead.
+            warn!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                "migration cancel signalled during an in-flight VMM transfer; not confirming"
+            );
+            return Err(Status::unavailable(
+                "migration is inside a non-cancellable VMM transfer; retry after it completes",
+            ));
+        }
+        if cancelled
+            && !self
+                .migration_tasks
+                .wait_until_stopped(&inner.operation_id, MIGRATION_CANCEL_CONFIRM_TIMEOUT)
+                .await
+        {
+            // Do not report a cancel the caller could act on (the control
+            // plane unpauses the source VM only after a confirmed cancel)
+            // while the detached task may still be alive. The durable retry
+            // queue will call again.
+            warn!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                timeout_secs = MIGRATION_CANCEL_CONFIRM_TIMEOUT.as_secs(),
+                "migration cancel signalled but the task did not stop in time"
+            );
+            return Err(Status::unavailable(format!(
+                "migration task {} did not stop within {}s",
+                inner.operation_id,
+                MIGRATION_CANCEL_CONFIRM_TIMEOUT.as_secs()
+            )));
+        }
+        let outcome = if cancelled {
+            "cancelled"
+        } else {
+            "not_tracked"
+        };
+        if cancelled {
+            info!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                "cancel signalled for tracked migration task"
+            );
+        } else {
+            info!(
+                operation_id = %inner.operation_id,
+                migration_id = %inner.migration_id,
+                "cancel found no tracked migration task (already finished or agent restarted)"
+            );
+        }
+
+        Ok(Response::new(proto::CancelMigrationResponse {
+            cancelled,
+            outcome: outcome.to_string(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3893,12 +4028,22 @@ mod tests {
     const TEST_AGENT_TOKEN: &str = "agent-token-0123456789abcdef0123456789";
 
     async fn spawn_agent_with_auth(auth: AgentAuth) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, socket, _server) = spawn_agent_with_auth_and_server(auth).await;
+        (dir, socket)
+    }
+
+    /// Same as [`spawn_agent_with_auth`], but also returns a handle to the
+    /// served `AgentServer` so a test can seed the migration task registry.
+    async fn spawn_agent_with_auth_and_server(
+        auth: AgentAuth,
+    ) -> (tempfile::TempDir, std::path::PathBuf, AgentServer) {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("agent.sock");
         let server = test_server().with_agent_auth(auth);
+        let serving = server.clone();
         let server_socket = socket.clone();
         tokio::spawn(async move {
-            let _ = server.serve(&server_socket).await;
+            let _ = serving.serve(&server_socket).await;
         });
         for _ in 0..100 {
             if socket.exists() {
@@ -3907,7 +4052,245 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(socket.exists(), "agent socket was not bound");
-        (dir, socket)
+        (dir, socket, server)
+    }
+
+    async fn connect_migration_control(
+        socket: &std::path::Path,
+    ) -> proto::migration_control_service_client::MigrationControlServiceClient<
+        tonic::transport::Channel,
+    > {
+        let path = socket.to_path_buf();
+        let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")
+            .expect("endpoint")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let path = path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await
+            .expect("connect to agent");
+        proto::migration_control_service_client::MigrationControlServiceClient::new(channel)
+    }
+
+    fn cancel_request(op_id: &str, node_id: &str) -> proto::CancelMigrationRequest {
+        proto::CancelMigrationRequest {
+            meta: Some(test_meta("1")),
+            node_id: node_id.to_string(),
+            operation_id: op_id.to_string(),
+            migration_id: format!("mig-{op_id}"),
+        }
+    }
+
+    /// The served cancel RPC aborts a tracked task and reports `not_tracked`
+    /// (still success) once the registry entry is gone.
+    #[tokio::test]
+    async fn migration_control_service_cancels_tracked_task_over_uds() {
+        let (_dir, socket, server) = spawn_agent_with_auth_and_server(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+
+        // Keep the test fast while still exercising the cooperative-grace
+        // path; the production value is 2 s.
+        server
+            .migration_tasks
+            .set_cancel_grace(Duration::from_millis(50));
+
+        let cancel_token = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        server.migration_tasks.insert(
+            "op-live".to_string(),
+            task.abort_handle(),
+            cancel_token.clone(),
+        );
+
+        // Model the production completion reaper: the registry entry is
+        // removed only after the future resolves. `CancelMigration` waits for
+        // that, so `cancelled=true` means the task actually exited.
+        let registry = server.migration_tasks.clone();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = task.await;
+            registry.remove("op-live");
+            let _ = finished_tx.send(result);
+        });
+
+        let mut client = connect_migration_control(&socket).await;
+        let response = client
+            .cancel_migration(with_token(
+                cancel_request("op-live", "node-1"),
+                TEST_AGENT_TOKEN,
+            ))
+            .await
+            .expect("cancel should be served")
+            .into_inner();
+        assert!(response.cancelled);
+        assert_eq!(response.outcome, "cancelled");
+        assert!(cancel_token.is_cancelled());
+        assert!(finished_rx
+            .await
+            .expect("completion reaper")
+            .expect_err("tracked task must be aborted")
+            .is_cancelled());
+
+        // A retry must be a benign `not_tracked`, not an error (the agent
+        // restart case: the task is already gone).
+        let response = client
+            .cancel_migration(with_token(
+                cancel_request("op-live", "node-1"),
+                TEST_AGENT_TOKEN,
+            ))
+            .await
+            .expect("unknown op is idempotent success")
+            .into_inner();
+        assert!(!response.cancelled);
+        assert_eq!(response.outcome, "not_tracked");
+    }
+
+    /// A cancel that cannot stop the task must not be reported as confirmed:
+    /// the control plane keeps the durable cancel queued and retries rather
+    /// than auto-resuming a source VM under a live sender.
+    #[tokio::test]
+    async fn migration_control_returns_unavailable_when_task_keeps_running() {
+        let server = test_server();
+        // Prevent the delayed hard abort so the task is still tracked when
+        // the confirmation deadline expires.
+        server
+            .migration_tasks
+            .set_cancel_grace(Duration::from_secs(60));
+        let task = tokio::spawn(std::future::pending::<()>());
+        server.migration_tasks.insert(
+            "op-wedged".to_string(),
+            task.abort_handle(),
+            CancellationToken::new(),
+        );
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-wedged", "node-1")),
+            )
+            .await
+            .expect_err("an unresponsive task must not be reported as cancelled");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            server.migration_tasks.contains("op-wedged"),
+            "the task must still be tracked; the retry queue owns it"
+        );
+
+        task.abort();
+        let _ = task.await;
+        server.migration_tasks.remove("op-wedged");
+    }
+
+    /// A cancel during an in-flight Cloud Hypervisor transfer must not be
+    /// confirmed: dropping the future does not stop the transfer, and the
+    /// control plane would resume the source VM while the destination still
+    /// receives memory. It must stay tracked and report `Unavailable`.
+    #[tokio::test]
+    async fn migration_control_refuses_cancel_during_vmm_transfer() {
+        let server = test_server();
+        server
+            .migration_tasks
+            .set_cancel_grace(Duration::from_secs(60));
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(transfer.try_begin());
+        let task = tokio::spawn(std::future::pending::<()>());
+        server.migration_tasks.insert_with_transfer_window(
+            "op-transfer".to_string(),
+            task.abort_handle(),
+            CancellationToken::new(),
+            transfer.clone(),
+        );
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-transfer", "node-1")),
+            )
+            .await
+            .expect_err("a transfer must not be reported as cancelled");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            server.migration_tasks.contains("op-transfer"),
+            "the task must stay tracked while the VMM transfer runs"
+        );
+
+        task.abort();
+        let _ = task.await;
+        server.migration_tasks.remove("op-transfer");
+    }
+
+    /// A cancel naming another node, or missing the operation id, is refused
+    /// before it can touch this agent's registry.
+    #[tokio::test]
+    async fn migration_control_rejects_misrouted_cancel() {
+        let server = test_server();
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-live", "node-2")),
+            )
+            .await
+            .expect_err("cancel for another node must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            !err.message().contains("node-2") && !err.message().contains("node-1"),
+            "the refusal must not echo node ids: {}",
+            err.message()
+        );
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("   ", "node-1")),
+            )
+            .await
+            .expect_err("empty operation id must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Core-managed mode has no legacy migration task to cancel, exactly like
+    /// `migrate_vm`; fail closed before touching the registry.
+    #[tokio::test]
+    async fn migration_control_refuses_core_managed_mode() {
+        let server = test_server()
+            .with_core_authority(cellhv_core_operations::AuthorityHandle::disconnected());
+
+        let err =
+            proto::migration_control_service_server::MigrationControlService::cancel_migration(
+                &server,
+                Request::new(cancel_request("op-live", "node-1")),
+            )
+            .await
+            .expect_err("core-managed cancel must be refused");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("core-managed"));
+    }
+
+    /// The new service is registered behind the same auth interceptor as the
+    /// existing services; a missing token must never reach the handler.
+    #[tokio::test]
+    async fn migration_control_rejects_missing_token_over_uds() {
+        let (_dir, socket) = spawn_agent_with_auth(AgentAuth::new(
+            TEST_AGENT_TOKEN,
+            false,
+            vec![nix::unistd::geteuid().as_raw()],
+        ))
+        .await;
+        let mut client = connect_migration_control(&socket).await;
+        let status = client
+            .cancel_migration(cancel_request("op-live", "node-1"))
+            .await
+            .expect_err("missing token must be rejected");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 
     async fn connect_reconcile(
@@ -4107,6 +4490,143 @@ mod tests {
             "the refusal must name the agent gate: {}",
             err.message()
         );
+    }
+
+    /// The destination `migrate_vm` handler must register the spawned task
+    /// with the exact `TransferWindow` the task uses. A fresh default window
+    /// would let `CancelMigration` confirm and force-drop a live VMM receive.
+    #[tokio::test]
+    async fn migrate_vm_destination_shares_transfer_window_and_retains_sealed_task() {
+        let mock = Arc::new(MockCloudHypervisorAdapter::default());
+        *mock.migration_timeout.lock().unwrap() = true;
+        let mut cache = NodeCache::new("node-1");
+        cache.node_state = crate::state_machine::NodeState::TenantReady
+            .as_str()
+            .to_string();
+        cache.connectivity_state = crate::connectivity::ConnectivityState::Connected;
+        let server = AgentServer::new(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(mock),
+            std::path::PathBuf::from("/run/chv/stord/api.sock"),
+            std::path::PathBuf::from("/run/chv/nwd/api.sock"),
+            None,
+            std::path::PathBuf::from("/var/lib/chv/agent"),
+        );
+
+        let req = proto::MigrateVmRequest {
+            meta: Some(test_meta("1")),
+            node_id: "node-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            source_node_id: "node-2".to_string(),
+            destination_node_id: "node-1".to_string(),
+            config: None,
+        };
+        proto::lifecycle_service_server::LifecycleService::migrate_vm(&server, Request::new(req))
+            .await
+            .expect("the destination must ACK the migration");
+
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "the destination task must be registered before the ACK"
+        );
+
+        // The mock receive call returns a timeout, which seals the task's
+        // window. The registry entry only observes that state if it shares
+        // the same `TransferWindow`; wait for the task to reach it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !server.migration_tasks.transfer_in_progress("op-1") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the registry must observe the task's sealed transfer window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The completion reaper's remove must retain a sealed task, so a
+        // later cancel keeps failing closed instead of reporting not_tracked.
+        server.migration_tasks.remove("op-1");
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "a sealed destination task must stay tracked after remove"
+        );
+        assert!(server.migration_tasks.transfer_in_progress("op-1"));
+    }
+
+    /// The source `migrate_vm` handler must register the spawned disk+memory
+    /// task with the exact `TransferWindow` the task uses. A fresh default
+    /// window would let `CancelMigration` confirm and force-drop a source still
+    /// sending after its memory phase sealed as outcome-unknown.
+    #[tokio::test]
+    async fn migrate_vm_source_shares_transfer_window_and_retains_sealed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stord.sock");
+        {
+            let uds = tokio::net::UnixListener::bind(&socket).unwrap();
+            tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(
+                        chv_stord_api::chv_stord_api::storage_service_server::StorageServiceServer::new(
+                            MockStord::default(),
+                        ),
+                    )
+                    .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds))
+                    .await
+                    .ok();
+            });
+        }
+
+        let mock = Arc::new(MockCloudHypervisorAdapter::default());
+        *mock.migration_timeout.lock().unwrap() = true;
+        let mut cache = NodeCache::new("node-1");
+        cache.node_state = crate::state_machine::NodeState::TenantReady
+            .as_str()
+            .to_string();
+        cache.connectivity_state = crate::connectivity::ConnectivityState::Connected;
+        let server = AgentServer::new(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(mock),
+            socket,
+            std::path::PathBuf::from("/run/chv/nwd/api.sock"),
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let req = proto::MigrateVmRequest {
+            meta: Some(test_meta("1")),
+            node_id: "node-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            source_node_id: "node-1".to_string(),
+            destination_node_id: "node-2".to_string(),
+            config: None,
+        };
+        proto::lifecycle_service_server::LifecycleService::migrate_vm(&server, Request::new(req))
+            .await
+            .expect("the source must ACK the migration");
+
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "the source task must be registered before the ACK"
+        );
+
+        // No attached volumes: the disk phase skips stord triggers and goes
+        // straight to the memory phase, where the mock timeout seals the
+        // transfer window. The registry entry only observes that state if it
+        // shares the same `TransferWindow`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !server.migration_tasks.transfer_in_progress("op-1") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the registry must observe the task's sealed transfer window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        server.migration_tasks.remove("op-1");
+        assert!(
+            server.migration_tasks.contains("op-1"),
+            "a sealed source task must stay tracked after remove"
+        );
+        assert!(server.migration_tasks.transfer_in_progress("op-1"));
     }
 
     #[tokio::test]

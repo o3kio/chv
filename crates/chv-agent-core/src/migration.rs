@@ -7,6 +7,7 @@
 //! REST API calls.
 
 use crate::daemon_clients::StordClient;
+use crate::migration_registry::TransferWindow;
 use crate::vm_runtime::VmRuntime;
 use chv_errors::ChvError;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -101,6 +102,7 @@ pub fn spawn_destination_migration(
     vm_id: String,
     operation_id: String,
     receiver_url: String,
+    transfer: Arc<TransferWindow>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         info!(
@@ -110,10 +112,29 @@ pub fn spawn_destination_migration(
             "destination agent: starting receive-migration"
         );
 
-        match vm_runtime
+        // Enter the non-cancellable window atomically: if a cancel was armed
+        // first, do not start the VMM receive at all (dropping this future
+        // would not stop it).
+        if !transfer.try_begin() {
+            warn!(
+                vm_id = %vm_id,
+                operation_id = %operation_id,
+                "destination agent: migration cancelled before receive-migration"
+            );
+            return Err("migration cancelled before receive-migration".to_string());
+        }
+        let result = vm_runtime
             .receive_migration(&vm_id, &receiver_url, Some(&operation_id))
-            .await
-        {
+            .await;
+        match &result {
+            // The agent stopped waiting, or lost the VMM reply, while Cloud
+            // Hypervisor may still be receiving. Seal the window so a cancel
+            // can never be confirmed.
+            Err(e) if is_outcome_unknown(e) => transfer.seal_unknown(),
+            _ => transfer.end(),
+        }
+
+        match result {
             Ok(()) => {
                 info!(
                     vm_id = %vm_id,
@@ -642,6 +663,7 @@ pub async fn source_migration_with_disk_precopy(
     disk_config: DiskPrecopyConfig,
     progress_reporter: Option<ProgressReporter>,
     cancel_token: CancellationToken,
+    transfer: Arc<TransferWindow>,
 ) -> Result<(), String> {
     info!(
         vm_id = %vm_id,
@@ -797,6 +819,38 @@ pub async fn source_migration_with_disk_precopy(
         return Err("migration cancelled at phase: pre-memory-migration".to_string());
     }
 
+    send_memory_migration(
+        &vm_runtime,
+        &vm_id,
+        &operation_id,
+        &node_id,
+        &destination_url,
+        progress_reporter.as_ref(),
+        &mut pause_guard,
+        &transfer,
+    )
+    .await
+}
+
+/// Phase 2 of a source migration: report the memory phase, enter the
+/// non-cancellable VMM transfer window atomically, run `send-migration`, then
+/// seal the window on an unknown outcome (a cancel must never be confirmed) or
+/// end it on a definitive result. On failure the paused-source policy resumes
+/// the VM only when the transfer is definitively stopped.
+///
+/// Extracted so the seal/resume wiring has a direct test against a real paused
+/// VM, not just the classification predicates.
+#[allow(clippy::too_many_arguments)]
+async fn send_memory_migration(
+    vm_runtime: &VmRuntime,
+    vm_id: &str,
+    operation_id: &str,
+    node_id: &str,
+    destination_url: &str,
+    progress_reporter: Option<&ProgressReporter>,
+    pause_guard: &mut PausedVmGuard,
+    transfer: &TransferWindow,
+) -> Result<(), String> {
     // Phase 2: Memory migration
     info!(
         vm_id = %vm_id,
@@ -805,11 +859,11 @@ pub async fn source_migration_with_disk_precopy(
         "source agent: starting memory migration (send-migration)"
     );
 
-    if let Some(ref reporter) = progress_reporter {
+    if let Some(reporter) = progress_reporter {
         let progress = build_progress(
-            &node_id,
-            &vm_id,
-            &operation_id,
+            node_id,
+            vm_id,
+            operation_id,
             proto::MigrationPhase::MemoryMigration,
             0,
             0,
@@ -821,16 +875,33 @@ pub async fn source_migration_with_disk_precopy(
         cb(progress);
     }
 
-    match vm_runtime
-        .send_migration(&vm_id, &destination_url, Some(&operation_id))
-        .await
-    {
+    // Enter the non-cancellable window atomically. If a cancel was armed
+    // first, do not start send-migration; resume a VM paused for the disk
+    // phase and surface the cancellation.
+    if !transfer.try_begin() {
+        warn!(
+            vm_id = %vm_id,
+            operation_id = %operation_id,
+            "source agent: migration cancelled before send-migration"
+        );
+        pause_guard.resume_if_paused().await;
+        return Err("migration cancelled before memory migration".to_string());
+    }
+    let send_result = vm_runtime
+        .send_migration(vm_id, destination_url, Some(operation_id))
+        .await;
+    if matches!(&send_result, Err(e) if is_outcome_unknown(e)) {
+        transfer.seal_unknown();
+    } else {
+        transfer.end();
+    }
+    match send_result {
         Ok(()) => {
-            if let Some(ref reporter) = progress_reporter {
+            if let Some(reporter) = progress_reporter {
                 let progress = build_progress(
-                    &node_id,
-                    &vm_id,
-                    &operation_id,
+                    node_id,
+                    vm_id,
+                    operation_id,
                     proto::MigrationPhase::Completed,
                     0,
                     0,
@@ -856,11 +927,54 @@ pub async fn source_migration_with_disk_precopy(
                 error = %e,
                 "source agent: memory migration (send-migration) failed"
             );
-            // The VM is still paused from the final disk sync; resume it so
-            // the reconciler can drive it back to Running.
-            pause_guard.resume_if_paused().await;
+            // A normal failure means Cloud Hypervisor is no longer sending,
+            // so the VM must be resumed or the reconciler cannot run it. An
+            // unknown outcome is different: CH may still be streaming, so
+            // leave the VM paused for the reaper / operator (the sealed window
+            // keeps the cancel unconfirmed).
+            settle_paused_source_after_send_failure(&e, pause_guard, vm_id, operation_id).await;
             Err(format!("memory migration failed: {e}"))
         }
+    }
+}
+
+/// Whether an error from a migration VMM call leaves Cloud Hypervisor in a
+/// known-stopped state. A timeout or a lost response does not: the request was
+/// delivered and the transfer may still run, so unpausing the source would
+/// race a live sender (and a cancel must never be confirmed).
+fn is_outcome_unknown(error: &ChvError) -> bool {
+    matches!(
+        error,
+        ChvError::Timeout { .. } | ChvError::OutcomeUnknown { .. }
+    )
+}
+
+/// Whether a failed source-side `send-migration` leaves Cloud Hypervisor in a
+/// known-stopped state, i.e. the paused VM is safe to resume.
+fn source_should_resume_after_send_failure(error: &ChvError) -> bool {
+    !is_outcome_unknown(error)
+}
+
+/// Apply the send-failure policy to the paused source VM.
+///
+/// A definitive failure resumes it so the reconciler can drive it back to
+/// Running; an unknown outcome leaves it paused for the reaper/operator so a
+/// possibly-live memory sender is never resumed underneath.
+async fn settle_paused_source_after_send_failure(
+    error: &ChvError,
+    pause_guard: &mut PausedVmGuard,
+    vm_id: &str,
+    operation_id: &str,
+) {
+    if source_should_resume_after_send_failure(error) {
+        pause_guard.resume_if_paused().await;
+    } else {
+        warn!(
+            vm_id = %vm_id,
+            operation_id = %operation_id,
+            "source agent: send-migration outcome is unknown; leaving the VM paused \
+             because the transfer may still be running"
+        );
     }
 }
 
@@ -897,6 +1011,7 @@ pub const DEFAULT_MIGRATION_PORT: u16 = 49152;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration_registry::MigrationTaskRegistry;
 
     #[test]
     fn determine_role_source() {
@@ -1428,5 +1543,361 @@ mod tests {
         // A resume call would flip the record to Running; staying "Created"
         // proves resume_vm was never invoked.
         assert_eq!(rt.get("vm-1").await.unwrap().runtime_status, "Created");
+    }
+
+    /// A timeout or a lost VMM reply from the adapter must seal the transfer
+    /// window (the VMM may still be receiving) so a later cancel cannot be
+    /// confirmed. This drives the real `spawn_destination_migration` wiring.
+    #[tokio::test]
+    async fn destination_timeout_seals_transfer_window() {
+        let (rt, mock) = test_runtime();
+        *mock.migration_timeout.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+
+        let handle = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-timeout".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        );
+        let err = handle
+            .await
+            .expect("task joins")
+            .expect_err("the mock must time out");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            transfer.is_unknown(),
+            "a VMM timeout must seal the transfer as outcome-unknown"
+        );
+        assert!(transfer.in_progress());
+        assert!(
+            !transfer.try_begin(),
+            "a sealed transfer must not restart the VMM call"
+        );
+
+        // Connect the adapter timeout to the registry: the tracked task must
+        // stay tracked (and its cancel never confirm) after the completion
+        // reaper's `remove`.
+        let registry = Arc::new(MigrationTaskRegistry::new());
+        registry.set_cancel_grace(std::time::Duration::from_millis(20));
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.insert_with_transfer_window(
+            "op-timeout".to_string(),
+            task.abort_handle(),
+            CancellationToken::new(),
+            transfer.clone(),
+        );
+        assert!(registry.cancel("op-timeout"));
+        assert!(
+            !registry
+                .wait_until_stopped("op-timeout", std::time::Duration::from_millis(100))
+                .await,
+            "a timed-out transfer must never look stopped"
+        );
+        registry.remove("op-timeout");
+        assert!(
+            registry.contains("op-timeout"),
+            "a sealed task must stay tracked after remove so cancels keep failing closed"
+        );
+        task.abort();
+
+        // A lost VMM reply is the same outcome class as a timeout and must
+        // seal through the same production call site.
+        let (rt, mock) = test_runtime();
+        *mock.migration_outcome_unknown.lock().unwrap() = true;
+        let lost = Arc::new(TransferWindow::default());
+        let err = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-lost-reply".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            lost.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect_err("the mock must report a lost reply");
+        assert!(err.contains("outcome unknown"), "{err}");
+        assert!(
+            lost.is_unknown(),
+            "a lost VMM reply must seal the transfer as outcome-unknown"
+        );
+    }
+
+    /// Only a definitive send-migration failure may unpause the source. A
+    /// timeout or a lost response leaves Cloud Hypervisor potentially
+    /// streaming, so the VM stays paused for the reaper/operator.
+    #[test]
+    fn source_resumes_only_on_definitive_send_failure() {
+        assert!(!source_should_resume_after_send_failure(
+            &ChvError::Timeout {
+                operation: "send-migration".to_string(),
+                secs: 7200,
+            }
+        ));
+        assert!(!source_should_resume_after_send_failure(
+            &ChvError::OutcomeUnknown {
+                operation: "send-migration".to_string(),
+                reason: "connection closed mid-response".to_string(),
+            }
+        ));
+        assert!(source_should_resume_after_send_failure(
+            &ChvError::Internal {
+                reason: "connection reset".to_string(),
+            }
+        ));
+    }
+
+    /// The fail-closed branch must hold when applied to a real paused VM, not
+    /// just in the predicate: an unknown outcome keeps the guard and the VM
+    /// paused, while a definitive failure resumes it.
+    #[tokio::test]
+    async fn unknown_send_outcome_keeps_source_paused_but_definitive_failure_resumes() {
+        let (rt, _mock) = test_runtime();
+        create_vm_record(&rt).await;
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+        assert_eq!(rt.get("vm-1").await.unwrap().runtime_status, "Paused");
+
+        for unknown in [
+            ChvError::OutcomeUnknown {
+                operation: "send-migration".to_string(),
+                reason: "connection closed mid-response".to_string(),
+            },
+            ChvError::Timeout {
+                operation: "send-migration".to_string(),
+                secs: 7200,
+            },
+        ] {
+            settle_paused_source_after_send_failure(&unknown, &mut guard, "vm-1", "op-1").await;
+            assert!(
+                guard.is_paused(),
+                "the guard must still consider it paused after {unknown:?}"
+            );
+        }
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Paused",
+            "an unknown transfer outcome must not unpause the source"
+        );
+
+        settle_paused_source_after_send_failure(
+            &ChvError::Internal {
+                reason: "connection reset".to_string(),
+            },
+            &mut guard,
+            "vm-1",
+            "op-1",
+        )
+        .await;
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Running",
+            "a definitive failure must resume the source"
+        );
+    }
+
+    /// Drive the real source memory-phase wiring: both unknown outcomes must
+    /// seal the transfer window, leave the paused source paused, and keep the
+    /// cancel unconfirmable.
+    #[tokio::test]
+    async fn source_send_unknown_outcomes_seal_window_and_stay_paused() {
+        for (timeout, lost_reply) in [(true, false), (false, true)] {
+            let (rt, mock) = test_runtime();
+            create_vm_record(&rt).await;
+            *mock.migration_timeout.lock().unwrap() = timeout;
+            *mock.migration_outcome_unknown.lock().unwrap() = lost_reply;
+
+            let transfer = Arc::new(TransferWindow::default());
+            let mut guard = new_guard(&rt);
+            guard.pause_vm().await.expect("pause the VM");
+
+            let err = send_memory_migration(
+                &rt,
+                "vm-1",
+                "op-1",
+                "node-1",
+                "tcp://127.0.0.1:1",
+                None,
+                &mut guard,
+                &transfer,
+            )
+            .await
+            .expect_err("the mock must report an unknown outcome");
+            assert!(err.contains("memory migration failed"), "{err}");
+            assert!(
+                transfer.is_unknown(),
+                "timeout={timeout} lost_reply={lost_reply}: the source send must seal the window"
+            );
+            assert!(
+                guard.is_paused(),
+                "the guard must still consider the VM paused"
+            );
+            assert_eq!(
+                rt.get("vm-1").await.unwrap().runtime_status,
+                "Paused",
+                "an unknown source outcome must not unpause the VM"
+            );
+            assert!(
+                !transfer.try_begin(),
+                "a sealed task must not start another VMM transfer"
+            );
+        }
+    }
+
+    /// The destination success and definitive-failure arms must end (not seal)
+    /// the window, and a pre-armed cancel must refuse to start receive at all.
+    #[tokio::test]
+    async fn destination_end_window_and_prearmed_cancel() {
+        let (rt, _mock) = test_runtime();
+        let transfer = Arc::new(TransferWindow::default());
+        spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-1".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect("the mock receive succeeds");
+        assert!(!transfer.is_unknown());
+        assert!(!transfer.in_progress(), "success must end the window");
+
+        let (rt, mock) = test_runtime();
+        *mock.migration_definitive_failure.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+        let err = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-1".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect_err("the mock reports a definitive failure");
+        assert!(err.contains("receive-migration failed"), "{err}");
+        assert!(!transfer.is_unknown());
+        assert!(
+            !transfer.in_progress(),
+            "a definitive failure must end the window"
+        );
+
+        // A cancel armed before the task starts must prevent the VMM call.
+        let (rt, mock) = test_runtime();
+        *mock.migration_timeout.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(!transfer.arm_cancel(), "nothing was active yet");
+        let err = spawn_destination_migration(
+            rt,
+            "vm-1".to_string(),
+            "op-1".to_string(),
+            "tcp://127.0.0.1:1".to_string(),
+            transfer.clone(),
+        )
+        .await
+        .expect("task joins")
+        .expect_err("a pre-armed cancel must refuse to start receive");
+        assert_eq!(err, "migration cancelled before receive-migration");
+        assert!(!transfer.in_progress());
+    }
+
+    /// The success and definitive-failure arms must end (not seal) the window.
+    /// A stuck `TRANSFER_ACTIVE` would make a cancel that lands while the entry
+    /// is still tracked return `Unavailable` and skip the registry's delayed
+    /// force-abort, even though the VMM call already finished.
+    #[tokio::test]
+    async fn source_send_success_and_definitive_failure_end_window() {
+        // Success: the migrated source stays paused, but the window is over.
+        let (rt, _mock) = test_runtime();
+        create_vm_record(&rt).await;
+        let transfer = Arc::new(TransferWindow::default());
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+        send_memory_migration(
+            &rt,
+            "vm-1",
+            "op-1",
+            "node-1",
+            "tcp://127.0.0.1:1",
+            None,
+            &mut guard,
+            &transfer,
+        )
+        .await
+        .expect("the mock send succeeds");
+        assert!(!transfer.is_unknown());
+        assert!(!transfer.in_progress(), "success must end the window");
+        assert!(
+            guard.is_paused(),
+            "a successfully migrated source must not be resumed"
+        );
+        assert!(
+            transfer.try_begin(),
+            "the window must be reusable after end"
+        );
+
+        // Definitive failure: end the window and resume the paused source.
+        let (rt, mock) = test_runtime();
+        create_vm_record(&rt).await;
+        *mock.migration_definitive_failure.lock().unwrap() = true;
+        let transfer = Arc::new(TransferWindow::default());
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+        let err = send_memory_migration(
+            &rt,
+            "vm-1",
+            "op-1",
+            "node-1",
+            "tcp://127.0.0.1:1",
+            None,
+            &mut guard,
+            &transfer,
+        )
+        .await
+        .expect_err("the mock reports a definitive failure");
+        assert!(err.contains("memory migration failed"), "{err}");
+        assert!(!transfer.is_unknown());
+        assert!(
+            !transfer.in_progress(),
+            "a definitive failure must end the window"
+        );
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Running",
+            "a definitive failure must resume the source"
+        );
+    }
+
+    /// A cancel armed before the memory phase must refuse to start the VMM
+    /// send and resume the VM paused for the disk pre-copy.
+    #[tokio::test]
+    async fn source_prearmed_cancel_resumes_paused_vm_without_send() {
+        let (rt, _mock) = test_runtime();
+        create_vm_record(&rt).await;
+        let transfer = Arc::new(TransferWindow::default());
+        assert!(!transfer.arm_cancel(), "nothing was active yet");
+        let mut guard = new_guard(&rt);
+        guard.pause_vm().await.expect("pause the VM");
+
+        let err = send_memory_migration(
+            &rt,
+            "vm-1",
+            "op-1",
+            "node-1",
+            "tcp://127.0.0.1:1",
+            None,
+            &mut guard,
+            &transfer,
+        )
+        .await
+        .expect_err("a pre-armed cancel must not start send-migration");
+        assert_eq!(err, "migration cancelled before memory migration");
+        assert_eq!(
+            rt.get("vm-1").await.unwrap().runtime_status,
+            "Running",
+            "the VM paused for disk pre-copy must be resumed"
+        );
     }
 }

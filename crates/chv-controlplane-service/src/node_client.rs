@@ -166,14 +166,21 @@ where
             // explanation (e.g. "snapshot_volume is unsupported in
             // core-managed mode") still rides the error. Every other tonic
             // code flattens exactly as before.
-            if e.code() == tonic::Code::Unimplemented {
-                ChvError::Unimplemented {
+            match e.code() {
+                tonic::Code::Unimplemented => ChvError::Unimplemented {
                     reason: format!("{method} failed: {e}"),
-                }
-            } else {
-                ChvError::Internal {
+                },
+                // A misrouted/rejected request is permanent too. The
+                // migration reaper parks such a cancel instead of retrying
+                // forever, which only works if the code survives the
+                // flattening below.
+                tonic::Code::InvalidArgument => ChvError::InvalidArgument {
+                    field: method.to_string(),
                     reason: format!("{method} failed: {e}"),
-                }
+                },
+                _ => ChvError::Internal {
+                    reason: format!("{method} failed: {e}"),
+                },
             }
         })
         .map(|r| r.into_inner())
@@ -183,6 +190,8 @@ where
 pub struct NodeClient {
     reconcile: proto::reconcile_service_client::ReconcileServiceClient<Channel>,
     lifecycle: proto::lifecycle_service_client::LifecycleServiceClient<Channel>,
+    migration_control:
+        proto::migration_control_service_client::MigrationControlServiceClient<Channel>,
     circuit_breaker: Arc<CircuitBreaker>,
     /// Control-plane agent bearer token attached to every RPC (#662). One
     /// value is shared by every agent this control plane serves. `None` is
@@ -240,7 +249,11 @@ impl NodeClient {
             reconcile: proto::reconcile_service_client::ReconcileServiceClient::new(
                 channel.clone(),
             ),
-            lifecycle: proto::lifecycle_service_client::LifecycleServiceClient::new(channel),
+            lifecycle: proto::lifecycle_service_client::LifecycleServiceClient::new(
+                channel.clone(),
+            ),
+            migration_control:
+                proto::migration_control_service_client::MigrationControlServiceClient::new(channel),
             circuit_breaker,
             auth_token: token
                 .map(str::trim)
@@ -1597,6 +1610,53 @@ impl NodeClient {
         result
     }
 
+    /// Ask the source agent to abort a detached migration task (#656).
+    ///
+    /// The response is meaningful even on success: `cancelled == false`
+    /// (`outcome == "not_tracked"`) means the agent has no task for this
+    /// operation, which is the expected agent-restart case and must be
+    /// treated as terminal by the caller. Only a transport error is retryable.
+    pub async fn cancel_migration(
+        &mut self,
+        node_id: &str,
+        operation_id: &str,
+        migration_id: &str,
+    ) -> Result<proto::CancelMigrationResponse, ChvError> {
+        let req = proto::CancelMigrationRequest {
+            meta: Some(proto::RequestMeta {
+                operation_id: operation_id.to_string(),
+                requested_by: "control-plane".to_string(),
+                target_node_id: node_id.to_string(),
+                desired_state_version: String::new(),
+                request_unix_ms: now_unix_ms(),
+            }),
+            node_id: node_id.to_string(),
+            operation_id: operation_id.to_string(),
+            migration_id: migration_id.to_string(),
+        };
+        let method = "cancel_migration";
+        let span = tracing::info_span!("cancel_migration", operation_id, migration_id);
+        self.circuit_breaker.check(method)?;
+        let result = with_timeout(
+            self.migration_control
+                .cancel_migration(with_operation_id_metadata(
+                    req,
+                    operation_id,
+                    &self.auth_token,
+                ))
+                .instrument(span),
+            "agent",
+            method,
+        )
+        .await;
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(method),
+            Err(ChvError::BackendUnavailable { .. }) => self.circuit_breaker.record_failure(method),
+            Err(_) => {}
+        };
+        result
+    }
+
     /// Dispatch an ADR-021 fabric plan to a node agent's UpdateOverlay RPC.
     ///
     /// The legacy pre-ADR-021 VTEP/FDB variants were retired; `fabric` is
@@ -1864,6 +1924,56 @@ mod tests {
             .metadata()
             .get(chv_common::NODE_AUTH_METADATA_KEY)
             .is_none());
+    }
+
+    /// The reaper parks a cancel that the agent rejects as `InvalidArgument`
+    /// instead of retrying it forever. That branch is only reachable if
+    /// `with_timeout` preserves the tonic code through the real client stack.
+    #[tokio::test]
+    async fn cancel_migration_preserves_invalid_argument_refusal() {
+        use control_plane_node_api::control_plane_node_api as proto;
+        use tonic::transport::Server;
+
+        struct InvalidCancel;
+
+        #[tonic::async_trait]
+        impl proto::migration_control_service_server::MigrationControlService for InvalidCancel {
+            async fn cancel_migration(
+                &self,
+                _request: tonic::Request<proto::CancelMigrationRequest>,
+            ) -> Result<tonic::Response<proto::CancelMigrationResponse>, tonic::Status>
+            {
+                Err(tonic::Status::invalid_argument(
+                    "this node is not the migration target",
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind agent uds");
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(
+                    proto::migration_control_service_server::MigrationControlServiceServer::new(
+                        InvalidCancel,
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await;
+        });
+
+        let mut client = super::NodeClient::connect(&socket)
+            .await
+            .expect("connect to mock agent");
+        let err = client
+            .cancel_migration("node-1", "op-1", "mig-1")
+            .await
+            .expect_err("invalid argument must surface as an error");
+        assert!(
+            matches!(err, chv_errors::ChvError::InvalidArgument { .. }),
+            "a permanent refusal must not flatten to Internal: {err:?}"
+        );
     }
 
     /// #513 PR 1 (DP2/DP3, the dispatch-carrier producer): the create

@@ -238,6 +238,20 @@ pub struct MockCloudHypervisorAdapter {
     /// `None` ⇒ the all-default counters (nothing measured, no epoch —
     /// the honest "VM just started / identity unknown" shape).
     pub counters_result: Arc<Mutex<Option<VmCounters>>>,
+    /// When true, `send_migration`/`receive_migration` return
+    /// `ChvError::Timeout` without touching the VM, modelling the agent's
+    /// bounded wait expiring while the VMM transfer may still run. Used to
+    /// pin the transfer-window seal (fail-closed cancellation) end to end.
+    pub migration_timeout: Arc<Mutex<bool>>,
+    /// When true, `send_migration`/`receive_migration` return
+    /// `ChvError::OutcomeUnknown` without touching the VM, modelling a VMM
+    /// reply lost after the request was delivered. Must seal exactly like a
+    /// timeout (the transfer may still run).
+    pub migration_outcome_unknown: Arc<Mutex<bool>>,
+    /// When true, `send_migration`/`receive_migration` return a definitive
+    /// `ChvError::Internal`. Used to pin the non-sealing branch: the transfer
+    /// window must end and a paused source must be resumed.
+    pub migration_definitive_failure: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
@@ -418,6 +432,23 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
         _destination_url: &str,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
+        if *self.migration_timeout.lock().unwrap() {
+            return Err(ChvError::Timeout {
+                operation: "send-migration (mock)".to_string(),
+                secs: 7200,
+            });
+        }
+        if *self.migration_outcome_unknown.lock().unwrap() {
+            return Err(ChvError::OutcomeUnknown {
+                operation: "send-migration (mock)".to_string(),
+                reason: "reply lost after delivery".to_string(),
+            });
+        }
+        if *self.migration_definitive_failure.lock().unwrap() {
+            return Err(ChvError::Internal {
+                reason: "send-migration failed (mock)".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -427,6 +458,23 @@ impl CloudHypervisorAdapter for MockCloudHypervisorAdapter {
         _receiver_url: &str,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
+        if *self.migration_timeout.lock().unwrap() {
+            return Err(ChvError::Timeout {
+                operation: "receive-migration (mock)".to_string(),
+                secs: 7200,
+            });
+        }
+        if *self.migration_outcome_unknown.lock().unwrap() {
+            return Err(ChvError::OutcomeUnknown {
+                operation: "receive-migration (mock)".to_string(),
+                reason: "reply lost after delivery".to_string(),
+            });
+        }
+        if *self.migration_definitive_failure.lock().unwrap() {
+            return Err(ChvError::Internal {
+                reason: "receive-migration failed (mock)".to_string(),
+            });
+        }
         Ok(())
     }
 

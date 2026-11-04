@@ -8,6 +8,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **migration (detached agent-task cancellation across restarts — #656)**:
+  `MigrateVm` is fire-and-forget, so the source *and* destination agents keep
+  detached tasks after the control plane restarts, the reaper force-fails a
+  stale row, the state machine rolls back, or an operator cancels an
+  already-terminal row. Nothing could abort those orphans. The wire now has
+  `MigrationControlService.CancelMigration` (agent-served; rejects a request
+  naming another node and refuses core-managed mode), which flips the task's
+  cancellation token so it can resume a paused source VM, then force-aborts it
+  after a bounded grace if it has not exited. A task inside a Cloud Hypervisor
+  send/receive transfer is not force-dropped (that would not stop the VMM
+  transfer) and the RPC reports `Unavailable` so the control plane retries
+  instead of confirming; the agent's own migration-call bound is now two hours
+  (was ten minutes, which could cut a legitimate large-VM transfer); if that
+  bound expires, or the VMM reply is lost after the request was delivered,
+  while Cloud Hypervisor may still be transferring, the task is sealed as
+  "outcome unknown" and stays tracked so that agent process can never falsely
+  confirm a cancellation, and the source VM stays paused. A restart is the only
+  mechanical clear; the next drain then reports `not_tracked`, which re-enables
+  the ordinary resume gate only for a row already in `pending`/`resuming`
+  without an ambiguous interrupted phase. Verify the VM and set
+  `reaper_resume_state = 'blocked'` before restarting the agent if the row is
+  queued for resume and the destination may own it. The reply confirms the task actually stopped
+  (`Unavailable` keeps the row pending otherwise). A bounded
+  registry tombstone signals a delayed `MigrateVm` that registers after a
+  `not_tracked` reply, and force-aborts it unless it has already entered a
+  non-cancellable VMM transfer window. The control plane queues cancellation durably in
+  `migrations.agent_cancel_pending` (migration `0070`; plus
+  `agent_cancel_confirmed_at`, `agent_cancel_attempts`,
+  `agent_cancel_last_attempt_at`, `agent_cancel_last_error`) on every terminal
+  `Failed`/`RolledBack` transition (including agent-reported progress and
+  operator cancels of already-terminal rows), on restart reconciliation, and
+  on the reaper's force-fail; `Completed` is never queued and clears any stale
+  marker. Migration `0070` also backfills recent pre-upgrade terminal orphans.
+  The reaper drains up to 8 rows per tick, signalling both endpoints with a 5 s
+  per-call bound (the connect handshake is bounded too), before the
+  source-resume pass. `cancelled=false`/`not_tracked` is success (the agent
+  restarted and the task is gone), while transport failures leave the row
+  queued and rotate it behind untouched rows via the attempt timestamp. A
+  permanent refusal (`Unimplemented` on a core-managed/pre-#656 agent,
+  `InvalidArgument` for a misroute) is parked in `agent_cancel_last_error`
+  once no endpoint remains retryable, instead of retrying forever, and the
+  source VM is not auto-resumed until the cancel is confirmed (a parked
+  refusal keeps it paused for operator review). A `Completed` report that
+  arrives after the row was terminalized `Failed`/`RolledBack` also blocks
+  auto-resume: the detached agent may have finished the transfer, so the
+  destination could own the VM. Even a confirmed cancel must settle for 30 s
+  (the agent's report interval) before the source is auto-resumed, so a queued
+  terminal report cannot race the resume. An agent-reported `Completed`
+  migration is finalized by resuming the destination VM first (pause-first
+  mode leaves it paused), recording any resume failure in `error_message` and
+  `chv_migration_destination_resume_failures_total` while still moving
+  placement; a failed resume is operator-visible instead of silently losing
+  the VM. The resume paths also read `desired_generation` (the actual column)
+  instead of a non-existent `generation`, which had made both the source and
+  destination resume lookups fail.
+  Tests: agent UDS cancel service (tracked task aborted, cooperative
+  cleanup before hard abort, stop-confirmation timeout, `not_tracked` retry,
+  misrouted/empty-op refusal, missing-token refusal, core-managed refusal,
+  late-registration tombstone), store queue/confirm/attempt/batch/fairness
+  semantics and parked-error reset, terminal-transition and terminal-race
+  queueing, completion refusal for `Failed`/`RolledBack` and
+  cancel-pending rows (an agent-reported `Completed` row completes
+  idempotently and still moves placement),
+  agent-reported terminal queueing, post-restart operator-cancel queueing,
+  resume gating while a cancel is pending or permanently refused (and after a
+  late agent-reported `Completed` on a terminal row), the 30 s settle window
+  (including a real UDS resume after it and reclaim of a stranded `resuming`
+  row), destination resume before placement with a recorded resume failure,
+  the post-memory-migration decision, a sealed (outcome-unknown) transfer that
+  can never confirm a cancel (including a lost VMM reply), an
+  already-running resume treated as a no-op so a reclaimed `resuming` row
+  converges, a paused source kept paused on an unknown send outcome, real
+  `NodeClient` invalid-argument preservation, and reaper drains for both
+  endpoints, `not_tracked`, partial/unreachable retry (including a permanent
+  refusal alongside a retryable endpoint), token attachment, bad token,
+  timeout, connect stall, and permanent refusal. Refs #656.
 - **migration (direct-gRPC stop-the-world gate + dispatch config — #656)**:
   `LifecycleService::migrate_vm` is reachable directly, not only through the
   BFF/CLI, and previously accepted `pause_first=false` there. It now rejects
