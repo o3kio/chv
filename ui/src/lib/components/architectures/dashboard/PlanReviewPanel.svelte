@@ -130,7 +130,7 @@
 				size="sm"
 				loading={loading}
 				onclick={() => onGenerate('apply')}
-				ariaLabel="Generate apply plan"
+				ariaLabel={generateLabel}
 				data-testid="plan-generate-button"
 			>{generateLabel}</Button>
 			<Button
@@ -138,7 +138,7 @@
 				size="sm"
 				loading={loading}
 				onclick={() => onGenerate('destroy')}
-				ariaLabel="Generate destroy plan"
+				ariaLabel={destroyLabel}
 				data-testid="plan-destroy-button"
 			>{destroyLabel}</Button>
 		</div>

@@ -20,7 +20,7 @@ test.describe('Navigation & Auth', () => {
 	});
 
 	test('command palette opens via top bar click', async ({ page }) => {
-		await page.getByRole('button', { name: /open command palette/i }).click();
+		await page.getByRole('button', { name: /search commands or jump to a resource/i }).click();
 		await expect(page.locator('.fixed.inset-0')).toBeVisible();
 	});
 

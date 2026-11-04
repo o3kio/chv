@@ -35,7 +35,6 @@
 		class="flex items-center gap-[0.625rem] min-h-[36px] border border-[var(--border-subtle)] rounded-[var(--radius-sm)] bg-[var(--bg-surface-muted)] px-3 w-[min(28rem,100%)] cursor-pointer transition-all duration-150 ease-in-out hover:border-[var(--color-primary)] hover:bg-[color-mix(in_srgb,var(--bg-surface-muted)_82%,var(--color-primary-light))] focus-visible:outline-none focus-visible:border-[var(--color-primary)] focus-visible:shadow-[0_0_0_3px_rgba(var(--color-primary-rgb),0.14)] max-[960px]:w-full"
 		style="font-family: inherit"
 		onclick={openCommandPalette}
-		aria-label="Open command palette"
 	>
 		<span class="inline-flex shrink-0 text-[var(--shell-text-muted)]" aria-hidden="true">
 			<Search size={14} />
