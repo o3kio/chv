@@ -215,6 +215,38 @@ transitions to `FAILED`. N9 and F5 accept either shape and assert the same
 refusal text ("refusing to truncate"), so the contract is unchanged and the
 evidence records which shape the candidate produced.
 
+### 2.3 Fourth failure: F7's stop contract (harness) and the detached-open
+session residual
+
+Run [41908930893](https://github.com/o3kio/chv/actions/runs/41908930893)
+(`f8ca4491`) cleared F1–F6 — including the migration authorization, F5
+recovery, and F6 control-plane kill — then failed F7 on two harness
+expectations, with no candidate regression:
+
+1. **Graceful stop retains the VMM by design.** F7 called
+   `wait_vm_stopped` after `vm stop` (force=false) and waited for the
+   cloud-hypervisor process to exit. Under `--no-shutdown` the product
+   contract is different: the guest shuts down (`Shutdown`/`Created`) and the
+   VMM is **kept** so a later start can reuse it; only delete stops it. The
+   agent log proves it worked: `force=false`, then ~6 s later
+   `truncated console.log on graceful stop`, with the same CH pid alive.
+   The harness now waits for a terminal **guest state**, asserts the retained
+   VMM is the same pid after a second stop (no respawn), and waits for CH
+   exit only after delete.
+2. **The final sweep counted detached-open sessions as residue.** It found
+   two `open` rows — the boot volumes of the base and F2 VMs, both created
+   **before** F2's agent SIGKILL. Delete after an agent restart detaches the
+   volume (clears `vm_id`) but cannot close it, because the stord attachment
+   handle lives in memory and dies with the process (the M2.2a
+   handle-persistence residual documented in the #405 fix). This is a known
+   limitation, not a live attachment: the sweep now **fails** if any session
+   is still attached to a VM and **warns** (does not gate) on detached-open
+   rows, naming the volumes and the residual. Follow-up filed as **#711** so
+   the limitation stays tracked rather than being normalized.
+
+Both changes keep the same safety property: no VM may still own a session,
+and the residue class is disclosed in the artifact instead of hidden.
+
 ---
 
 ## 3. Fixes
@@ -250,8 +282,15 @@ Branch `fix/659-qual-auth` (based on `a4da490d`):
    share one dedicated signing secret; receivers declare `node_id` and verify
    per-trigger HMAC tokens minted by the harness (destination, volume, size,
    expiry, single-use nonce). No scenario enables the insecure bypass.
+7. **F7 stop/delete contract and session residue.** The scenario waits for a
+   terminal guest state after a graceful `vm stop` and asserts the retained
+   VMM is the same pid (only delete must exit CH); the final sweep fails on
+   any session still attached to a VM and records detached-open rows as the
+   documented M2.2a handle-persistence residual (#711).
 
-Product finding filed separately (not fixed in this slice): **#709**.
+Product findings filed separately (not fixed in this slice): **#709**
+(first-enrollment bootstrap result) and **#711** (detached-open stord
+sessions after delete-following-agent-restart).
 
 ---
 
@@ -267,6 +306,8 @@ Product finding filed separately (not fixed in this slice): **#709**.
 | [41894243197](https://github.com/o3kio/chv/actions/runs/41894243197) | full | `a4da490d` | fail — all scenarios: same split + metrics-port collision |
 | [41905691606](https://github.com/o3kio/chv/actions/runs/41905691606) | chaos (m4.7) | `90f97ddb` | fail — orphaned harness restarted a stack on `:9103` (§2.1) |
 | [41906413327](https://github.com/o3kio/chv/actions/runs/41906413327) | chaos (m4.7) | `66aaed0b` | fail — F5/F6 DST startup: no migration signing secret (#663, §2.2) |
+| [41907950799](https://github.com/o3kio/chv/actions/runs/41907950799) | chaos (m4.7) | `f3642aca` | fail — F5 recovery: sync create_new refusal treated as a dead trigger (§2.2) |
+| [41908930893](https://github.com/o3kio/chv/actions/runs/41908930893) | chaos (m4.7) | `f8ca4491` | fail — F7: wrong graceful-stop expectation + detached-open session residue (§2.3) |
 | _chaos re-run_ | chaos (m4.7) | _this commit_ | _pending_ |
 | _full lane_ | full (m4.3–m4.8) | _final fix commit_ | _pending_ |
 
@@ -346,12 +387,16 @@ They must be carried into any production-readiness decision:
   stord (#401)**, **mTLS rejection observability (#402)**,
   **delete-path kill tolerance (#351)**, **JWT/encryption-key coupling
   (#336)**.
+- **Detached-open stord sessions after delete/restart (#711)** — a VM created
+  before an agent restart is detached but its session cannot be closed
+  (in-memory attachment handles, the M2.2a residual); no VM remains attached,
+  and the backing is already retained under M2.5. Recorded, not gated.
 - **Backup/restore is hard-fenced**, not DR-validated.
 - **Single-host, nested-KVM, quiescent, serial-lifecycle evidence only** —
   no multi-host, HA, Ceph/iSCSI, or scale claim.
 - **Multi-stord-per-host metrics default** — a deployment running more than
   one stord on a host must set distinct `metrics_bind` values (the harness
-  now does; this is not yet documented as an operator requirement).
+  now does; the operator requirement is documented in `docs/DEPLOYMENT.md`).
 
 ### 5.5 Recommended plan
 

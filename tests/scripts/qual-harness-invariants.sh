@@ -132,6 +132,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 3c. F7 stop/delete contract and the documented session residue
+# ---------------------------------------------------------------------------
+m47="${QUAL}/m4.7-faults.sh"
+grep -q 'wait_vm_guest_stopped "\$F2_VM"' "$m47" \
+    && pass "m4.7 waits for a terminal guest state after a graceful stop" \
+    || fail "m4.7 no longer uses wait_vm_guest_stopped for the F7 stop"
+grep -q 'vm_id IS NOT NULL AND vm_id !=' "$m47" \
+    && pass "m4.7 fails the final sweep on any still-attached stord session" \
+    || fail "m4.7 lost the attached-session final-sweep gate"
+grep -q 'M2.2a handle-persistence residual' "$m47" \
+    && pass "m4.7 records detached-open sessions as the documented residual" \
+    || fail "m4.7 no longer discloses the M2.2a detached-session residual"
+
+# ---------------------------------------------------------------------------
 # 4. teardown and lane hygiene
 # ---------------------------------------------------------------------------
 for bin in chv-agent chv-stord chv-controlplane; do
