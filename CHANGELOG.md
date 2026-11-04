@@ -26,10 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "outcome unknown" and stays tracked so that agent process can never falsely
   confirm a cancellation, and the source VM stays paused. A restart is the only
   mechanical clear; the next drain then reports `not_tracked`, which re-enables
-  the ordinary resume gate only for a reaper-owned `pending` row without an
-  ambiguous interrupted phase. Verify the VM and set
-  `reaper_resume_state = 'blocked'` before restarting a reaper-owned row if the
-  destination may own it. The reply confirms the task actually stopped
+  the ordinary resume gate only for a row already in `pending`/`resuming`
+  without an ambiguous interrupted phase. Verify the VM and set
+  `reaper_resume_state = 'blocked'` before restarting the agent if the row is
+  queued for resume and the destination may own it. The reply confirms the task actually stopped
   (`Unavailable` keeps the row pending otherwise). A bounded
   registry tombstone signals a delayed `MigrateVm` that registers after a
   `not_tracked` reply, and force-aborts it unless it has already entered a

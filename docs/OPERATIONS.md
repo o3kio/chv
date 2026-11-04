@@ -628,12 +628,13 @@ transferring, the task is sealed as "outcome unknown" and remains tracked, so
 cancellation stays unconfirmable for that agent process; a restart is the only
 mechanical clear (`agent_cancel_pending = 1`) and the paused source VM is left
 paused. After the restart the next drain reports `not_tracked`, which counts as
-success. That re-enables the ordinary resume gate only for a reaper-failed row
-already queued for resume (`reaper_resume_state = 'pending'` and no ambiguous
-interrupted phase); rows terminalized by restart recovery (NULL) and blocked
-rows stay operator-only. An operator who cannot rule out a completed
-destination transfer must verify the VM and set `reaper_resume_state =
-'blocked'` before restarting the agent for a reaper-owned row. A non-NULL
+success. That re-enables the ordinary resume gate only for a row already queued
+for resume (`reaper_resume_state` `pending`/`resuming` and no ambiguous
+interrupted phase); rows left NULL (terminalized by restart recovery) or
+`blocked` stay operator-only until explicitly requeued. An operator who cannot
+rule out a completed destination transfer must verify the VM and set
+`reaper_resume_state = 'blocked'` before restarting the agent if the row is
+queued for resume. A non-NULL
 `agent_cancel_last_error` means the agent refused
 permanently (core-managed or pre-#656 agent, an unsafe/misrouted node id, or an
 invalid request); the detached task may still exist, so verify placement and
