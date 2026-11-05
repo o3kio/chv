@@ -535,14 +535,21 @@ found it.
 - **Cross-restart snapshot-lifecycle edge** — a stord restart does not
   rehydrate handles taken before the restart (#376 side effect).
 - **#336** — the `CHV_JWT_SECRET` fallback still couples S3 credential
-  encryption to the JWT signing secret.
-- **#709** — the first-enrollment `ReportBootstrapResult` is sent on the
-  pre-enrollment certificate and rejected by the peer-node-id check. It is
-  fail-closed and non-fatal, but a fresh install does not record bootstrap
-  success and audits a spurious denial; tracked, not a gate blocker.
-- **#711** — a VM created before an agent restart is detached but its stord
-  session cannot be closed (in-memory attachment handles, the M2.2a
-  residual). No VM remains attached and the backing is retained under M2.5.
+  encryption to the JWT signing secret (the fallback is now deprecated and
+  loudly logged, but it is retained for compatibility).
+- **#709 — fixed after the qualified candidate `e82d49a1`.** In that
+  candidate the first-enrollment `ReportBootstrapResult` is sent on the
+  pre-enrollment certificate and rejected by the peer-node-id check, so a
+  fresh install does not record bootstrap success and audits a spurious
+  denial. The fix (report on the issued node identity) is on the
+  v0.4.0-rc.1 branch and requires re-qualification before it can be claimed
+  for a release; until then this entry describes the qualified tree.
+- **#711 — fixed after the qualified candidate `e82d49a1`.** In that
+  candidate a VM created before an agent restart is detached but its stord
+  session cannot be closed (the M2.2a residual). The fix (recover the
+  session from stord and close detached sessions after detach) is on the
+  v0.4.0-rc.1 branch and requires re-qualification; no VM remains attached
+  and the backing is retained under M2.5 in either case.
 - **Multi-stord-per-host metrics** — more than one stord on a host must set
   distinct `metrics_bind` values (the harness now uses ephemeral ports; the
   operator requirement is documented in [DEPLOYMENT.md](DEPLOYMENT.md)).
