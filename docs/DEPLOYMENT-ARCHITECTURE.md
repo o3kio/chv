@@ -537,6 +537,10 @@ found it.
 - **#336** — the `CHV_JWT_SECRET` fallback still couples S3 credential
   encryption to the JWT signing secret (the fallback is now deprecated and
   loudly logged, but it is retained for compatibility).
+- **#706 — audit crash window.** The audit insert happens after the mutation's
+  handler returns, so a crash between commit and insert can leave a mutation
+  unrecorded. The mTLS-interceptor denials (missing, unparseable, or revoked
+  certificate) write no audit row at all. Tracked for Phase 1.
 - **#709 — fixed after the qualified candidate `e82d49a1`.** In that
   candidate the first-enrollment `ReportBootstrapResult` is sent on the
   pre-enrollment certificate and rejected by the peer-node-id check, so a
