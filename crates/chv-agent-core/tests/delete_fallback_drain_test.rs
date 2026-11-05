@@ -143,7 +143,13 @@ async fn restarted_delete_drains_pre_restart_vm_from_the_node_cache() {
             .with_observed_attachments(Arc::new(NodeCacheAttachmentSource::new(cache))),
     );
 
-    // 3. The post-restart delete: must succeed AND drain.
+    // 3. stord still holds the pre-restart VM's live session for vol-0,
+    //    while vol-1 has no session (already closed/never attached). The
+    //    cached handle died with the agent process, so only stord's
+    //    durable session table can supply vol-0's handle (#711).
+    controller.add_volume_session("vol-0", vm_id, "handle-vol-0");
+
+    // 4. The post-restart delete: must succeed AND drain.
     restarted
         .execute(entry(
             OperationKind::DeleteVm,
@@ -170,11 +176,30 @@ async fn restarted_delete_drains_pre_restart_vm_from_the_node_cache() {
             "fallback drain must issue {expected}: {log:?}"
         );
     }
-    // No handle was durably recorded for a Core-created volume (the
-    // in-memory-only map died with the process), so no close is possible:
-    // the open session is the narrowed M2.2a residual, disclosed in the PR.
+    // vol-0's handle was resolved from stord's session table BEFORE the
+    // detach cleared `vm_id`, so its session is closed exactly like the
+    // live path (#711). vol-1 has no live session, so it is detached only.
     assert!(
-        !log.iter().any(|c| c.starts_with("close:")),
-        "no close without a durably recorded handle: {log:?}"
+        is_subsequence(&log, &["resolve:vol-0", "detach:vol-0", "close:vol-0"]),
+        "the resolved handle must be closed after the detach: {log:?}"
     );
+    assert!(
+        !log.iter().any(|c| c == "close:vol-1"),
+        "a volume with no live stord session must not be closed: {log:?}"
+    );
+}
+
+/// Ordering helper for the #711 close-after-detach pin.
+fn is_subsequence(haystack: &[String], needle: &[&str]) -> bool {
+    let mut hay = haystack.iter();
+    for want in needle {
+        loop {
+            match hay.next() {
+                Some(got) if got == want => break,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    }
+    true
 }

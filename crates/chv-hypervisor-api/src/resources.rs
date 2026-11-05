@@ -346,6 +346,26 @@ pub trait HostResourceController: Send + Sync + 'static {
         operation_id: Option<&str>,
     ) -> Result<(), ChvError>;
 
+    /// Resolve the live attachment handle for `(volume_id, vm_id)` from
+    /// the storage daemon's durable session table (#711).
+    ///
+    /// The delete-time fallback drain's observed attachments carry a
+    /// handle only when one was durably cached; after an agent restart the
+    /// in-memory handle map is gone. This read-only lookup recovers the
+    /// handle from stord BEFORE [`Self::detach_volume_from_vm`] clears the
+    /// session's `vm_id`, restoring the detach-then-close sequence the
+    /// live path performs.
+    ///
+    /// Returns `Ok(None)` when no live session exists for the pair. RPC
+    /// failures must surface as `Err`: callers keep their existing policy
+    /// (the best-effort delete drain logs and continues; the legacy
+    /// cleanup records a first error).
+    async fn resolve_volume_handle(
+        &self,
+        volume_id: &str,
+        vm_id: &str,
+    ) -> Result<Option<String>, ChvError>;
+
     /// Ensure a network's bridge topology exists.
     async fn ensure_network_topology(
         &self,
@@ -454,7 +474,8 @@ pub struct ObservedVmAttachments {
     /// order. The handle is `Some` only when the source durably recorded
     /// the stord attachment handle; a `None` handle still allows the
     /// detach (stord keys a VM attachment by volume + vm, not by handle)
-    /// but not the session close.
+    /// and lets the drain resolve the live handle from stord's session
+    /// table before detaching (#711).
     pub volumes: Vec<(String, Option<String>)>,
     /// `nic_id`s, in attach order.
     pub nics: Vec<String>,
