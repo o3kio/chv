@@ -447,7 +447,7 @@ belongs to MH-A.
 | Aspect | Profile (planned) | Boundary |
 |---|---|---|
 | Topology | One host runs `chv-controlplane`, `chv-agent`, `chv-stord`, `chv-nwd`, and nginx; internal listeners loopback; nginx is the edge | Multi-host, remote nodes, node-only packaging: unsupported |
-| Host | Ubuntu 24.04 noble amd64; **bare metal preferred**. A KVM-capable cloud VM is allowed only when it exposes `/dev/kvm`, and it is recorded as virtualized — never described as bare metal. Hardware is recorded as the field host, not promoted to a qualified minimum | arm64 unsupported; no qualified hardware minimum (§7) |
+| Host | Ubuntu 24.04 noble amd64; **bare metal preferred**. A KVM-capable cloud VM is allowed only when it exposes `/dev/kvm`, and it is recorded as virtualized — never described as bare metal. Hardware is recorded, not promoted to a qualified minimum | arm64 unsupported; no qualified hardware minimum (§7) |
 | VMM | Cloud Hypervisor **v53.0**, digest-verified by the installer | Serial-console containment boundary remains (#345/#409) |
 | Artifacts | Published **`.deb`** set for the tag, installed by the published quick installer pinned to that tag; the upgrade drill starts from the previous published RC's tarball and moves to the candidate's packages | RPM built but unexercised; no source builds or local patches |
 | Storage | Local directory + **LVM** only, through per-volume `storage_class` | iSCSI, Ceph, Volvisor, shared/multi-host storage excluded |
@@ -456,7 +456,7 @@ belongs to MH-A.
 | Workload | 3–5 VMs; repeated create/delete; start/stop/reboot; console; one live policy change; LVM attach/use/detach | Migration and backup/restore excluded |
 | Upgrade | Previous published RC → current RC through the supported package upgrade; config, database, certificates, and operator account preserved | Downgrade unsupported; rolling node upgrade absent |
 | Data | **Disposable qualification data only** | No backup engine (`501`); no data-protection claim |
-| Duration | 21 days minimum, 30 preferred | A shorter window does not satisfy Prompt 06 |
+| Duration | 21 days minimum, 30 preferred | A shorter window does not satisfy the campaign plan (Stage C / decision D2) |
 
 **Claim boundary.** Even a passing field run of this profile would not
 establish multi-host, HA/control-plane failover, backup/restore, migration,
@@ -465,8 +465,9 @@ Volvisor. Those remain governed by §7, §9, and the transition plan.
 
 **Stable relevance.** Field evidence from this profile is an input to the
 `v0.4.0` stable decision, not a pre-approval. The stable gate also requires no
-product changes after the final RC, a signed tag, verified assets, and a
-support matrix no broader than the evidence.
+product-source changes after the final RC (a disclosed docs/evidence-only
+stable-prep commit is permitted), a signed tag, verified assets, and a support
+matrix no broader than the evidence.
 
 ## 6. Upgrade and lifecycle paths
 
