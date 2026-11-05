@@ -1120,10 +1120,11 @@ async fn delete_after_restart_drains_from_observed_attachments() {
         !h.adapter.vms.lock().expect("vms lock").contains_key(vm_id),
         "adapter must no longer contain the VM"
     );
-    // The fallback drained: every observed volume detached, the
-    // handle-bearing one closed, the handle-less one NOT closed (stord
-    // keys sessions by handle — a close without one is impossible), and
-    // every observed nic detached (the tap removal).
+    // The fallback drained: every observed volume detached, the one with a
+    // live stord session was closed after its detach (its cached handle
+    // was gone — the post-restart case), the volume with neither a cached
+    // handle nor a live session was NOT closed, and every observed nic was
+    // detached (the tap removal).
     let log = calls(&h.controller);
     assert!(
         is_subsequence(
@@ -1139,13 +1140,137 @@ async fn delete_after_restart_drains_from_observed_attachments() {
     );
     assert!(
         !log.iter().any(|c| c == "close:vol-0"),
-        "a volume without a durably recorded handle must not be closed: {log:?}"
+        "a volume with no cached handle and no live stord session must not be closed: {log:?}"
     );
     // No last-detach network teardown on the fallback path (residue until
     // network delete / node reprovision, as before the fallback existed).
     assert!(
         !log.iter().any(|c| c.starts_with("net_teardown:")),
         "the fallback must not tear network topology down: {log:?}"
+    );
+}
+
+/// #711: the post-restart delete's cached handle is gone, but stord's
+/// durable session table still has the live attachment for `(volume,
+/// vm)`. The fallback drain must resolve it BEFORE the detach (which
+/// clears `vm_id`) and then close it after the detach — restoring the
+/// tracked path's detach-then-close pair instead of leaving a detached
+/// `runtime_status = "open"` row behind.
+#[tokio::test]
+async fn delete_after_restart_resolves_missing_handle_and_closes_the_session() {
+    let h = harness(None);
+    let vm_id = "vm-resolve";
+    h.runtime
+        .execute(entry(
+            OperationKind::CreateVm,
+            vm_id,
+            "op-create",
+            envelope(MutationCommand::CreateVm {
+                definition: definition(vm_id, 1, 1),
+            }),
+        ))
+        .await
+        .expect("create succeeds");
+
+    // The post-restart world: the cache handle died with the process, but
+    // stord still reports the session attached to this VM.
+    h.controller
+        .add_volume_session("vol-0", vm_id, "handle-vol-0");
+    let source = TestAttachmentSource::new(ObservedVmAttachments {
+        volumes: vec![("vol-0".to_string(), None)],
+        nics: vec![format!("{vm_id}-net-0")],
+    });
+    let restarted = Arc::new(
+        CloudHypervisorCoreRuntime::new(
+            h.adapter.clone(),
+            h.controller.clone(),
+            h.runtime_dir.clone(),
+        )
+        .with_observed_attachments(source),
+    );
+    let result = restarted
+        .execute(entry(
+            OperationKind::DeleteVm,
+            vm_id,
+            "op-del-resolve",
+            envelope(MutationCommand::DeleteVm {
+                vm_id: VmId::new(vm_id).expect("vm id"),
+            }),
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "delete after restart must succeed: {result:?}"
+    );
+    let log = calls(&h.controller);
+    assert!(
+        is_subsequence(
+            &log,
+            &[
+                "resolve:vol-0",
+                "detach:vol-0",
+                "close:vol-0",
+                "detach_nic:vm-resolve-net-0",
+            ]
+        ),
+        "the resolved handle must be closed AFTER the detach: {log:?}"
+    );
+}
+
+/// #711's error policy: stord's session lookup is part of the best-effort
+/// fallback drain, so a transient lookup failure logs and continues — the
+/// detach still runs, no close is invented, and the already-deleted VM's
+/// op still succeeds (matching every other drain step).
+#[tokio::test]
+async fn fallback_drain_resolve_failure_is_best_effort() {
+    let h = harness(Some("resolve:1"));
+    let vm_id = "vm-resolve-fail";
+    h.runtime
+        .execute(entry(
+            OperationKind::CreateVm,
+            vm_id,
+            "op-create",
+            envelope(MutationCommand::CreateVm {
+                definition: definition(vm_id, 1, 0),
+            }),
+        ))
+        .await
+        .expect("create succeeds");
+
+    let source = TestAttachmentSource::new(ObservedVmAttachments {
+        volumes: vec![("vol-0".to_string(), None)],
+        nics: Vec::new(),
+    });
+    let restarted = Arc::new(
+        CloudHypervisorCoreRuntime::new(
+            h.adapter.clone(),
+            h.controller.clone(),
+            h.runtime_dir.clone(),
+        )
+        .with_observed_attachments(source),
+    );
+    let result = restarted
+        .execute(entry(
+            OperationKind::DeleteVm,
+            vm_id,
+            "op-del-resolve-fail",
+            envelope(MutationCommand::DeleteVm {
+                vm_id: VmId::new(vm_id).expect("vm id"),
+            }),
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "a failed handle lookup must not fail the delete: {result:?}"
+    );
+    let log = calls(&h.controller);
+    assert!(
+        log.iter().any(|c| c == "detach:vol-0"),
+        "the detach must still run after a failed lookup: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|c| c == "close:vol-0"),
+        "no close may be invented without a resolved handle: {log:?}"
     );
 }
 

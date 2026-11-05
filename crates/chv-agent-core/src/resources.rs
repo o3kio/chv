@@ -104,6 +104,15 @@ impl HostResourceController for AgentResourceController {
             .await
     }
 
+    async fn resolve_volume_handle(
+        &self,
+        volume_id: &str,
+        vm_id: &str,
+    ) -> Result<Option<String>, ChvError> {
+        let mut client = StordClient::connect(&self.stord_socket).await?;
+        client.resolve_volume_handle(volume_id, vm_id).await
+    }
+
     async fn ensure_network_topology(
         &self,
         network_id: &str,
@@ -208,9 +217,10 @@ impl HostResourceController for AgentResourceController {
 /// missing observation falls back to deriving volume ids and
 /// `{vm_id}-{network_id}` nic ids from the projected `vm_fragments`
 /// spec; stord attachment handles ride `volume_handles` when recorded
-/// (legacy-mode RPCs record them; the Core create path does not — there
-/// the drain detaches without a close, and the open session remains the
-/// documented M2.2a handle-persistence residual).
+/// (legacy-mode RPCs record them; the Core create path does not). When a
+/// handle is absent the fallback drain resolves it from stord's durable
+/// session table before detaching (#711), so the detach-then-close pair
+/// runs on the post-restart path too instead of leaking an open session.
 ///
 /// Read-only by contract: nothing is removed here. The delete's own
 /// projection (`ProjectingCoreRuntime` → `remove_vm_state`) owns cache

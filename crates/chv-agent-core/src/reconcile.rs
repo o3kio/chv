@@ -2180,6 +2180,26 @@ pub(crate) async fn cleanup_vm_resources(
     if !volumes.is_empty() {
         let mut stord = StordClient::connect(stord_socket).await?;
         for (volume_id, handle) in &volumes {
+            // #711: after an agent restart `cache.volume_handles` is gone,
+            // but stord's durable session table still holds the live
+            // handle. Resolve it BEFORE the detach clears `vm_id`, so the
+            // post-restart path closes the session too. A failed lookup is
+            // a stord failure: record it like any other cleanup error and
+            // still attempt the detach (which may itself release the
+            // VM-scoped attachment).
+            let handle = match handle {
+                Some(handle) => Some(handle.clone()),
+                None => match stord.resolve_volume_handle(volume_id, vm_id).await {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        tracing::warn!(volume_id = %volume_id, vm_id = %vm_id, error = %e, "cleanup: resolve_volume_handle failed, continuing");
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                        None
+                    }
+                },
+            };
             if let Err(e) = stord
                 .detach_volume_from_vm(volume_id, vm_id, false, operation_id)
                 .await
@@ -2191,7 +2211,7 @@ pub(crate) async fn cleanup_vm_resources(
                 continue;
             }
             if let Some(handle) = handle {
-                if let Err(e) = stord.close_volume(volume_id, handle, operation_id).await {
+                if let Err(e) = stord.close_volume(volume_id, &handle, operation_id).await {
                     tracing::warn!(volume_id = %volume_id, error = %e, "cleanup: close_volume failed, continuing");
                     if first_error.is_none() {
                         first_error = Some(e);
