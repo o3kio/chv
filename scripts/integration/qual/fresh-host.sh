@@ -736,6 +736,47 @@ rotate_admin_password() {
     return 1
 }
 
+# A clean install must preserve the documented first-login credential across a
+# control-plane restart. v0.3.0 and v0.4.0-rc.2 seeded the admin with a second
+# sqlite3 writer while the service was live; that writer unlinked the WAL the
+# service had open, so the rotation was acknowledged and then silently lost on
+# the next restart. rc.3 writes with the service stopped
+# (scripts/install.sh chv_sqlite_offline). Assert both the durable result and
+# the direct cause: no pooled connection may hold a "(deleted)" WAL.
+check_credential_persistence() {
+    local before_pid after_pid
+    section "credential persistence across control-plane restart"
+    if [ -z "${ADMIN_PW:-}" ]; then
+        bad "credential persistence (no rotated admin password)"
+        return 1
+    fi
+    before_pid="$(systemctl show -p MainPID --value chv-controlplane 2>/dev/null || true)"
+    if systemctl restart chv-controlplane >/dev/null 2>&1; then
+        ok "control plane restarted"
+    else
+        bad "control plane failed to restart"
+        return 1
+    fi
+    after_pid="$(systemctl show -p MainPID --value chv-controlplane 2>/dev/null || true)"
+    if [ -n "${before_pid:-}" ] && [ "$before_pid" != "0" ] \
+        && [ -n "${after_pid:-}" ] && [ "$after_pid" != "$before_pid" ]; then
+        ok "control plane came back with a new process (${before_pid} -> ${after_pid})"
+    else
+        bad "control plane did not restart (PID ${before_pid:-unknown} -> ${after_pid:-unknown})"
+    fi
+    if wait_api_login; then
+        ok "rotated admin credential survived the restart"
+    else
+        bad "rotated admin credential was lost across the restart (HTTP ${LOGIN_HTTP:-no-response})"
+    fi
+    if [ -d "/proc/${after_pid:-}/fd" ] \
+        && ls -l "/proc/${after_pid}/fd" 2>/dev/null | grep -qF 'controlplane.db-wal (deleted)'; then
+        bad "control plane holds an unlinked database WAL after the restart"
+    else
+        ok "control plane holds the on-disk database WAL after the restart"
+    fi
+}
+
 # Read-only control-plane diagnostics for a failed bring-up. The DB/WAL state,
 # the open file descriptors and the filesystem type are the facts that
 # distinguish a product defect from a storage/runner problem.
@@ -1039,6 +1080,7 @@ else
     finish
 fi
 check_bringup candidate http://127.0.0.1:8080/ "$CANDIDATE_VERSION"
+check_credential_persistence
 check_binaries_version "$CANDIDATE_VERSION" "$CANDIDATE_SHA"
 section "WebUI edge"
 wait_http_200 "nginx edge serves the WebUI" http://127.0.0.1/ /tmp/fresh-host-edge.html 60 || true
@@ -1159,6 +1201,22 @@ wait_cmd "previous release seeded the admin credential" 90 test -s /etc/chv/init
 for b in chv-controlplane chv-agent chv-stord chv-nwd; do
     record "PREVIOUS_VERSION ${b}=$("/usr/bin/${b}" --version 2>/dev/null | head -1 || true)"
 done
+
+# v0.3.0 and v0.4.0-rc.1/rc.2 seeded the admin with a second sqlite3 writer
+# while the control plane was live, which unlinked the WAL that service still
+# had open. Those releases therefore lose API writes made in that process
+# lifetime on the next restart - including the restart the upgrade performs.
+# rc.3 fixed the installer. Restart the previous release once here so this leg
+# measures upgrade preservation, not a known defect of the release being
+# upgraded *from*; the clean-install leg asserts the candidate does not need
+# this repair.
+if systemctl restart chv-controlplane >/dev/null 2>&1; then
+    ok "restarted the previous release to reopen its database WAL"
+else
+    bad "could not restart the previous release control plane"
+fi
+wait_cmd "previous release control plane healthy after restart" 60 \
+    curl -sf http://127.0.0.1:8080/health || true
 
 section "identifiable pre-upgrade state"
 STATE_DIR=/var/fresh-host-upgrade-state
@@ -1395,6 +1453,7 @@ if [ "$QUICK_VERSION" = "$CANDIDATE_VERSION" ]; then
     # A manual run may point the quick leg at the candidate itself; only a
     # strictly older release may use the weaker previous-mode assertion.
     check_bringup
+    check_credential_persistence
 elif [ "$(printf '%s\n%s\n' "$QUICK_VERSION" "$CANDIDATE_VERSION" | sort -V | head -1)" = "$QUICK_VERSION" ]; then
     # QUICK_VERSION sorts strictly before the candidate: a previous release,
     # whose dedicated-key path logs nothing, so only the absence of the
