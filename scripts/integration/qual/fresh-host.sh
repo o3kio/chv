@@ -647,54 +647,96 @@ check_encryption() {
 }
 
 TOKEN=""
+ADMIN_PW=""
+LOGIN_HTTP=""
 
-# The bootstrap admin is seeded with must_change_password=1, and install.sh
-# restores that flag before exiting. The BFF denies every non-auth route for
-# such a token (403 PASSWORD_CHANGE_REQUIRED), so node visibility cannot be
-# asserted until it is cleared. Clear it exactly as install.sh seeds it: a WAL
-# write as the service user. This is a recorded test-fixture concession, not a
-# claim about the operator's first-login flow.
-clear_admin_rotation_flag() {
-    local db=/var/lib/chv/controlplane.db
-    if [ ! -f "$db" ]; then
-        bad "admin rotation flag (control-plane database missing)"
-        return 1
+# api_login <password> — control-plane API login; sets TOKEN on success.
+api_login() {
+    local pw="$1" body=/tmp/fresh-host-login.json
+    LOGIN_HTTP="$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/api/v1/auth/login \
+        -H 'Content-Type: application/json' \
+        --data-binary "{\"username\":\"admin\",\"password\":\"${pw}\"}" 2>/dev/null || true)"
+    if [ "$LOGIN_HTTP" = "200" ] && grep -q '"token"' "$body" 2>/dev/null; then
+        TOKEN="$(grep -o '"token":"[^"]*"' "$body" | head -1 | sed 's/^"token":"//; s/"$//')"
+        [ -n "$TOKEN" ]
+        return
     fi
-    if ! command -v sqlite3 >/dev/null 2>&1; then
-        bad "admin rotation flag (sqlite3 missing)"
-        return 1
-    fi
-    if runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$db" \
-        "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
-        >/dev/null 2>&1; then
-        record "ADMIN_ROTATION_FLAG=cleared for the node-visibility check (test fixture)"
-        return 0
-    fi
-    bad "admin rotation flag (could not clear must_change_password)"
     return 1
 }
 
 check_admin_login() {
-    local pw code body
     if [ ! -s /etc/chv/initial_admin_password ]; then
         bad "admin login round-trip (initial_admin_password missing)"
         return 1
     fi
-    pw="$(cat /etc/chv/initial_admin_password)"
-    body=/tmp/fresh-host-login.json
-    code="$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
-        -X POST http://127.0.0.1:8080/api/v1/auth/login \
-        -H 'Content-Type: application/json' \
-        --data-binary "{\"username\":\"admin\",\"password\":\"${pw}\"}" 2>/dev/null || true)"
-    if [ "$code" = "200" ] && grep -q '"token"' "$body" 2>/dev/null; then
-        TOKEN="$(grep -o '"token":"[^"]*"' "$body" | head -1 | sed 's/^"token":"//; s/"$//')"
-        if [ -n "$TOKEN" ]; then
-            ok "admin login round-trip"
-            return 0
-        fi
+    ADMIN_PW="$(cat /etc/chv/initial_admin_password)"
+    if api_login "$ADMIN_PW"; then
+        ok "admin login round-trip"
+        return 0
     fi
-    bad "admin login round-trip (HTTP ${code:-no-response})"
+    bad "admin login round-trip (HTTP ${LOGIN_HTTP:-no-response})"
     return 1
+}
+
+# The bootstrap admin is seeded with must_change_password=1 and install.sh
+# restores that flag before exiting. The BFF denies every non-auth route for
+# such a token (403 PASSWORD_CHANGE_REQUIRED), so node visibility cannot be
+# asserted until the first-login rotation happens.
+#
+# Rotate through the documented API (`POST /v1/auth/change-password`) rather
+# than a direct `sqlite3` UPDATE against the live database. The old fixture
+# write was a second process writing WAL pages while the control plane was
+# serving; the v0.3.0 -> rc.2 version-assert run hit
+# "database disk image is malformed" seconds after it, and the product must
+# not be blamed for a test-only concurrent writer. The API path also proves
+# the operator can actually rotate the seeded credential, which the core
+# contract depends on.
+rotate_admin_password() {
+    local new_pw code body=/tmp/fresh-host-change-password.json
+    if [ -z "$TOKEN" ]; then
+        bad "first-login password change (no admin token)"
+        return 1
+    fi
+    new_pw="FreshHost-$(openssl rand -hex 12)"
+    code="$(curl -sS --max-time 15 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/v1/auth/change-password \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H 'Content-Type: application/json' \
+        --data-binary "{\"current_password\":\"${ADMIN_PW}\",\"new_password\":\"${new_pw}\"}" 2>/dev/null || true)"
+    if [ "$code" != "200" ] || ! grep -q '"ok":true' "$body" 2>/dev/null; then
+        bad "first-login password change (HTTP ${code:-no-response})"
+        return 1
+    fi
+    ok "first-login password change accepted"
+    # The change bumps token_version and revokes the token that made the
+    # request; the node-visibility check needs a session minted after it.
+    if api_login "$new_pw"; then
+        ok "admin re-login with the rotated password"
+        return 0
+    fi
+    bad "admin re-login with the rotated password (HTTP ${LOGIN_HTTP:-no-response})"
+    return 1
+}
+
+# Read-only control-plane diagnostics for a failed bring-up. The DB/WAL state
+# and the filesystem type are the two facts that distinguish a product defect
+# from a runner-storage problem, and the earlier timeout captured neither.
+diagnose_controlplane() {
+    local db=/var/lib/chv/controlplane.db
+    record "--- control-plane database diagnostics ---"
+    ls -l "$db" "$db-wal" "$db-shm" 2>&1 | while IFS= read -r line; do record "  ${line}"; done
+    if command -v sqlite3 >/dev/null 2>&1 && [ -f "$db" ]; then
+        record "  sqlite3 --version: $(sqlite3 --version 2>&1 | head -1)"
+        record "  PRAGMA integrity_check(5):"
+        runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$db" 'PRAGMA integrity_check(5);' 2>&1 \
+            | while IFS= read -r line; do record "    ${line}"; done
+    fi
+    record "  df -T /var/lib/chv: $(df -T /var/lib/chv 2>&1 | tail -1)"
+    record "  mount: $(findmnt -no FSTYPE,SOURCE,TARGET /var/lib/chv 2>/dev/null || echo unknown)"
+    record "  dmesg tail:"
+    dmesg 2>/dev/null | tail -20 | while IFS= read -r line; do record "    ${line}"; done
+    record "--- end control-plane database diagnostics ---"
 }
 
 # check_node_visible [expected_version]
@@ -737,7 +779,8 @@ check_node_visible() {
     record "--- journalctl -u chv-controlplane (last 80 lines) ---"
     journalctl -u chv-controlplane -n 80 --no-pager 2>/dev/null \
         | while IFS= read -r line; do record "  ${line}"; done
-    record "--- end controlplane diagnostics ---"
+    record "--- end controlplane journal ---"
+    diagnose_controlplane
     if [ -n "$expect_version" ]; then
         bad "node did not report version ${expect_version} within 150 s (last HTTP ${code:-no-response}: ${body:-<no body>})"
     else
@@ -803,8 +846,8 @@ check_bringup() {
     wait_units_active 180 || true
     check_units_contract
     check_encryption "$encryption_mode"
-    clear_admin_rotation_flag || true
     check_admin_login || true
+    rotate_admin_password || true
     check_webui "$webui_url"
     check_node_visible "$expected_node_version" || true
     check_metrics
