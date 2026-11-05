@@ -551,6 +551,21 @@ unit_field() {
     systemctl show "$1" -p "$2" --value 2>/dev/null | head -1
 }
 
+# A failing unit's journal is the only place the reason exists. Record a
+# bounded tail (and the resolved unit file) in the transcript so a failed
+# lane is diagnosable from the uploaded evidence instead of a crash-loop
+# count alone.
+unit_diagnostics() {
+    local u="$1" line
+    record "--- journalctl -u ${u} (last 80 lines) ---"
+    journalctl -u "$u" -n 80 --no-pager 2>/dev/null \
+        | while IFS= read -r line; do record "  ${line}"; done
+    record "--- systemctl cat ${u} ---"
+    systemctl cat "$u" 2>/dev/null \
+        | while IFS= read -r line; do record "  ${line}"; done
+    record "--- end diagnostics for ${u} ---"
+}
+
 wait_units_active() {
     local timeout="${1:-180}" waited=0 all u
     while :; do
@@ -572,8 +587,9 @@ wait_units_active() {
 }
 
 check_units_contract() {
-    local u state sub nrest
+    local u state sub nrest diagnosed
     for u in chv-controlplane chv-agent chv-stord chv-nwd; do
+        diagnosed=0
         state="$(unit_field "$u" ActiveState)"
         sub="$(unit_field "$u" SubState)"
         nrest="$(unit_field "$u" NRestarts)"
@@ -582,11 +598,14 @@ check_units_contract() {
             ok "${u} active/running"
         else
             bad "${u} not active/running (state=${state:-missing} sub=${sub:-missing})"
+            unit_diagnostics "$u"
+            diagnosed=1
         fi
         if [ "$nrest" = "0" ]; then
             ok "${u} zero restarts"
         else
             bad "${u} restarted (NRestarts=${nrest:-missing})"
+            [ "$diagnosed" -eq 1 ] || unit_diagnostics "$u"
         fi
     done
 }

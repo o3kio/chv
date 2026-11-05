@@ -330,6 +330,9 @@ grep -q 'documented fail-closed guard did not fire' "$fresh" \
 grep -q "sqlite3 -cmd '.timeout 5000'" "$fresh" \
     && pass "fresh-host sqlite writes wait out a live control-plane lock" \
     || fail "fresh-host sqlite writes can fail spuriously on SQLITE_BUSY"
+grep -qF 'journalctl -u "$u" -n 80 --no-pager' "$fresh" \
+    && pass "fresh-host records a failing unit's journal tail in the evidence" \
+    || fail "fresh-host failures are not diagnosable from the uploaded evidence"
 grep -q 'export GITHUB_REPO=' "$fresh" \
     && pass "fresh-host exports GITHUB_REPO to the in-container child" \
     || fail "fresh-host in-container quick installer falls back to o3kio/chv"
