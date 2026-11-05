@@ -94,6 +94,10 @@ RELEASE_GPG_HOME=""
 JWT_SECRET=""
 BOOTSTRAP_TOKEN=""
 CHV_NODE_ID=""
+# Set only when this run temporarily clears the bootstrap admin's
+# must_change_password flag. cleanup() must not mutate an existing deployment
+# when a re-run refuses at the persistent-data guard.
+ADMIN_FLAG_MANAGED=0
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -2040,6 +2044,11 @@ wipe_deployment() {
 # Cleanup
 # -----------------------------------------------------------------------------
 reset_must_change_password() {
+    # Only undo a flag this run actually cleared. A plain re-run over
+    # persistent data must fail closed without changing the live deployment;
+    # resetting the flag here would revoke the operator's current session
+    # (403 PASSWORD_CHANGE_REQUIRED) even though the re-run did nothing.
+    [ "$ADMIN_FLAG_MANAGED" = "1" ] || return 0
     # Ensure the bootstrap admin is flagged for rotation on first login even
     # if we temporarily cleared it during install to allow API seeding.
     # chv_sqlite_offline stops the control plane for the write and restarts
@@ -2184,6 +2193,10 @@ seed_admin_user || fatal "Failed to seed bootstrap admin user."
 # middleware.  The flag is restored to 1 in cleanup() / reset_must_change_password()
 # so the operator is still forced to rotate on first UI login.
 info "Temporarily clearing must_change_password for install-time API seeding..."
+# Record the intent before the write: the SQL may have committed even when
+# the helper reports a restart/health failure, and cleanup must still restore
+# the flag.
+ADMIN_FLAG_MANAGED=1
 chv_sqlite_offline "${CHV_DB_PATH}" \
     "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
     || warn "Failed to clear must_change_password; API seeding may be blocked."
