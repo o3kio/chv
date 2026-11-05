@@ -1,6 +1,6 @@
 # CHV Deployment Architecture — Single Source of Truth
 
-> **Status (2026-10-03, branch `docs/deployment-architecture`, base `1fbb2b04`):**
+> **Status (2026-11-05, branch `phase0/docs`, base `406b7d08`):**
 > this document is the authoritative reference for **what deploys, how the
 > components connect, and which use cases are supported at which confidence
 > tier**. It does not replace the operator how-to ([DEPLOYMENT.md](DEPLOYMENT.md)),
@@ -13,10 +13,20 @@
 > ([evidence/production-readiness/v0.3.0-rc1/00-execution-declaration.md](evidence/production-readiness/v0.3.0-rc1/00-execution-declaration.md)
 > §5). MULTI-HOST-VERIFIED and FIELD-QUALIFIED are **unprovable** on the
 > qualification infrastructure and are reported as unproven, never claimed.
-> Two campaign prompts are pending and will extend this document without
-> restructuring it: Prompt 05 (release-candidate notes wording) and
-> Prompt 06 (reference deployment / field qualification). Where their results
-> are expected, this document says **pending** and does not pre-claim.
+>
+> **Post-campaign reconciliation (2026-11-05).** Findings that the prompt-04
+> close-out recorded as open have since been fixed on `main`:
+> **#368** (create re-drive) by #484, **#378** (accept-time snapshot/clone
+> refusal) by #495, **#355/#360** (network-policy dispatch and empty-ruleset
+> handling) by #565/#566/#567 and #452, **#394** (concurrent-write migration)
+> by the pause-first mode #578 plus the #582 follow-ups, and **#379** (LVM)
+> by #510/#511/#512. The full real-KVM lane (m4.3–m4.8) is green on
+> [run 41938443045](https://github.com/o3kio/chv/actions/runs/41938443045)
+> (`e82d49a1`, code-identical to `main` `406b7d08` on the qualified
+> Rust/proto/packaging paths), recorded in the
+> [nightly evidence note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md).
+> Prompt 06 (reference deployment / field qualification) is still pending and
+> is not pre-claimed.
 
 ---
 
@@ -95,7 +105,7 @@ KVM-VERIFIED, and multi-host behavior is reported as unproven.
 
 | Component | Role | Key details | Tier |
 |---|---|---|---|
-| SvelteKit UI statics | Browser application | Built to static files. `scripts/install.sh` serves them from `/opt/chv/ui` through **nginx** on `:80` — the only component that listens on a non-loopback address. Since #447 (D3 target) the control plane binary itself can serve the tree: opt-in `[webui]` config section (`chv-config`), disabled by default, prefix-guarded static fallback with SPA + cache headers on the HTTP listener (`crates/chv-controlplane-service/src/api/router.rs`); install.sh enables it and its nginx edge is proxy-only. The `.deb`/`.rpm` ships the same tree at `/usr/share/chv/ui` plus the proxy-only example configuration under `/usr/share/chv/examples/` — no web server is installed or enabled (see §5 UC-3 and decision D3). | UI serving via install.sh: [CONTAINER-VERIFIED] — the packaging/systemd contract, proven in a clean container by the [m4.2 install-sh leg](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.2-clean-install.md) (the pre-#447 nginx-statics shape; the proxy-only shape re-qualification is the #447 container leg). UI serving from the packaged tree via the example conf / `[webui]`: [CONTAINER-VERIFIED] — the #549 container package-smoke leg (`scripts/package/smoke-webui.sh`, built from the `.deb`s and wired into `package-pr.yml`, 2026-10-08) starts the binary with `[webui] enabled = true` behind the packaged proxy-only edge and asserts shell, cache headers, login round-trip, BFF API, and the `/ws/` console proxy. UI behavior end-to-end: see §9 (#355). |
+| SvelteKit UI statics | Browser application | Built to static files. `scripts/install.sh` serves them from `/opt/chv/ui` through **nginx** on `:80` — the only component that listens on a non-loopback address. Since #447 (D3 target) the control plane binary itself can serve the tree: opt-in `[webui]` config section (`chv-config`), disabled by default, prefix-guarded static fallback with SPA + cache headers on the HTTP listener (`crates/chv-controlplane-service/src/api/router.rs`); install.sh enables it and its nginx edge is proxy-only. The `.deb`/`.rpm` ships the same tree at `/usr/share/chv/ui` plus the proxy-only example configuration under `/usr/share/chv/examples/` — no web server is installed or enabled (see §5 UC-3 and decision D3). | UI serving via install.sh: [CONTAINER-VERIFIED] — the packaging/systemd contract, proven in a clean container by the [m4.2 install-sh leg](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.2-clean-install.md) (the pre-#447 nginx-statics shape; the proxy-only shape re-qualification is the #447 container leg). UI serving from the packaged tree via the example conf / `[webui]`: [CONTAINER-VERIFIED] — the #549 container package-smoke leg (`scripts/package/smoke-webui.sh`, built from the `.deb`s and wired into `package-pr.yml`, 2026-10-08) starts the binary with `[webui] enabled = true` behind the packaged proxy-only edge and asserts shell, cache headers, login round-trip, BFF API, and the `/ws/` console proxy. UI behavior end-to-end is not separately qualified; see §9. |
 | nginx | Edge reverse proxy | Terminates HTTP `:80`; proxies `/api/` and `/v1/` to the BFF `:8080`; proxies `/ws/vms/{node_id}/…` to the agent console `:8444`. Installed and configured by `scripts/install.sh`; the packages ship an example configuration only (D3 interim). | [CONTAINER-VERIFIED] — the same m4.2 install-sh contract leg |
 
 ### 2.3 External dependencies
@@ -317,7 +327,8 @@ packaged UI tree + the agent console behind `/ws/`) and asserts the
 single-listener shape end to end; it is wired into `package-pr.yml`.
 The label moved [CODE-SUPPORTED, UNQUALIFIED] → [CONTAINER-VERIFIED]
 per the tier-path convention. The scope is the packaging/serving
-contract in a clean container — not guest-level UI behavior (§9, #355)
+contract in a clean container — not guest-level UI behavior (§9; the UI was
+not re-qualified end-to-end)
 and not a published container image (none exists; the leg builds a
 local one).
 
@@ -424,8 +435,8 @@ define them is decision **D5**.
 | Agent drain on stop | **[QUALIFIED — KVM-VERIFIED]** | SIGTERM drains in-flight journal operations for up to 60 s; the unit's `TimeoutStopSec=75` protects the budget (unit file; m4.7 F1→F2 ordering). |
 | Node-upgrade orchestration | **[CODE-SUPPORTED, UNQUALIFIED]** — partial, and narrower than documented | What exists: the compatibility-matrix boot gate (`crates/chv-controlplane-service/src/compat.rs`, wired at startup via `cmd/chv-controlplane/src/bootstrap.rs`, opt-in through `CHV_COMPAT_MATRIX_PATH`, fail-closed) and the `DrainNode` / `EnterMaintenance` / resume-scheduling gRPC handlers. What does **not** exist: the `SystemdNodeUpgrader` rolling-upgrade stack was **deleted as dead code** (PR #213, commit `26209555`); [ARCHITECTURE.md](ARCHITECTURE.md) still references it (stale — see §9). ADR-007's bundle-upgrade/one-step-rollback model is not implemented by the package lifecycle; how to present that gap is decision **D8**. |
 | `chvctl upgrade` subcommands | **Removed** | `chvctl upgrade start/status/rollback/list` POSTed to BFF `/v1/upgrades` routes, which were **never registered** in the BFF router (`crates/chv-webui-bff/src/router.rs`), so the commands could not succeed. Originally recorded here as a finding (same class as the fixed #320); the dead surface was **removed** in #427. |
-| Live network-policy update | **Half-open** | Policy enforcement end-to-end is qualified (attach-time materialization, m4.4). The UI firewall editor that wrote a dead-end store was **removed** with its `/v1/firewall-rules` CRUD and backing table (#355 Phase 1; the issue stays open for the live re-dispatch path). Remaining: legacy `set_firewall_policy` call sites can apply empty rulesets (**#360**, open). |
-| Storage migration during upgrade | Boundary | Quiescent-source migration only (**#394**): concurrent-write migration silently loses data and is not claimed. Migration task state is in-memory; no cross-restart resume. |
+| Live network-policy update | **[QUALIFIED — KVM-VERIFIED]** | Policy enforcement is end-to-end: attach-time materialization plus live re-dispatch. #355 PRs #565/#566/#567 journal `UpdateNetworkPolicy` on `POST /v1/networks/update` and fan the stored ruleset out to every node with a live attached VM; the UI firewall editor that wrote a dead-end store was removed (#451), and the legacy empty-ruleset hazard is guarded (#360 → #452). An empty or never-set ruleset resolves to the DP4 baseline (DHCP/DNS/conntrack allowed, default-deny otherwise), never a bare default-deny. The 2026-11-04 nightly m4.4 leg proves the empty-ruleset baseline and a both-direction allow through the BFF on real KVM ([run 41938443045](https://github.com/o3kio/chv/actions/runs/41938443045)). Pre-fix stored-data caveats (pre-#365 NULL gateways, pre-#369 dialect rules) are repaired by re-saving the network. |
+| Storage migration during upgrade | Boundary | **Pause-first stop-the-world is the only operator-facing mode (#656/#683):** the BFF, control-plane mutation service, `chvctl`, and the WebUI reject `pause_first=false` (and a missing field), so the VM is paused before any source byte is read and the transfer is correct for any write pattern at the cost of downtime equal to the full disk+memory transfer. The underlying stord↔stord disk-transfer primitive (mTLS, SHA-256 finalize digest) is qualified with a quiescent source; concurrent-write ("live") migration remains **not claimed**. #394 closed by #578; the #582 tracker items landed (#583/#584/#585/#590), with the multi-volume convergence-skew residual disclosed in the adoption record. stord-side task state is in-memory (a stord restart loses a live transfer); the control-plane migration registry is persisted and reconciled (#691). No cross-restart stord resume claim. |
 
 ## 7. Supported envelope
 
@@ -434,20 +445,26 @@ is not supported.
 
 | Dimension | Supported statement | Source |
 |---|---|---|
-| Host count | **Single host.** All qualification evidence is single-host (nested KVM on a 16 vCPU / 31 GiB shared host). | Declaration §5; m4.9 §3 |
-| VMM | Cloud Hypervisor only, pinned **v53.0** (moved from v43.0 via the #448 campaign — [campaign evidence root](evidence/vmm-requalification/v53.0/README.md)). The CH serial-console upstream defect (silent serial-manager thread death — present at both v43.0 and v53.0, campaign leg 02) is the recorded gate above KVM-VERIFIED; re-verify at any Cloud Hypervisor upgrade. | Declaration §3; m4.9 §3; #448 leg 02 |
-| Architecture / OS | Linux x86_64; `.deb` + `.rpm`. Qualified on Ubuntu noble amd64; `.rpm` untested in prompt-04. | Declaration §3; m4.2 |
-| Network profile | Single-host CHV-owned bridge overlay (local bridge + taps) with the nwd host-safety gate. Multi-host VXLAN fabric unproven. | Declaration §3 with the m4.9 §4.5 precision record |
-| Storage profiles | Local file (VM-integrated) + LVM (stord layer only; not reachable from the VM lifecycle, #379). Ceph RBD / iSCSI not claimed. | Declaration §3; m4.5 |
-| Migration | Quiescent-volume (single-writer) disk migration over mTLS between two stord instances, single host. Multi-host migration unproven. | Declaration §3; m4.6; m4.9 §4.1 |
+| Host count | **Single host.** All qualification evidence is single-host (nested KVM on a shared self-hosted qualification host; 16 vCPU / 31 GiB at campaign close-out, reported as 12 vCPU / 31 GiB on the 2026-11-04 nightly runner). | Declaration §5; m4.9 §3; [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §2 |
+| VMM | Cloud Hypervisor only, pinned **v53.0** (moved from v43.0 via the #448 campaign — [campaign evidence root](evidence/vmm-requalification/v53.0/README.md); installer digest-verifies the qualified assets). The CH serial-console upstream defect (silent serial-manager thread death — present at both v43.0 and v53.0, campaign leg 02) is the recorded gate above KVM-VERIFIED; re-verify at any Cloud Hypervisor upgrade. | Declaration §3; m4.9 §3; #448 leg 02 |
+| Architecture / OS | Linux x86_64; `.deb` + `.rpm`. Qualified on Ubuntu noble amd64; `.rpm` built but not exercised end-to-end on a real host. arm64 is **not** a support claim (no released artifact). | Declaration §3; m4.2; declaration §10 |
+| Network profile | Single-host CHV-owned bridge overlay (local bridge + taps) with the nwd host-safety gate. Operator firewall policy materializes at attach time and on update, with the DP4 baseline for empty rulesets. Multi-host VXLAN fabric unproven. | Declaration §3 with the m4.9 §4.5 precision record; m4.4; run 41938443045 |
+| Storage profiles | **Local file + LVM, both VM-integrated** through per-volume `storage_class` (#379; PRs #510/#511/#512). LVM boot volumes are provisioned create-on-open and addressed by dm-path locators; the m4.5 Leg G end-to-end run passed in the 2026-11-04 full lane. Ceph RBD / iSCSI are coded but unqualified. | m4.5 §9; [run 41938443045](https://github.com/o3kio/chv/actions/runs/41938443045) |
+| Migration | **Pause-first stop-the-world is the only operator-facing mode** (#656/#683); the live/concurrent-write path is rejected. The underlying quiescent-source stord↔stord disk transfer over mTLS is qualified (m4.6). The pause-first BFF/CP/agent orchestration is CI-verified but not separately real-KVM-qualified. Multi-host migration unproven. | m4.6; [live-migration spec](specs/component/live-migration-spec.md); #578/#582 |
 | Lifecycle authority | Exactly one durable CellHV Core authority per node; legacy/control-plane paths are compatibility adapters only. | Declaration §3; prompt-02 |
-| Backup/restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** | Declaration §3; no execution engine or restore validation exists |
+| Backup/restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** No execution engine or restore validation exists; tenant-data backup is the operator's responsibility. | Declaration §3; this document §5 UC-9 |
+| Upgrade | Package upgrade (deb/rpm) is CI-verified; migrations are forward-only and **downgrade is unsupported**. Rolling node upgrade is absent (the `SystemdNodeUpgrader` stack was deleted in #213; ADR-007 is not implemented). The fresh-host install+upgrade demonstration (#666) is **not yet done**, and the quick-install leg #556 is open. | §6; `scripts/package/lifecycle-{deb,rpm}.sh`; [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §5.6 |
 | Scale | **No concurrency, density, throughput, or requests-per-second claim.** M4.8 numbers are baselines on the qualification host only. | m4.8; m4.9 §3 |
-| Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" and now labels it an **unevidenced recommendation**; it remains pending Prompt-05/06 qualification. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; ADR-011 |
+| Multi-host | **Unsupported/absent.** Control-plane→agent dispatch is a Unix-socket path; the agent has no TCP gRPC listener. ADR-029 is accepted as design but **not implemented**. | §3.3, §5 UC-6; [ADR-029](specs/adr/029-multi-host-dispatch.md) |
+| Volvisor | **Design-only.** ADR-028 selects Volvisor as the future storage authority; runtime integration is pending (pin/contract work upstream). The qualified storage path remains `chv-stord`. | [ADR-028](specs/adr/028-volvisor-storage-orchestration.md) |
+| Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" and labels it an **unevidenced recommendation**. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; [DEPLOYMENT.md](DEPLOYMENT.md) Prerequisites; ADR-011 |
+| Qualification status | The full real-KVM lane (m4.3–m4.8) is green on **run 41938443045** (`e82d49a1`); `main` `406b7d08` is identical on the qualified Rust/proto/packaging paths. This closes #659's execution-evidence condition; #666's fresh-host demonstration remains open. | [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §4–§5 |
 
-**Pending:** Prompt 05 (release-candidate notes) will fix the public wording
-of the supported matrix; Prompt 06 (reference deployment) will add the first
-field-evidence tier. Neither is pre-claimed here.
+**Pending:** Prompt 06 (reference deployment / field qualification) will add the
+first field-evidence tier and is not pre-claimed here. The draft release
+support matrix ([release/v0.4.0-rc.1-support-matrix.md](release/v0.4.0-rc.1-support-matrix.md))
+carries the same claims with per-row evidence pointers and is not a release
+announcement.
 
 ## 8. Open design decisions
 
@@ -483,86 +500,105 @@ found it.
 - Multi-host anything is unprovable (declaration §5); capability is capped at
   KVM-VERIFIED.
 
-**Open disclosed issues (worst-first; anchored in m4.9 §3, with later
-disclosures added here):**
+**Still-true boundaries (worst-first; reconciled with the issue tracker on
+2026-11-05):**
 
-- **Pinned-VMM CVE exposure — CLOSED 2026-10-03 (D6 option (b) implemented).**
-  The former v43.0 pin was in the affected range of CVE-2026-27211
-  (GHSA-jmr4-g2hv-mjj6) and CVE-2026-45782 (GHSA-f47p-p25q-83rh); both
-  close at the v53.0 pin, with runtime proof for CVE-2026-27211 (the full
-  exfiltration chain reproduced at v43 under the CHV invocation shape and
-  refused fail-closed at v53 on every entry point) —
-  [campaign leg 06](evidence/vmm-requalification/v53.0/06-security-regression.md).
-  No advisory affects v53.0 as of 2026-10-03.
-- **#394** — concurrent-write migration silently loses data; quiescent-source
-  migration is the claimed mode.
-- **#368** — fixed by #484 — a transient effector failure terminally
-  failing a journaled VM create is now re-driven by a bounded orchestrator
-  pass (a new `RecreateVm` operation per attempt, spaced by the
-  dispatch-retry backoff curve 10 s / 20 s / 40 s, at most 3 attempts);
-  on exhaustion the VM is marked terminally Failed with
-  `CREATE_REDRIVE_EXHAUSTED` plus the reported failure code, and the BFF
-  renders a `Failed` runtime status as-is with `last_error` (Failed-wins
-  over the desired power state). No pre-fix state persists
-  (already-terminal creates stay terminal — a re-drive is always a new
-  operation, never a resurrection).
-- **#345 (Cloud Hypervisor side)** — the v43 control-loop hang after guest
-  poweroff is contained, not cured; the CH v43 serial-console upstream defect
-  gates above KVM-VERIFIED and requires re-verification at any Cloud
-  Hypervisor upgrade. Restated 2026-10-03: upstream has since fixed parts of
-  the chain (Pty flush gate + socket fd leak, v50.0 #7502; pre-connect
-  output buffering, v53.0 #8322), but per source inspection the silent
-  serial-manager thread death is **still present at v53.0** — the defect is
-  contained, not cured, on both v43.0 and v53.0, so CHV's containment
-  (reboot rotation, drain-then-close, console healing) carries forward and
-  the gate above KVM-VERIFIED survives any pin move, including the #448
-  campaign.
-- **#355 / #360** — the UI firewall editor that wrote a dead-end store was
-  removed (#355 Phase 1; the issue stays open for live re-dispatch), and
-  the legacy empty-ruleset hazard at the two legacy `set_firewall_policy`
-  call sites was fixed by #452. Pre-fix stored data caveats apply
-  (pre-#365 NULL gateways, pre-#369 dialect rules; re-save repairs).
-- **#378 / #379** — #378 fixed by #495 — the volume snapshot family
-  (snapshot/clone/restore/delete-snapshot) is now rejected at accept
-  time on core-managed nodes: InvalidArgument surfaced as HTTP 400
-  BEFORE any journaling (no operations row, no volume_desired_state
-  intent, no clone target row), keyed on the node's authority mode as
-  carried by the agent's node inventory and failing OPEN on an unknown
-  mode; the agent-side Unimplemented fail-closed dispatch remains the
-  enforcement backstop. #379 stays open — LVM is still unreachable
-  from the VM lifecycle (stord layer only).
-- **#384 / #385 / #386** — last-writer-wins physical upserts + clone TOCTOU;
-  respawned stord drops operator config beyond the allowlist; ownerless
-  imported/template volumes (fixed by #481 — pre-fix volumes remain
-  ownerless and admin-only).
-- **#401 / #402** — destination-only stord was not expressible and
-  migration mTLS rejections were unobservable on both ends; fixed by #483
-  (the two migration halves are independently optional under
-  `enabled = true`) and #479 (rejection causes surfaced at the sender,
-  rejected handshakes warn-logged on the destination). No pre-fix state
-  persists.
-- **#351 / #336 / #372** — delete-path kill-refusal tolerance;
-  JWT-secret/encryption-key coupling; remaining chvctl↔BFF contract drift.
-
-**Inherited / design non-claims:**
-
-- The UI itself was not re-qualified in prompt-04; all scenario evidence is
-  chvctl/BFF/API-driven. The declaration's "UI/BFF/CLI: supported for the
-  reference deployment" should be scoped to the exercised surfaces when
-  Prompt 05 words the release notes (m4.9 §4.6).
-- M2.5 delete retention: `vm delete` removes authority-side state but the
-  BFF list row, CP row, VM dir, volume row, and backing file persist.
-- CP-orchestrated migration (`agent migrate_vm`) fails closed in
-  core-managed mode by design (single-writer enforcement).
-- Migration-path edges: FinalizeAck wait has no timeout; migration task
-  state is in-memory (no cross-restart resume).
-- The dnsmasq runtime path is hardcoded to `/run/chv/nwd`
+- **#345/#409 (Cloud Hypervisor side)** — the Cloud Hypervisor control-loop
+  hang after guest poweroff and the silent serial-manager thread death are
+  **contained, not cured**, at the v53.0 pin. Upstream has fixed parts of the
+  chain (Pty flush gate + socket fd leak, v50.0 #7502; pre-connect output
+  buffering, v53.0 #8322), but per source inspection the serial-manager
+  thread death is still present at v53.0. CHV's containment (reboot rotation,
+  drain-then-close, console healing, `/proc`-proven dead-thread heal) carries
+  the boundary, and the gate above KVM-VERIFIED survives any pin move,
+  including the #448 campaign. Re-verify at every Cloud Hypervisor upgrade.
+- **Migration is stop-the-world only.** Pause-first is the only
+  operator-facing mode (#656/#683); live/concurrent-write migration is not
+  claimed. The underlying stord↔stord primitive assumes a quiescent source;
+  its dirty bitmap observes only stord-mediated writes, and the write canary
+  / finalize digest turn a concurrent write into a fast or late *failure*,
+  never a claimed live migration. One disclosed #582 residual remains: in
+  multi-volume skew an early volume can declare convergence while a later
+  volume is still in bulk copy, starting the memory-phase timeout budget
+  early (the migration still completes correctly; a telemetry-contract
+  change is needed to close it). stord-side task state is in-memory, so a
+  stord restart loses a live transfer; the control-plane registry is
+  persisted and reconciled (#691).
+- **M2.5 delete retention** — `vm delete` removes authority-side state but
+  the BFF list row, CP row, VM directory, volume row, and backing file
+  persist (warned, never gated, in M4.3/M4.5/M4.7/M4.8 and the nightly lane).
+- **CP-orchestrated migration** (`agent migrate_vm`) fails closed in
+  core-managed mode by design (single-writer enforcement); M4.6 drives
+  stord↔stord directly and makes no claim about the legacy CP path.
+- **The dnsmasq runtime path is hardcoded to `/run/chv/nwd`**
   (`crates/chv-nwd-core/src/dns.rs`) — a single-host assumption.
-- Cross-restart snapshot-lifecycle edge (stord restart does not rehydrate
-  handles taken before the restart).
+- **Cross-restart snapshot-lifecycle edge** — a stord restart does not
+  rehydrate handles taken before the restart (#376 side effect).
+- **#336** — the `CHV_JWT_SECRET` fallback still couples S3 credential
+  encryption to the JWT signing secret.
+- **#709** — the first-enrollment `ReportBootstrapResult` is sent on the
+  pre-enrollment certificate and rejected by the peer-node-id check. It is
+  fail-closed and non-fatal, but a fresh install does not record bootstrap
+  success and audits a spurious denial; tracked, not a gate blocker.
+- **#711** — a VM created before an agent restart is detached but its stord
+  session cannot be closed (in-memory attachment handles, the M2.2a
+  residual). No VM remains attached and the backing is retained under M2.5.
+- **Multi-stord-per-host metrics** — more than one stord on a host must set
+  distinct `metrics_bind` values (the harness now uses ephemeral ports; the
+  operator requirement is documented in [DEPLOYMENT.md](DEPLOYMENT.md)).
+- **Pre-fix stored-data caveats** — pre-#365 NULL gateways and pre-#369
+  dialect rules are repaired by re-saving the network; pre-#481
+  imported/template volumes remain ownerless and admin-only.
+- **The UI itself was not re-qualified end-to-end in prompt-04**; scenario
+  evidence is chvctl/BFF/API-driven (the 2026-11-04 lane also drives the
+  network-policy path through the BFF). The declaration's "UI/BFF/CLI:
+  supported for the reference deployment" remains scoped to the exercised
+  surfaces.
+- **Backup/restore is hard-fenced** (§5 UC-9), not DR-validated.
+- **Multi-host and Volvisor are design-only** — ADR-029 (multi-host dispatch)
+  and ADR-028 (Volvisor storage orchestration) are accepted, but neither is
+  implemented. No multi-host or Volvisor capability is claimed.
 
-**Documentation drift found while writing this document (not fixed here —
-this branch changes only this file):**
+**Resolved since close-out (history preserved, not a boundary):**
+
+- **Pinned-VMM CVE exposure — CLOSED 2026-10-03 (D6 option (b)).** The former
+  v43.0 pin was in the affected range of CVE-2026-27211
+  (GHSA-jmr4-g2hv-mjj6) and CVE-2026-45782 (GHSA-f47p-p25q-83rh); both close
+  at v53.0, with runtime proof for CVE-2026-27211 —
+  [campaign leg 06](evidence/vmm-requalification/v53.0/06-security-regression.md).
+- **#368 → #484** — a transient effector failure no longer terminally fails a
+  journaled VM create: a bounded orchestrator pass issues a new `RecreateVm`
+  operation per attempt (10 s / 20 s / 40 s backoff, at most 3 attempts),
+  then marks the VM terminally Failed with `CREATE_REDRIVE_EXHAUSTED`. A
+  re-drive is always a new operation, never a resurrection of a terminal one.
+- **#378 → #495** — the volume snapshot family (snapshot/clone/restore/
+  delete-snapshot) is rejected at accept time on core-managed nodes: HTTP 400
+  before any journaling (no operations row, no desired-state intent, no clone
+  target row), keyed on the node authority mode carried in inventory and
+  failing open on an unknown mode; the agent-side `Unimplemented` dispatch
+  refusal remains the enforcement backstop.
+- **#355 → #565/#566/#567; #360 → #452** — network policy now dispatches
+  end-to-end (journaled update → fan-out to nodes with live attached VMs),
+  the dead UI firewall editor was removed (#451), and legacy empty-ruleset
+  call sites are guarded.
+- **#394 → #578 (+ #583/#584/#585/#590)** — pause-first stop-the-world mode
+  is the operator answer to concurrent writes; the write canary (#571) and
+  the bound FinalizeAck wait (#683) carry the failure paths. The live path
+  stays fail-closed at the API surface until it is proven.
+- **#379 → #510/#511/#512** — LVM is VM-integrated through per-volume
+  `storage_class`, with create-on-open, real-class inventory, accept-time
+  rejection for unsupported classes, and dm-path locators. The m4.5 Leg G
+  end-to-end run is green in the 2026-11-04 full lane.
+- **#384/#385/#386, #401/#402, #351, #372** — clone/upsert TOCTOU and
+  last-writer-wins (#384), respawned-stord config fidelity (#385), owner
+  stamping for imported/template volumes (#386, #481), independent migration
+  halves (#401, #483), migration-rejection observability (#402, #479),
+  delete-path kill-refusal (#351, #415), and the chvctl↔BFF contract drift
+  (#372, #519–#521) are fixed on `main`. The pre-fix data caveats above
+  remain.
+
+**Documentation drift recorded at authoring time (not all of it is fixed in
+this pass):**
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) still describes `SystemdNodeUpgrader`
   at `crates/chv-controlplane-service/src/systemd_upgrader.rs`; that file was
@@ -605,7 +641,7 @@ deploy them; do not file evidence against them.
 | Document | Owns | Relationship to this document |
 |---|---|---|
 | **This document** (`docs/DEPLOYMENT-ARCHITECTURE.md`) | Deployment architecture: components, interface/port contract, provisioning model, topology + use-case tiers, upgrade paths, supported envelope, open design decisions | Authoritative for the above; all other docs link here for architecture and tier claims. |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | Single-host operator how-to (quick start, manual steps, multi-node console routing, installer hosting) | How-to only; its hardware-minimums claim is flagged in §7 pending Prompt-05/06. |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Single-host operator how-to (quick start, manual steps, multi-node console routing, installer hosting) | How-to only; its hardware minimums are labeled an **unevidenced recommendation** in §7. |
 | [release/PIPELINE.md](release/PIPELINE.md) | Release engineering: versioning, CI/CD, artifact pipeline | Links here for what the artifacts deploy. |
 | [release/package-contract.md](release/package-contract.md) | The package contract: contents, ownership, upgrade/rollback procedures | nfpm configurations remain the mechanical truth for contents (§2.4). |
 | [PACKAGING.md](PACKAGING.md) | Packaging overview and operator package steps | Links here for topology and tiers. |
@@ -615,7 +651,7 @@ deploy them; do not file evidence against them.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and data flow | The deleted upgrade stack and the removed `chvctl upgrade` surface are recorded there in past tense; this document supersedes on deployment matters. |
 | [specs/adr/](specs/adr/) | Design authority | ADRs are decisions; this document records their qualification tier (for example ADR-021 is DESIGN-ONLY). |
 | [evidence/](evidence/) (frozen prompt-04 milestones) | Proof | Every [QUALIFIED — KVM-VERIFIED] label here cites a milestone doc. |
-| [prompts/production-readiness/](prompts/production-readiness/) | Campaign definitions | Prompt 05 and Prompt 06 are pending; their results extend §5 and §7. |
+| [prompts/production-readiness/](prompts/production-readiness/) | Campaign definitions | Prompt 06 is pending and will extend §5 and §7 when it has field evidence. The draft [v0.4.0-rc.1 support matrix](release/v0.4.0-rc.1-support-matrix.md) and [release notes](release/v0.4.0-rc.1-release-notes.md) restate this document's claims; they are not a release announcement. |
 
 ---
 
