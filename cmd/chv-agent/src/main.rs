@@ -6,7 +6,7 @@ use chv_agent_core::{
     console_server::ConsoleServer,
     control_plane::ControlPlaneClient,
     daemon_clients::{NwdClient, StordClient},
-    enrollment::EnrollmentClient,
+    enrollment::{BootstrapResponse, EnrollmentClient},
     health::{check_host_resources, HealthAggregator},
     inventory::InventoryReporter,
     metrics_server::{metrics_router, MetricsState},
@@ -525,6 +525,175 @@ async fn connect_enrollment_client(
     .await
 }
 
+fn bootstrap_result_meta(
+    node_id: &str,
+) -> control_plane_node_api::control_plane_node_api::RequestMeta {
+    control_plane_node_api::control_plane_node_api::RequestMeta {
+        operation_id: format!("bootstrap-result-{node_id}"),
+        requested_by: "agent".to_string(),
+        target_node_id: node_id.to_string(),
+        desired_state_version: String::new(),
+        request_unix_ms: now_unix_ms(),
+    }
+}
+
+/// Persist the newly issued identity and record it in the NodeCache.
+///
+/// Returns `true` only when all three files were durably written. A partial
+/// write is treated as failure: the caller must not trust a half-written
+/// credential or mark enrollment complete, and must report the failure using
+/// the issued identity still held in memory.
+async fn persist_enrollment_material(
+    config: &AgentConfig,
+    cache: &mut NodeCache,
+    issued: &BootstrapResponse,
+) -> bool {
+    let cert_path = config.runtime_dir.join("agent.crt");
+    let key_path = config.runtime_dir.join("agent.key");
+    let ca_path = config.runtime_dir.join("ca.crt");
+    if let Err(e) = tokio::fs::create_dir_all(&config.runtime_dir).await {
+        warn!(error = %e, "failed to create runtime dir");
+        return false;
+    }
+
+    let mut ok = true;
+    if let Err(e) = write_file_durable(&cert_path, &issued.certificate_pem, 0o644).await {
+        warn!(error = %e, "failed to write certificate");
+        ok = false;
+    }
+    if let Err(e) = write_private_file(&key_path, &issued.private_key_pem).await {
+        warn!(error = %e, "failed to write private key");
+        ok = false;
+    }
+    if let Err(e) = write_file_durable(&ca_path, &issued.ca_pem, 0o644).await {
+        warn!(error = %e, "failed to write ca certificate");
+        ok = false;
+    }
+    if !ok {
+        return false;
+    }
+
+    cache.node_id = issued.node_id.clone();
+    cache.certificate_path = Some(cert_path.to_string_lossy().to_string());
+    cache.private_key_path = Some(key_path.to_string_lossy().to_string());
+    cache.ca_path = Some(ca_path.to_string_lossy().to_string());
+    cache.last_certificate_rotation_unix_ms = Some(now_unix_ms());
+    cache.enrollment_complete = true;
+    if let Err(e) = cache.save(&config.cache_path).await {
+        warn!(error = %e, "failed to save cache after enrollment");
+    } else {
+        info!(node_id = %issued.node_id, "enrollment complete");
+    }
+    true
+}
+
+/// Report the first-enrollment result on the newly issued node identity.
+///
+/// The enrollment connection intentionally uses the *pre-enrollment* client
+/// certificate, so the control plane's peer-node-id check rejects
+/// `ReportBootstrapResult` on that channel (#709). Success is reported through
+/// a fresh client resolved from the cache, which now points at the issued
+/// certificate/key.
+///
+/// When persisting the issued material failed, the issued certificate may not
+/// be on disk, but the response still holds it. Report the failure with that
+/// in-memory identity: it is the credential the control plane just issued for
+/// this node, and using it keeps the peer-node-id binding intact. Only if that
+/// identity cannot even be constructed do we fall back to the enrollment
+/// channel as a last resort; that fallback is expected to be rejected by the
+/// control plane's peer identity check, and we deliberately do not weaken it
+/// with a server-side exemption.
+async fn report_enrollment_result(
+    config: &AgentConfig,
+    cache: &NodeCache,
+    issued: &BootstrapResponse,
+    persisted: bool,
+    enrollment_client: &mut EnrollmentClient,
+) {
+    let (status, message) = if persisted {
+        ("ok", "bootstrap complete")
+    } else {
+        ("failed", "failed to persist enrollment material")
+    };
+
+    let result = if persisted {
+        let tls_cert = cache
+            .certificate_path
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| config.tls_cert_path.clone());
+        let tls_key = cache
+            .private_key_path
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| config.tls_key_path.clone());
+        let ca_cert = cache
+            .ca_path
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| config.ca_cert_path.clone());
+        match ControlPlaneClient::new(
+            &config.control_plane_addr,
+            tls_cert.as_deref(),
+            tls_key.as_deref(),
+            ca_cert.as_deref(),
+        )
+        .await
+        {
+            Ok(mut client) => {
+                client
+                    .report_bootstrap_result(
+                        bootstrap_result_meta(&issued.node_id),
+                        &issued.node_id,
+                        status,
+                        message,
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        match ControlPlaneClient::new_with_pem(
+            &config.control_plane_addr,
+            issued.certificate_pem.clone(),
+            issued.private_key_pem.clone(),
+            Some(issued.ca_pem.clone()),
+        )
+        .await
+        {
+            Ok(mut client) => {
+                client
+                    .report_bootstrap_result(
+                        bootstrap_result_meta(&issued.node_id),
+                        &issued.node_id,
+                        status,
+                        message,
+                    )
+                    .await
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "issued identity unusable for bootstrap failure report; \
+                     attempting the pre-enrollment channel"
+                );
+                enrollment_client
+                    .report_bootstrap_result(
+                        bootstrap_result_meta(&issued.node_id),
+                        &issued.node_id,
+                        status,
+                        message,
+                    )
+                    .await
+            }
+        }
+    };
+
+    if let Err(e) = result {
+        warn!(error = %e, "failed to report bootstrap result");
+    }
+}
+
 async fn enqueue_pending_message(
     cache: &Arc<tokio::sync::Mutex<NodeCache>>,
     cache_path: &Path,
@@ -761,102 +930,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(mut client) => {
                             match client.enroll_node(token, inventory, versions).await {
                                 Ok(resp) => {
-                                    let cert_path = config.runtime_dir.join("agent.crt");
-                                    let key_path = config.runtime_dir.join("agent.key");
-                                    let ca_path = config.runtime_dir.join("ca.crt");
-                                    if let Err(e) =
-                                        tokio::fs::create_dir_all(&config.runtime_dir).await
-                                    {
-                                        warn!(error = %e, "failed to create runtime dir");
-                                    } else {
-                                        let mut ok = true;
-                                        if let Err(e) = write_file_durable(
-                                            &cert_path,
-                                            &resp.certificate_pem,
-                                            0o644,
-                                        )
-                                        .await
-                                        {
-                                            warn!(error = %e, "failed to write certificate");
-                                            ok = false;
-                                        }
-                                        if let Err(e) =
-                                            write_private_file(&key_path, &resp.private_key_pem)
-                                                .await
-                                        {
-                                            warn!(error = %e, "failed to write private key");
-                                            ok = false;
-                                        }
-                                        if let Err(e) =
-                                            write_file_durable(&ca_path, &resp.ca_pem, 0o644).await
-                                        {
-                                            warn!(error = %e, "failed to write ca certificate");
-                                            ok = false;
-                                        }
-                                        if ok {
-                                            cache.node_id = resp.node_id.clone();
-                                            cache.certificate_path =
-                                                Some(cert_path.to_string_lossy().to_string());
-                                            cache.private_key_path =
-                                                Some(key_path.to_string_lossy().to_string());
-                                            cache.ca_path =
-                                                Some(ca_path.to_string_lossy().to_string());
-                                            cache.last_certificate_rotation_unix_ms =
-                                                Some(now_unix_ms());
-                                            cache.enrollment_complete = true;
-                                            if let Err(e) = cache.save(&config.cache_path).await {
-                                                warn!(error = %e, "failed to save cache after enrollment");
-                                            } else {
-                                                info!(node_id = %resp.node_id, "enrollment complete");
-                                            }
-
-                                            let meta =
-                                                control_plane_node_api::control_plane_node_api::RequestMeta {
-                                                    operation_id: format!(
-                                                        "bootstrap-result-{}",
-                                                        resp.node_id
-                                                    ),
-                                                    requested_by: "agent".to_string(),
-                                                    target_node_id: resp.node_id.clone(),
-                                                    desired_state_version: String::new(),
-                                                    request_unix_ms: now_unix_ms(),
-                                                };
-                                            if let Err(e) = client
-                                                .report_bootstrap_result(
-                                                    meta,
-                                                    &resp.node_id,
-                                                    "ok",
-                                                    "bootstrap complete",
-                                                )
-                                                .await
-                                            {
-                                                warn!(error = %e, "failed to report bootstrap result");
-                                            }
-                                        } else {
-                                            let meta =
-                                                control_plane_node_api::control_plane_node_api::RequestMeta {
-                                                    operation_id: format!(
-                                                        "bootstrap-result-{}",
-                                                        resp.node_id
-                                                    ),
-                                                    requested_by: "agent".to_string(),
-                                                    target_node_id: resp.node_id.clone(),
-                                                    desired_state_version: String::new(),
-                                                    request_unix_ms: now_unix_ms(),
-                                                };
-                                            if let Err(e) = client
-                                                .report_bootstrap_result(
-                                                    meta,
-                                                    &resp.node_id,
-                                                    "failed",
-                                                    "failed to persist enrollment material",
-                                                )
-                                                .await
-                                            {
-                                                warn!(error = %e, "failed to report bootstrap result");
-                                            }
-                                        }
-                                    }
+                                    let persisted =
+                                        persist_enrollment_material(&config, &mut cache, &resp)
+                                            .await;
+                                    report_enrollment_result(
+                                        &config,
+                                        &cache,
+                                        &resp,
+                                        persisted,
+                                        &mut client,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "enrollment failed");
@@ -1760,8 +1844,15 @@ mod monitoring;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_plane_node_api::control_plane_node_api as proto;
+    use proto::enrollment_service_server::{EnrollmentService, EnrollmentServiceServer};
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+    use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+    use tonic::{Request, Response, Status};
 
     fn core_config(directory: &tempfile::TempDir) -> AgentConfig {
         let cache = directory.path().join("cache");
@@ -2057,5 +2148,305 @@ mod tests {
             &cache,
             1_000 + (CERT_ROTATION_INTERVAL_SECS * 1000)
         ));
+    }
+
+    // ---- first-enrollment bootstrap result (#709) -------------------------
+
+    struct EnrollmentTestCa {
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+        cert_pem: Vec<u8>,
+    }
+
+    fn enrollment_test_ca(cn: &str) -> EnrollmentTestCa {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let cert = params.self_signed(&key).unwrap();
+        EnrollmentTestCa {
+            params,
+            key,
+            cert_pem: cert.pem().into_bytes(),
+        }
+    }
+
+    /// Issue a leaf and return `(cert_pem, key_pem, cert_der)`.
+    fn issue_enrollment_test_leaf(
+        ca: &EnrollmentTestCa,
+        cn: &str,
+        server: bool,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use rcgen::string::Ia5String;
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::NoCa;
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![if server {
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth
+        } else {
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth
+        }];
+        if server {
+            params.subject_alt_names.push(rcgen::SanType::DnsName(
+                Ia5String::try_from("localhost").unwrap(),
+            ));
+            params.subject_alt_names.push(rcgen::SanType::IpAddress(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+            ));
+        }
+        let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key);
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        let der = cert.der().to_vec();
+        (
+            cert.pem().into_bytes(),
+            key.serialize_pem().into_bytes(),
+            der,
+        )
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedBootstrapReport {
+        node_id: String,
+        status: String,
+        message: String,
+    }
+
+    #[derive(Clone)]
+    struct MockBootstrapService {
+        expected_peer_der: Vec<u8>,
+        reports: Arc<tokio::sync::Mutex<Vec<RecordedBootstrapReport>>>,
+    }
+
+    fn peer_leaf_der<T>(request: &Request<T>) -> Option<Vec<u8>> {
+        let info = request
+            .extensions()
+            .get::<TlsConnectInfo<TcpConnectInfo>>()?;
+        let certs = info.peer_certs()?;
+        certs.first().map(|cert| cert.as_ref().to_vec())
+    }
+
+    #[tonic::async_trait]
+    impl EnrollmentService for MockBootstrapService {
+        async fn enroll_node(
+            &self,
+            _request: Request<proto::EnrollmentRequest>,
+        ) -> Result<Response<proto::EnrollmentResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn rotate_node_certificate(
+            &self,
+            _request: Request<proto::RotateNodeCertificateRequest>,
+        ) -> Result<Response<proto::RotateNodeCertificateResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn report_bootstrap_result(
+            &self,
+            request: Request<proto::ReportBootstrapResultRequest>,
+        ) -> Result<Response<proto::AckResponse>, Status> {
+            let Some(peer_der) = peer_leaf_der(&request) else {
+                return Err(Status::unauthenticated("missing peer certificate"));
+            };
+            // Mirror the control plane's peer-node-id binding: only the
+            // newly issued identity may report this node's bootstrap result.
+            if peer_der != self.expected_peer_der {
+                return Err(Status::permission_denied("peer node_id mismatch"));
+            }
+            let payload = request.into_inner();
+            self.reports.lock().await.push(RecordedBootstrapReport {
+                node_id: payload.node_id,
+                status: payload.bootstrap_status,
+                message: payload.message,
+            });
+            Ok(Response::new(proto::AckResponse {
+                result: Some(proto::ResultMeta {
+                    operation_id: "bootstrap-report".to_string(),
+                    status: "ok".to_string(),
+                    node_observed_generation: String::new(),
+                    error_code: String::new(),
+                    human_summary: "bootstrap reported".to_string(),
+                }),
+            }))
+        }
+    }
+
+    async fn spawn_mock_control_plane(
+        ca: &EnrollmentTestCa,
+        expected_peer_der: Vec<u8>,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<RecordedBootstrapReport>>>,
+        oneshot::Sender<()>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server_cert, server_key, _) = issue_enrollment_test_leaf(ca, "localhost", true);
+        let service = MockBootstrapService {
+            expected_peer_der,
+            reports: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        };
+        let reports = service.reports.clone();
+        let tls = ServerTlsConfig::new()
+            .identity(Identity::from_pem(server_cert, server_key))
+            .client_ca_root(Certificate::from_pem(ca.cert_pem.clone()));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(EnrollmentServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+                .unwrap();
+        });
+        (
+            format!("https://localhost:{}", addr.port()),
+            reports,
+            shutdown_tx,
+        )
+    }
+
+    async fn test_enrollment_client(
+        dir: &std::path::Path,
+        endpoint: &str,
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> EnrollmentClient {
+        let cert_path = dir.join("enrollment-client.crt");
+        let key_path = dir.join("enrollment-client.key");
+        let ca_path = dir.join("enrollment-ca.crt");
+        std::fs::write(&cert_path, cert_pem).unwrap();
+        std::fs::write(&key_path, key_pem).unwrap();
+        std::fs::write(&ca_path, ca_pem).unwrap();
+        EnrollmentClient::connect_with_tls(
+            endpoint,
+            Some(&cert_path),
+            Some(&key_path),
+            Some(&ca_path),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_enrollment_reports_success_on_issued_identity() {
+        let ca = enrollment_test_ca("test-ca");
+        let (issued_cert, issued_key, issued_der) =
+            issue_enrollment_test_leaf(&ca, "qual-node-1", false);
+        let (enrollment_cert, enrollment_key, _) =
+            issue_enrollment_test_leaf(&ca, "qual-enroll", false);
+        let (endpoint, reports, shutdown) = spawn_mock_control_plane(&ca, issued_der).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            control_plane_addr: endpoint.clone(),
+            runtime_dir: dir.path().join("runtime"),
+            cache_path: dir.path().join("agent-cache.json"),
+            ..AgentConfig::default()
+        };
+        let issued = BootstrapResponse {
+            node_id: "qual-node-1".to_string(),
+            certificate_pem: issued_cert,
+            private_key_pem: issued_key,
+            ca_pem: ca.cert_pem.clone(),
+        };
+        let mut cache = NodeCache::new("qual-enroll");
+        let mut enrollment_client = test_enrollment_client(
+            dir.path(),
+            &endpoint,
+            &ca.cert_pem,
+            &enrollment_cert,
+            &enrollment_key,
+        )
+        .await;
+
+        let persisted = persist_enrollment_material(&config, &mut cache, &issued).await;
+        assert!(persisted, "issued material must persist");
+        report_enrollment_result(&config, &cache, &issued, persisted, &mut enrollment_client).await;
+
+        let reports = reports.lock().await;
+        assert_eq!(reports.len(), 1, "exactly one successful report");
+        assert_eq!(reports[0].node_id, "qual-node-1");
+        assert_eq!(reports[0].status, "ok");
+        assert_eq!(reports[0].message, "bootstrap complete");
+        drop(reports);
+
+        assert!(cache.enrollment_complete);
+        assert_eq!(cache.node_id, "qual-node-1");
+        let expected_cert = config.runtime_dir.join("agent.crt");
+        let expected_key = config.runtime_dir.join("agent.key");
+        let expected_ca = config.runtime_dir.join("ca.crt");
+        assert_eq!(cache.certificate_path.as_deref(), expected_cert.to_str());
+        assert_eq!(cache.private_key_path.as_deref(), expected_key.to_str());
+        assert_eq!(cache.ca_path.as_deref(), expected_ca.to_str());
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn persist_failure_reports_failure_on_issued_identity() {
+        let ca = enrollment_test_ca("test-ca");
+        let (issued_cert, issued_key, issued_der) =
+            issue_enrollment_test_leaf(&ca, "qual-node-1", false);
+        let (enrollment_cert, enrollment_key, _) =
+            issue_enrollment_test_leaf(&ca, "qual-enroll", false);
+        let (endpoint, reports, shutdown) = spawn_mock_control_plane(&ca, issued_der).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        // A file where the runtime directory belongs makes every persist
+        // attempt fail, simulating an unwritable runtime directory.
+        std::fs::write(&runtime_dir, b"not a directory").unwrap();
+        let config = AgentConfig {
+            control_plane_addr: endpoint.clone(),
+            runtime_dir,
+            cache_path: dir.path().join("agent-cache.json"),
+            ..AgentConfig::default()
+        };
+        let issued = BootstrapResponse {
+            node_id: "qual-node-1".to_string(),
+            certificate_pem: issued_cert,
+            private_key_pem: issued_key,
+            ca_pem: ca.cert_pem.clone(),
+        };
+        let mut cache = NodeCache::new("qual-enroll");
+        let mut enrollment_client = test_enrollment_client(
+            dir.path(),
+            &endpoint,
+            &ca.cert_pem,
+            &enrollment_cert,
+            &enrollment_key,
+        )
+        .await;
+
+        let persisted = persist_enrollment_material(&config, &mut cache, &issued).await;
+        assert!(!persisted, "persist failure must be detected");
+        assert!(!cache.enrollment_complete, "failed persist must not enroll");
+        report_enrollment_result(&config, &cache, &issued, persisted, &mut enrollment_client).await;
+
+        let reports = reports.lock().await;
+        assert_eq!(reports.len(), 1, "exactly one failure report");
+        assert_eq!(reports[0].node_id, "qual-node-1");
+        assert_eq!(reports[0].status, "failed");
+        assert_eq!(reports[0].message, "failed to persist enrollment material");
+        drop(reports);
+        let _ = shutdown.send(());
     }
 }
