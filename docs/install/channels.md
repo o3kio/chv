@@ -26,11 +26,13 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
+# GitHub rewrites RC asset filenames: X.Y.Z-rc.N -> X.Y.Z.rc.N.
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
-curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
-curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
-curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"
-sudo dpkg -i chv-controlplane_${VERSION}_amd64.deb chv-node_${VERSION}_amd64.deb chvctl_${VERSION}_amd64.deb
+curl -sLO "${BASE_URL}/chv-controlplane_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chv-node_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chvctl_${ASSET_VERSION}_amd64.deb"
+sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb chv-node_${ASSET_VERSION}_amd64.deb chvctl_${ASSET_VERSION}_amd64.deb
 ```
 
 Full instructions: [Debian / Ubuntu](debian-ubuntu.md) or [RHEL / Rocky / AlmaLinux](rhel-rocky-alma.md)
@@ -54,6 +56,13 @@ RC releases are tagged as `v<version>-rc.1`, `v<version>-rc.2`, and so on.
 
 Download from the GitHub Pre-release page. The install command is identical to stable.
 
+GitHub rewrites release-asset filenames: characters outside
+`[A-Za-z0-9._-]` become `.`. An RC whose internal package version is
+`0.4.0~rc.1` is therefore published as
+`chv-controlplane_0.4.0.rc.1_amd64.deb`. The installed package's `Version`
+still reads `0.4.0~rc.1`, so dpkg/rpm ordering (`~rc.1` sorts below the
+stable release) is unchanged; only the filename on the release page differs.
+
 ## Nightly
 
 Nightly packages are built automatically from every merge to `main`.
@@ -66,10 +75,13 @@ Nightly packages are built automatically from every merge to `main`.
 ### Version format
 
 ```text
-<version>~nightly.20260510.g0872c4a7   (Debian and RPM)
+<version>~nightly.20260510.g0872c4a7   (package metadata, both formats)
 ```
 
-The version includes the date and git short SHA, making every nightly build uniquely identifiable.
+Release-asset filenames replace `~` with `.`
+(`chv-controlplane_<version>.nightly.20260510.g0872c4a7_amd64.deb`); the
+installed package `Version` keeps `~`. The version includes the date and git
+short SHA, making every nightly build uniquely identifiable.
 
 ### When to use nightly
 

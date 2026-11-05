@@ -102,10 +102,14 @@ fi
 select_deb() {
     local name="$1"
     if [ -n "${PACKAGE_VERSION:-}" ]; then
-        local exact
-        exact="$(ls "${PKGDIR}/${name}_${PACKAGE_VERSION}"_*.deb 2>/dev/null | head -n1 || true)"
+        # GitHub (and build-packages.sh) use a filename-safe version:
+        # characters outside [A-Za-z0-9._-] are replaced with '.', so the
+        # internal 0.4.0~rc.1 package is stored as ..._0.4.0.rc.1_....
+        local asset_version exact
+        asset_version="$(printf '%s' "${PACKAGE_VERSION}" | tr -c 'A-Za-z0-9._-' '.')"
+        exact="$(ls "${PKGDIR}/${name}_${asset_version}"_*.deb 2>/dev/null | head -n1 || true)"
         if [ -z "${exact}" ]; then
-            echo "ERROR: PACKAGE_VERSION='${PACKAGE_VERSION}' set but no ${name}_${PACKAGE_VERSION}_*.deb under ${PKGDIR}" >&2
+            echo "ERROR: PACKAGE_VERSION='${PACKAGE_VERSION}' (asset version '${asset_version}') set but no ${name}_${asset_version}_*.deb under ${PKGDIR}" >&2
             return 1
         fi
         echo "${exact}"
@@ -122,7 +126,9 @@ if [ -z "${CONTROLPLANE_DEB}" ] || [ -z "${NODE_DEB}" ]; then
 fi
 
 PKG_VERSION="$(basename "${CONTROLPLANE_DEB}" | sed -E 's/^chv-controlplane_(.+)_(amd64|arm64)\.deb$/\1/')"
-# Image tags cannot carry '~' (deb rc versions use it: 0.4.0~rc.2).
+# Image tags cannot carry '~'; older artifact names used it (0.4.0~rc.2),
+# so keep the defensive replacement even though published filenames are
+# already sanitized to '.'.
 IMAGE="${IMAGE:-chv-webui-smoke:$(echo "${PKG_VERSION}" | tr '~+' '--')}"
 CONTAINER="chv-webui-smoke-$$"
 

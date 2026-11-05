@@ -46,12 +46,15 @@ Set `VERSION` to the release tag, without the leading `v`:
 
 ```bash
 VERSION="<version>"
+# GitHub rewrites asset filenames: an RC tag X.Y.Z-rc.N publishes packages
+# as X.Y.Z.rc.N (the installed Version stays X.Y.Z~rc.N).
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 RELEASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
 # Download .deb packages
-curl -sLO "${RELEASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
-curl -sLO "${RELEASE_URL}/chv-node_${VERSION}_amd64.deb"
-curl -sLO "${RELEASE_URL}/chvctl_${VERSION}_amd64.deb"
+curl -sLO "${RELEASE_URL}/chv-controlplane_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${RELEASE_URL}/chv-node_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${RELEASE_URL}/chvctl_${ASSET_VERSION}_amd64.deb"
 
 # Download checksums
 curl -sLO "${RELEASE_URL}/SHA256SUMS"
@@ -74,9 +77,9 @@ For additional verification (signatures, SBOM, attestations), see [Verify Releas
 ### Debian / Ubuntu
 
 ```bash
-sudo dpkg -i chv-controlplane_${VERSION}_amd64.deb \
-             chv-node_${VERSION}_amd64.deb \
-             chvctl_${VERSION}_amd64.deb
+sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb \
+             chv-node_${ASSET_VERSION}_amd64.deb \
+             chvctl_${ASSET_VERSION}_amd64.deb
 sudo apt-get install -f
 ```
 
@@ -85,9 +88,9 @@ Full instructions: [Debian / Ubuntu](debian-ubuntu.md)
 ### RHEL / Rocky / AlmaLinux
 
 ```bash
-sudo rpm -i chv-controlplane-${VERSION}-1.x86_64.rpm \
-         chv-node-${VERSION}-1.x86_64.rpm \
-         chvctl-${VERSION}-1.x86_64.rpm
+sudo rpm -i chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm \
+         chv-node-${ASSET_VERSION}-1.x86_64.rpm \
+         chvctl-${ASSET_VERSION}-1.x86_64.rpm
 ```
 
 Full instructions: [RHEL / Rocky / AlmaLinux](rhel-rocky-alma.md)
@@ -141,11 +144,16 @@ sudo systemctl enable --now chv-agent chv-stord chv-nwd
 Download the new release and install over the existing packages. Config files and persistent data are preserved.
 
 ```bash
+# ASSET_VERSION is the published filename version: X.Y.Z for stable,
+# X.Y.Z.rc.N for an RC tag X.Y.Z-rc.N (the installed Version stays X.Y.Z~rc.N).
+VERSION="<new-version>"
+ASSET_VERSION="${VERSION/-rc./.rc.}"
+
 # Debian/Ubuntu
-sudo dpkg -i chv-controlplane_${NEW_VERSION}_amd64.deb ...
+sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb ...
 
 # RHEL/Rocky/Alma
-sudo rpm -U chv-controlplane-${NEW_VERSION}-1.x86_64.rpm ...
+sudo rpm -U chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm ...
 
 # Restart services
 sudo systemctl restart chv-controlplane chv-agent chv-stord chv-nwd

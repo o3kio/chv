@@ -120,6 +120,7 @@ RPM_ARCH=""          # rpm architecture (x86_64/aarch64)
 PKG_KIND=""          # deb | rpm | tarball
 VERSION=""           # resolved version, no leading 'v' (e.g. 0.4.0, 0.4.0-rc.1)
 PKG_VERSION=""       # package version (RC maps -rc.N -> ~rc.N)
+ASSET_VERSION=""     # GitHub-safe filename version ('~' -> '.'; matches release assets)
 WORK_DIR=""
 FRESH_INSTALL="1"
 JWT_SECRET=""
@@ -272,6 +273,14 @@ not supported. Check available releases at:
     rm -f "$body"
 }
 
+# GitHub release assets replace characters outside [A-Za-z0-9._-] with '.'.
+# build-packages.sh emits that safe filename while the package's internal
+# Version keeps '~' for correct dpkg/rpm ordering, so this is the name to
+# look for on the release, not PKG_VERSION.
+package_asset_version() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '.'
+}
+
 resolve_release() {
     local pin="${ARG_VERSION:-${INSTALL_CHV_VERSION}}"
     pin="${pin#v}"
@@ -307,6 +316,12 @@ default, no nightly pin). Use a pinned stable/RC version, e.g. --version 0.4.0-r
         PKG_VERSION="$VERSION"
     fi
 
+    # Published release assets carry the GitHub-safe filename version:
+    # GitHub replaces characters outside [A-Za-z0-9._-] with '.', and
+    # build-packages.sh emits that form, so a `~rc.N` package is published
+    # as `.rc.N` while its internal Version keeps `~rc.N`.
+    ASSET_VERSION="$(package_asset_version "$PKG_VERSION")"
+
     # Asset names actually published on this release, taken from the
     # browser_download_url values (one per asset; the filename is the last
     # path segment). This is the reality check: we never assume an asset
@@ -316,7 +331,7 @@ default, no nightly pin). Use a pinned stable/RC version, e.g. --version 0.4.0-r
 
     require_supported_release
 
-    info "Resolved release: v${VERSION} (package version: ${PKG_VERSION})"
+    info "Resolved release: v${VERSION} (package version: ${PKG_VERSION}; asset version: ${ASSET_VERSION})"
 }
 
 # The quick path configures the #447 D3 serving shape: the control plane
@@ -385,16 +400,16 @@ expected_assets() {
     case "$PKG_KIND" in
         deb)
             printf '%s\n' \
-                "chv-controlplane_${PKG_VERSION}_${DEB_ARCH}.deb" \
-                "chv-node_${PKG_VERSION}_${DEB_ARCH}.deb" \
-                "chvctl_${PKG_VERSION}_${DEB_ARCH}.deb" \
+                "chv-controlplane_${ASSET_VERSION}_${DEB_ARCH}.deb" \
+                "chv-node_${ASSET_VERSION}_${DEB_ARCH}.deb" \
+                "chvctl_${ASSET_VERSION}_${DEB_ARCH}.deb" \
                 "SHA256SUMS"
             ;;
         rpm)
             printf '%s\n' \
-                "chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                "chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                "chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
+                "chv-controlplane-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                "chv-node-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                "chvctl-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
                 "SHA256SUMS"
             ;;
         tarball)
@@ -423,9 +438,8 @@ download_and_verify() {
     done <<< "$assets"
 
     # Checksum verification, fail closed on any mismatch or missing entry.
-    # - packages: the release's SHA256SUMS (covers the .deb/.rpm set; note it
-    #   also covers stray 0.0.1 lifecycle-test packages the release job
-    #   sweeps up — we match EXACT filenames, never a glob)
+    # - packages: the release's SHA256SUMS (covers exactly the three package
+    #   files installed here; the release pipeline publishes one version)
     # - tarball: the .tar.gz.sha256 sidecar
     # The SHA256SUMS file is GPG/cosign-signed by the release pipeline when
     # signing keys are configured, but no signature asset is published on
@@ -435,10 +449,8 @@ download_and_verify() {
     case "$PKG_KIND" in
         deb|rpm)
             # Exact per-name field matching (awk '$2 == n'), never a regex:
-            # '.' in a pattern matches any character, and the release's
-            # SHA256SUMS also lists stray 0.0.1 lifecycle-test packages
-            # whose names differ from ours only in digits — matching must
-            # be unambiguous. Fail-closed: exactly three entries required.
+            # '.' in a pattern matches any character, so matching must be
+            # unambiguous. Fail-closed: exactly three entries required.
             local name count
             : > "${WORK_DIR}/local-SHA256SUMS"
             while IFS= read -r name; do
@@ -595,17 +607,17 @@ install_artifacts() {
         deb)
             info "Installing .deb packages (dpkg-owned upgrades)..."
             if ! (cd "$WORK_DIR" && apt-get install -y --allow-downgrades \
-                    "./chv-controlplane_${PKG_VERSION}_${DEB_ARCH}.deb" \
-                    "./chv-node_${PKG_VERSION}_${DEB_ARCH}.deb" \
-                    "./chvctl_${PKG_VERSION}_${DEB_ARCH}.deb"); then
+                    "./chv-controlplane_${ASSET_VERSION}_${DEB_ARCH}.deb" \
+                    "./chv-node_${ASSET_VERSION}_${DEB_ARCH}.deb" \
+                    "./chvctl_${ASSET_VERSION}_${DEB_ARCH}.deb"); then
                 # No usable apt (offline mirror, broken lists): plain dpkg.
                 # Dependency resolution (libssl3) is then the host's job;
                 # dpkg fails loudly if it is missing.
                 warn "apt-get local install failed; falling back to dpkg -i."
                 (cd "$WORK_DIR" && dpkg -i \
-                    "chv-controlplane_${PKG_VERSION}_${DEB_ARCH}.deb" \
-                    "chv-node_${PKG_VERSION}_${DEB_ARCH}.deb" \
-                    "chvctl_${PKG_VERSION}_${DEB_ARCH}.deb")
+                    "chv-controlplane_${ASSET_VERSION}_${DEB_ARCH}.deb" \
+                    "chv-node_${ASSET_VERSION}_${DEB_ARCH}.deb" \
+                    "chvctl_${ASSET_VERSION}_${DEB_ARCH}.deb")
             fi
             ;;
         rpm)
@@ -613,19 +625,19 @@ install_artifacts() {
             (cd "$WORK_DIR"
              if cmd_exists dnf; then
                  dnf install -y \
-                    "./chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                    "./chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                    "./chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm"
+                    "./chv-controlplane-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chv-node-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chvctl-${ASSET_VERSION}-1.${RPM_ARCH}.rpm"
              elif cmd_exists yum; then
                  yum install -y \
-                    "./chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                    "./chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                    "./chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm"
+                    "./chv-controlplane-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chv-node-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "./chvctl-${ASSET_VERSION}-1.${RPM_ARCH}.rpm"
              else
                  rpm -Uvh \
-                    "chv-controlplane-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                    "chv-node-${PKG_VERSION}-1.${RPM_ARCH}.rpm" \
-                    "chvctl-${PKG_VERSION}-1.${RPM_ARCH}.rpm"
+                    "chv-controlplane-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "chv-node-${ASSET_VERSION}-1.${RPM_ARCH}.rpm" \
+                    "chvctl-${ASSET_VERSION}-1.${RPM_ARCH}.rpm"
              fi)
             ;;
         tarball)
@@ -1560,7 +1572,7 @@ main() {
 
     if [ "$ARG_DRYRUN" = "1" ]; then
         info "Dry run: artifacts resolved and verified. Plan:"
-        info "  version:      v${VERSION} (package version ${PKG_VERSION})"
+        info "  version:      v${VERSION} (package version ${PKG_VERSION}; asset version ${ASSET_VERSION})"
         info "  platform:     ${CHV_ARCH} via ${PKG_KIND} leg"
         info "  assets:       $(expected_assets | tr '\n' ' ')"
         info "  layout:       binaries /usr/bin/chv-*, UI ${CHV_UI_DIR},"

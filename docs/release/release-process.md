@@ -102,8 +102,8 @@ Download the RC artifacts and validate:
 gh release download v<version>-rc.1
 sha256sum -c SHA256SUMS
 
-# Install on a test host
-sudo dpkg -i chv-controlplane_<version>~rc.1_amd64.deb ...
+# Install on a test host (GitHub asset filenames use '.', internal Version uses '~')
+sudo dpkg -i chv-controlplane_<version>.rc.1_amd64.deb ...
 
 # Run smoke tests
 make package-smoke-deb
@@ -207,6 +207,15 @@ Both formats use `~` for pre-release sorting (`X.Y.Z~rc.1 < X.Y.Z` in
 `~` strings as `--deb` for every channel; its former `^` post-release
 output for nightly/PR, which would have sorted above stable in RPM, was
 removed (#432).
+
+GitHub release-asset filenames are not the internal package version: GitHub
+replaces characters outside `[A-Za-z0-9._-]` with `.`, so
+`chv-controlplane_0.4.0~rc.1_amd64.deb` is published as
+`chv-controlplane_0.4.0.rc.1_amd64.deb`. `scripts/build-packages.sh` emits
+that safe filename before checksums are generated, so `SHA256SUMS` and the
+quick installer reference the names the release page actually serves; the
+installed package's `Version` keeps `~`. Use `gh release download` (or the
+sanitized name) rather than constructing a `~` URL by hand.
 
 ### Channel precedence
 

@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PKGDIR="${REPO_ROOT}/dist/packages"
 VERSION="${PACKAGE_VERSION:-$(cat "${REPO_ROOT}/VERSION")}"
+# GitHub release assets replace characters outside [A-Za-z0-9._-] with '.',
+# and build-packages.sh emits that safe name so the published assets and
+# SHA256SUMS agree. The package's internal Version keeps '~'.
+ASSET_VERSION="$(printf '%s' "$VERSION" | tr -c 'A-Za-z0-9._-' '.')"
 
 ERRORS=0
 error() { echo "[FAIL] $*" >&2; ERRORS=$((ERRORS + 1)); }
@@ -43,17 +47,17 @@ done
 # ---------------------------------------------------------------------------
 # 2. Package names contain the expected version
 # ---------------------------------------------------------------------------
-info "Checking version strings in package names (expecting ${VERSION})..."
+info "Checking version strings in package names (expecting ${ASSET_VERSION})..."
 for deb in "${PKGDIR}"/*.deb; do
     [ -e "$deb" ] || continue
-    if ! basename "$deb" | grep -q "$VERSION"; then
-        error "$(basename "$deb") missing version ${VERSION}"
+    if ! basename "$deb" | grep -Fq "$ASSET_VERSION"; then
+        error "$(basename "$deb") missing version ${ASSET_VERSION}"
     fi
 done
 for rpm in "${PKGDIR}"/*.rpm; do
     [ -e "$rpm" ] || continue
-    if ! basename "$rpm" | grep -q "$VERSION"; then
-        error "$(basename "$rpm") missing version ${VERSION}"
+    if ! basename "$rpm" | grep -Fq "$ASSET_VERSION"; then
+        error "$(basename "$rpm") missing version ${ASSET_VERSION}"
     fi
 done
 

@@ -515,4 +515,109 @@ for pkg_yaml in "${REPO_ROOT}"/packaging/nfpm/*.yaml; do
     done < <(sed -n 's|^[[:space:]]*-[[:space:]]*src:[[:space:]]*target/release/\([^[:space:]]*\)$|\1|p' "$pkg_yaml")
 done
 
+# ---------------------------------------------------------------------------
+# Release assets: GitHub sanitizes filenames, so package files must be
+# emitted with the same name the release page will serve. GitHub replaces
+# characters outside [A-Za-z0-9._-] with '.', which turned a published
+# `~rc.1` package into `.rc.1` while SHA256SUMS and the quick installer
+# still named the `~` form (run 42023294265).
+# ---------------------------------------------------------------------------
+build_packages="${REPO_ROOT}/scripts/build-packages.sh"
+check_package_files="${REPO_ROOT}/scripts/package/check-package-files.sh"
+grep -q 'safe_asset_name' "$build_packages" \
+    && pass "build-packages.sh derives a GitHub-safe asset filename" \
+    || fail "build-packages.sh emits filenames GitHub will rewrite"
+grep -q "tr -c 'A-Za-z0-9._-'" "$build_packages" \
+    && pass "build-packages.sh uses GitHub's character-replacement rule" \
+    || fail "build-packages.sh sanitization does not match GitHub's rule"
+grep -q 'ASSET_VERSION' "$check_package_files" \
+    && pass "check-package-files.sh validates the published asset name" \
+    || fail "check-package-files.sh validates a filename the release never serves"
+smoke_webui="${REPO_ROOT}/scripts/package/smoke-webui.sh"
+grep -q 'asset_version' "$smoke_webui" \
+    && pass "smoke-webui.sh selects the published asset name" \
+    || fail "smoke-webui.sh selects a '~' filename the build no longer emits"
+grep -q "tr -c 'A-Za-z0-9._-'" "$smoke_webui" \
+    && pass "smoke-webui.sh applies GitHub's filename sanitization" \
+    || fail "smoke-webui.sh filename sanitization drifted from GitHub's rule"
+
+# The lifecycle upgrade test installs a synthetic 0.0.1 build. The workflows
+# copy it to dist/packages-old and then rebuild the real version into the same
+# dist/packages directory; without a clean in between, the 0.0.1 probe
+# packages were published as release assets and listed in SHA256SUMS
+# (observed on v0.3.0 and v0.4.0-rc.1).
+for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.yml"; do
+    wf_name="$(basename "$wf")"
+    ordered_clean="$(awk '
+        /cp dist\/packages\/\* dist\/packages-old\// { copied = NR }
+        /rm -rf dist\/packages[[:space:]]*$/ && !/packages-old/ { cleaned = NR }
+        END { if (copied && cleaned && cleaned > copied) print "ok" }
+    ' "$wf")"
+    [ "$ordered_clean" = "ok" ] \
+        && pass "${wf_name} removes 0.0.1 probe packages before the real build" \
+        || fail "${wf_name} would publish the 0.0.1 lifecycle probe packages"
+    grep -q 'Refusing to publish package' "$wf" \
+        && pass "${wf_name} fails closed on a foreign staged package version" \
+        || fail "${wf_name} has no runtime guard against publishing a foreign version"
+    # version.sh prints a trailing newline; piping it straight into tr -c
+    # turns that newline into a trailing '.', which makes every package look
+    # foreign. Strip first via command substitution, then sanitize.
+    grep -q 'RAW_VERSION="$(./scripts/version.sh --deb)"' "$wf" \
+        && pass "${wf_name} strips the version newline before sanitizing" \
+        || fail "${wf_name} sanitizes a newline-terminated version"
+    if grep -q 'version.sh --deb | tr -c' "$wf"; then
+        fail "${wf_name} pipes a newline into the asset-version sanitizer"
+    else
+        pass "${wf_name} does not pipe a newline into the asset-version sanitizer"
+    fi
+    grep -Fq 'case "$base" in' "$wf" \
+        && grep -Fq '*-"${ASSET_VERSION}"-*.rpm' "$wf" \
+        && pass "${wf_name} matches the staged version with delimiters" \
+        || fail "${wf_name} accepts a package version by prefix (rc.1 vs rc.10)"
+done
+
+nightly_workflow="${REPO_ROOT}/.github/workflows/package-nightly.yml"
+grep -Fq 'ASSET_VERSION_DEB=' "$nightly_workflow" \
+    && grep -Fq 'chv-controlplane_${ASSET_VERSION_DEB}_amd64.deb' "$nightly_workflow" \
+    && grep -Fq 'chv-controlplane-${ASSET_VERSION_RPM}-1.x86_64.rpm' "$nightly_workflow" \
+    && pass "nightly install notes use the published asset names" \
+    || fail "nightly install notes name '~' assets the release never serves"
+
+# Release-note install snippets must name the published (sanitized) asset,
+# not the internal '~' version GitHub rewrites.
+if grep -q 'pkg_version }}_amd64.deb\|pkg_version }}-1.x86_64.rpm' "$release_workflow"; then
+    fail "release notes publish an install command for a '~' asset name"
+else
+    pass "release notes use the published asset version in install commands"
+fi
+grep -q 'ASSET_VERSION=' "$release_workflow" \
+    && pass "release workflow derives the asset version for release notes" \
+    || fail "release workflow has no asset-version derivation for release notes"
+
+quick_deb_assets="$(source_path="$quick_installer" bash -c '
+    set +u
+    # shellcheck disable=SC1090
+    source "$source_path" >/dev/null 2>&1
+    PKG_KIND=deb
+    DEB_ARCH=amd64
+    ASSET_VERSION="$(package_asset_version "0.4.0~rc.1")"
+    expected_assets
+' 2>&1)"
+printf '%s\n' "$quick_deb_assets" | grep -qxF 'chv-controlplane_0.4.0.rc.1_amd64.deb' \
+    && pass "quick installer looks for the published (dot) RC asset name" \
+    || fail "quick installer looks for an RC asset name GitHub never serves"
+if printf '%s\n' "$quick_deb_assets" | grep -q '~'; then
+    fail "quick installer still expects a literal '~' release asset"
+else
+    pass "quick installer no longer constructs a '~' release asset name"
+fi
+[ "$(source_path="$quick_installer" bash -c '
+    set +u
+    # shellcheck disable=SC1090
+    source "$source_path" >/dev/null 2>&1
+    package_asset_version "0.4.0~rc.1"
+' 2>/dev/null)" = "0.4.0.rc.1" ] \
+    && pass "package_asset_version maps 0.4.0~rc.1 to the published 0.4.0.rc.1" \
+    || fail "package_asset_version does not match GitHub's filename sanitization"
+
 exit "$rc"

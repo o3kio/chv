@@ -138,8 +138,14 @@ jobs:
         run: |
           export PACKAGE_VERSION="0.0.1"
           ./scripts/build-packages.sh --skip-build
+          rm -rf dist/packages-old
           mkdir -p dist/packages-old
           cp dist/packages/* dist/packages-old/
+          # The 0.0.1 probe packages exist only so the upgrade test has an
+          # older release to install. Drop them before the real build:
+          # leaving them in dist/packages published 0.0.1 assets and listed
+          # them in SHA256SUMS (observed on v0.3.0 and v0.4.0-rc.1).
+          rm -rf dist/packages
 
       - name: Build new version packages
         run: |
@@ -153,6 +159,28 @@ jobs:
       - name: Lifecycle test .rpm packages
         run: |
           ./scripts/package/lifecycle-rpm.sh --new-packages dist/packages --old-packages dist/packages-old
+
+      - name: Assert only the nightly version is staged
+        # The lifecycle probe (0.0.1) must never reach the published set.
+        # Runtime backstop for the workflow-ordering invariant.
+        run: |
+          RAW_VERSION="$(./scripts/version.sh --deb)"
+          ASSET_VERSION="$(printf '%s' "$RAW_VERSION" | tr -c 'A-Za-z0-9._-' '.')"
+          bad=""
+          for pkg in dist/packages/*.deb dist/packages/*.rpm; do
+            [ -e "$pkg" ] || continue
+            base="$(basename "$pkg")"
+            # Delimiter-aware: an rc.1 prefix must not accept rc.10.
+            case "$base" in
+              *_"${ASSET_VERSION}"_*.deb|*-"${ASSET_VERSION}"-*.rpm) ;;
+              *) bad="${bad}${base}"$'\n' ;;
+            esac
+          done
+          if [ -n "$bad" ]; then
+            echo "Refusing to publish package(s) that are not ${ASSET_VERSION}:" >&2
+            printf '%s' "$bad" >&2
+            exit 1
+          fi
 
       - name: Generate SHA256 checksums
         run: |
@@ -218,6 +246,10 @@ jobs:
 
       - name: Generate install notes
         run: |
+          # Release assets use the GitHub-safe filename version ('~' -> '.');
+          # the package metadata keeps '~'.
+          ASSET_VERSION_DEB="$(printf '%s' "$PKG_VERSION_DEB" | tr -c 'A-Za-z0-9._-' '.')"
+          ASSET_VERSION_RPM="$(printf '%s' "$PKG_VERSION_RPM" | tr -c 'A-Za-z0-9._-' '.')"
           cat > /tmp/nightly-release-notes.md <<EOF
           ## CHV Nightly Build
 
@@ -229,6 +261,8 @@ jobs:
           |----------|-------|
           | Debian version | ${PKG_VERSION_DEB} |
           | RPM version | ${PKG_VERSION_RPM} |
+          | Debian asset version | ${ASSET_VERSION_DEB} |
+          | RPM asset version | ${ASSET_VERSION_RPM} |
           | Git SHA | ${GIT_SHA} |
           | Build date | $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC) |
 
@@ -237,9 +271,9 @@ jobs:
           Download the \`.deb\` files below and install:
 
           \`\`\`bash
-          sudo dpkg -i chv-controlplane_${PKG_VERSION_DEB}_amd64.deb
-          sudo dpkg -i chv-node_${PKG_VERSION_DEB}_amd64.deb
-          sudo dpkg -i chvctl_${PKG_VERSION_DEB}_amd64.deb
+          sudo dpkg -i chv-controlplane_${ASSET_VERSION_DEB}_amd64.deb
+          sudo dpkg -i chv-node_${ASSET_VERSION_DEB}_amd64.deb
+          sudo dpkg -i chvctl_${ASSET_VERSION_DEB}_amd64.deb
           \`\`\`
 
           ### Install (RHEL / CentOS / Fedora)
@@ -247,9 +281,9 @@ jobs:
           Download the \`.rpm\` files below and install:
 
           \`\`\`bash
-          sudo rpm -i chv-controlplane-${PKG_VERSION_RPM}-1.x86_64.rpm
-          sudo rpm -i chv-node-${PKG_VERSION_RPM}-1.x86_64.rpm
-          sudo rpm -i chvctl-${PKG_VERSION_RPM}-1.x86_64.rpm
+          sudo rpm -i chv-controlplane-${ASSET_VERSION_RPM}-1.x86_64.rpm
+          sudo rpm -i chv-node-${ASSET_VERSION_RPM}-1.x86_64.rpm
+          sudo rpm -i chvctl-${ASSET_VERSION_RPM}-1.x86_64.rpm
           \`\`\`
 
           ### Package Repository (future)
