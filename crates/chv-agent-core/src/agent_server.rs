@@ -311,10 +311,29 @@ impl AgentServer {
             .open_volume(volume_id, backend_class, &locator, Some(operation_id))
             .await
             .map_err(|e| Status::internal(format!("open_volume failed: {}", e)))?;
-        stord
+        if let Err(e) = stord
             .attach_volume_to_vm(volume_id, vm_id, &handle, Some(operation_id))
             .await
-            .map_err(|e| Status::internal(format!("attach_volume_to_vm failed: {}", e)))?;
+        {
+            // The attach failed after the open succeeded. Close the session
+            // best-effort: a stranded `open` row is spared by the detached
+            // sweep and makes destroy_volume refuse forever (#711 review).
+            if let Err(close_err) = stord
+                .close_volume(volume_id, &handle, Some(operation_id))
+                .await
+            {
+                tracing::warn!(
+                    volume_id,
+                    vm_id,
+                    error = %close_err,
+                    "close after failed attach also failed; session may leak"
+                );
+            }
+            return Err(Status::internal(format!(
+                "attach_volume_to_vm failed: {}",
+                e
+            )));
+        }
         Ok(handle)
     }
 
@@ -1365,10 +1384,29 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                     )
                     .await
                     .map_err(|e| Status::internal(format!("open_volume failed: {}", e)))?;
-                stord
+                if let Err(e) = stord
                     .attach_volume_to_vm(&disk.volume_id, &vm.vm_id, &handle, Some(op_id))
                     .await
-                    .map_err(|e| Status::internal(format!("attach_volume_to_vm failed: {}", e)))?;
+                {
+                    // The open succeeded; close the session best-effort so a
+                    // failed attach cannot strand an `open` row that blocks
+                    // destroy and is spared by the detached sweep (#711).
+                    if let Err(close_err) = stord
+                        .close_volume(&disk.volume_id, &handle, Some(op_id))
+                        .await
+                    {
+                        warn!(
+                            volume_id = %disk.volume_id,
+                            vm_id = %vm.vm_id,
+                            error = %close_err,
+                            "close after failed attach also failed; session may leak"
+                        );
+                    }
+                    return Err(Status::internal(format!(
+                        "attach_volume_to_vm failed: {}",
+                        e
+                    )));
+                }
                 disks.push(chv_hypervisor_api::VmDiskConfig {
                     path: std::path::PathBuf::from(export_path),
                     read_only: disk.read_only,
@@ -4836,6 +4874,9 @@ mod tests {
         destroys: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
         clones: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         events: Arc<std::sync::Mutex<Vec<String>>>,
+        /// When set, `attach_volume_to_vm` answers RPC-OK with an in-band
+        /// error, the way stord reports a backend attach failure (#711).
+        fail_attach: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[derive(Default)]
@@ -4911,6 +4952,25 @@ mod tests {
         ) -> Result<Response<chv_stord_api::chv_stord_api::AttachVolumeToVmResponse>, Status>
         {
             let inner = req.into_inner();
+            if self
+                .opens
+                .fail_attach
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(Response::new(
+                    chv_stord_api::chv_stord_api::AttachVolumeToVmResponse {
+                        result: Some(chv_stord_api::chv_stord_api::Result {
+                            status: "error".to_string(),
+                            error_code: "attach_failed".to_string(),
+                            human_summary: "simulated backend attach failure".to_string(),
+                        }),
+                        volume_id: inner.volume_id,
+                        vm_id: inner.vm_id,
+                        export_kind: "".to_string(),
+                        export_path: "".to_string(),
+                    },
+                ));
+            }
             Ok(Response::new(
                 chv_stord_api::chv_stord_api::AttachVolumeToVmResponse {
                     result: Some(chv_stord_api::chv_stord_api::Result {
@@ -5919,6 +5979,49 @@ mod tests {
                 ),
             ],
             "a standalone volume's attach must open at the create carrier's `{{volume_id}}.img` locator, never the bare-id default"
+        );
+    }
+
+    /// #711 review: `open_and_attach_volume` must not strand the session it
+    /// just opened when the in-band attach fails. A stranded `open` row is
+    /// deliberately spared by the detached-session sweep and makes
+    /// `destroy_volume` refuse forever, so the handler closes it before
+    /// returning the error.
+    #[tokio::test]
+    async fn attach_volume_closes_the_session_when_attach_fails_in_band() {
+        let (server, opens, _dir) = create_volume_test_server().await;
+        opens
+            .fail_attach
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let resp = proto::lifecycle_service_server::LifecycleService::attach_volume(
+            &server,
+            Request::new(proto::AttachVolumeRequest {
+                meta: Some(test_meta("1")),
+                node_id: "node-1".to_string(),
+                volume: Some(proto::VolumeMutationSpec {
+                    volume_id: "vol-att-fail".to_string(),
+                    vm_id: "vm-1".to_string(),
+                    volume_spec_json: br#"{}"#.to_vec(),
+                }),
+            }),
+        )
+        .await;
+        assert!(resp.is_err(), "the in-band attach error must surface");
+
+        assert_eq!(
+            opens.closes.lock().unwrap().as_slice(),
+            [("vol-att-fail".to_string(), "handle-1".to_string())],
+            "the opened session must be closed after the failed attach"
+        );
+        assert!(
+            !server
+                .cache
+                .lock()
+                .await
+                .volume_handles
+                .contains_key("vol-att-fail"),
+            "a failed attach must not cache the handle"
         );
     }
 

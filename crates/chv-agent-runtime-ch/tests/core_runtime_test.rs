@@ -1356,6 +1356,52 @@ async fn tracked_delete_never_consults_the_fallback_source() {
     );
 }
 
+/// #711 review: the tracked delete arm must sweep detached rows too. A
+/// close that failed on an earlier attempt leaves `runtime_status =
+/// "detached"`; without the sweep that row would survive until the next
+/// agent restart (the fallback arm) and trip session-count checks.
+#[tokio::test]
+async fn tracked_delete_sweeps_leftover_detached_sessions() {
+    let h = harness(None);
+    let vm_id = "vm-tracked-sweep";
+    h.runtime
+        .execute(entry(
+            OperationKind::CreateVm,
+            vm_id,
+            "op-create",
+            envelope(MutationCommand::CreateVm {
+                definition: definition(vm_id, 1, 0),
+            }),
+        ))
+        .await
+        .expect("create succeeds");
+    // A crash-window orphan from an earlier attempt: `vm_id` cleared, marked
+    // detached, and carrying a handle this delete does not close directly.
+    h.controller.add_detached_session("vol-0", "handle-orphan");
+
+    let result = h
+        .runtime
+        .execute(entry(
+            OperationKind::DeleteVm,
+            vm_id,
+            "op-del",
+            envelope(MutationCommand::DeleteVm {
+                vm_id: VmId::new(vm_id).expect("vm id"),
+            }),
+        ))
+        .await;
+    assert!(result.is_ok(), "tracked delete must succeed: {result:?}");
+    assert!(
+        h.controller
+            .volume_sessions
+            .lock()
+            .expect("sessions lock")
+            .is_empty(),
+        "the detached row must be swept by the tracked drain: {:?}",
+        h.controller.volume_sessions.lock().unwrap()
+    );
+}
+
 /// The fallback drain is fail-open exactly like the tracked drain: a
 /// failing cleanup step (detach, close, or detach_nic) logs and continues,
 /// and the delete still succeeds — a missing tap or an unknown volume must

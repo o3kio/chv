@@ -802,6 +802,16 @@ impl CloudHypervisorCoreRuntime {
             {
                 warn!(vm_id, volume_id, error = %e, "delete cleanup: close_volume failed, continuing");
             }
+            // A failed close leaves a `detached` row that the fallback sweep
+            // only reaches after a restart. Sweep it now as well, mirroring
+            // the fallback arm (#711 review).
+            if let Err(e) = self
+                .resources
+                .close_detached_volume_sessions(volume_id, Some(op_id))
+                .await
+            {
+                warn!(vm_id, volume_id, error = %e, "delete cleanup: close_detached_volume_sessions failed, continuing");
+            }
         }
         for nic_id in effects.nics.iter().rev() {
             if let Err(e) = self
