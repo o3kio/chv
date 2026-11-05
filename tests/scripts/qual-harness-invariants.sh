@@ -372,4 +372,16 @@ grep -q '_pending_' "$fresh_report" \
     && pass "fresh-host evidence template keeps unexecuted results pending" \
     || fail "fresh-host evidence template looks pre-filled with results"
 
+# The in-container marker and the host-side assertion are one contract; a
+# wording change on either side silently makes the leg unable to pass.
+install_sh_leg="${QUAL}/install-sh-leg.sh"
+encmarker='ENCKEY-LOADED (no plaintext/fallback warning in CP journal)'
+marker_count="$(grep -cF "$encmarker" "$install_sh_leg" 2>/dev/null || true)"
+[ "${marker_count:-0}" -ge 2 ] \
+    && pass "install-sh leg asserts the exact encryption success marker it emits" \
+    || fail "install-sh leg's encryption marker and host assertion have drifted"
+grep -q 'QUICK_VERSION" = "$CANDIDATE_VERSION' "$fresh" \
+    && pass "fresh-host quick leg uses candidate-mode checks when installing the candidate" \
+    || fail "fresh-host quick leg weakens candidate checks unconditionally"
+
 exit "$rc"

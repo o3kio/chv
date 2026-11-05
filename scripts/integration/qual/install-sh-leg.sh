@@ -258,7 +258,7 @@ assert_contains "CHV_ENCRYPTION_KEY is 64 hex chars (#335)" \
 assert_not_contains "no malformed encryption key" \
     "$RESULTS_TEXT" "ENCKEY-FORMAT-BAD"
 assert_contains "control plane loaded the key — no plaintext-fallback warning (#335)" \
-    "$RESULTS_TEXT" "ENCKEY-LOADED (no plaintext warning in CP journal)"
+    "$RESULTS_TEXT" "ENCKEY-LOADED (no plaintext/fallback warning in CP journal)"
 assert_not_contains "no plaintext credential storage (#335)" \
     "$RESULTS_TEXT" "ENCKEY-NOT-LOADED"
 

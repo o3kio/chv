@@ -1204,7 +1204,13 @@ else
     tail -n 30 /var/fresh-host-quick.log >>"$OUT"
     finish
 fi
-check_bringup previous
+if [ "$QUICK_VERSION" = "$CANDIDATE_VERSION" ]; then
+    # A manual run may point the quick leg at the candidate itself; only a
+    # different (older) release may use the weaker previous-mode assertion.
+    check_bringup
+else
+    check_bringup previous
+fi
 check_binaries_version "$QUICK_VERSION" ""
 finish
 EOS
