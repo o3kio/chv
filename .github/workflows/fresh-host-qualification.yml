@@ -1,0 +1,220 @@
+name: Fresh-host qualification
+
+# Fresh-host install / operate / upgrade / uninstall lane for the
+# pre-production gate (#666), including the #556 quick-install leg.
+#
+# The lane builds the candidate tarball and .debs from the checked-out
+# commit, then runs scripts/integration/qual/fresh-host.sh on a clean
+# debootstrap + systemd-nspawn guest on the self-hosted runner. It is
+# manual-only: a container demonstration is evidence, not a nightly signal.
+#
+# Honest environment label (also emitted in the evidence summary):
+#   clean Ubuntu noble amd64 root + systemd inside a systemd-nspawn
+#   container, sharing the host kernel and network namespace, with no
+#   /dev/kvm. It is not a bare-metal or cloud-VM host. VM execution is
+#   covered by the real-KVM m4.3-m4.8 lane (#659).
+#
+# Prerequisites (runner image, not repository secrets):
+#   - labels: self-hosted, linux, x64, chv-kvm
+#   - passwordless sudo -E; /dev/kvm is asserted because this runner fleet
+#     is shared with the KVM lane (the container itself does not use it)
+#   - host ports 80/8080/8443/8444/9101-9103/9901 free (the container
+#     shares the host netns)
+#   - debootstrap, systemd-container, gh, and the packaging toolchain
+#
+# Evidence: results.tsv, summary.md, per-leg transcripts and boot logs are
+# uploaded on success and failure; missing results.tsv fails the upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_release:
+        description: 'Previous released tag to install before the upgrade leg'
+        required: true
+        default: 'v0.3.0'
+        type: string
+      skip_upgrade:
+        description: 'Skip the upgrade leg (diagnostic only; not gate evidence)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# nspawn containers share the host network namespace and CHV_QUAL_ROOT.
+# Never run two fresh-host lanes at once.
+concurrency:
+  group: fresh-host-qualification
+  cancel-in-progress: false
+
+jobs:
+  fresh-host:
+    name: Fresh-host install/upgrade/uninstall
+    runs-on: [self-hosted, linux, x64, chv-kvm]
+    timeout-minutes: 300
+    env:
+      CHV_QUAL_ROOT: /var/lib/chv/qual
+      GITHUB_REPO: ${{ github.repository }}
+      PREVIOUS_RELEASE: ${{ inputs.previous_release }}
+      EVIDENCE_DIR: /var/lib/chv/qual/ci-artifacts/fresh-host-${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      CHV_GIT_SHA: ${{ github.sha }}
+    steps:
+      - name: Verify runner prerequisites
+        # Fail before the long build if the shared runner cannot host this
+        # lane. No runner = queued (visible); present runner without the
+        # prerequisites = a real failure, never a skip-as-pass.
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::Fresh-host qualification runs on the shared chv-kvm fleet, which must expose /dev/kvm; this runner does not."
+            exit 1
+          fi
+          if ! sudo -E -n true 2>/dev/null; then
+            echo "::error::Fresh-host qualification requires passwordless sudo -E on the self-hosted runner."
+            exit 1
+          fi
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh is required to download the previous release (${PREVIOUS_RELEASE})."
+            exit 1
+          fi
+
+      - name: Restore workspace ownership
+        # A previous root staging pass must not block actions/checkout.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE:-$PWD}" 2>/dev/null || true
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
+
+      - name: Record runner cargo/rustup homes
+        # Root staging through sudo -E must use the runner-owned homes.
+        run: |
+          mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}" "${CARGO_HOME:-$HOME/.cargo}"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 (pinned 2026-09-30)
+
+      - name: Install build prerequisites
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+          sudo apt-get install -y gettext-base
+          if ! command -v nfpm >/dev/null 2>&1; then
+            # Pin nfpm for a reproducible package build.
+            curl -sL "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_x86_64.tar.gz" | tar -xz -C /tmp nfpm
+            sudo mv /tmp/nfpm /usr/local/bin/nfpm
+          fi
+          nfpm --version
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 (pinned 2026-09-30)
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build candidate tarball and packages
+        # CHV_GIT_SHA is exported at job level so every binary reports this
+        # commit even though VERSION is unchanged during the qualification.
+        run: |
+          set -euo pipefail
+          # build-release.sh is the tarball assembler (the Makefile's
+          # build-release target only compiles binaries). The package builder
+          # then reuses those binaries/UI with --skip-build.
+          ./scripts/build-release.sh
+          ./scripts/build-packages.sh --skip-build --format deb
+          test -s "dist/chv-$(cat VERSION)-linux-amd64.tar.gz"
+          ls -l dist/packages/*.deb
+
+      - name: Record candidate artifact digests
+        run: |
+          set -euo pipefail
+          {
+            echo "candidate_commit  ${GITHUB_SHA}"
+            echo "candidate_version $(cat VERSION)"
+            sha256sum "dist/chv-$(cat VERSION)-linux-amd64.tar.gz"
+            ( cd dist/packages && sha256sum ./*.deb )
+          } | tee "${RUNNER_TEMP}/candidate-digests.txt"
+
+      - name: Download previous release
+        if: ${{ !inputs.skip_upgrade }}
+        run: |
+          set -euo pipefail
+          prev_dir="${RUNNER_TEMP}/fresh-host-previous/${PREVIOUS_RELEASE}"
+          mkdir -p "$prev_dir"
+          gh release download "$PREVIOUS_RELEASE" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'chv-*-linux-amd64.tar.gz' \
+            --pattern 'chv-*-linux-amd64.tar.gz.sha256' \
+            --dir "$prev_dir" --clobber
+          prev_tarball="$(find "$prev_dir" -maxdepth 1 -name 'chv-*-linux-amd64.tar.gz' -print -quit)"
+          test -n "$prev_tarball"
+          echo "PREVIOUS_TARBALL=${prev_tarball}" >> "$GITHUB_ENV"
+          sha256sum "$prev_tarball"
+
+      - name: Run fresh-host qualification
+        run: |
+          set -euo pipefail
+          previous_version="${PREVIOUS_RELEASE#v}"
+          args=(
+            --candidate-tarball "dist/chv-$(cat VERSION)-linux-amd64.tar.gz"
+            --candidate-version "$(cat VERSION)"
+            --candidate-sha "$GITHUB_SHA"
+            --previous-release "$PREVIOUS_RELEASE"
+            --previous-version "$previous_version"
+            --packages dist/packages
+            --quick-install "$GITHUB_SHA"
+            --quick-install-version "$previous_version"
+            --evidence-dir "$EVIDENCE_DIR"
+          )
+          if [ "${PREVIOUS_TARBALL:-}" != "" ]; then
+            args+=(--previous-tarball "$PREVIOUS_TARBALL")
+          fi
+          if [ "${{ inputs.skip_upgrade }}" = "true" ]; then
+            args+=(--skip-upgrade)
+          fi
+          sudo -E env "PATH=$PATH" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            CARGO_HOME="$CARGO_HOME" \
+            CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
+            ./scripts/integration/qual/fresh-host.sh "${args[@]}"
+          # The driver runs as root and only grants a+rX on the evidence dir;
+          # the runner user cannot write into it. Copy as root.
+          sudo cp "${RUNNER_TEMP}/candidate-digests.txt" "${EVIDENCE_DIR}/candidate-digests.txt"
+
+      - name: Restore runner ownership after root staging
+        if: always()
+        run: |
+          for path in "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
+            if [ -e "$path" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$path"
+            fi
+          done
+
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fresh-host-qualification-${{ github.run_id }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload required results marker
+        # results.tsv is written before preflight and appended on every
+        # failure. If it is missing the run produced no usable evidence.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fresh-host-qualification-${{ github.run_id }}-results
+          path: ${{ env.EVIDENCE_DIR }}/results.tsv
+          if-no-files-found: error
+          retention-days: 30
