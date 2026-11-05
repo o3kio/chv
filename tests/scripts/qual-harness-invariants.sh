@@ -349,9 +349,12 @@ grep -q 'workflow_dispatch' "$fresh_workflow" \
 grep -Fq '[self-hosted, linux, x64, chv-kvm]' "$fresh_workflow" \
     && pass "fresh-host workflow targets the self-hosted chv-kvm fleet" \
     || fail "fresh-host workflow lost the self-hosted runner labels"
-grep -q 'gh release download' "$fresh_workflow" \
+grep -q 'releases/download' "$fresh_workflow" \
     && pass "fresh-host workflow downloads the previous release" \
     || fail "fresh-host workflow does not stage the previous release"
+grep -q 'sha256sum -c' "$fresh_workflow" \
+    && pass "fresh-host workflow verifies the previous release checksum" \
+    || fail "fresh-host workflow consumes the previous release without verifying its checksum"
 grep -q 'sudo cp .*candidate-digests' "$fresh_workflow" \
     && pass "fresh-host workflow stages the digest file as root" \
     || fail "fresh-host workflow cannot write the digest into the root-owned evidence dir"

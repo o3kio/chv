@@ -20,7 +20,7 @@ name: Fresh-host qualification
 #     is shared with the KVM lane (the container itself does not use it)
 #   - host ports 80/8080/8443/8444/9101-9103/9901 free (the container
 #     shares the host netns)
-#   - debootstrap, systemd-container, gh, and the packaging toolchain
+#   - debootstrap, systemd-container, curl, and the packaging toolchain
 #
 # Evidence: results.tsv, summary.md, per-leg transcripts and boot logs are
 # uploaded on success and failure; missing results.tsv fails the upload.
@@ -75,8 +75,8 @@ jobs:
             echo "::error::Fresh-host qualification requires passwordless sudo -E on the self-hosted runner."
             exit 1
           fi
-          if ! command -v gh >/dev/null 2>&1; then
-            echo "::error::gh is required to download the previous release (${PREVIOUS_RELEASE})."
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "::error::Fresh-host qualification needs curl to download the previous release (${PREVIOUS_RELEASE})."
             exit 1
           fi
 
@@ -150,11 +150,15 @@ jobs:
           set -euo pipefail
           prev_dir="${RUNNER_TEMP}/fresh-host-previous/${PREVIOUS_RELEASE}"
           mkdir -p "$prev_dir"
-          gh release download "$PREVIOUS_RELEASE" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern 'chv-*-linux-amd64.tar.gz' \
-            --pattern 'chv-*-linux-amd64.tar.gz.sha256' \
-            --dir "$prev_dir" --clobber
+          previous_version="${PREVIOUS_RELEASE#v}"
+          tarball="chv-${previous_version}-linux-amd64.tar.gz"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${PREVIOUS_RELEASE}"
+          # Download by tag with curl rather than requiring the GitHub CLI on
+          # the self-hosted runner, then verify the published checksum before
+          # the upgrade leg consumes the tarball.
+          curl -fsSL "${base}/${tarball}" -o "${prev_dir}/${tarball}"
+          curl -fsSL "${base}/${tarball}.sha256" -o "${prev_dir}/${tarball}.sha256"
+          ( cd "$prev_dir" && sha256sum -c "${tarball}.sha256" )
           prev_tarball="$(find "$prev_dir" -maxdepth 1 -name 'chv-*-linux-amd64.tar.gz' -print -quit)"
           test -n "$prev_tarball"
           echo "PREVIOUS_TARBALL=${prev_tarball}" >> "$GITHUB_ENV"
