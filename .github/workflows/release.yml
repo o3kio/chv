@@ -429,7 +429,8 @@ jobs:
             RC_SUFFIX="${RC_SUFFIX##*-rc.}"
             export CHV_PKG_PRERELEASE="rc.${RC_SUFFIX}"
           fi
-          ASSET_VERSION="$(./scripts/version.sh --deb | tr -c 'A-Za-z0-9._-' '.')"
+          RAW_VERSION="$(./scripts/version.sh --deb)"
+          ASSET_VERSION="$(printf '%s' "$RAW_VERSION" | tr -c 'A-Za-z0-9._-' '.')"
           bad="$(find dist/packages -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) -printf '%f\n' \
             | grep -vF -- "$ASSET_VERSION" || true)"
           if [ -n "$bad" ]; then

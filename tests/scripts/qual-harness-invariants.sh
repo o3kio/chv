@@ -559,6 +559,17 @@ for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.ym
     grep -q 'Refusing to publish package' "$wf" \
         && pass "${wf_name} fails closed on a foreign staged package version" \
         || fail "${wf_name} has no runtime guard against publishing a foreign version"
+    # version.sh prints a trailing newline; piping it straight into tr -c
+    # turns that newline into a trailing '.', which makes every package look
+    # foreign. Strip first via command substitution, then sanitize.
+    grep -q 'RAW_VERSION="$(./scripts/version.sh --deb)"' "$wf" \
+        && pass "${wf_name} strips the version newline before sanitizing" \
+        || fail "${wf_name} sanitizes a newline-terminated version"
+    if grep -q 'version.sh --deb | tr -c' "$wf"; then
+        fail "${wf_name} pipes a newline into the asset-version sanitizer"
+    else
+        pass "${wf_name} does not pipe a newline into the asset-version sanitizer"
+    fi
 done
 
 # Release-note install snippets must name the published (sanitized) asset,
