@@ -697,24 +697,52 @@ check_admin_login() {
     return 1
 }
 
+# check_node_visible [expected_version]
+#
+# The base assertion is that the node is listed at all. The optional
+# expected_version covers the in-place-upgrade contract (#720): the node row
+# must follow the agent's own ReportServiceVersions report, which the agent
+# sends every 6th 5 s reconcile tick (~30 s). After a v0.3.0 -> 0.4.0 package
+# upgrade the row still carries the enrollment version when the check starts,
+# so a version assertion has to poll past at least one report interval; an
+# immediate read would pass visibility while silently proving nothing about
+# the refresh.
 check_node_visible() {
-    local body i
+    local expect_version="${1:-}" body code i out=/tmp/fresh-host-nodes.json
     if [ -z "$TOKEN" ]; then
         bad "node enrolled and visible (no auth token)"
         return 1
     fi
-    for i in $(seq 1 45); do
-        body="$(curl -sS --max-time 10 -X POST http://127.0.0.1:8080/v1/nodes \
+    for i in $(seq 1 75); do
+        code="$(curl -sS --max-time 10 -o "$out" -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/nodes \
             -H "Authorization: Bearer ${TOKEN}" \
             -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+        body="$(cat "$out" 2>/dev/null || true)"
         if printf '%s' "$body" | grep -q '"node_id"'; then
+            record "NODES_HTTP=${code}"
             record "NODES=${body}"
-            ok "node enrolled and visible"
-            return 0
+            if [ -z "$expect_version" ]; then
+                ok "node enrolled and visible"
+                return 0
+            fi
+            if printf '%s' "$body" | grep -q "\"version\":\"${expect_version}\""; then
+                ok "node visible and reports version ${expect_version}"
+                return 0
+            fi
         fi
         sleep 2
     done
-    bad "node enrolled and visible (timeout)"
+    record "NODES_LAST_HTTP=${code:-no-response}"
+    record "NODES_LAST=${body:-<no body>}"
+    record "--- journalctl -u chv-controlplane (last 80 lines) ---"
+    journalctl -u chv-controlplane -n 80 --no-pager 2>/dev/null \
+        | while IFS= read -r line; do record "  ${line}"; done
+    record "--- end controlplane diagnostics ---"
+    if [ -n "$expect_version" ]; then
+        bad "node did not report version ${expect_version} within 150 s (last HTTP ${code:-no-response}: ${body:-<no body>})"
+    else
+        bad "node enrolled and visible (timeout)"
+    fi
     return 1
 }
 
@@ -770,6 +798,7 @@ check_binaries_version() {
 check_bringup() {
     local encryption_mode="${1:-candidate}"
     local webui_url="${2:-http://127.0.0.1:8080/}"
+    local expected_node_version="${3:-}"
     section "bring-up contract"
     wait_units_active 180 || true
     check_units_contract
@@ -777,7 +806,7 @@ check_bringup() {
     clear_admin_rotation_flag || true
     check_admin_login || true
     check_webui "$webui_url"
-    check_node_visible || true
+    check_node_visible "$expected_node_version" || true
     check_metrics
 }
 
@@ -929,7 +958,7 @@ else
     tail -n 30 /var/fresh-host-install.log >>"$OUT"
     finish
 fi
-check_bringup
+check_bringup candidate http://127.0.0.1:8080/ "$CANDIDATE_VERSION"
 check_binaries_version "$CANDIDATE_VERSION" "$CANDIDATE_SHA"
 section "WebUI edge"
 wait_http_200 "nginx edge serves the WebUI" http://127.0.0.1/ /tmp/fresh-host-edge.html 60 || true
@@ -1200,7 +1229,9 @@ if [ "$UPGRADED" = "1" ]; then
     # disables. Metrics stay asserted: the candidate binds its dedicated
     # listener on 127.0.0.1:9103 by default when metrics_bind is absent.
     section "preserved-edge surface (upgrade keeps previous config)"
-    check_bringup candidate http://127.0.0.1/
+    # The node row starts at the previous release's version and must follow
+    # the upgraded agent's report (#720); poll past one ~30 s report interval.
+    check_bringup candidate http://127.0.0.1/ "$CANDIDATE_VERSION"
 else
     bad "upgrade did not complete; bring-up not asserted"
 fi
