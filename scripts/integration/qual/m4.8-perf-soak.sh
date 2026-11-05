@@ -56,8 +56,16 @@
 #   - LOG_SHAPES_TOTAL_MAX = 2000 distinct normalized shapes per daemon
 #                                  across the whole run (bounded set).
 #   - METRIC_SERIES_MAX    = 200  Prometheus series at the agent's
-#                                  /metrics (the exporter is a fixed
-#                                  node-scoped gauge set).
+#                                  /metrics. The exporter is bounded: the
+#                                  hand-built node gauges plus registry
+#                                  families keyed by op/result and grpc
+#                                  service/method/status. Registry series
+#                                  materialize on first use (#702), so the
+#                                  growth verdict compares the
+#                                  post-first-lifecycle warm baseline to
+#                                  the at-rest sample instead of the
+#                                  pre-work P1 sample (which precedes the
+#                                  one-time materialization).
 #   - RSS growth at rest   = record-only (allocator retention makes
 #                                  gating unsound); warn > 100 MiB.
 #
@@ -1039,6 +1047,7 @@ qual_info "--- P1: idle daemon resources at rest (zero VMs, ${IDLE_SAMPLES}×${I
 P1_DB_T0="$(db_total_bytes "$QUAL_DB")"
 P1_CORE_T0="$(db_total_bytes "$CORE_DB")"
 P1_METRICS="$(metrics_series_count)"
+WARM_METRICS=""
 record metrics-cardinality.txt "phase=p1idle series=${P1_METRICS}"
 idle_resource_window p1-idle
 idle_db_growth_check p1-idle "$P1_DB_T0"
@@ -1232,6 +1241,17 @@ for c in $(seq 1 "$N_SOAK"); do
     record_db_sizes "soak-cycle-${c}"
     save_state_evidence "soak-cycle-${c}"
 
+    # Warm baseline: the first full lifecycle exercises every VM op this
+    # soak repeats, so the #702 registry families have materialized by now.
+    # Comparing this sample to the at-rest one tests the real property
+    # (repeating identical work adds no series) without counting the
+    # one-time materialization as growth.
+    if [ -z "$WARM_METRICS" ] && [ "$c" -eq 1 ]; then
+        WARM_METRICS="$(metrics_series_count)"
+        record metrics-cardinality.txt "phase=soak-warm series=${WARM_METRICS}"
+        qual_pass "warm-baseline /metrics series after the first lifecycle recorded (${WARM_METRICS})"
+    fi
+
     if [ "$LOG_MID_MARKED" -eq 0 ] && [ "$c" -eq $((N_SOAK / 2)) ]; then
         capture_log_offsets b
         LOG_MID_MARKED=1
@@ -1300,14 +1320,25 @@ fi
 
 P3_METRICS="$(metrics_series_count)"
 record metrics-cardinality.txt "phase=p3idle series=${P3_METRICS}"
-if is_number "${P1_METRICS:-}" && is_number "${P3_METRICS:-}"; then
-    if [ "$(( P3_METRICS - P1_METRICS ))" -le 10 ]; then
-        qual_pass "P3: /metrics series at rest unchanged across the soak (${P1_METRICS} → ${P3_METRICS})"
+if is_number "${WARM_METRICS:-}" && is_number "${P3_METRICS:-}"; then
+    # Repeated identical lifecycles must add no series. The warm sample is
+    # taken after the first full lifecycle because the #702 registry
+    # families materialize on first use; that one-time jump is recorded in
+    # metrics-cardinality.txt (p1idle → soak-warm) but is not growth.
+    if [ "$(( P3_METRICS - WARM_METRICS ))" -le 0 ]; then
+        qual_pass "P3: /metrics series unchanged across repeated identical lifecycles (warm ${WARM_METRICS} → at-rest ${P3_METRICS})"
     else
-        qual_error "P3: FORBIDDEN — /metrics series grew at rest across the soak (${P1_METRICS} → ${P3_METRICS}; unbounded metric cardinality)"
+        qual_error "P3: FORBIDDEN — /metrics series grew across repeated identical lifecycles (warm ${WARM_METRICS} → at-rest ${P3_METRICS}; unbounded metric cardinality)"
     fi
+elif is_number "${P1_METRICS:-}" && is_number "${P3_METRICS:-}"; then
+    qual_warn "P3: no warm baseline (first lifecycle did not complete); P1→P3 comparison is materialization-confounded (${P1_METRICS} → ${P3_METRICS}) and is not used for the verdict"
 else
     qual_warn "P3: /metrics unreadable at one of the at-rest windows — cardinality comparison skipped"
+fi
+if is_number "${P3_METRICS:-}" && [ "$P3_METRICS" -le "$METRIC_SERIES_MAX" ]; then
+    qual_pass "P3: agent /metrics series count ${P3_METRICS} (≤ ${METRIC_SERIES_MAX})"
+else
+    qual_error "P3: agent /metrics series count ${P3_METRICS:-unreadable} exceeds ${METRIC_SERIES_MAX} or unreadable (bounded exporter expected)"
 fi
 save_state_evidence "p3-idle"
 
