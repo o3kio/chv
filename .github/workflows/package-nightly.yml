@@ -246,6 +246,10 @@ jobs:
 
       - name: Generate install notes
         run: |
+          # Release assets use the GitHub-safe filename version ('~' -> '.');
+          # the package metadata keeps '~'.
+          ASSET_VERSION_DEB="$(printf '%s' "$PKG_VERSION_DEB" | tr -c 'A-Za-z0-9._-' '.')"
+          ASSET_VERSION_RPM="$(printf '%s' "$PKG_VERSION_RPM" | tr -c 'A-Za-z0-9._-' '.')"
           cat > /tmp/nightly-release-notes.md <<EOF
           ## CHV Nightly Build
 
@@ -257,6 +261,8 @@ jobs:
           |----------|-------|
           | Debian version | ${PKG_VERSION_DEB} |
           | RPM version | ${PKG_VERSION_RPM} |
+          | Debian asset version | ${ASSET_VERSION_DEB} |
+          | RPM asset version | ${ASSET_VERSION_RPM} |
           | Git SHA | ${GIT_SHA} |
           | Build date | $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC) |
 
@@ -265,9 +271,9 @@ jobs:
           Download the \`.deb\` files below and install:
 
           \`\`\`bash
-          sudo dpkg -i chv-controlplane_${PKG_VERSION_DEB}_amd64.deb
-          sudo dpkg -i chv-node_${PKG_VERSION_DEB}_amd64.deb
-          sudo dpkg -i chvctl_${PKG_VERSION_DEB}_amd64.deb
+          sudo dpkg -i chv-controlplane_${ASSET_VERSION_DEB}_amd64.deb
+          sudo dpkg -i chv-node_${ASSET_VERSION_DEB}_amd64.deb
+          sudo dpkg -i chvctl_${ASSET_VERSION_DEB}_amd64.deb
           \`\`\`
 
           ### Install (RHEL / CentOS / Fedora)
@@ -275,9 +281,9 @@ jobs:
           Download the \`.rpm\` files below and install:
 
           \`\`\`bash
-          sudo rpm -i chv-controlplane-${PKG_VERSION_RPM}-1.x86_64.rpm
-          sudo rpm -i chv-node-${PKG_VERSION_RPM}-1.x86_64.rpm
-          sudo rpm -i chvctl-${PKG_VERSION_RPM}-1.x86_64.rpm
+          sudo rpm -i chv-controlplane-${ASSET_VERSION_RPM}-1.x86_64.rpm
+          sudo rpm -i chv-node-${ASSET_VERSION_RPM}-1.x86_64.rpm
+          sudo rpm -i chvctl-${ASSET_VERSION_RPM}-1.x86_64.rpm
           \`\`\`
 
           ### Package Repository (future)

@@ -576,6 +576,13 @@ for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.ym
         || fail "${wf_name} accepts a package version by prefix (rc.1 vs rc.10)"
 done
 
+nightly_workflow="${REPO_ROOT}/.github/workflows/package-nightly.yml"
+grep -Fq 'ASSET_VERSION_DEB=' "$nightly_workflow" \
+    && grep -Fq 'chv-controlplane_${ASSET_VERSION_DEB}_amd64.deb' "$nightly_workflow" \
+    && grep -Fq 'chv-controlplane-${ASSET_VERSION_RPM}-1.x86_64.rpm' "$nightly_workflow" \
+    && pass "nightly install notes use the published asset names" \
+    || fail "nightly install notes name '~' assets the release never serves"
+
 # Release-note install snippets must name the published (sanitized) asset,
 # not the internal '~' version GitHub rewrites.
 if grep -q 'pkg_version }}_amd64.deb\|pkg_version }}-1.x86_64.rpm' "$release_workflow"; then
