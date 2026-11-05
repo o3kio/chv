@@ -1452,7 +1452,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        for vm_id in ["vm-stored", "vm-explicit"] {
+        for vm_id in [
+            "vm-stored",
+            "vm-explicit",
+            "vm-stored-both",
+            "vm-explicit-both",
+        ] {
             sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES (?, ?)")
                 .bind(vm_id)
                 .bind(vm_id)
@@ -1463,6 +1468,7 @@ mod tests {
         for (volume_id, attached) in [
             ("vol-detach-stored", Some("vm-stored")),
             ("vol-detach-explicit", None),
+            ("vol-detach-both", Some("vm-stored-both")),
         ] {
             sqlx::query(
                 "INSERT INTO volumes (volume_id, node_id, display_name, capacity_bytes) \
@@ -1517,9 +1523,20 @@ mod tests {
             )
             .await
             .expect("detach with an explicit vm_id must be accepted");
+        service
+            .mutate_volume(
+                "vol-detach-both".to_string(),
+                "detach".to_string(),
+                false,
+                None,
+                Some("vm-explicit-both".to_string()),
+                "test-user".to_string(),
+            )
+            .await
+            .expect("detach with both ids must be accepted");
 
         let calls = detach_calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2, "both detaches relayed: {calls:?}");
+        assert_eq!(calls.len(), 3, "all detaches relayed: {calls:?}");
         let vm_for = |volume_id: &str| {
             calls
                 .iter()
@@ -1537,6 +1554,11 @@ mod tests {
             vm_for("vol-detach-explicit"),
             "vm-explicit",
             "an explicit id wins even when the CP has cleared the stored attachment"
+        );
+        assert_eq!(
+            vm_for("vol-detach-both"),
+            "vm-explicit-both",
+            "an explicit id wins over a non-empty stored attachment (precedence, not fallback)"
         );
     }
 
