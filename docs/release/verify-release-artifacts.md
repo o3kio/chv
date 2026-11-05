@@ -26,12 +26,14 @@ From the [GitHub Releases](https://github.com/o3kio/chv/releases) page, download
 
 ```bash
 VERSION="<version>"
+# GitHub rewrites RC asset filenames: X.Y.Z-rc.N -> X.Y.Z.rc.N.
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 RELEASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
 # Download packages and checksums
-curl -sLO "${RELEASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
-curl -sLO "${RELEASE_URL}/chv-node_${VERSION}_amd64.deb"
-curl -sLO "${RELEASE_URL}/chvctl_${VERSION}_amd64.deb"
+curl -sLO "${RELEASE_URL}/chv-controlplane_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${RELEASE_URL}/chv-node_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${RELEASE_URL}/chvctl_${ASSET_VERSION}_amd64.deb"
 curl -sLO "${RELEASE_URL}/SHA256SUMS"
 
 # Download signature if available

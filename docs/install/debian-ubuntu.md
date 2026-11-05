@@ -43,11 +43,13 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
+# GitHub rewrites RC asset filenames: X.Y.Z-rc.N -> X.Y.Z.rc.N.
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
-curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
-curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
-curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chv-controlplane_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chv-node_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chvctl_${ASSET_VERSION}_amd64.deb"
 ```
 
 ### 2. Verify checksums (recommended)
@@ -60,9 +62,9 @@ sha256sum -c SHA256SUMS
 ### 3. Install packages
 
 ```bash
-sudo dpkg -i chv-controlplane_${VERSION}_amd64.deb \
-             chv-node_${VERSION}_amd64.deb \
-             chvctl_${VERSION}_amd64.deb
+sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb \
+             chv-node_${ASSET_VERSION}_amd64.deb \
+             chvctl_${ASSET_VERSION}_amd64.deb
 
 # Fix any missing dependencies
 sudo apt-get install -f
@@ -124,15 +126,17 @@ To upgrade to a newer version, download the new packages and install them over t
 ```bash
 # Download new packages
 VERSION="<new-version>"
+# GitHub rewrites RC asset filenames: X.Y.Z-rc.N -> X.Y.Z.rc.N.
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
-curl -sLO "${BASE_URL}/chv-controlplane_${VERSION}_amd64.deb"
-curl -sLO "${BASE_URL}/chv-node_${VERSION}_amd64.deb"
-curl -sLO "${BASE_URL}/chvctl_${VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chv-controlplane_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chv-node_${ASSET_VERSION}_amd64.deb"
+curl -sLO "${BASE_URL}/chvctl_${ASSET_VERSION}_amd64.deb"
 
 # Upgrade (config files are preserved)
-sudo dpkg -i chv-controlplane_${VERSION}_amd64.deb \
-             chv-node_${VERSION}_amd64.deb \
-             chvctl_${VERSION}_amd64.deb
+sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb \
+             chv-node_${ASSET_VERSION}_amd64.deb \
+             chvctl_${ASSET_VERSION}_amd64.deb
 
 # Fix dependencies if needed
 sudo apt-get install -f

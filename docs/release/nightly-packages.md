@@ -13,8 +13,13 @@ Nightly packages let you test the latest features, verify bug fixes, and validat
 Nightly versions include the date and git short SHA:
 
 ```text
-<version>~nightly.20260510.g0872c4a7   (Debian and RPM, as shipped by CI)
+<version>~nightly.20260510.g0872c4a7   (package metadata, both .deb and .rpm)
 ```
+
+GitHub release-asset filenames replace the `~` with `.`
+(`chv-controlplane_<version>.nightly.20260510.g0872c4a7_amd64.deb`) because
+GitHub sanitizes characters outside `[A-Za-z0-9._-]`; the version installed in
+the package database keeps `~`.
 
 This guarantees that each nightly build is uniquely identifiable and traceable to a specific commit.
 
@@ -116,7 +121,7 @@ sudo apt-get install -f
 sudo apt upgrade
 
 # RHEL/CentOS/Fedora
-sudo rpm -U chv-controlplane-<version>~nightly.NEW-1.x86_64.rpm
+sudo rpm -U chv-controlplane-<version>.nightly.NEW-1.x86_64.rpm
 
 # Or via dnf once the repo is configured
 sudo dnf upgrade
@@ -132,8 +137,8 @@ release on both:
 
 | Comparison | Result |
 |------------|--------|
-| `<version>` vs `<version>~nightly.20260510.g0872c4a7` (`.deb`, as shipped) | `<version>` is newer |
-| `<version>` vs `<version>~nightly.20260510.g0872c4a7` (`.rpm`, as shipped) | `<version>` is newer |
+| `<version>` vs `<version>~nightly.20260510.g0872c4a7` (`.deb`, package metadata) | `<version>` is newer |
+| `<version>` vs `<version>~nightly.20260510.g0872c4a7` (`.rpm`, package metadata) | `<version>` is newer |
 
 `~` is the pre-release operator in both Debian and RPM version ordering.
 

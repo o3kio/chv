@@ -48,11 +48,13 @@ Set `VERSION` to the release you want, without the leading `v`:
 
 ```bash
 VERSION="<version>"
+# GitHub rewrites RC asset filenames: X.Y.Z-rc.N -> X.Y.Z.rc.N.
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
 
-curl -sLO "${BASE_URL}/chv-controlplane-${VERSION}-1.x86_64.rpm"
-curl -sLO "${BASE_URL}/chv-node-${VERSION}-1.x86_64.rpm"
-curl -sLO "${BASE_URL}/chvctl-${VERSION}-1.x86_64.rpm"
+curl -sLO "${BASE_URL}/chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm"
+curl -sLO "${BASE_URL}/chv-node-${ASSET_VERSION}-1.x86_64.rpm"
+curl -sLO "${BASE_URL}/chvctl-${ASSET_VERSION}-1.x86_64.rpm"
 ```
 
 ### 2. Verify checksums (recommended)
@@ -65,9 +67,9 @@ sha256sum -c SHA256SUMS
 ### 3. Install packages
 
 ```bash
-sudo rpm -i chv-controlplane-${VERSION}-1.x86_64.rpm \
-         chv-node-${VERSION}-1.x86_64.rpm \
-         chvctl-${VERSION}-1.x86_64.rpm
+sudo rpm -i chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm \
+         chv-node-${ASSET_VERSION}-1.x86_64.rpm \
+         chvctl-${ASSET_VERSION}-1.x86_64.rpm
 ```
 
 If dependencies are missing:
@@ -133,15 +135,17 @@ To upgrade to a newer version, download the new packages and install them over t
 ```bash
 # Download new packages
 VERSION="<new-version>"
+# GitHub rewrites RC asset filenames: X.Y.Z-rc.N -> X.Y.Z.rc.N.
+ASSET_VERSION="${VERSION/-rc./.rc.}"
 BASE_URL="https://github.com/o3kio/chv/releases/download/v${VERSION}"
-curl -sLO "${BASE_URL}/chv-controlplane-${VERSION}-1.x86_64.rpm"
-curl -sLO "${BASE_URL}/chv-node-${VERSION}-1.x86_64.rpm"
-curl -sLO "${BASE_URL}/chvctl-${VERSION}-1.x86_64.rpm"
+curl -sLO "${BASE_URL}/chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm"
+curl -sLO "${BASE_URL}/chv-node-${ASSET_VERSION}-1.x86_64.rpm"
+curl -sLO "${BASE_URL}/chvctl-${ASSET_VERSION}-1.x86_64.rpm"
 
 # Upgrade (config files are preserved as .rpmsave if modified)
-sudo rpm -U chv-controlplane-${VERSION}-1.x86_64.rpm \
-         chv-node-${VERSION}-1.x86_64.rpm \
-         chvctl-${VERSION}-1.x86_64.rpm
+sudo rpm -U chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm \
+         chv-node-${ASSET_VERSION}-1.x86_64.rpm \
+         chvctl-${ASSET_VERSION}-1.x86_64.rpm
 
 # Restart services to pick up new binaries
 sudo systemctl restart chv-controlplane chv-agent chv-stord chv-nwd
