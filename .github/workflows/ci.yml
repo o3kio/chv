@@ -452,7 +452,12 @@ jobs:
     name: E2E tests
     runs-on: ubuntu-latest
     needs: ui
-    timeout-minutes: 15
+    # 15 minutes was too tight for `npx playwright install --with-deps` on a
+    # slow apt mirror: run 42037500194's E2E job was cancelled at the timeout
+    # while still installing browser dependencies, which cancelled the whole
+    # Release run before Build/Package even started. Leave headroom for the
+    # apt fetch; the test step itself is unchanged.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
 
