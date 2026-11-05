@@ -121,6 +121,13 @@ PLAIN_PORT="51053"    # N8 throwaway plaintext echo listener
 VOL_SIZE_BYTES=$((4 * 1024 * 1024 * 1024))
 SEED_FILE="${M46_DIR}/m46-seed.img"
 
+# Destination identity the migration receiver expects in its authorization
+# token (issue #663). Written into the DST config as migration.node_id and
+# bound into every token this scenario mints.
+QUAL_MIGRATION_DEST_NODE_ID="qual-m46-dst"
+[ -n "${QUAL_MIGRATION_SECRET_FILE:-}" ] \
+    || qual_die "QUAL_MIGRATION_SECRET_FILE not set — run via deploy.sh --exec"
+
 RPC_TIMEOUT=180       # per status poll loop budget (transfer + digest)
 STARTUP_TIMEOUT=20    # stord startup / expected-failure guard
 
@@ -276,20 +283,40 @@ close_volume() {
     return 1
 }
 
-# trigger_migration SOCK VOLID HANDLE ENDPOINT → migration_id on stdout.
-trigger_migration() {
+# trigger_migration_raw SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → raw grpcurl
+# output (stdout+stderr). Mints a fresh authorization for exactly this
+# destination/volume/size (issue #663): the direct stord RPC below bypasses
+# the control plane that would normally mint it. A fresh token per trigger is
+# required — the receiver consumes the nonce once, so recovery retries reuse
+# the volume but must not reuse the authorization.
+#
+# Kept separate from trigger_migration because negative legs expect a
+# *rejection*: a receiver that refuses before readiness (e.g. an existing
+# partial volume) now returns its error synchronously, so there is no
+# migration_id to poll.
+trigger_migration_raw() {
     local sock="$1" volid="$2" handle="$3" endpoint="$4"
-    local json resp status mid
-    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\"}"
-    resp="$(stord_rpc "$sock" TriggerDiskMigration "$json")" \
-        || { qual_error "TriggerDiskMigration RPC failed for ${volid}"; return 1; }
-    status="$(printf '%s' "$resp" | jq -r '.result.status // empty')"
-    mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty')"
+    local size="${5:-$VOL_SIZE_BYTES}"
+    local auth json
+    auth="$(mint_migration_authorization "$volid" "$size")" \
+        || { qual_error "minting migration authorization failed for ${volid}"; return 1; }
+    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\",\"migrationAuthorization\":\"${auth}\"}"
+    stord_rpc "$sock" TriggerDiskMigration "$json" 2>&1
+}
+
+# trigger_migration SOCK VOLID HANDLE ENDPOINT [SIZE_BYTES] → migration_id on
+# stdout. Asserts the trigger was accepted.
+trigger_migration() {
+    local resp status mid
+    resp="$(trigger_migration_raw "$@")" \
+        || { qual_error "TriggerDiskMigration RPC failed for $2: $(printf '%s' "$resp" | head -c 300)"; return 1; }
+    status="$(printf '%s' "$resp" | jq -r '.result.status // empty' 2>/dev/null)"
+    mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty' 2>/dev/null)"
     if [ "$status" = "OK" ] && [ -n "$mid" ]; then
         printf '%s' "$mid"
         return 0
     fi
-    qual_error "TriggerDiskMigration for ${volid} not accepted (status=${status}): $(printf '%s' "$resp" | head -c 300)"
+    qual_error "TriggerDiskMigration for $2 not accepted (status=${status}): $(printf '%s' "$resp" | head -c 300)"
     return 1
 }
 
@@ -575,6 +602,10 @@ write_src_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+# Port 0: scenario stords run alongside the deployed stord (9101) and up to
+# two at once; a fixed default would collide (#687 makes the metrics bind
+# fatal). The harness never scrapes these listeners.
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -594,6 +625,7 @@ write_dst_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -606,6 +638,10 @@ listen_addr = "127.0.0.1:${4}"
 server_cert_path = "${5}"
 server_key_path = "${6}"
 client_ca_path = "${7}"
+# Issue #663: a receiver must know its own node id and share the control
+# plane's signing secret, or it refuses to start / denies every stream.
+node_id = "${QUAL_MIGRATION_DEST_NODE_ID}"
+signing_secret_file = "${QUAL_MIGRATION_SECRET_FILE}"
 EOF
 }
 
@@ -665,6 +701,11 @@ assert_file_contains "SRC is source-only (receiver listener not configured)" \
     "$SRC_LOG" "storage migration receiver listener not configured"
 assert_file_contains "DST logged the receiver listener bound (mTLS, client auth required)" \
     "$DST_LOG" "storage migration receiver listening on 127.0.0.1:${DST_PORT} (mTLS, client auth required)"
+# Positive proof the receiver is in token-required mode, not the insecure
+# bypass: without this line every migration below would be testing an
+# unauthenticated path.
+assert_file_contains "DST requires control-plane migration authorizations (not the insecure bypass)" \
+    "$DST_LOG" "storage migration authorizations enabled"
 tcp_port_open "$DST_PORT" \
     && qual_pass "DST receiver TCP listener accepts connections on ${DST_PORT}" \
     || qual_error "DST receiver TCP listener not reachable on ${DST_PORT}"
@@ -770,15 +811,36 @@ N1_VOL="m46n1"
 N1_HANDLE="$(open_volume "$DEPLOY_STORD_SOCK" "$N1_VOL" "m46n1.img" "8388608")" \
     || qual_die "aborting (Leg N1a) — could not open a volume on the deployed stord"
 qual_pass "OpenVolume on the DEPLOYED stord accepted (${N1_VOL}, handle ${N1_HANDLE})"
-N1_MID="$(trigger_migration "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" "https://127.0.0.1:${DST_PORT}")" \
-    || qual_die "aborting (Leg N1a)"
-wait_for "deployed-stord migration task FAILED (no mTLS config)" "$RPC_TIMEOUT" \
-    phase_is "$DEPLOY_STORD_SOCK" "$N1_MID" "FAILED" \
-    || qual_error "deployed-stord migration task never failed (no mTLS config)"
-N1_ERR="$(migration_field "$DEPLOY_STORD_SOCK" "$N1_MID" errorMessage)"
-assert_contains "deployed-stord task error is the mTLS-required precondition" \
-    "$N1_ERR" "mTLS is required for storage migration"
-record_migration_error "leg-N1a deployed stord (no [migration])" "$DEPLOY_STORD_SOCK" "$N1_MID"
+# Two fail-closed shapes are conformant: the trigger can be refused
+# synchronously (current contract: a node with no client identity does
+# not initiate migrations at all) or accepted as a journaled task that
+# then fails with the mTLS-required precondition (older contract).
+N1_RESP="$(trigger_migration_raw "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" \
+    "https://127.0.0.1:${DST_PORT}" "8388608")"; N1_RC=$?
+if [ "$N1_RC" -ne 0 ]; then
+    assert_contains "deployed-stord trigger refuses synchronously (no migration client identity)" \
+        "$N1_RESP" "no migration client identity"
+    assert_contains "deployed-stord refusal names the mTLS requirement" \
+        "$N1_RESP" "mTLS is required for storage migration"
+    qual_pass "deployed-stord fails closed at TriggerDiskMigration (no client identity configured)"
+    {
+        echo "### leg-N1a deployed stord (no [migration]) — synchronous refusal ($(date -u +%FT%TZ))"
+        printf '%s\n\n' "$N1_RESP"
+    } >> "${EVIDENCE_DIR}/failed-migrations.jsonl"
+else
+    N1_STATUS="$(printf '%s' "$N1_RESP" | jq -r '.result.status // empty' 2>/dev/null)"
+    N1_MID="$(printf '%s' "$N1_RESP" | jq -r '.migrationId // empty' 2>/dev/null)"
+    if [ "$N1_STATUS" != "OK" ] || [ -z "$N1_MID" ]; then
+        qual_die "aborting (Leg N1a) — trigger neither refused nor accepted (status=${N1_STATUS}): $(printf '%s' "$N1_RESP" | head -c 300)"
+    fi
+    wait_for "deployed-stord migration task FAILED (no mTLS config)" "$RPC_TIMEOUT" \
+        phase_is "$DEPLOY_STORD_SOCK" "$N1_MID" "FAILED" \
+        || qual_error "deployed-stord migration task never failed (no mTLS config)"
+    N1_ERR="$(migration_field "$DEPLOY_STORD_SOCK" "$N1_MID" errorMessage)"
+    assert_contains "deployed-stord task error is the mTLS-required precondition" \
+        "$N1_ERR" "mTLS is required for storage migration"
+    record_migration_error "leg-N1a deployed stord (no [migration])" "$DEPLOY_STORD_SOCK" "$N1_MID"
+fi
 close_volume "$DEPLOY_STORD_SOCK" "$N1_VOL" "$N1_HANDLE" || true
 
 # N1b: the startup-vs-trigger distinction (#393/#396/#395) — client or
@@ -790,6 +852,7 @@ cat > "${N1B_DIR}/client-disabled.toml" <<EOF
 socket_path = "${N1B_DIR}/client.sock"
 runtime_dir = "${N1B_DIR}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 
 [migration]
 enabled = false
@@ -806,6 +869,7 @@ cat > "${N1B_DIR}/receiver-disabled.toml" <<EOF
 socket_path = "${N1B_DIR}/receiver.sock"
 runtime_dir = "${N1B_DIR}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 
 [migration]
 enabled = false
@@ -860,7 +924,7 @@ assert_contains_any() {
 run_negative_src() {
     local name="$1" ca="$2" cert="$3" key="$4" dest="$5" log_needle="$6"
     shift 6
-    local dir sock log pid vol handle mid err bytes
+    local dir sock log pid vol handle mid err bytes resp rc status
     dir="${M46_DIR}/${name}"
     mkdir -p "$dir"
     sock="${dir}/api.sock"
@@ -872,31 +936,55 @@ run_negative_src() {
         || { qual_error "N-leg ${name}: stord did not come up — log: $(tail -5 "$log" 2>/dev/null)"; return 1; }
     handle="$(open_volume "$sock" "$vol" "vol.img" "8388608")" \
         || { qual_error "N-leg ${name}: OpenVolume failed"; return 1; }
-    mid="$(trigger_migration "$sock" "$vol" "$handle" "https://127.0.0.1:${DST_PORT}")" \
-        || { qual_error "N-leg ${name}: trigger failed"; return 1; }
-    wait_for "N-${name}: migration task FAILED at the TLS handshake" "$RPC_TIMEOUT" \
-        phase_is "$sock" "$mid" "FAILED" \
-        || qual_error "N-${name}: task never failed"
-    err="$(migration_field "$sock" "$mid" errorMessage)"
-    assert_contains_any "N-${name}: error is a transport-level mTLS failure" "$err" "$@"
+
+    # Two fail-closed shapes are conformant: the trigger can be refused
+    # synchronously (the sender dials the peer inside TriggerDiskMigration —
+    # current contract) or accepted as a journaled task that then FAILs at
+    # the TLS handshake (older contract). Both must name the transport
+    # failure and leave no bytes/volume behind.
+    resp="$(trigger_migration_raw "$sock" "$vol" "$handle" \
+        "https://127.0.0.1:${DST_PORT}" "8388608")"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        assert_contains_any "N-${name}: synchronous trigger refusal is a transport-level mTLS failure" \
+            "$resp" "$@"
+        qual_pass "N-${name}: trigger refused synchronously at the TLS handshake (fail-closed)"
+        {
+            echo "### leg-${name} — synchronous refusal ($(date -u +%FT%TZ))"
+            printf '%s\n\n' "$resp"
+        } >> "${EVIDENCE_DIR}/failed-migrations.jsonl"
+    else
+        status="$(printf '%s' "$resp" | jq -r '.result.status // empty' 2>/dev/null)"
+        mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty' 2>/dev/null)"
+        if [ "$status" != "OK" ] || [ -z "$mid" ]; then
+            qual_error "N-leg ${name}: trigger neither refused nor accepted (status=${status}): $(printf '%s' "$resp" | head -c 300)"
+            stop_scenario_stord "$pid" "${name}"
+            return 1
+        fi
+        wait_for "N-${name}: migration task FAILED at the TLS handshake" "$RPC_TIMEOUT" \
+            phase_is "$sock" "$mid" "FAILED" \
+            || qual_error "N-${name}: task never failed"
+        err="$(migration_field "$sock" "$mid" errorMessage)"
+        assert_contains_any "N-${name}: error is a transport-level mTLS failure" "$err" "$@"
+        # Fail-closed: nothing left the source.
+        bytes="$(migration_field "$sock" "$mid" bytesTransferred)"
+        if [ "$bytes" = "0" ]; then
+            qual_pass "N-${name}: zero bytes transferred (fail-closed)"
+        else
+            qual_error "N-${name}: bytes were transferred despite rejection (${bytes})"
+        fi
+        record_migration_error "leg-${name}" "$sock" "$mid"
+    fi
     if [ -n "$log_needle" ]; then
         assert_file_contains "N-${name}: SRC log shows the leg's distinguishing input" \
             "$log" "$log_needle"
     fi
-    # Fail-closed: nothing left the source and the receiver never
-    # materialized a receiving volume for this identity-rejected source.
-    bytes="$(migration_field "$sock" "$mid" bytesTransferred)"
-    if [ "$bytes" = "0" ]; then
-        qual_pass "N-${name}: zero bytes transferred (fail-closed)"
-    else
-        qual_error "N-${name}: bytes were transferred despite rejection (${bytes})"
-    fi
+    # Fail-closed: the receiver never materialized a receiving volume for
+    # this identity-rejected source.
     if [ ! -e "${DST_DIR}/${vol}.img" ]; then
         qual_pass "N-${name}: no receiving volume created on the destination"
     else
         qual_error "N-${name}: destination materialized a receiving volume (${DST_DIR}/${vol}.img)"
     fi
-    record_migration_error "leg-${name}" "$sock" "$mid"
     stop_scenario_stord "$pid" "${name}"
     cp "$log" "${EVIDENCE_DIR}/leg-${name}-stord.log" 2>/dev/null || true
 }
@@ -1030,14 +1118,31 @@ wait_for "N8 plaintext listener up" 10 tcp_port_open "$PLAIN_PORT" \
 N8_VOL="m46n8"
 N8_HANDLE="$(open_volume "$SRC_SOCK" "$N8_VOL" "n8.img" "8388608")" \
     || qual_die "aborting (Leg N8)"
-N8_MID="$(trigger_migration "$SRC_SOCK" "$N8_VOL" "$N8_HANDLE" "http://127.0.0.1:${PLAIN_PORT}")" \
-    || qual_die "aborting (Leg N8)"
-wait_for "N8: migration task FAILED against the non-TLS endpoint" "$RPC_TIMEOUT" \
-    phase_is "$SRC_SOCK" "$N8_MID" "FAILED" \
-    || qual_error "N8: task never failed against the plaintext endpoint"
-N8_ERR="$(migration_field "$SRC_SOCK" "$N8_MID" errorMessage)"
-assert_contains "N8: error indicates the mTLS connect failure (no plaintext fallback)" \
-    "$N8_ERR" "failed to connect to peer with mTLS"
+N8_MID=""
+N8_RESP="$(trigger_migration_raw "$SRC_SOCK" "$N8_VOL" "$N8_HANDLE" \
+    "http://127.0.0.1:${PLAIN_PORT}" "8388608")"; N8_RC=$?
+if [ "$N8_RC" -ne 0 ]; then
+    assert_contains "N8: synchronous trigger failure indicates the mTLS connect failure (no plaintext fallback)" \
+        "$N8_RESP" "failed to connect to peer with mTLS"
+    qual_pass "N8: http:// endpoint upgraded → mTLS dial failed synchronously (fail-closed)"
+    {
+        echo "### leg-N8 plaintext endpoint — synchronous refusal ($(date -u +%FT%TZ))"
+        printf '%s\n\n' "$N8_RESP"
+    } >> "${EVIDENCE_DIR}/failed-migrations.jsonl"
+else
+    N8_MID="$(printf '%s' "$N8_RESP" | jq -r '.migrationId // empty' 2>/dev/null)"
+    if [ -z "$N8_MID" ]; then
+        qual_error "N8: trigger neither refused nor accepted: $(printf '%s' "$N8_RESP" | head -c 300)"
+    else
+        wait_for "N8: migration task FAILED against the non-TLS endpoint" "$RPC_TIMEOUT" \
+            phase_is "$SRC_SOCK" "$N8_MID" "FAILED" \
+            || qual_error "N8: task never failed against the plaintext endpoint"
+        N8_ERR="$(migration_field "$SRC_SOCK" "$N8_MID" errorMessage)"
+        assert_contains "N8: error indicates the mTLS connect failure (no plaintext fallback)" \
+            "$N8_ERR" "failed to connect to peer with mTLS"
+        record_migration_error "leg-N8 plaintext endpoint" "$SRC_SOCK" "$N8_MID"
+    fi
+fi
 # The upgrade proof, from the sender's own log: the http:// endpoint was
 # rewritten to https:// before dialing.
 # tracing writes ANSI escapes between the message text and the endpoint=
@@ -1048,7 +1153,6 @@ assert_file_contains "N8: sender force-upgraded http:// → https:// before dial
     "$SRC_LOG" "https://127.0.0.1:${PLAIN_PORT}"
 assert_file_contains "N8: the plaintext listener actually received the (upgraded) dial" \
     "$N8_LOG" "accepted connection"
-record_migration_error "leg-N8 plaintext endpoint" "$SRC_SOCK" "$N8_MID"
 kill "$N8_LISTENER_PID" 2>/dev/null || true
 
 # ===========================================================================
@@ -1113,15 +1217,26 @@ assert_file_contains "N9: restarted DST re-bound the receiver listener" \
 # First retry hits the create_new refusal: the partial receiving volume
 # exists and the receiver REFUSES to truncate it (documented operator step:
 # remove the partial volume; there is no in-place resume).
-MID9B="$(trigger_migration "$SRC_SOCK" "$VOL9_ID" "$HANDLE9" "https://127.0.0.1:${DST_PORT}")" \
-    || qual_die "aborting (Leg N9 recovery)"
-wait_for "N9: retry FAILED — receiver refuses to truncate the partial receiving volume" \
-    "$RPC_TIMEOUT" phase_is "$SRC_SOCK" "$MID9B" "FAILED" \
-    || qual_error "N9: retry against the partial volume never failed"
-N9B_ERR="$(migration_field "$SRC_SOCK" "$MID9B" errorMessage)"
+#
+# The receiver rejects before readiness, and the source surfaces that
+# destination error synchronously — so the expected shape is EITHER a
+# migration_id whose task then FAILs (older behavior) OR a direct rejection
+# with no task. Both prove the same contract; assert the refusal text.
+N9B_RESP="$(trigger_migration_raw "$SRC_SOCK" "$VOL9_ID" "$HANDLE9" "https://127.0.0.1:${DST_PORT}")"
+N9B_MID="$(printf '%s' "$N9B_RESP" | jq -r '.migrationId // empty' 2>/dev/null)"
+if [ -n "$N9B_MID" ]; then
+    wait_for "N9: retry FAILED — receiver refuses to truncate the partial receiving volume" \
+        "$RPC_TIMEOUT" phase_is "$SRC_SOCK" "$N9B_MID" "FAILED" \
+        || qual_error "N9: retry against the partial volume never failed"
+    N9B_ERR="$(migration_field "$SRC_SOCK" "$N9B_MID" errorMessage)"
+else
+    N9B_ERR="$N9B_RESP"
+    qual_pass "N9: retry refused synchronously (no migration task created)"
+fi
 assert_contains "N9: refusal names the existing receiving volume (create_new semantics)" \
     "$N9B_ERR" "refusing to truncate"
-record_migration_error "leg-N9 retry against the partial receiving volume" "$SRC_SOCK" "$MID9B"
+[ -z "$N9B_MID" ] \
+    || record_migration_error "leg-N9 retry against the partial receiving volume" "$SRC_SOCK" "$N9B_MID"
 assert_file_exists "N9: partial receiving volume still on disk (not clobbered)" "${DST_DIR}/${VOL9_ID}.img"
 
 # Deterministic recovery: remove the partial volume, re-trigger (a THIRD

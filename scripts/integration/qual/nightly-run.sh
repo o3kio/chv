@@ -104,6 +104,173 @@ fail() {
     exit 1
 }
 
+# --- Runner hygiene and failure observability ------------------------------
+# The self-hosted runner is dedicated to this lane. A lane that dies
+# mid-scenario can leave chv daemons/VMMs holding 8443/8080/9100-9103 and
+# /tmp/chv-qual-* trees behind; the next lane then fails for reasons that
+# have nothing to do with the candidate ("Address already in use", CP→agent
+# auth against a stale process). Sweep before preflight, scoped by argv[0]
+# and the qualification roots so nothing else on the host is touched.
+qual_daemon_pattern="(^|/)(cloud-hypervisor|chv-controlplane|chv-agent|chv-stord|chv-nwd)( |\$).*(/tmp/chv-qual-|${CHV_QUAL_ROOT})"
+qual_harness_pattern='(^|/)(nightly-run|deploy)\.sh( |$)|(^| )\./m4\.[0-9][^ ]*\.sh( |$)'
+
+# Kill orphaned HARNESS scripts, not just their daemons. A canceled workflow
+# does not reap the self-hosted job's children: an orphaned nightly-run.sh
+# keeps iterating scenarios and starts a *new* stack (new /tmp/chv-qual-*
+# dir) after the daemon sweep — observed in run 41905691606 as a fresh
+# control plane holding :9103 two minutes after the sweep had passed. Match
+# the qualification scripts by argv (absolute path for nightly-run/deploy,
+# `./m4.N-*.sh` for scenario children) and by the qual script cwd, and
+# never touch this invocation or its ancestors.
+sweep_orphaned_harness() {
+    local pid cmd cwd
+    local -a p_kill=()
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        case " ${protected_pids} " in *" ${pid} "*) continue ;; esac
+        # Scope by cwd: the harness always runs from this directory, so a
+        # same-named deploy.sh/nightly-run.sh from another project on the
+        # runner is never touched.
+        cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+        [ "$cwd" = "$SCRIPT_DIR" ] || continue
+        cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+        printf '%s' "$cmd" | grep -Eq "$qual_harness_pattern" || continue
+        p_kill+=("$pid")
+    done < <(ls -1 /proc 2>/dev/null | grep -E '^[0-9]+$')
+    if [ "${#p_kill[@]}" -gt 0 ]; then
+        echo "::warning::nightly-run: killing orphaned qualification harness scripts (a canceled lane does not reap its children): ${p_kill[*]}" >&2
+        ps -o pid,ppid,etime,args -p "$(IFS=,; echo "${p_kill[*]}")" >&2 2>/dev/null || true
+        kill -TERM "${p_kill[@]}" 2>/dev/null || true
+        sleep 2
+        kill -KILL "${p_kill[@]}" 2>/dev/null || true
+    fi
+}
+
+sweep_stale_qual_state() {
+    local found
+    # Protect self and ancestors: this script's own argv matches the pattern.
+    protected_pids="$$"
+    local p=$$
+    while [ "$p" -gt 1 ]; do
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+        [ -n "$p" ] && [ "$p" -gt 1 ] || break
+        protected_pids="${protected_pids} ${p}"
+    done
+    sweep_orphaned_harness
+    found="$(pgrep -af "$qual_daemon_pattern" 2>/dev/null || true)"
+    if [ -n "$found" ]; then
+        echo "::warning::nightly-run: killing stale qualification processes from a previous lane:" >&2
+        printf '%s\n' "$found" >&2
+        pkill -f "$qual_daemon_pattern" 2>/dev/null || true
+        sleep 2
+        pkill -9 -f "$qual_daemon_pattern" 2>/dev/null || true
+        sleep 1
+    fi
+    # A daemon restarted by an orphan just before it died can still be
+    # shutting down; retry the daemon kill once after the harness is gone.
+    pkill -9 -f "$qual_daemon_pattern" 2>/dev/null || true
+    sleep 1
+    # Only the throwaway trees: the persistent root holds staged binaries,
+    # firmware, and guest images and must survive. Never touch the artifact
+    # root, even when a manual invocation puts it under /tmp.
+    local d
+    for d in /tmp/chv-qual-*; do
+        [ -d "$d" ] || continue
+        case "${QUAL_ARTIFACT_ROOT}/" in "$d"/*) continue ;; esac
+        case "$d/" in "${QUAL_ARTIFACT_ROOT}"/*) continue ;; esac
+        rm -rf -- "$d"
+    done
+    # nwd hardcodes its dnsmasq runtime here; a killed nwd can leave it behind.
+    # Kill its dnsmasq children first: removing the runtime dir does not stop
+    # a daemon that still references the deleted config file.
+    pkill -9 -f 'dnsmasq .*--conf-file=/run/chv/nwd/' 2>/dev/null || true
+    rm -rf /run/chv/nwd 2>/dev/null || true
+
+    # Orphaned HOST state (links, nft tables) from a lane killed before its
+    # teardown. This is not cosmetic: a stale `br-<network>` keeps a route
+    # for the network CIDR, and Linux picks the first route — run
+    # 41926076717's m4.4 could not reach any guest because a DOWN bridge
+    # from a previous lane still owned 10.200.0.0/24, so every ping/ARP
+    # looked like a policy failure. Names are CHV-specific (`br-`/`tap-`
+    # plus hex, `chv-<network_id>` table) and the lane holds the
+    # single-lane lock, so nothing else on this dedicated runner owns them.
+    local stale_links stale_tables l t
+    stale_links="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+        | awk '{print $1}' | grep -E '^(br|tap)-[0-9a-f]{8,}$' || true)"
+    if [ -n "$stale_links" ]; then
+        echo "::warning::nightly-run: removing orphaned CHV host links from a previous lane: $(echo "$stale_links" | tr '\n' ' ')" >&2
+        for l in $stale_links; do ip link delete "$l" 2>/dev/null || true; done
+    fi
+    stale_tables="$(nft list tables 2>/dev/null \
+        | awk '$2=="inet" && $3 ~ /^chv-[0-9a-f]{16,}$/ {print $3}' || true)"
+    if [ -n "$stale_tables" ]; then
+        echo "::warning::nightly-run: removing orphaned CHV nft tables from a previous lane: $(echo "$stale_tables" | tr '\n' ' ')" >&2
+        for t in $stale_tables; do nft delete table inet "$t" 2>/dev/null || true; done
+    fi
+}
+
+require_qual_ports_free() {
+    local ports="8080 8443 8444 9100 9101 9102 9103 51052 51053 51062 51063"
+    local busy attempt
+    # SIGKILL is immediate, but a process that was mid-restart can take a
+    # moment to lose its listeners. Retry before declaring the runner dirty.
+    for attempt in $(seq 1 15); do
+        busy="$(ss -ltnH 2>/dev/null | awk -v want="$ports" \
+            'BEGIN { split(want, a, " "); for (i in a) w[a[i]] = 1 }
+             { n = split($4, p, ":"); if (p[n] in w) print $4 }')"
+        [ -z "$busy" ] && return 0
+        sleep 1
+    done
+    fail "qualification ports still in use after the stale-state sweep: $(echo "$busy" | tr '\n' ' ') — inspect with: ss -ltnp"
+}
+
+snapshot_host_state() {
+    local out="$1"
+    {
+        date -u
+        hostname
+        echo "--- listeners"
+        ss -ltnp 2>/dev/null | grep -E ':(8080|8443|8444|9100|9101|9102|9103|5105[0-9]|5106[0-9])\b' || true
+        echo "--- qual processes"
+        ps -eo pid,ppid,etime,rss,args 2>/dev/null \
+            | grep -E 'cloud-hypervisor|chv-(agent|stord|nwd|controlplane)' \
+            | grep -v grep || true
+        echo "--- memory/disk"
+        free -h 2>/dev/null || true
+        df -h / /tmp 2>/dev/null || true
+        echo "--- kernel"
+        dmesg 2>/dev/null | tail -n 50 || true
+    } > "$out" 2>&1
+}
+
+# Copy the log/state files from each NEWLY preserved failed test tree into the
+# uploaded artifact. The deploy teardown keeps those trees on the runner for
+# post-mortem, but the workflow artifact only carries QUAL_ARTIFACT_ROOT, so
+# without this the per-VM console and daemon logs that explain a boot or
+# volume failure never leave the runner. Text files only, capped per file.
+preserve_failed_dirs() {
+    local before="$1" scenario="$2" d f rel out dest
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ -n "$before" ] && printf '%s\n' "$before" | grep -Fxq -- "$d"; then
+            continue
+        fi
+        dest="${QUAL_ARTIFACT_ROOT}/failed/${scenario}/$(basename "$d")"
+        mkdir -p "$dest"
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            rel="${f#"$d"/}"
+            out="${dest}/${rel}"
+            mkdir -p "$(dirname "$out")"
+            head -c 2097152 "$f" > "$out" 2>/dev/null || true
+        done < <(find "$d" -type f \
+            \( -name '*.log' -o -name '*.toml' -o -name 'deployment.map' \
+               -o -name 'pids.current' -o -name 'host-state.txt' -o -name '*.jsonl' \) \
+            -print 2>/dev/null)
+        echo "::warning::nightly-run: preserved failed test tree for ${scenario}: ${dest}" >&2
+    done < <(ls -1d /tmp/chv-qual-failed-* 2>/dev/null || true)
+}
+
 [ "$(id -u)" -eq 0 ] || fail "must run as root on the self-hosted KVM runner"
 [ -e /dev/kvm ] || fail "/dev/kvm is absent on this runner — real-KVM qualification cannot run (this is a failure, not a skip)"
 [ -n "$SCENARIOS" ] || fail "no scenarios requested (use --scenarios)"
@@ -112,9 +279,31 @@ command -v curl >/dev/null 2>&1 || fail "curl is required by the qualification h
 
 printf 'scenario\tstatus\trc\tduration_s\tlog\tevidence\n' > "$RESULT_FILE"
 
+# --- Single-lane lock --------------------------------------------------------
+# The workflow concurrency group serializes GitHub jobs but cannot see a
+# canceled job's orphaned children (the sweep below kills those). This lock
+# makes a second *live* lane fail fast instead of letting its sweep kill the
+# first lane's daemons mid-run.
+mkdir -p "$CHV_QUAL_ROOT" || fail "cannot create ${CHV_QUAL_ROOT}"
+LANE_LOCK="${CHV_QUAL_ROOT}/.nightly-run.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$LANE_LOCK"
+    if ! flock -n 9; then
+        holder="$(tr -d '\n' < "$LANE_LOCK" 2>/dev/null || true)"
+        fail "another qualification lane holds ${LANE_LOCK}${holder:+ (${holder})}; refusing to run two lanes concurrently"
+    fi
+    printf 'pid=%s started=%s\n' "$$" "$(date -u +%FT%TZ)" > "$LANE_LOCK"
+else
+    echo "::warning::nightly-run: flock not available; cannot assert a single active lane" >&2
+fi
+
 # deploy.sh resolves the --exec command relative to its caller's working
 # directory (the documented usage is `cd qual && ./deploy.sh --exec ./m4.x.sh`).
 cd "$SCRIPT_DIR" || fail "cannot cd to ${SCRIPT_DIR}"
+
+echo "[qual-nightly] sweeping stale qualification state from a previous lane"
+sweep_stale_qual_state
+require_qual_ports_free
 
 # The stock Ubuntu cloud image cannot boot through the CHV firmware chain
 # (GRUB's LABEL= root needs an initramfs the shim/firmware path never
@@ -149,9 +338,21 @@ for scenario in $SCENARIOS; do
         fail "scenario script not found: ${script}"
     fi
 
+    # EVIDENCE_DIR lives under the persistent CHV_QUAL_ROOT, so without
+    # this a run inherits the previous lane's screenshots/nft dumps and the
+    # uploaded artifact cannot be read as one run's evidence (observed in
+    # 41926076717: three runs' snapshots in one host-state.txt).
+    rm -rf -- "$evidence_src"
+
     echo "[qual-nightly] running ${scenario}"
     started="$(date +%s)"
-    if "${SCRIPT_DIR}/deploy.sh" --exec "./${scenario}.sh" > "$scenario_log" 2>&1; then
+    failed_before="$(ls -1d /tmp/chv-qual-failed-* 2>/dev/null || true)"
+    # Do NOT let the scenario/deploy tree inherit the lane lock (fd 9). A
+    # canceled job can leave deploy.sh + daemons alive; if they held the lock
+    # the next lane could never acquire it and could not sweep them. Closing
+    # the fd here keeps the lock owned by this script alone, which the orphan
+    # sweep below is allowed to kill.
+    if "${SCRIPT_DIR}/deploy.sh" --exec "./${scenario}.sh" 9>&- > "$scenario_log" 2>&1; then
         status="pass"
         scenario_rc=0
     else
@@ -161,6 +362,11 @@ for scenario in $SCENARIOS; do
         echo "::error::nightly-run: ${scenario} failed (rc=${scenario_rc}); log artifact: ${scenario_log}"
     fi
     duration="$(( $(date +%s) - started ))"
+
+    preserve_failed_dirs "$failed_before" "$scenario"
+    if [ "$status" = "fail" ]; then
+        snapshot_host_state "${LOG_DIR}/${scenario}-host-state.txt"
+    fi
 
     if [ -d "$evidence_src" ]; then
         rm -rf "$evidence_dst"

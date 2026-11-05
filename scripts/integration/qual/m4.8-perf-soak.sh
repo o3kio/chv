@@ -206,6 +206,11 @@ GRPCURL_DIR="${M48_DIR}/grpcurl"
 DST_PORT="51063"        # DST mTLS receiver listener (loopback only)
 VOL_SIZE_BYTES=$((4 * 1024 * 1024 * 1024))   # 4 GiB = 1024 x 4 MiB chunks
 SEED_FILE="${M48_DIR}/m48-seed.img"
+# Destination identity the migration receiver expects in its authorization
+# token (issue #663); bound into the DST config and the minted token.
+QUAL_MIGRATION_DEST_NODE_ID="qual-m48-dst"
+[ -n "${QUAL_MIGRATION_SECRET_FILE:-}" ] \
+    || qual_die "QUAL_MIGRATION_SECRET_FILE not set — run via deploy.sh --exec"
 
 # grpcurl pin (supply-chain discipline — same as M4.6/M4.7).
 GRPCURL_VERSION="1.9.3"
@@ -585,34 +590,6 @@ poll_until() {
     return 0
 }
 
-# wait_vm_stopped — graceful-stop wait with the #345 wedge detection and
-# SIGKILL remediation (m4.7-verbatim; a wedge is a WARN — the documented
-# operator path — and the stop latency record carries the flag).
-wait_vm_stopped() {
-    local vm="$1" waited=0 strikes=0 pid
-    while ! vm_ch_gone "$vm"; do
-        if curl -sg --max-time 2 --unix-socket "${VMS_DIR}/${vm}/vm.sock" \
-            http://localhost/api/v1/vm.info >/dev/null 2>&1; then
-            strikes=0
-        else
-            strikes=$((strikes + 1))
-            if [ "$strikes" -ge 3 ]; then
-                pid="$(ch_pid_of "$vm")"
-                VM_LAST_STOP_WEDGED=1
-                qual_warn "wait_vm_stopped(${vm}): known #345 wedge — CH ${pid} alive with a dead API after the graceful stop; remediating with SIGKILL (the documented operator path)"
-                [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
-            fi
-        fi
-        sleep 2
-        waited=$((waited + 2))
-        if [ "$waited" -ge "$STOP_TIMEOUT" ]; then
-            qual_error "wait_vm_stopped(${vm}): guest did not stop within ${STOP_TIMEOUT}s"
-            return 1
-        fi
-    done
-    return 0
-}
-
 # ---------------------------------------------------------------------------
 # Idle resource window (P1/P3 shape) — RECORDS + the two at-rest
 # ASSERTIONS that use the window (DB growth; fd/socket baseline capture)
@@ -909,8 +886,10 @@ close_volume_quiet() {
 
 try_trigger_migration() {
     local sock="$1" volid="$2" handle="$3" endpoint="$4"
-    local json resp status mid
-    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\"}"
+    local size="${5:-$VOL_SIZE_BYTES}"
+    local auth json resp status mid
+    auth="$(mint_migration_authorization "$volid" "$size")" || { printf ''; return 1; }
+    json="{\"volumeId\":\"${volid}\",\"attachmentHandle\":\"${handle}\",\"destEndpoint\":\"${endpoint}\",\"migrationAuthorization\":\"${auth}\"}"
     resp="$(stord_rpc "$sock" TriggerDiskMigration "$json" 2>&1)" || { printf ''; return 1; }
     status="$(printf '%s' "$resp" | jq -r '.result.status // empty')"
     mid="$(printf '%s' "$resp" | jq -r '.migrationId // empty')"
@@ -1209,12 +1188,12 @@ for c in $(seq 1 "$N_SOAK"); do
         && qual_pass "cycle ${c}: vm stop accepted" \
         || qual_error "cycle ${c}: vm stop rejected"
     T_ACC="$(now_us)"
-    if wait_vm_stopped "$SOAK_VM"; then
+    if wait_vm_guest_stopped "$SOAK_VM"; then
         T_CONV="$(now_us)"
         NOTE="graceful"
         [ "$VM_LAST_STOP_WEDGED" = "1" ] && NOTE="#345-wedge-sigkill"
         echo "${c},stop,$(latency_s "$T_SUB" "$T_ACC"),$(latency_s "$T_ACC" "$T_CONV"),${NOTE}" >> "$LIFECYCLE_CSV"
-        qual_pass "cycle ${c}: stop converged in $(latency_s "$T_ACC" "$T_CONV") s (CH process exited; ${NOTE})"
+        qual_pass "cycle ${c}: stop converged in $(latency_s "$T_ACC" "$T_CONV") s (guest terminal; VMM retained until delete; ${NOTE})"
     else
         echo "${c},stop,$(latency_s "$T_SUB" "$T_ACC"),timeout,stop-timeout" >> "$LIFECYCLE_CSV"
     fi
@@ -1580,6 +1559,7 @@ write_src_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -1595,6 +1575,7 @@ write_dst_config() {
 socket_path = "${2}"
 runtime_dir = "${3}"
 log_level = "info"
+metrics_bind = "127.0.0.1:0"
 path_allowlist = ["${3}"]
 
 [migration]
@@ -1607,6 +1588,8 @@ listen_addr = "127.0.0.1:${4}"
 server_cert_path = "${CERTS_DIR}/dst-server.crt"
 server_key_path = "${CERTS_DIR}/dst-server.key"
 client_ca_path = "${CERTS_DIR}/ca.crt"
+node_id = "${QUAL_MIGRATION_DEST_NODE_ID}"
+signing_secret_file = "${QUAL_MIGRATION_SECRET_FILE}"
 EOF
 }
 
@@ -1626,6 +1609,8 @@ wait_for "P5: DST stord UDS up" 20 test -S "$DST_SOCK" \
     || qual_die "P5: DST stord did not come up — log: $(tail -20 "$DST_LOG" 2>/dev/null)"
 assert_file_contains "P5: DST receiver listener bound (mTLS, client auth required)" \
     "$DST_LOG" "storage migration receiver listening on 127.0.0.1:${DST_PORT}"
+assert_file_contains "P5: DST requires control-plane migration authorizations (not the insecure bypass)" \
+    "$DST_LOG" "storage migration authorizations enabled"
 
 # Seed: 4 GiB patterned (one random 4 MiB block repeated) — the M4.6/
 # M4.7 size, so the throughput record is comparable across milestones.

@@ -176,34 +176,6 @@ vm_ch_gone() {
     ! pgrep -f "(^|/)cloud-hypervisor( |$).*vms/$1" >/dev/null 2>&1
 }
 
-# wait_vm_stopped VM_ID — graceful stop completion: BFF power_state
-# Stopped AND the VM's CH process gone (wedge-aware: if CH lingers with a
-# dead API — the #345 class — SIGKILL it after 3 strikes, as in M4.3).
-wait_vm_stopped() {
-    local vm="$1" waited=0 strikes=0 pid
-    while ! vm_ch_gone "$vm"; do
-        if curl -sg --max-time 2 --unix-socket "${VMS_DIR}/${vm}/vm.sock" \
-            http://localhost/api/v1/vm.info >/dev/null 2>&1; then
-            strikes=0
-        else
-            strikes=$((strikes + 1))
-            if [ "$strikes" -ge 3 ]; then
-                pid="$(cat "${VMS_DIR}/${vm}/ch.pid" 2>/dev/null || true)"
-                qual_error "wait_vm_stopped(${vm}): #345 wedge — CH ${pid} alive with a dead API; remediating with SIGKILL"
-                [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
-            fi
-        fi
-        sleep 2
-        waited=$((waited + 2))
-        if [ "$waited" -ge "$STOP_TIMEOUT" ]; then
-            qual_error "wait_vm_stopped(${vm}): guest did not stop within ${STOP_TIMEOUT}s"
-            return 1
-        fi
-    done
-    qual_pass "vm ${vm}: guest down (CH process exited)"
-    return 0
-}
-
 # create_vm NAME CPU MEM NETWORK → VM_ID on stdout (empty on failure).
 create_vm() {
     local name="$1" cpu="$2" mem="$3" network="$4" out vm_id
@@ -327,6 +299,41 @@ ping_ok() {
     fi
 }
 
+# ping_ok_retry IP [IFACE] [TIMEOUT] — poll connectivity. Policy application
+# and the nwd restart are asynchronous; a single ping races the dispatcher
+# and the firewall chain rebuild (run 41912418366: one-shot pings failed
+# while the rules landed seconds later).
+ping_ok_retry() {
+    local ip="$1" iface="${2:-}" timeout="${3:-60}"
+    local deadline=$((SECONDS + timeout))
+    until ping_ok "$ip" "$iface"; do
+        [ "$SECONDS" -ge "$deadline" ] && return 1
+        sleep 2
+    done
+}
+
+# nft_icmp_allowed TABLE — both-direction ICMP accept rules are present in
+# the CHV policy table (in + out; the rulesets the scenario applies carry
+# one accept per direction).
+nft_icmp_allowed() {
+    local table="$1" n
+    n="$(nft list table inet "$table" 2>/dev/null | grep -c 'l4proto icmp.*accept' || true)"
+    [ "${n:-0}" -ge 2 ]
+}
+
+# nft_icmp_allowed_wait TABLE [TIMEOUT] — silent poll (no qual_error on
+# timeout) for call sites where an unmaterialized update is recorded as a
+# WARN/deferred observation rather than a hard failure.
+nft_icmp_allowed_wait() {
+    local table="$1"
+    local timeout="${2:-90}"
+    local deadline=$((SECONDS + timeout))
+    until nft_icmp_allowed "$table"; do
+        [ "$SECONDS" -ge "$deadline" ] && return 1
+        sleep 2
+    done
+}
+
 # bridge_addr BRIDGE — first inet address (e.g. "10.200.0.1/24"), or empty.
 bridge_addr() {
     ip -4 addr show dev "$1" 2>/dev/null | awk '/inet /{print $2; exit}'
@@ -417,6 +424,18 @@ save_console_evidence "$VM1_ID" "leg-a"
 [ -n "$(bridge_addr "$VM1_BRIDGE")" ] \
     && qual_pass "bridge ${VM1_BRIDGE} exists ($(bridge_addr "$VM1_BRIDGE"))" \
     || qual_error "FORBIDDEN: bridge ${VM1_BRIDGE} missing after attach"
+# One route per CIDR. A second route means an orphaned bridge from an
+# earlier lane still owns the prefix; Linux would use the FIRST route, so
+# every reachability assertion below would fail for a reason unrelated to
+# the candidate. Fail with the real cause instead (the nightly lane now
+# sweeps such links before preflight).
+CIDR_ROUTE_COUNT="$(ip -o route show 2>/dev/null \
+    | awk -v c="$QUAL_NETWORK_CIDR" '$1 == c' | wc -l)"
+if [ "$CIDR_ROUTE_COUNT" -le 1 ]; then
+    qual_pass "exactly one host route for ${QUAL_NETWORK_CIDR} (no stale bridge)"
+else
+    qual_error "FORBIDDEN: ${CIDR_ROUTE_COUNT} host routes for ${QUAL_NETWORK_CIDR} — an orphaned bridge from a previous lane still owns the prefix: $(ip route show | grep "$QUAL_NETWORK_CIDR" | tr '\n' ';')"
+fi
 VM1_TAP="$(tap_of "$VM1_ID")"
 if [ -n "$VM1_TAP" ]; then
     qual_pass "vm tap ${VM1_TAP} present in CH payload"
@@ -459,14 +478,27 @@ done
 console_has "$VM1_ID" "$VM1_IP" \
     && qual_pass "guest configured its NIC with the reserved IP (${VM1_IP})" \
     || qual_error "guest console shows no evidence of IP ${VM1_IP}"
-if ping_ok "$VM1_IP"; then
-    qual_pass "host → guest connectivity (${VM1_IP}: 2/2 icmp)"
-    ip neigh show dev "$VM1_BRIDGE" | grep -q "${VM1_IP}.*${VM1_MAC}" \
-        && qual_pass "ARP entry ${VM1_IP} → ${VM1_MAC} on ${VM1_BRIDGE}" \
-        || qual_warn "no ARP entry for ${VM1_IP} (check ip neigh evidence)"
+# Baseline policy (#355 PR3): an empty ruleset is DHCP/DNS/conntrack plus
+# default-deny, so host→guest ICMP is blocked BY DESIGN until a rule
+# allows it. Prove that baseline here; Leg B/C apply the allow rules and
+# assert connectivity. On the frozen candidate (bare table, no chains)
+# host→guest ICMP works, which this branch still accepts truthfully.
+if [ "$(nft_table_chain_count "$VM1_NFT_TABLE")" -eq 0 ]; then
+    if ping_ok "$VM1_IP"; then
+        qual_pass "host → guest connectivity (${VM1_IP}: 2/2 icmp; bare-table candidate)"
+    else
+        qual_error "FORBIDDEN: host → guest ping FAILED for ${VM1_IP} (bare table)"
+    fi
 else
-    qual_error "FORBIDDEN: host → guest ping FAILED for ${VM1_IP}"
+    if ping_ok "$VM1_IP"; then
+        qual_error "FORBIDDEN: host → guest ping SUCCEEDED with an empty ruleset despite default-deny"
+    else
+        qual_pass "empty ruleset default-denies host → guest ICMP (${VM1_IP}) — policy must allow it"
+    fi
 fi
+ip neigh show dev "$VM1_BRIDGE" | grep -q "${VM1_IP}.*${VM1_MAC}" \
+    && qual_pass "ARP entry ${VM1_IP} → ${VM1_MAC} on ${VM1_BRIDGE}" \
+    || qual_warn "no ARP entry for ${VM1_IP} (check ip neigh evidence)"
 save_evidence "leg-a-after-boot"
 
 # ---------------------------------------------------------------------------
@@ -568,9 +600,19 @@ if [ "$NONCHV_TABLES_BEFORE" = "$NONCHV_TABLES_NOW" ]; then
 else
     qual_error "FORBIDDEN: non-CHV nft tables changed: '${NONCHV_TABLES_BEFORE}' → '${NONCHV_TABLES_NOW}'"
 fi
-ping_ok "$VM1_IP" \
-    && qual_pass "host → guest connectivity unaffected" \
-    || qual_error "FORBIDDEN: policy attempt broke guest connectivity"
+# The update is journaled and fanned out on the orchestrator tick (2 s
+# base interval, but the task may queue behind other work). Poll for the
+# ICMP accepts instead of assuming a fixed 15 s is enough; if they only
+# land with the next VM dispatch, record that honestly rather than
+# treating the still-default-denied baseline as "broken connectivity".
+if nft_icmp_allowed_wait "$VM1_NFT_TABLE" 90; then
+    qual_pass "policy ICMP allow materialized on ${VM1_NFT_TABLE}"
+    ping_ok_retry "$VM1_IP" "" 60 \
+        && qual_pass "host → guest connectivity allowed by the policy (${VM1_IP})" \
+        || qual_error "FORBIDDEN: policy allows ICMP but guest connectivity still fails"
+else
+    qual_warn "journaled policy update not materialized within 90s; the attach-time path (next VM dispatch) will be asserted in Leg C"
+fi
 save_evidence "leg-b-after-policy-attempt"
 
 # ---------------------------------------------------------------------------
@@ -583,7 +625,7 @@ NWD_BEFORE_C="$(nwd_pid)"
 kill -9 "$NWD_BEFORE_C"
 qual_info "nwd (pid ${NWD_BEFORE_C}) SIGKILLed"
 sleep 2
-ping_ok "$VM1_IP" \
+ping_ok_retry "$VM1_IP" "" 60 \
     && qual_pass "data plane survives nwd death (kernel-only: bridge/tap/dnsmasq)" \
     || qual_error "FORBIDDEN: guest connectivity lost with nwd down"
 
@@ -603,7 +645,7 @@ NWD_PID="$(nwd_pid)"
     && qual_pass "nwd restarted by the agent supervisor (pid ${NWD_BEFORE_C} → ${NWD_PID})" \
     || qual_error "nwd pid did not change (${NWD_PID})"
 pids_current
-ping_ok "$VM1_IP" \
+ping_ok_retry "$VM1_IP" "" 90 \
     && qual_pass "guest connectivity intact across the nwd restart" \
     || qual_error "FORBIDDEN: guest connectivity lost after nwd restart"
 
@@ -621,10 +663,6 @@ VM2_TAP="$(tap_of "$VM2_ID")"
 [ -n "$VM2_TAP" ] && ip link show "$VM2_TAP" 2>/dev/null | grep -q "master ${VM1_BRIDGE}" \
     && qual_pass "new VM attached to existing network after nwd restart (tap ${VM2_TAP} re-ensured)" \
     || qual_error "FORBIDDEN: attach to existing network failed after nwd restart"
-ping_ok "$VM2_IP" \
-    && qual_pass "host → guest-2 connectivity (${VM2_IP})" \
-    || qual_error "FORBIDDEN: host → guest-2 ping FAILED for ${VM2_IP}"
-
 # N2 flip (#355 part 1): vm-2's create is the first VM spec DISPATCH
 # after Leg B's firewall_rules update. On post-#355 main the policy
 # snapshot travels with the spec and the Core executor applies it via
@@ -643,6 +681,19 @@ elif [ "$VM2_CHAINS_C" -gt 0 ]; then
 else
     qual_warn "nft table still BARE after a post-update VM dispatch — attach-time policy path absent (defect N2, issue filed)"
 fi
+# The dispatch (vm-2 create) is where the operator rules are guaranteed
+# to travel with the spec. Wait for them, then assert connectivity to
+# BOTH guests — this is the scenario's "attach + policy → reachable"
+# contract, and it does not depend on the journaled fan-out timing.
+nft_icmp_allowed_wait "$VM1_NFT_TABLE" 60 \
+    && qual_pass "ICMP allow present in ${VM1_NFT_TABLE} after the vm-2 dispatch" \
+    || qual_warn "ICMP allow still absent after the vm-2 dispatch (attach-time policy path incomplete)"
+ping_ok_retry "$VM1_IP" "" 60 \
+    && qual_pass "host → guest-1 connectivity with the operator policy (${VM1_IP})" \
+    || qual_error "FORBIDDEN: host → guest-1 ping FAILED with the policy applied"
+ping_ok_retry "$VM2_IP" "" 60 \
+    && qual_pass "host → guest-2 connectivity (${VM2_IP})" \
+    || qual_error "FORBIDDEN: host → guest-2 ping FAILED for ${VM2_IP}"
 save_evidence "leg-c-after-nwd-restart"
 
 # ---------------------------------------------------------------------------
@@ -652,10 +703,16 @@ qual_info "--- Leg D: stop → tap quiesced, bridge/dnsmasq persist → start �
 
 VM1_TAP_BEFORE_D="$VM1_TAP"
 qual_chvctl vm stop "$VM1_ID" >/dev/null || qual_die "vm stop failed for ${VM1_ID}"
-wait_vm_stopped "$VM1_ID" || qual_error "vm ${VM1_ID} did not stop cleanly"
-[ "$(count_cloud_hypervisor_processes)" -eq 1 ] \
-    && qual_pass "CH for qual-net-1 exited (1 CH remains: qual-net-2)" \
-    || qual_error "FORBIDDEN: expected 1 CH process after stop, found $(count_cloud_hypervisor_processes)"
+# --no-shutdown contract: the guest reaches a terminal state and the VMM
+# is RETAINED; DeleteVm is what stops it. Waiting for CH exit here is the
+# stale pre-contract expectation that made this leg time out for 240 s.
+wait_vm_guest_stopped "$VM1_ID" || qual_error "vm ${VM1_ID} did not reach a terminal guest state"
+pgrep -f "(^|/)cloud-hypervisor( |$).*vms/${VM1_ID}" >/dev/null 2>&1 \
+    && qual_pass "VMM retained after graceful stop (${VM1_ID}; delete is what stops it)" \
+    || qual_error "FORBIDDEN: VMM exited on graceful stop (contract: retained until delete)"
+[ "$(count_cloud_hypervisor_processes)" -eq 2 ] \
+    && qual_pass "2 CH processes remain after stop (qual-net-1 retained + qual-net-2 running)" \
+    || qual_error "FORBIDDEN: expected 2 CH processes after stop, found $(count_cloud_hypervisor_processes)"
 if [ -n "$VM1_TAP_BEFORE_D" ] && ip link show "$VM1_TAP_BEFORE_D" >/dev/null 2>&1; then
     qual_info "tap ${VM1_TAP_BEFORE_D} persists after stop (kernel link; carrier drops with the CH side)"
     ip link show "$VM1_TAP_BEFORE_D" | grep -q "NO-CARRIER" \
@@ -682,7 +739,7 @@ VM1_IP_AFTER_D="$(nic_field "$VM1_ID" ip_address)"
 [ "$VM1_IP_AFTER_D" = "$VM1_IP" ] \
     && qual_pass "IPAM assignment stable across stop/start (${VM1_IP})" \
     || qual_error "IPAM assignment changed: ${VM1_IP} → ${VM1_IP_AFTER_D}"
-ping_ok "$VM1_IP" \
+ping_ok_retry "$VM1_IP" "" 90 \
     && qual_pass "host → guest connectivity restored after re-start" \
     || qual_error "FORBIDDEN: connectivity not restored after re-start"
 save_evidence "leg-d-after-restart"
@@ -707,6 +764,7 @@ VM3_IP="$(nic_field "$VM3_ID" ip_address)"
 VM3_NET="$(nic_field "$VM3_ID" network_id)"
 [ -n "$VM3_NET" ] || qual_die "no network_id in vm_nic_desired_state for ${VM3_ID}"
 VM3_BRIDGE="$(bridge_for_network "$VM3_NET")"
+VM3_TAP="$(tap_of "$VM3_ID")"
 qual_info "network ref '${SECOND_NET}' → network_id '${VM3_NET}' (bridge ${VM3_BRIDGE})"
 
 # The operator's network is what the VM must attach to; the frozen
@@ -736,17 +794,37 @@ if ip route show | grep "$FALLBACK_CIDR" | grep -q "dev ${VM3_BRIDGE}" && \
 else
     qual_pass "no duplicate route for ${FALLBACK_CIDR} (each network on its own subnet)"
 fi
-if ping_ok "$VM3_IP"; then
-    qual_pass "host → guest-3 directly reachable (${VM3_IP})"
-else
-    qual_warn "DEFECT N1 forbidden outcome (issue #354): host → guest-3 (${VM3_IP}, on ${VM3_BRIDGE}) UNREACHABLE — duplicate-subnet routing"
-    if ping_ok "$VM3_IP" "$VM3_BRIDGE"; then
-        qual_pass "forced via ${VM3_BRIDGE}: guest-3 reachable (proves the guest/network is healthy; only routing is ambiguous)"
+# The new network also starts with an empty ruleset (DHCP/DNS +
+# default-deny). Allow ICMP both directions before using reachability as
+# the N1 routing probe — otherwise a policy drop would masquerade as a
+# routing defect. The update is journaled; wait for materialization.
+F_TOKEN="$(bff_token)"
+F_POLICY_CODE="$(curl -s -o "${EVIDENCE_DIR}/bff-update-leg-f.json" -w '%{http_code}' \
+    -X POST "${QUAL_BFF_URL}/v1/networks/update" \
+    -H "Authorization: Bearer ${F_TOKEN}" -H "Content-Type: application/json" \
+    -d '{"network_id":"'"$VM3_NET"'","firewall_rules":[{"direction":"inbound","action":"accept","protocol":"icmp","source_cidr":"'"$VM3_NET_CIDR"'"},{"direction":"outbound","action":"accept","protocol":"icmp","source_cidr":"'"$VM3_NET_CIDR"'"}]}')"
+[ "$F_POLICY_CODE" = "200" ] \
+    && qual_pass "BFF accepted the ICMP allow for the second network (HTTP ${F_POLICY_CODE})" \
+    || qual_warn "BFF networks/update for the second network returned HTTP ${F_POLICY_CODE}: $(head -c 200 "${EVIDENCE_DIR}/bff-update-leg-f.json")"
+nft_icmp_allowed_wait "chv-${VM3_NET}" 90 \
+    && qual_pass "ICMP allow materialized on chv-${VM3_NET}" \
+    || true
+
+if nft_icmp_allowed "chv-${VM3_NET}"; then
+    if ping_ok_retry "$VM3_IP" "" 30; then
+        qual_pass "host → guest-3 directly reachable (${VM3_IP})"
     else
-        qual_error "guest-3 unreachable even forced via ${VM3_BRIDGE} (beyond the filed N1 defect)"
+        qual_warn "DEFECT N1 forbidden outcome (issue #354): host → guest-3 (${VM3_IP}, on ${VM3_BRIDGE}) UNREACHABLE — duplicate-subnet routing"
+        if ping_ok_retry "$VM3_IP" "$VM3_BRIDGE" 30; then
+            qual_pass "forced via ${VM3_BRIDGE}: guest-3 reachable (proves the guest/network is healthy; only routing is ambiguous)"
+        else
+            qual_error "guest-3 unreachable even forced via ${VM3_BRIDGE} (beyond the filed N1 defect)"
+        fi
     fi
+else
+    qual_warn "guest-3 reachability not asserted: the second network's ICMP allow did not materialize within 90s (empty-ruleset default-deny); routing itself is asserted by the route table above"
 fi
-ping_ok "$VM1_IP" \
+ping_ok_retry "$VM1_IP" "" 60 \
     && qual_pass "guest-1 (first bridge) unaffected by the second network" \
     || qual_error "FORBIDDEN: second network broke first-bridge connectivity"
 save_evidence "leg-f-two-networks"
@@ -758,10 +836,13 @@ qual_info "--- Leg E: stop+delete VMs → network delete (orphan-row block N4, n
 
 for vm in "$VM1_ID" "$VM2_ID" "$VM3_ID"; do
     qual_chvctl vm stop "$vm" >/dev/null 2>&1 || true
-    wait_vm_stopped "$vm" || qual_error "vm ${vm} did not stop cleanly"
+    wait_vm_guest_stopped "$vm" || qual_error "vm ${vm} did not reach a terminal guest state"
     qual_chvctl vm delete "$vm" >/dev/null 2>&1 \
         && qual_pass "vm ${vm} deleted" \
         || qual_error "vm delete failed for ${vm}"
+    # Delete (not stop) is what reaps the retained VMM.
+    wait_for "vm ${vm}: CH process exited after delete" 90 vm_ch_gone "$vm" \
+        || qual_error "FORBIDDEN: CH process still alive after delete for ${vm}"
 done
 [ "$(count_cloud_hypervisor_processes)" -eq 0 ] \
     && qual_pass "no CH processes remain" \
@@ -771,17 +852,25 @@ done
 # the chvctl call returning (run-1 lesson: an immediate check raced the
 # removal) — poll up to 30 s before asserting. Bridges/dnsmasq are
 # network-scoped and must persist until the network itself is deleted.
+# Scope the assertion to THIS deployment's taps: a stale tap from a
+# previous lane is swept at lane start, and a global tap- count would
+# report an unrelated interface as this scenario's residue.
+TAPS_UNDER_TEST=" ${VM1_TAP:-} ${VM2_TAP:-} ${VM3_TAP:-} "
 taps_gone=0
 LEFTOVER_TAPS=""
 for _ in $(seq 1 15); do
-    LEFTOVER_TAPS="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | grep '^tap-' || true)"
+    LEFTOVER_TAPS=""
+    for t in $TAPS_UNDER_TEST; do
+        [ -n "$t" ] || continue
+        ip link show "$t" >/dev/null 2>&1 && LEFTOVER_TAPS="${LEFTOVER_TAPS} ${t}"
+    done
     [ -z "$LEFTOVER_TAPS" ] && { taps_gone=1; break; }
     sleep 2
 done
 if [ "$taps_gone" -eq 1 ]; then
-    qual_pass "all taps removed by vm delete"
+    qual_pass "all scenario taps removed by vm delete"
 else
-    qual_error "FORBIDDEN: taps remain 30s after vm deletes: $(echo "$LEFTOVER_TAPS" | tr '\n' ' ')"
+    qual_error "FORBIDDEN: scenario taps remain 30s after vm deletes:${LEFTOVER_TAPS}"
 fi
 
 # N5 flip (#356 part 2 / PR #362): the last-detach host teardown fires on

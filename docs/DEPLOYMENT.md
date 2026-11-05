@@ -319,6 +319,16 @@ scrapes them without an admin JWT. See
 [docs/OBSERVABILITY.md](OBSERVABILITY.md) for the auth model and remote-scrape
 guidance.
 
+The bind is **fatal when the port is already in use** (a typo must not leave a
+daemon silently unscrapable). The packaged install runs one stord and one nwd
+per host, so the defaults above are unambiguous. A host that runs **more than
+one instance of the same daemon** (test harnesses, side-by-side migrations, or
+a future multi-pool split) must give every instance its own `metrics_bind`;
+reusing the default fails the second instance at startup with `Address already
+in use`. The qualification harness sets explicit values for exactly this
+reason; `127.0.0.1:0` asks the kernel for an ephemeral port when the listener
+is not scraped (#659).
+
 ### Verification
 
 ```bash

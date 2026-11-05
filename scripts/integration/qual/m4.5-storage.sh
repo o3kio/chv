@@ -472,7 +472,9 @@ save_evidence "leg-a booted"
 qual_info "--- Leg B: stop → start → guest reads the SAME marker back"
 
 qual_chvctl vm stop "$VM1_ID" >/dev/null || qual_error "vm stop failed for ${VM1_ID}"
-wait_vm_stopped "$VM1_ID" || qual_die "vm did not stop (Leg B)"
+# --no-shutdown contract: graceful stop leaves the VMM retained; the guest
+# reaching a terminal state is the stop-completion signal.
+wait_vm_guest_stopped "$VM1_ID" || qual_die "vm did not stop (Leg B)"
 
 # At rest: the backing persists, unchanged (data survives the stop).
 [ -f "$VOL1_PATH" ] && [ "$(stat -c %s "$VOL1_PATH" 2>/dev/null)" = "$VOL1_SIZE" ] \
@@ -660,7 +662,7 @@ STORD_LIVE_DIR="$(stord_runtime_dir)"
 qual_info "live stord runtime_dir: ${STORD_LIVE_DIR}"
 
 qual_chvctl vm stop "$VM1_ID" >/dev/null || qual_error "vm stop failed for ${VM1_ID}"
-wait_vm_stopped "$VM1_ID" || qual_die "vm did not stop (Leg D)"
+wait_vm_guest_stopped "$VM1_ID" || qual_die "vm did not stop (Leg D)"
 
 # Snapshot: rejected at accept time — chvctl exits non-zero with the
 # CP's InvalidArgument message surfaced by the BFF's map_ack (the #495
@@ -1056,9 +1058,12 @@ STORD_CFG_G="$(stord_config_path)"
 [ "$STORD_CFG_G" = "$STORD_TOML" ] \
     && qual_pass "LVM stord execs the operator config (${STORD_CFG_G})" \
     || qual_error "LVM stord is NOT the operator config: ${STORD_CFG_G:-unresolved}"
-grep -aq 'backend_type=lvm' "${QUAL_LOGS_DIR}/agent.log" \
-    && qual_pass "stord initialized the LVM backend (backend_type=lvm in agent.log)" \
-    || qual_error "no backend_type=lvm startup line in agent.log — the respawned stord is not the LVM daemon"
+# tracing renders a string field as backend_type="lvm" and interleaves ANSI
+# escapes around the key/value, so match the quoted value with a wildcard
+# rather than the literal backend_type=lvm form (which never matches).
+grep -aqE 'backend_type.*"lvm"' "${QUAL_LOGS_DIR}/agent.log" \
+    && qual_pass "stord initialized the LVM backend (backend_type=\"lvm\" in agent.log)" \
+    || qual_error "no backend_type=\"lvm\" startup line in agent.log — the respawned stord is not the LVM daemon"
 
 # DP4: the node's inventory must report the REAL backend class.
 node_reports_lvm() {
@@ -1171,7 +1176,7 @@ save_console_evidence "$VM3_ID" leg-g
 # 8. stop → start → the SAME bytes read back (LV persistence across the
 #    attach/detach cycle).
 qual_chvctl vm stop "$VM3_ID" >/dev/null || qual_error "vm stop failed for ${VM3_ID} (Leg G)"
-wait_vm_stopped "$VM3_ID" || qual_die "vm did not stop (Leg G)"
+wait_vm_guest_stopped "$VM3_ID" || qual_die "vm did not stop (Leg G)"
 qual_chvctl vm start "$VM3_ID" >/dev/null || qual_die "vm re-start failed for ${VM3_ID} (Leg G)"
 wait_for "vm ${VM3_ID}: re-booted (logind lines in the fresh console)" \
     "$LOGIND_TIMEOUT" \

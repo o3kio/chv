@@ -37,6 +37,11 @@ on:
         options:
           - chaos  # m4.7 fault/interruption matrix (~25 min)
           - full   # m4.3–m4.8 sequence (hours; includes soak)
+      scenarios:
+        description: 'full lane only: space-separated scenario subset (empty = all of m4.3–m4.8)'
+        required: false
+        default: ''
+        type: string
 
   schedule:
     # Nightly chaos: the m4.7 fault & interruption matrix.
@@ -85,6 +90,17 @@ jobs:
             echo "::error::Nightly KVM qualification requires passwordless sudo with env preservation (-E) on the self-hosted chv-kvm runner."
             exit 1
           fi
+
+      - name: Restore workspace ownership
+        # A lane that dies mid-build can leave root-owned files in the
+        # workspace (observed: target/.rustc_info.json from a pre-isolation
+        # build). actions/checkout then cannot clean the tree and the run
+        # fails before preflight ("Unable to clean or reset the repository").
+        # The runner is dedicated to this lane, so hand the workspace back
+        # to the runner user before checkout. Current builds target
+        # CHV_QUAL_ROOT/target, so this is recovery for older residue.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE:-$PWD}" 2>/dev/null || true
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
@@ -177,6 +193,12 @@ jobs:
             exit 1
           fi
 
+      - name: Restore workspace ownership
+        # Same recovery as the chaos lane: an interrupted root build must not
+        # block checkout on the next run.
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE:-$PWD}" 2>/dev/null || true
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (pinned 2026-09-30)
 
@@ -203,14 +225,20 @@ jobs:
       - name: Run m4.3–m4.8 qualification sequence
         # One deploy per scenario; the results file and per-scenario evidence
         # directories are uploaded below even if an early scenario fails.
+        # A manual run may pass a subset via the `scenarios` input to
+        # re-qualify a single fixed scenario without paying for the soak.
+        env:
+          QUAL_SCENARIOS: ${{ inputs.scenarios }}
         run: |
+          scenarios="${QUAL_SCENARIOS:-}"
+          [ -n "$scenarios" ] || scenarios="m4.3-lifecycle m4.4-network m4.5-storage m4.6-migration m4.7-faults m4.8-perf-soak"
           sudo -E env "PATH=$PATH" \
             RUSTUP_HOME="$RUSTUP_HOME" \
             CARGO_HOME="$CARGO_HOME" \
             CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
             QUAL_ARTIFACT_ROOT="$QUAL_ARTIFACT_ROOT" \
             ./scripts/integration/qual/nightly-run.sh \
-              --scenarios "m4.3-lifecycle m4.4-network m4.5-storage m4.6-migration m4.7-faults m4.8-perf-soak"
+              --scenarios "$scenarios"
 
       - name: Restore runner ownership after root staging
         # The build targets CHV_QUAL_ROOT/target (isolated), not the workspace
