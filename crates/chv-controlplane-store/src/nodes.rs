@@ -365,9 +365,10 @@ impl NodeRepository {
     /// (`ReportServiceVersions`); that report is the authoritative "what is
     /// running now" signal and must update this row.
     ///
-    /// The `WHERE` clause makes a repeated identical report a no-op, so a
-    /// stable node does not rewrite the row (or its `updated_at`) every
-    /// report cycle.
+    /// The `WHERE` clause avoids a redundant write when the reported version
+    /// is unchanged. (`ensure_node_record` still refreshes `last_seen_at` on
+    /// every report; this method does not touch a row it has nothing to
+    /// change.)
     pub async fn refresh_agent_version(
         &self,
         node_id: &NodeId,

@@ -252,26 +252,32 @@ impl InventoryService for InventoryServiceImplementation {
 
         for (name, version) in components {
             if !version.is_empty() {
-                self.node_repo
-                    .append_version(&NodeVersionInput {
-                        node_id: node_id.clone(),
-                        component_name: name.into(),
-                        version: version.clone(),
-                        source: Some(SOURCE_PERIODIC.into()),
-                        reported_unix_ms: now,
-                    })
-                    .await?;
-
                 // The node row's `agent_version` is what the node API and
                 // cluster summary display. Enrollment is otherwise its only
                 // writer, so an in-place upgrade would keep showing the
                 // enrollment version until the next enrollment. The agent's
                 // own periodic version report is the current truth.
+                //
+                // The `node_inventory.chv_*_version` columns remain
+                // enrollment-time values (periodic inventory sends `None`
+                // and the upsert preserves them). Nothing reads those
+                // columns today; if something starts to, refresh them here
+                // too rather than reintroducing the same lag.
                 if name == COMPONENT_AGENT {
                     self.node_repo
                         .refresh_agent_version(&node_id, &version, now)
                         .await?;
                 }
+
+                self.node_repo
+                    .append_version(&NodeVersionInput {
+                        node_id: node_id.clone(),
+                        component_name: name.into(),
+                        version,
+                        source: Some(SOURCE_PERIODIC.into()),
+                        reported_unix_ms: now,
+                    })
+                    .await?;
             }
         }
 
