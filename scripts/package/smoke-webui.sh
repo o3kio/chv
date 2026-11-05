@@ -126,7 +126,9 @@ if [ -z "${CONTROLPLANE_DEB}" ] || [ -z "${NODE_DEB}" ]; then
 fi
 
 PKG_VERSION="$(basename "${CONTROLPLANE_DEB}" | sed -E 's/^chv-controlplane_(.+)_(amd64|arm64)\.deb$/\1/')"
-# Image tags cannot carry '~' (deb rc versions use it: 0.4.0~rc.2).
+# Image tags cannot carry '~'; older artifact names used it (0.4.0~rc.2),
+# so keep the defensive replacement even though published filenames are
+# already sanitized to '.'.
 IMAGE="${IMAGE:-chv-webui-smoke:$(echo "${PKG_VERSION}" | tr '~+' '--')}"
 CONTAINER="chv-webui-smoke-$$"
 
