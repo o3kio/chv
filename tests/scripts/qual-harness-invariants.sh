@@ -558,6 +558,17 @@ for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.ym
         || fail "${wf_name} would publish the 0.0.1 lifecycle probe packages"
 done
 
+# Release-note install snippets must name the published (sanitized) asset,
+# not the internal '~' version GitHub rewrites.
+if grep -q 'pkg_version }}_amd64.deb\|pkg_version }}-1.x86_64.rpm' "$release_workflow"; then
+    fail "release notes publish an install command for a '~' asset name"
+else
+    pass "release notes use the published asset version in install commands"
+fi
+grep -q 'ASSET_VERSION=' "$release_workflow" \
+    && pass "release workflow derives the asset version for release notes" \
+    || fail "release workflow has no asset-version derivation for release notes"
+
 quick_deb_assets="$(source_path="$quick_installer" bash -c '
     set +u
     # shellcheck disable=SC1090

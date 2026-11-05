@@ -628,6 +628,10 @@ jobs:
       - name: Prepare release notes
         run: |
           VERSION="${{ needs.build.outputs.pkg_version }}"
+          # Release assets use GitHub's filename-safe version (0.4.0~rc.1 ->
+          # 0.4.0.rc.1), so install snippets must not name a '~' file the
+          # release page cannot serve. VERSION itself stays the changelog key.
+          ASSET_VERSION="$(printf '%s' "$VERSION" | tr -c 'A-Za-z0-9._-' '.')"
           IS_PRERELEASE="${{ needs.build.outputs.is_prerelease }}"
 
           # Try to extract changelog section
@@ -647,16 +651,16 @@ jobs:
 
           **Debian / Ubuntu**
           \`\`\`bash
-          sudo dpkg -i chv-controlplane_${{ needs.build.outputs.pkg_version }}_amd64.deb
-          sudo dpkg -i chv-node_${{ needs.build.outputs.pkg_version }}_amd64.deb
-          sudo dpkg -i chvctl_${{ needs.build.outputs.pkg_version }}_amd64.deb
+          sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb
+          sudo dpkg -i chv-node_${ASSET_VERSION}_amd64.deb
+          sudo dpkg -i chvctl_${ASSET_VERSION}_amd64.deb
           \`\`\`
 
           **RHEL / CentOS / Fedora**
           \`\`\`bash
-          sudo rpm -i chv-controlplane-${{ needs.build.outputs.pkg_version }}-1.x86_64.rpm
-          sudo rpm -i chv-node-${{ needs.build.outputs.pkg_version }}-1.x86_64.rpm
-          sudo rpm -i chvctl-${{ needs.build.outputs.pkg_version }}-1.x86_64.rpm
+          sudo rpm -i chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm
+          sudo rpm -i chv-node-${ASSET_VERSION}-1.x86_64.rpm
+          sudo rpm -i chvctl-${ASSET_VERSION}-1.x86_64.rpm
           \`\`\`
           EOF
             else
@@ -667,16 +671,16 @@ jobs:
 
           **Debian / Ubuntu**
           \`\`\`bash
-          sudo dpkg -i chv-controlplane_${{ needs.build.outputs.pkg_version }}_amd64.deb
-          sudo dpkg -i chv-node_${{ needs.build.outputs.pkg_version }}_amd64.deb
-          sudo dpkg -i chvctl_${{ needs.build.outputs.pkg_version }}_amd64.deb
+          sudo dpkg -i chv-controlplane_${ASSET_VERSION}_amd64.deb
+          sudo dpkg -i chv-node_${ASSET_VERSION}_amd64.deb
+          sudo dpkg -i chvctl_${ASSET_VERSION}_amd64.deb
           \`\`\`
 
           **RHEL / CentOS / Fedora**
           \`\`\`bash
-          sudo rpm -i chv-controlplane-${{ needs.build.outputs.pkg_version }}-1.x86_64.rpm
-          sudo rpm -i chv-node-${{ needs.build.outputs.pkg_version }}-1.x86_64.rpm
-          sudo rpm -i chvctl-${{ needs.build.outputs.pkg_version }}-1.x86_64.rpm
+          sudo rpm -i chv-controlplane-${ASSET_VERSION}-1.x86_64.rpm
+          sudo rpm -i chv-node-${ASSET_VERSION}-1.x86_64.rpm
+          sudo rpm -i chvctl-${ASSET_VERSION}-1.x86_64.rpm
           \`\`\`
           EOF
             fi
