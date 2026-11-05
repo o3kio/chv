@@ -118,8 +118,10 @@ under the **JWT signing secret** and logs a startup warning saying so. This
 fallback is **deprecated**: it is retained only for backward compatibility
 with existing deployments, and a dedicated key is required for all new
 deployments. At startup, `chv-controlplane` logs the selected key source at
-INFO (`CHV_ENCRYPTION_KEY is set`) or, for this fallback, a WARN prefixed
-`SECURITY WARNING: ...`, so the key source is never implicit.
+INFO (dedicated key, including an explicit `[secrets] credential_encryption`
+key) or, for this fallback, a WARN prefixed `SECURITY WARNING: ...`, so the
+key source is never implicit. A whitespace-only key is treated as unset and
+fails closed.
 
 On such a host, rotating `CHV_JWT_SECRET` — a routine, sanctioned action —
 invalidates every stored S3 credential: decryption fails closed

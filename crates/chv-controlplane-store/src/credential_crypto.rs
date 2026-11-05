@@ -120,10 +120,15 @@ impl CredentialEncryption {
         // add new consumers. See docs/runbooks/control-plane-dr.md for the
         // 0600 encryption.env migration path.
         let (key_str, key_source) = match std::env::var("CHV_ENCRYPTION_KEY") {
-            Ok(key) if !key.is_empty() => (key, CredentialKeySource::DedicatedKey),
+            // Whitespace-only is not a usable secret. Treat it exactly like
+            // unset so a truncated/padded encryption.env fails closed instead
+            // of minting a cipher from a publicly guessable value. Do NOT trim
+            // the value used for derivation: that would silently re-key hosts
+            // whose key has legitimate leading/trailing bytes.
+            Ok(key) if !key.trim().is_empty() => (key, CredentialKeySource::DedicatedKey),
             Ok(_) => (String::new(), CredentialKeySource::NotConfigured),
             Err(_) => match std::env::var("CHV_JWT_SECRET") {
-                Ok(jwt) if !jwt.is_empty() => (jwt, CredentialKeySource::JwtSecretFallback),
+                Ok(jwt) if !jwt.trim().is_empty() => (jwt, CredentialKeySource::JwtSecretFallback),
                 Ok(_) => (String::new(), CredentialKeySource::NotConfigured),
                 Err(_) => (String::new(), CredentialKeySource::NotConfigured),
             },
@@ -133,7 +138,7 @@ impl CredentialEncryption {
         // truncated /etc/chv/encryption.env) otherwise disables encryption
         // silently — the install-time guards warn, but the daemon must not
         // trust them.
-        if key_str.is_empty() {
+        if key_str.trim().is_empty() {
             warn!(
                 "CHV_ENCRYPTION_KEY is unset or empty; credential writes \
                  (backup S3 credentials, NetBox API tokens) will be rejected \
@@ -147,33 +152,10 @@ impl CredentialEncryption {
             };
         }
 
-        // Key-source observability (#336): the operator must be able to tell
-        // from the logs which secret the credential cipher was keyed from.
-        match key_source {
-            CredentialKeySource::JwtSecretFallback => {
-                warn!(
-                    "SECURITY WARNING: CHV_ENCRYPTION_KEY is unset; using the \
-                     deprecated legacy CHV_JWT_SECRET fallback: S3 credentials \
-                     are being encrypted under the JWT signing secret. Rotating \
-                     CHV_JWT_SECRET will invalidate all stored S3 credentials — \
-                     decryption fails closed (AuthFailed) and the credentials \
-                     must be re-entered. Migrate to a dedicated 0600 \
-                     /etc/chv/encryption.env now: copy the current \
-                     CHV_JWT_SECRET into CHV_ENCRYPTION_KEY to preserve existing \
-                     ciphertexts, restart chv-controlplane, then rotate \
-                     CHV_JWT_SECRET. See docs/runbooks/control-plane-dr.md."
-                );
-            }
-            CredentialKeySource::DedicatedKey => {
-                info!(
-                    "CHV_ENCRYPTION_KEY is set; \
-                     S3 credentials will be encrypted with the dedicated key"
-                );
-            }
-            CredentialKeySource::NotConfigured => {
-                // Unreachable: the empty-key branch above returns early.
-            }
-        }
+        // Key-source logging happens in `from_key_with_source`, which is also
+        // the path the control-plane bootstrap uses for an explicit
+        // `[secrets] credential_encryption` key (#336, #662). Keeping it there
+        // means the recommended dedicated-key deployment logs its source too.
 
         // SHA-256 always produces 32 bytes, which is the exact key size for
         // AES-256-GCM, so this constructor cannot fail in practice. We still
@@ -200,6 +182,52 @@ impl CredentialEncryption {
     }
 
     fn from_key_with_source(key_str: &str, key_source: CredentialKeySource) -> Self {
+        // Fail closed on an empty/whitespace-only explicit key. `from_key` is
+        // public, so a caller passing "" must not get a cipher keyed by the
+        // publicly known SHA-256 of the empty string.
+        if key_str.trim().is_empty() {
+            warn!(
+                "credential encryption key is empty; credential writes \
+                 (backup S3 credentials, NetBox API tokens) will be rejected \
+                 (fail-closed) until a key is configured"
+            );
+            return Self {
+                cipher: None,
+                key_source: CredentialKeySource::NotConfigured,
+            };
+        }
+
+        // Key-source observability (#336): the operator must be able to tell
+        // from the logs which secret the credential cipher was keyed from.
+        // This runs for both environment selection and the bootstrap's
+        // explicit `[secrets] credential_encryption` key.
+        match key_source {
+            CredentialKeySource::JwtSecretFallback => {
+                warn!(
+                    "SECURITY WARNING: CHV_ENCRYPTION_KEY is unset; using the \
+                     deprecated legacy CHV_JWT_SECRET fallback: S3 credentials \
+                     are being encrypted under the JWT signing secret. Rotating \
+                     CHV_JWT_SECRET will invalidate all stored S3 credentials — \
+                     decryption fails closed (AuthFailed) and the credentials \
+                     must be re-entered. Migrate to a dedicated 0600 \
+                     /etc/chv/encryption.env now: copy the current \
+                     CHV_JWT_SECRET into CHV_ENCRYPTION_KEY to preserve existing \
+                     ciphertexts, restart chv-controlplane, then rotate \
+                     CHV_JWT_SECRET. See docs/runbooks/control-plane-dr.md."
+                );
+            }
+            CredentialKeySource::DedicatedKey => {
+                info!(
+                    "credential encryption key source: dedicated key \
+                     (CHV_ENCRYPTION_KEY or [secrets] credential_encryption); \
+                     S3 credentials will be encrypted with it"
+                );
+            }
+            CredentialKeySource::NotConfigured => {
+                // Unreachable: the empty-key branch above returns early.
+            }
+        }
+
         let mut hasher = Sha256::new();
         hasher.update(key_str.as_bytes());
         let key_bytes = hasher.finalize();
@@ -217,7 +245,9 @@ impl CredentialEncryption {
                 );
                 Self {
                     cipher: None,
-                    key_source: CredentialKeySource::NotConfigured,
+                    // Preserve the selected source: the operator still needs
+                    // to know which secret was present but unusable.
+                    key_source,
                 }
             }
         }
@@ -608,6 +638,34 @@ mod tests {
         std::env::set_var("CHV_JWT_SECRET", "jwt-secret-must-not-be-used");
 
         let crypto = CredentialEncryption::new();
+        assert_eq!(crypto.key_source(), CredentialKeySource::NotConfigured);
+        assert!(matches!(
+            crypto.encrypt("must-not-encrypt"),
+            Err(EncryptError::KeyUnavailable)
+        ));
+    }
+
+    /// Whitespace-only is not a key. A padded/truncated `encryption.env`
+    /// must fail closed rather than minting a cipher from a guessable value.
+    #[test]
+    fn whitespace_only_dedicated_key_fails_closed() {
+        let _g = EnvGuard::lock();
+        std::env::set_var("CHV_ENCRYPTION_KEY", "   ");
+        std::env::set_var("CHV_JWT_SECRET", "jwt-secret-must-not-be-used");
+
+        let crypto = CredentialEncryption::new();
+        assert_eq!(crypto.key_source(), CredentialKeySource::NotConfigured);
+        assert!(matches!(
+            crypto.encrypt("must-not-encrypt"),
+            Err(EncryptError::KeyUnavailable)
+        ));
+    }
+
+    /// The now-public explicit-key constructor must also fail closed on an
+    /// empty secret instead of keying AES from SHA-256("").
+    #[test]
+    fn explicit_empty_key_fails_closed() {
+        let crypto = CredentialEncryption::from_key("");
         assert_eq!(crypto.key_source(), CredentialKeySource::NotConfigured);
         assert!(matches!(
             crypto.encrypt("must-not-encrypt"),
