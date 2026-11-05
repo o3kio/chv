@@ -11,7 +11,15 @@ No candidate product defect was found in the failing path.
 
 ## 1. Summary
 
-The full real-KVM lane run
+**Final result (2026-11-05): the full real-KVM lane passes.** Run
+[41938443045](https://github.com/o3kio/chv/actions/runs/41938443045) on
+`e82d49a1` ran m4.3–m4.8 with `rc=0` for every scenario, and every
+per-scenario evidence directory is present. #659's execution-evidence
+condition is satisfied (§4). The sections below retain the failures that
+were found and fixed on the way, because the lane's value is the tripwire,
+not only the final result.
+
+The first full real-KVM lane run
 [41894243197](https://github.com/o3kio/chv/actions/runs/41894243197)
 (`a4da490d`) failed **all six** scenarios. The same shape had already failed
 run [41836073033](https://github.com/o3kio/chv/actions/runs/41836073033)
@@ -405,7 +413,28 @@ sessions after delete-following-agent-restart).
 | [41932222532](https://github.com/o3kio/chv/actions/runs/41932222532) | full subset (m4.3–m4.6) | `7fdd0946` | fail — **Checkout**, 14 s, no scenario ran: root-owned `target/` from a pre-isolation build blocked `actions/checkout` cleanup (fix 13) |
 | [41932437206](https://github.com/o3kio/chv/actions/runs/41932437206) | full subset (m4.3–m4.6) | `a86702a2` | **pass** — all four scenarios rc=0; 4 documented warnings (M2.5 retained VM/volume rows, one ARP timing note); no failures |
 | [41936507296](https://github.com/o3kio/chv/actions/runs/41936507296) | m4.8 only | `a86702a2` | **pass** — rc=0, 818 s; 6 soak cycles, stop converges in ~35 s with the VMM retained until delete; one documented M2.5 preamble warning |
-| _full lane_ | full (m4.3–m4.8) | _final fix commit_ | _pending_ |
+| [41938443045](https://github.com/o3kio/chv/actions/runs/41938443045) | **full (m4.3–m4.8)** | `e82d49a1` | **pass** — all six scenarios rc=0 in 47 min; every per-scenario evidence directory present; 9 documented warnings, 0 failures |
+
+The accepted full lane is
+[41938443045](https://github.com/o3kio/chv/actions/runs/41938443045)
+(`e82d49a1`, docs-only commit on top of the qualified code at `a86702a2`):
+
+```
+scenario        status  rc  duration_s
+m4.3-lifecycle  pass    0   456
+m4.4-network    pass    0   381
+m4.5-storage    pass    0   587
+m4.6-migration  pass    0   170
+m4.7-faults     pass    0   387
+m4.8-perf-soak  pass    0   789
+```
+
+The nine warnings are the previously documented residual classes, not new
+findings: M2.5 retained BFF rows/volumes/backings after delete (m4.3, m4.5,
+m4.7 F7, m4.8), one ARP-entry timing note (m4.4), two chaos windows that
+missed the create operation because it had already succeeded (m4.7 F1/F4,
+whose recovery assertions still ran), and two detached-open sessions after
+the F2 agent restart (#711).
 
 Only a row with `pass` and present per-scenario evidence is accepted; each
 earlier row is retained because a failure that is not written down is a
@@ -415,16 +444,16 @@ failure that will be rediscovered.
 
 ## 5. Pre-production gate assessment
 
-### 5.1 Gate scorecard (as of 2026-11-04)
+### 5.1 Gate scorecard (as of 2026-11-05)
 
 | Gate element | State | Evidence / gap |
 |---|---|---|
 | P0 blockers (#646–#654) | **9/9 closed** | Wave 3.1 merges; tracker #666 |
-| P1 (#655–#663) | **8/9 closed** | #659 is the only open P1 item |
+| P1 (#655–#663) | **9/9 closed** | #659 closed on the green full lane below |
 | #659 coverage / nextest / real-BFF E2E | **landed and green** | Tier 1 table in `docs/dev/test-evidence-tiers.md`; main CI green |
-| #659 real-KVM execution evidence | **open** | this incident; requires a green full lane on the final fix |
+| #659 real-KVM execution evidence | **satisfied** | full lane [41938443045](https://github.com/o3kio/chv/actions/runs/41938443045) on `e82d49a1`: m4.3–m4.8 all pass, evidence present (§4) |
 | #666 fresh-host demonstration | **open** | not yet demonstrated on the current `main`; #556 (quick-install) is also open |
-| Main CI / Security / Nightly Packages / proto | **green** | run 41894194933 / 41894195280 / 41894195039 / 41894195048 at `a4da490d` |
+| Main CI / Security / Nightly Packages / proto | **green** | `92cd54f7` after re-running a runner-side apt flake in `Real-BFF E2E` |
 
 ### 5.2 What the failed run proves — and what it does not
 
@@ -446,21 +475,23 @@ not a general proof of harness/config equivalence.
 
 ### 5.3 Readiness verdict
 
-**Not yet a closed pre-production gate.** The codebase is P0-clean and its
-P1 slices are merged, but the gate's own definition is evidence-based:
+**The #659 execution-evidence gate is closed; the #666 gate is not.** The
+gate's definition has two evidence conditions:
 
 1. the real-KVM full lane must be green on the final fix commit, with
-   `results.tsv` and per-scenario artifacts verified (this closes #659);
-2. the definition must then be demonstrated on a fresh host (this closes
-   #666), including the install/upgrade path and the documented exclusions.
+   `results.tsv` and per-scenario artifacts verified — **satisfied** by
+   [41938443045](https://github.com/o3kio/chv/actions/runs/41938443045)
+   (`e82d49a1`, m4.3–m4.8 all `pass`), which closes #659;
+2. the definition must then be demonstrated on a fresh host — **not yet
+   satisfied**, which keeps #666 open, including the install/upgrade path
+   and the documented exclusions.
 
-Neither step is satisfied by the historical manual evidence alone. The
-correct statement today is:
+The correct statement today is:
 
-> **CHV is pre-production-ready in capability terms (P0/P1 code and
-> documentation complete, main CI green), but the pre-production *gate* is
-> not yet evidenced on the current `main`.** The limiting factor is
-> qualification evidence, not a known candidate defect.
+> **CHV is pre-production-ready in capability terms and its real-KVM
+> qualification lane is green on the current candidate.** The remaining
+> gate item is a fresh-host demonstration of the install/upgrade path
+> (#666), not a known candidate defect or a missing qualification result.
 
 ### 5.4 Residual risks that remain after #659 closes
 
@@ -496,16 +527,17 @@ They must be carried into any production-readiness decision:
 
 ### 5.5 Recommended plan
 
-1. **Land the harness fix** (`fix/659-qual-auth`) after the offline guard and
-   green CI.
+1. **Land the harness fix** (`fix/659-qual-auth`, PR #710) after the offline
+   guard and green CI. **Done** — 58 offline invariants pass; CI green.
 2. **Chaos lane** on the fix (m4.7) to validate auth, volume, and the
-   two-stord legs quickly.
+   two-stord legs quickly. **Done** — run 41911127447 (`4e2cb37b`) pass.
 3. **Full lane** on the final commit; verify `results.tsv`, per-scenario
-   evidence, and that the artifact now contains the preserved failed-tree
-   logs/host snapshot. Close #659 with the run links.
+   evidence, and that the artifact contains the preserved failed-tree
+   logs/host snapshot. **Done** — run 41938443045 (`e82d49a1`) m4.3–m4.8 all
+   `pass`; #659 closes on it.
 4. **Fresh-host demonstration** of the documented install + upgrade +
    uninstall path on the same candidate; close #666 only then. The #556
-   quick-install leg is a separate, still-open claim.
+   quick-install leg is a separate, still-open claim. **Next action.**
 5. **Publish the residual-risk list** (5.4) with the release notes so the
    supported-envelope statement in `docs/DEPLOYMENT-ARCHITECTURE.md` §7 is
    not read as broader than the evidence.
