@@ -139,7 +139,15 @@ It then applies the documented package upgrade path (`dpkg --force-confold -i`
   which shadow the packaged `/lib` copies; the evidence records that rather
   than implying the packaged units were exercised;
 - the same config/cert/database/marker/operator/admin state is still present;
-- bring-up, login, WebUI, node visibility and metrics still pass.
+- bring-up, login, node visibility and metrics still pass. Because the
+  upgrade preserves the previous release's `controlplane.toml`, the serving
+  surface is the one that config describes, not the candidate's own: the
+  WebUI is asserted on the preserved nginx edge (`http://127.0.0.1/`), and
+  the control-plane's dedicated `/metrics` listener is recorded as
+  `not-configured` (a pre-0.4.0 config has no `metrics_bind`). Agent, stord
+  and nwd metrics are still asserted. The evidence never attributes the
+  candidate's `[webui]`/`:9103` shape to a config the candidate did not
+  write.
 
 If `--packages` is not supplied the leg fails after the guard check rather
 than pretending a tarball re-run upgraded the host.
@@ -148,14 +156,22 @@ than pretending a tarball re-run upgraded the host.
 
 Fetches `scripts/quick-install.sh` from an explicitly pinned 40-hex SHA or
 release tag (branch names and `main`/`master`/`HEAD`/`latest` are refused),
-hashes it, then runs it with `--version <previous-release>` in a clean root.
+hashes it, then runs it with `--version <quick version>` in a clean root.
+
+The quick installer requires a **published release of v0.4.0 or newer**
+(it fails closed on older releases: its serving shape — the control plane
+serves the static WebUI and its own metrics listener — landed in 0.4.0,
+and installing v0.3.0 left a 404 UI). A pre-publication candidate has no
+published release to install, so this leg is gate evidence only from the
+post-publication run with `--quick-install-version 0.4.0-rc.1` (the RC is
+then resolvable from GitHub releases). A pre-publication run that pins
+v0.3.0 records the documented refusal and is not gate evidence.
 
 Asserted: the pinned script passes `bash -n`; the installer returns `rc=0`;
-the bring-up contract as §3.1 passes (units, encryption key, login, node,
-WebUI, metrics), except the encryption-key journal check: for the v0.3.0
-binary it asserts only the absence of the plaintext/fallback warning, because
-v0.3.0 logs nothing on the dedicated-key path; binaries report the release
-version that was installed.
+the full candidate bring-up contract from §3.1 passes (units, encryption
+key source, login, node, WebUI, metrics); binaries report the base version
+from `VERSION` (`0.4.0` for the `v0.4.0-rc.1` tag, because the release
+workflow takes the `rc.N` suffix from the tag).
 
 ## 4. Results
 
@@ -209,8 +225,10 @@ _Pending until the workflow run is recorded above._
 # On the self-hosted chv-kvm runner, as root:
 # <candidate-version> is the tarball top-level version the build produced
 # (the VERSION base for the pre-tag gate run; the RC tag itself is
-# v0.4.0-rc.1). The quick-install leg intentionally installs the previous
-# published release, so v0.3.0 stays the quick-install version here.
+# v0.4.0-rc.1). The quick-install leg needs a *published* release >= 0.4.0,
+# so the gate run is repeated after the RC is published with the RC pinned;
+# a pre-publication run with v0.3.0 records the installer's documented
+# refusal and is not gate evidence.
 sudo ./scripts/integration/qual/fresh-host.sh \
   --candidate-tarball dist/chv-<candidate-version>-linux-amd64.tar.gz \
   --candidate-version <candidate-version> \
@@ -219,8 +237,9 @@ sudo ./scripts/integration/qual/fresh-host.sh \
   --previous-version 0.3.0 \
   --packages dist/packages \
   --quick-install "$(git rev-parse HEAD)" \
-  --quick-install-version 0.3.0 \
+  --quick-install-version 0.4.0-rc.1 \
   --evidence-dir /var/lib/chv/qual/ci-artifacts/fresh-host-manual
 ```
 
-Or dispatch **Fresh-host qualification** with the previous release input.
+Or dispatch **Fresh-host qualification** with the previous release input and
+`quick_install_version=0.4.0-rc.1` after the RC is published.

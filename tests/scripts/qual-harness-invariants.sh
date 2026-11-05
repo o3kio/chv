@@ -299,6 +299,46 @@ grep -Fq 'QUICK_REF="${QUICK_REF:-}"' "$fresh" \
 grep -q 'raw.githubusercontent.com/.*scripts/quick-install.sh' "$fresh" \
     && pass "fresh-host fetches quick-install.sh at the pinned ref" \
     || fail "fresh-host does not fetch the pinned quick-install.sh"
+grep -q 'check_bringup candidate http://127.0.0.1/ preserved' "$fresh" \
+    && pass "fresh-host asserts the preserved nginx edge after a config-preserving upgrade" \
+    || fail "fresh-host would claim the candidate WebUI listener on a preserved v0.3.0 config"
+grep -q 'METRICS controlplane=not-configured' "$fresh" \
+    && pass "fresh-host records the absent candidate metrics listener as not-configured" \
+    || fail "fresh-host would fail an upgrade for a listener the preserved config disables"
+grep -Fq 'expected_bin_version="${expected_bin_version%-rc.*}"' "$fresh" \
+    && pass "fresh-host compares RC binaries against their base VERSION" \
+    || fail "fresh-host can fail an RC quick leg because binaries report the base version"
+grep -q 'quick_install_version' "$fresh_workflow" \
+    && pass "fresh-host workflow can pin the quick leg to the published RC" \
+    || fail "fresh-host workflow cannot exercise the quick installer against the RC"
+grep -q 'QUICK_INSTALL_VERSION:-' "$fresh_workflow" \
+    && pass "fresh-host workflow defaults the quick leg to the previous release" \
+    || fail "fresh-host workflow has no quick-install version fallback"
+
+quick_installer="${REPO_ROOT}/scripts/quick-install.sh"
+grep -q 'QUICK_INSTALL_MIN_VERSION="0.4.0"' "$quick_installer" \
+    && pass "quick installer declares its minimum supported release" \
+    || fail "quick installer can install a release without the WebUI serving shape"
+grep -q 'require_supported_release' "$quick_installer" \
+    && pass "quick installer refuses releases older than its serving shape" \
+    || fail "quick installer silently installs a pre-0.4.0 host with no WebUI"
+grep -q '^ensure_runtime_contract()' "$quick_installer" \
+    && pass "quick installer applies the cross-leg runtime contract" \
+    || fail "quick installer can leave stord/nwd unable to start on the deb leg"
+grep -q 'usermod -aG chv-stord "\$CHV_USER"' "$quick_installer" \
+    && pass "quick installer grants chv the chv-stord group on both legs" \
+    || fail "quick installer writes a stord.toml the service user cannot read"
+grep -q 'systemd-tmpfiles --create "\$tmpfiles"' "$quick_installer" \
+    && pass "quick installer applies the tmpfiles entry that creates /run/netns" \
+    || fail "quick installer relies on a reboot before chv-nwd can start"
+
+postinst="${REPO_ROOT}/packaging/scripts/postinstall.sh"
+grep -q '^sync_legacy_migrations()' "$postinst" \
+    && pass "postinstall synchronizes migrations into a preserved install.sh tree" \
+    || fail "package upgrade over an install.sh deployment can keep a stale schema"
+grep -q 'systemd-tmpfiles --create /usr/lib/tmpfiles.d/chv-node.conf' "$postinst" \
+    && pass "postinstall applies the tmpfiles entry on a live host" \
+    || fail "package install can leave /run/netns missing until reboot"
 
 grep -q 'results.tsv' "$fresh" \
     && pass "fresh-host writes the required results.tsv marker" \

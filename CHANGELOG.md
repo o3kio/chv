@@ -10,6 +10,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0-rc.1] - 2026-11-05
 
 ### Fixed
+- **Installer (quick-install runtime contract + minimum supported
+  release — #556 qualification)**: the one-line installer now starts a
+  working `chv-stord`/`chv-nwd` on the `.deb`/`.rpm` leg without waiting
+  for a reboot. Two package-install gaps surfaced during qualification:
+  (1) `chv-stord.service` runs as `chv` and reads `/etc/chv/stord.toml`
+  (`root:chv-stord 0640`); a release whose postinst predates the #507
+  grant (v0.3.0 did) leaves that file unreadable, so the installer now
+  enforces the group membership itself rather than trusting the installed
+  release's postinst; (2) `/run/netns` — in `chv-nwd`'s
+  `ReadWritePaths` — is created by the package's tmpfiles entry at boot,
+  but the quick path starts units immediately after install, so nwd could
+  not start until a reboot. Both are now applied by a shared
+  `ensure_runtime_contract` step for every artifact leg (idempotent group
+  grant + `systemd-tmpfiles --create`), and the package postinst applies
+  the same tmpfiles entry on a live host. The installer also refuses
+  releases older than **v0.4.0**: the quick path configures the #447 D3
+  serving shape (control plane serves the static WebUI and its own
+  metrics listener), which v0.3.0 predates, so installing v0.3.0 left a
+  404 UI. During the v0.4.0-rc.N window `latest stable` is still v0.3.0;
+  the documented pin is `--version 0.4.0-rc.1`. `docs/DEPLOYMENT.md`
+  records the boundary.
+- **Packaging (`.deb`/`.rpm` upgrade over an `install.sh` deployment —
+  #666 fresh-host qualification)**: the package postinst now synchronizes
+  its schema migrations into the migrations directory a preserved
+  `scripts/install.sh` deployment points at (`/usr/local/share/chv/
+  migrations`), and applies the shipped `/run/netns` tmpfiles entry on a
+  live host. `install.sh` keeps its migrations under `/usr/local/share/chv`
+  while packages install `/usr/share/chv/migrations`; upgrading the
+  packages in place left the preserved `controlplane.toml` pointing at the
+  previous release's migration set, so the upgraded binary started against
+  a pre-upgrade schema and crash-looped. The postinst copies only absent
+  (immutable) migration files into the configured directory — it never
+  rewrites the preserved config — so the forward-only migration applies and
+  the upgraded deployment comes up.
 - **migration (detached agent-task cancellation across restarts — #656)**:
   `MigrateVm` is fire-and-forget, so the source *and* destination agents keep
   detached tasks after the control plane restarts, the reaper force-fails a

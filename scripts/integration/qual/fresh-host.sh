@@ -719,19 +719,29 @@ check_node_visible() {
 }
 
 check_webui() {
-    local out=/tmp/fresh-host-ui.html code
-    code="$(http_code http://127.0.0.1:8080/ "$out")"
+    local url="${1:-http://127.0.0.1:8080/}" out=/tmp/fresh-host-ui.html code
+    code="$(http_code "$url" "$out")"
     if [ "$code" = "200" ] && grep -qi '<!doctype html>' "$out" 2>/dev/null; then
-        ok "WebUI served on 127.0.0.1:8080"
+        ok "WebUI served on ${url}"
     else
-        bad "WebUI served on 127.0.0.1:8080 (HTTP ${code:-no-response})"
+        bad "WebUI served on ${url} (HTTP ${code:-no-response})"
     fi
 }
 
 check_metrics() {
-    local spec name port code out
+    local mode="${1:-candidate}" spec name port code out
+    if [ "$mode" = "preserved" ]; then
+        # The upgrade leg keeps the previous release's controlplane.toml by
+        # contract. A pre-0.4.0 config has no metrics_bind, so the candidate
+        # binary intentionally runs without its dedicated listener. Record the
+        # surface instead of claiming a listener the preserved config disables.
+        record "METRICS controlplane=not-configured (preserved pre-0.4.0 controlplane.toml has no metrics_bind)"
+    fi
     for spec in controlplane:9103 agent:9901 stord:9101 nwd:9102; do
         name="${spec%%:*}"
+        if [ "$name" = "controlplane" ] && [ "$mode" = "preserved" ]; then
+            continue
+        fi
         port="${spec##*:}"
         out="/tmp/fresh-host-${name}-metrics.txt"
         code="$(http_code "http://127.0.0.1:${port}/metrics" "$out")"
@@ -769,15 +779,17 @@ check_binaries_version() {
 
 check_bringup() {
     local encryption_mode="${1:-candidate}"
+    local webui_url="${2:-http://127.0.0.1:8080/}"
+    local metrics_mode="${3:-candidate}"
     section "bring-up contract"
     wait_units_active 180 || true
     check_units_contract
     check_encryption "$encryption_mode"
     clear_admin_rotation_flag || true
     check_admin_login || true
-    check_webui
+    check_webui "$webui_url"
     check_node_visible || true
-    check_metrics
+    check_metrics "$metrics_mode"
 }
 
 check_chv_ports_free() {
@@ -1192,7 +1204,13 @@ fi
 
 if [ "$UPGRADED" = "1" ]; then
     check_binaries_version "$CANDIDATE_VERSION" "$CANDIDATE_SHA"
-    check_bringup
+    # The package upgrade preserves the previous release's controlplane.toml
+    # by contract, so the candidate binary keeps the v0.3.0 serving surface:
+    # the nginx edge at :80 serves the static UI, and the config has no
+    # [webui]/metrics_bind. Assert exactly that surface; do not claim the
+    # candidate's own :8080 UI or :9103 listener for a config it did not write.
+    section "preserved-edge surface (upgrade keeps previous config)"
+    check_bringup candidate http://127.0.0.1/ preserved
 else
     bad "upgrade did not complete; bring-up not asserted"
 fi
@@ -1241,7 +1259,13 @@ else
     # contract rather than silently weakening it.
     check_bringup
 fi
-check_binaries_version "$QUICK_VERSION" ""
+# RC binaries report the base version from VERSION (release.yml takes the
+# -rc.N suffix from the tag), so compare against 0.4.0 for a 0.4.0-rc.1 run.
+expected_bin_version="$QUICK_VERSION"
+case "$expected_bin_version" in
+    *-rc.*) expected_bin_version="${expected_bin_version%-rc.*}" ;;
+esac
+check_binaries_version "$expected_bin_version" ""
 finish
 EOS
 )

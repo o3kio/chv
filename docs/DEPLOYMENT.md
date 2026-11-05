@@ -210,6 +210,14 @@ installed. It then installs the artifacts, generates TLS material and
 and starts the four systemd services, and waits for the local agent's
 enrollment.
 
+**Minimum supported release: v0.4.0.** The quick path configures the
+package-serving shape where the control plane serves the WebUI itself
+(#447 D3) and exposes its own metrics listener. Earlier releases predate
+that shape, so the script refuses them (`--version 0.3.0` fails closed)
+rather than install a host with a 404 UI. While v0.3.0 remains the latest
+stable during the v0.4.0-rc.N window, pin the pre-release explicitly:
+`--version 0.4.0-rc.1`.
+
 After it completes, open `http://<host-ip>:8080/` and log in as
 **admin** with the password from `/etc/chv/initial_admin_password`
 (printed once, mode 0600, root-only; rotation is forced on first login).

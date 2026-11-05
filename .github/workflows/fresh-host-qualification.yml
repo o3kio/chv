@@ -39,6 +39,11 @@ on:
         required: true
         default: false
         type: boolean
+      quick_install_version:
+        description: 'Release version the quick-install leg installs (default: previous_release; must be >= 0.4.0)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -58,6 +63,7 @@ jobs:
       CHV_QUAL_ROOT: /var/lib/chv/qual
       GITHUB_REPO: ${{ github.repository }}
       PREVIOUS_RELEASE: ${{ inputs.previous_release }}
+      QUICK_INSTALL_VERSION: ${{ inputs.quick_install_version }}
       EVIDENCE_DIR: /var/lib/chv/qual/ci-artifacts/fresh-host-${{ github.run_id }}
       GH_TOKEN: ${{ github.token }}
       CHV_GIT_SHA: ${{ github.sha }}
@@ -188,6 +194,8 @@ jobs:
         run: |
           set -euo pipefail
           previous_version="${PREVIOUS_RELEASE#v}"
+          quick_version="${QUICK_INSTALL_VERSION:-$previous_version}"
+          quick_version="${quick_version#v}"
           args=(
             --candidate-tarball "dist/chv-$(cat VERSION)-linux-amd64.tar.gz"
             --candidate-version "$(cat VERSION)"
@@ -196,7 +204,7 @@ jobs:
             --previous-version "$previous_version"
             --packages dist/packages
             --quick-install "$GITHUB_SHA"
-            --quick-install-version "$previous_version"
+            --quick-install-version "$quick_version"
             --evidence-dir "$EVIDENCE_DIR"
           )
           if [ "${PREVIOUS_TARBALL:-}" != "" ]; then

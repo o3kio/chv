@@ -89,6 +89,17 @@ install -d -m 0770 -o chv -g chv-stord /var/lib/chv/storage/localdisk /var/lib/c
 # the same ownership); kept here so non-systemd starts also work as 'chv'.
 install -d -m 0755 -o chv -g chv /run/chv/stord
 
+# Apply the shipped tmpfiles entry now. systemd-tmpfiles runs it at boot, but
+# a package installed on a live host starts the units in this same configure
+# run, and chv-nwd's ReadWritePaths=/run/netns requires the directory to
+# exist before the unit starts. Failure is loud but not fatal: a chroot or
+# container install without a running systemd still needs to configure.
+if [ -f /usr/lib/tmpfiles.d/chv-node.conf ] && command -v systemd-tmpfiles >/dev/null 2>&1; then
+    if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/chv-node.conf 2>/dev/null; then
+        echo "chv-node: WARNING: systemd-tmpfiles --create failed; chv-nwd needs /run/netns to start." >&2
+    fi
+fi
+
 # Add chv user to the kvm group if it exists (required for VM runtime)
 if getent group kvm >/dev/null 2>&1; then
     # NOTE: match the group list per-entry (`grep -qx` over one group per
@@ -125,6 +136,47 @@ fi
 if ! id -nG chv | tr ' ' '\n' | grep -qx chv-stord; then
     usermod -aG chv-stord chv
 fi
+
+# In-place upgrade from the scripts/install.sh layout (#666 fresh-host
+# qualification). install.sh copies migrations to
+# /usr/local/share/chv/migrations and writes that path into the preserved
+# controlplane.toml; the packages install the same tree under /usr/share.
+# On a package upgrade the upgraded binary would otherwise start against the
+# previous release's migration set and fail on schema it now expects. Copy
+# only absent files (migration files are immutable); never rewrite the
+# preserved config.
+sync_legacy_migrations() {
+    _section="$1"
+    _packaged="$2"
+    _configured=""
+    [ -f /etc/chv/controlplane.toml ] || return 0
+    [ -d "$_packaged" ] || return 0
+    _configured="$(awk -v want="$_section" '
+        /^[[:space:]]*\[/ { section=$0; gsub(/[[:space:]]/, "", section) }
+        section == want && /^[[:space:]]*migrations_dir[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*"/, ""); sub(/".*/, ""); print; exit
+        }' /etc/chv/controlplane.toml 2>/dev/null)" || true
+    [ -n "$_configured" ] || return 0
+    if [ "$_configured" = "$_packaged" ]; then
+        return 0
+    fi
+    [ -d "$_configured" ] || return 0
+    # Copy each absent migration individually. Existing files are left
+    # untouched so the checksums recorded for already-applied migrations
+    # stay valid; a bulk `cp -n` would also work but is non-portable.
+    for _mig in "$_packaged"/*.sql; do
+        [ -e "$_mig" ] || continue
+        _name="${_mig##*/}"
+        if [ -e "$_configured/$_name" ]; then
+            continue
+        fi
+        if ! cp -a "$_mig" "$_configured/"; then
+            echo "chv-controlplane: WARNING: could not copy ${_name} into ${_configured}; the upgraded control plane may fail its schema migration." >&2
+        fi
+    done
+}
+sync_legacy_migrations "[database]" /usr/share/chv/migrations
+sync_legacy_migrations "[monitoring]" /usr/share/chv/monitoring-migrations
 
 # Reload systemd so new service files are recognized
 if command -v systemctl >/dev/null 2>&1; then
