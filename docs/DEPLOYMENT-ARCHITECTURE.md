@@ -1,6 +1,6 @@
 # CHV Deployment Architecture — Single Source of Truth
 
-> **Status (2026-11-05, branch `phase0/docs`, base `406b7d08`):**
+> **Status (2026-11-05, `main` `b816b24f`):**
 > this document is the authoritative reference for **what deploys, how the
 > components connect, and which use cases are supported at which confidence
 > tier**. It does not replace the operator how-to ([DEPLOYMENT.md](DEPLOYMENT.md)),
@@ -22,8 +22,8 @@
 > by the pause-first mode #578 plus the #582 follow-ups, and **#379** (LVM)
 > by #510/#511/#512. The full real-KVM lane (m4.3–m4.8) is green on
 > [run 41938443045](https://github.com/o3kio/chv/actions/runs/41938443045)
-> (`e82d49a1`, code-identical to `main` `406b7d08` on the qualified
-> Rust/proto/packaging paths), recorded in the
+> (`e82d49a1`; at the time of that run `main` was `406b7d08`, and the two trees
+> were code-identical on the qualified Rust/proto/packaging paths), recorded in the
 > [nightly evidence note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md).
 > Prompt 06 (reference deployment / field qualification) is still pending and
 > is not pre-claimed.
@@ -503,10 +503,10 @@ is not supported.
 | Qualification status | The full real-KVM lane (m4.3–m4.8) is green on **run 41938443045** (`e82d49a1`); this closes #659's execution-evidence condition. The release candidate `v0.4.0-rc.1` (`c25360a8`) adds CI- and fresh-host-verified packaging/installer fixes on top of `e82d49a1`; the real-KVM lane was not re-run on the RC. #666's fresh-host demonstration passed on the RC in a clean container (run [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140)), which is [CONTAINER-VERIFIED], not bare metal; #556's published quick installer passed in the same run. | [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §4–§5; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md) |
 
 **Pending:** Prompt 06 (reference deployment / field qualification) will add the
-first field-evidence tier and is not pre-claimed here. The draft release
-support matrix ([release/v0.4.0-rc.1-support-matrix.md](release/v0.4.0-rc.1-support-matrix.md))
-carries the same claims with per-row evidence pointers and is not a release
-announcement.
+first field-evidence tier and is not pre-claimed here. The published
+release support matrix ([release/v0.4.0-rc.1-support-matrix.md](release/v0.4.0-rc.1-support-matrix.md))
+carries the same claims with per-row evidence pointers; `v0.4.0-rc.1` is a
+pre-release, not a stable support announcement.
 
 ## 8. Open design decisions
 
@@ -709,7 +709,7 @@ deploy them; do not file evidence against them.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and data flow | The deleted upgrade stack and the removed `chvctl upgrade` surface are recorded there in past tense; this document supersedes on deployment matters. |
 | [specs/adr/](specs/adr/) | Design authority | ADRs are decisions; this document records their qualification tier (for example ADR-021 is DESIGN-ONLY). |
 | [evidence/](evidence/) (frozen prompt-04 milestones) | Proof | Every [QUALIFIED — KVM-VERIFIED] label here cites a milestone doc. |
-| [prompts/production-readiness/](prompts/production-readiness/) | Campaign definitions | Prompt 06 is pending and will extend §5 and §7 when it has field evidence. The draft [v0.4.0-rc.1 support matrix](release/v0.4.0-rc.1-support-matrix.md) and [release notes](release/v0.4.0-rc.1-release-notes.md) restate this document's claims; they are not a release announcement. |
+| [prompts/production-readiness/](prompts/production-readiness/) | Campaign definitions | Prompt 06 is pending and will extend §5 and §7 when it has field evidence. The published [v0.4.0-rc.1 support matrix](release/v0.4.0-rc.1-support-matrix.md) and [release notes](release/v0.4.0-rc.1-release-notes.md) restate this document's claims; the RC is a **pre-release**, not a stable support announcement. |
 
 ---
 
