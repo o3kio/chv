@@ -113,6 +113,17 @@ impl HostResourceController for AgentResourceController {
         client.resolve_volume_handle(volume_id, vm_id).await
     }
 
+    async fn close_detached_volume_sessions(
+        &self,
+        volume_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<usize, ChvError> {
+        let mut client = StordClient::connect(&self.stord_socket).await?;
+        client
+            .close_detached_volume_sessions(volume_id, operation_id)
+            .await
+    }
+
     async fn ensure_network_topology(
         &self,
         network_id: &str,

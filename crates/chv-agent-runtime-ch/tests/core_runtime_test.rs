@@ -1152,12 +1152,12 @@ async fn delete_after_restart_drains_from_observed_attachments() {
 
 /// #711: the post-restart delete's cached handle is gone, but stord's
 /// durable session table still has the live attachment for `(volume,
-/// vm)`. The fallback drain must resolve it BEFORE the detach (which
-/// clears `vm_id`) and then close it after the detach — restoring the
-/// tracked path's detach-then-close pair instead of leaving a detached
+/// vm)`. The fallback drain detaches (clearing `vm_id`), then closes every
+/// detached session for the volume — restoring the tracked path's
+/// detach-then-close pair instead of leaving a detached
 /// `runtime_status = "open"` row behind.
 #[tokio::test]
-async fn delete_after_restart_resolves_missing_handle_and_closes_the_session() {
+async fn delete_after_restart_closes_the_detached_session() {
     let h = harness(None);
     let vm_id = "vm-resolve";
     h.runtime
@@ -1206,24 +1206,19 @@ async fn delete_after_restart_resolves_missing_handle_and_closes_the_session() {
     assert!(
         is_subsequence(
             &log,
-            &[
-                "resolve:vol-0",
-                "detach:vol-0",
-                "close:vol-0",
-                "detach_nic:vm-resolve-net-0",
-            ]
+            &["detach:vol-0", "close:vol-0", "detach_nic:vm-resolve-net-0",]
         ),
-        "the resolved handle must be closed AFTER the detach: {log:?}"
+        "the detached session must be closed AFTER the detach: {log:?}"
     );
 }
 
-/// #711's error policy: stord's session lookup is part of the best-effort
-/// fallback drain, so a transient lookup failure logs and continues — the
-/// detach still runs, no close is invented, and the already-deleted VM's
-/// op still succeeds (matching every other drain step).
+/// #711's error policy: stord's detached-session close is part of the
+/// best-effort fallback drain, so a transient failure logs and continues —
+/// the detach still runs and the already-deleted VM's op still succeeds
+/// (matching every other drain step). The session remains for a retry.
 #[tokio::test]
-async fn fallback_drain_resolve_failure_is_best_effort() {
-    let h = harness(Some("resolve:1"));
+async fn fallback_drain_close_failure_is_best_effort() {
+    let h = harness(Some("close_detached:1"));
     let vm_id = "vm-resolve-fail";
     h.runtime
         .execute(entry(
@@ -1237,6 +1232,8 @@ async fn fallback_drain_resolve_failure_is_best_effort() {
         .await
         .expect("create succeeds");
 
+    h.controller
+        .add_volume_session("vol-0", vm_id, "handle-vol-0");
     let source = TestAttachmentSource::new(ObservedVmAttachments {
         volumes: vec![("vol-0".to_string(), None)],
         nics: Vec::new(),
@@ -1253,7 +1250,7 @@ async fn fallback_drain_resolve_failure_is_best_effort() {
         .execute(entry(
             OperationKind::DeleteVm,
             vm_id,
-            "op-del-resolve-fail",
+            "op-del-close-fail",
             envelope(MutationCommand::DeleteVm {
                 vm_id: VmId::new(vm_id).expect("vm id"),
             }),
@@ -1261,16 +1258,16 @@ async fn fallback_drain_resolve_failure_is_best_effort() {
         .await;
     assert!(
         result.is_ok(),
-        "a failed handle lookup must not fail the delete: {result:?}"
+        "a failed detached-session close must not fail the delete: {result:?}"
     );
     let log = calls(&h.controller);
     assert!(
         log.iter().any(|c| c == "detach:vol-0"),
-        "the detach must still run after a failed lookup: {log:?}"
+        "the detach must still run before the close attempt: {log:?}"
     );
     assert!(
         !log.iter().any(|c| c == "close:vol-0"),
-        "no close may be invented without a resolved handle: {log:?}"
+        "a failed close must leave the session for a retry: {log:?}"
     );
 }
 

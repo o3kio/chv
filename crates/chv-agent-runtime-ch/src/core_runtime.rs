@@ -735,23 +735,14 @@ impl CloudHypervisorCoreRuntime {
                 "no in-memory side-effect state for delete; draining stord/nwd handles from durable observed attachments (post-restart fallback)"
             );
             for (volume_id, handle) in &observed.volumes {
-                // #711: the cached handle died with the agent process on
-                // restart, but stord's durable session table still knows
-                // the live attachment. Resolve it BEFORE the detach clears
-                // the session's `vm_id`, so this fallback detach-then-close
-                // exactly like the tracked path. A lookup failure follows
-                // the drain's fail-open policy below (log and continue);
-                // the detach still releases the VM-scoped attachment.
-                let handle = match handle {
-                    Some(handle) => Some(handle.clone()),
-                    None => match self.resources.resolve_volume_handle(volume_id, vm_id).await {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            warn!(vm_id, volume_id, error = %e, "delete cleanup: resolve_volume_handle failed, continuing");
-                            None
-                        }
-                    },
-                };
+                // #711: the Core create path never records a handle in the
+                // cache, so the fallback cannot rely on observed state alone.
+                // Detach is idempotent and keyed by (volume, vm); after it
+                // clears `vm_id`, close the recorded handle (if any) and
+                // every detached session for the volume. The latter closes
+                // this detach and any session left open by a crash (or
+                // failed close) between an earlier detach and close.
+                // Attached sessions are never touched.
                 if let Err(e) = self
                     .resources
                     .detach_volume_from_vm(volume_id, vm_id, false, Some(op_id))
@@ -759,16 +750,21 @@ impl CloudHypervisorCoreRuntime {
                 {
                     warn!(vm_id, volume_id, error = %e, "delete cleanup: detach_volume failed, continuing");
                 }
-                // No handle (not cached, and stord reported no live
-                // session) means there is nothing to close.
                 if let Some(handle) = handle {
                     if let Err(e) = self
                         .resources
-                        .close_volume(volume_id, &handle, Some(op_id))
+                        .close_volume(volume_id, handle, Some(op_id))
                         .await
                     {
                         warn!(vm_id, volume_id, error = %e, "delete cleanup: close_volume failed, continuing");
                     }
+                }
+                if let Err(e) = self
+                    .resources
+                    .close_detached_volume_sessions(volume_id, Some(op_id))
+                    .await
+                {
+                    warn!(vm_id, volume_id, error = %e, "delete cleanup: close_detached_volume_sessions failed, continuing");
                 }
             }
             for nic_id in &observed.nics {

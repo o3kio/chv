@@ -175,11 +175,15 @@ impl HostResourceController for MockHostResourceController {
     async fn close_volume(
         &self,
         volume_id: &str,
-        _attachment_handle: &str,
+        attachment_handle: &str,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
         self.begin_step("close")?;
         self.record("close", volume_id);
+        self.volume_sessions
+            .lock()
+            .unwrap()
+            .retain(|s| !(s.volume_id == volume_id && s.attachment_handle == attachment_handle));
         Ok(())
     }
 
@@ -197,6 +201,25 @@ impl HostResourceController for MockHostResourceController {
             .iter()
             .find(|session| session.volume_id == volume_id && session.vm_id == vm_id)
             .map(|session| session.attachment_handle.clone()))
+    }
+
+    async fn close_detached_volume_sessions(
+        &self,
+        volume_id: &str,
+        _operation_id: Option<&str>,
+    ) -> Result<usize, ChvError> {
+        self.begin_step("close_detached")?;
+        let mut sessions = self.volume_sessions.lock().unwrap();
+        let count = sessions
+            .iter()
+            .filter(|s| s.volume_id == volume_id && s.vm_id.is_empty())
+            .count();
+        sessions.retain(|s| !(s.volume_id == volume_id && s.vm_id.is_empty()));
+        drop(sessions);
+        for _ in 0..count {
+            self.record("close", volume_id);
+        }
+        Ok(count)
     }
 
     async fn ensure_network_topology(

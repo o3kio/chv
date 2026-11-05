@@ -176,12 +176,12 @@ async fn restarted_delete_drains_pre_restart_vm_from_the_node_cache() {
             "fallback drain must issue {expected}: {log:?}"
         );
     }
-    // vol-0's handle was resolved from stord's session table BEFORE the
-    // detach cleared `vm_id`, so its session is closed exactly like the
-    // live path (#711). vol-1 has no live session, so it is detached only.
+    // vol-0's session is found from stord's durable table after the detach
+    // cleared `vm_id`, so it is closed exactly like the live path (#711).
+    // vol-1 has no live session, so it is detached only.
     assert!(
-        is_subsequence(&log, &["resolve:vol-0", "detach:vol-0", "close:vol-0"]),
-        "the resolved handle must be closed after the detach: {log:?}"
+        is_subsequence(&log, &["detach:vol-0", "close:vol-0"]),
+        "the detached session must be closed after the detach: {log:?}"
     );
     assert!(
         !log.iter().any(|c| c == "close:vol-1"),

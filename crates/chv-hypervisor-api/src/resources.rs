@@ -366,6 +366,20 @@ pub trait HostResourceController: Send + Sync + 'static {
         vm_id: &str,
     ) -> Result<Option<String>, ChvError>;
 
+    /// Close every open stord session for `volume_id` whose owning VM has
+    /// already been cleared by a detach (#711).
+    ///
+    /// A crash or failed close between detach and close leaves exactly this
+    /// shape: `vm_id` empty, `runtime_status` open, handle still present. The
+    /// delete drain calls this after its own detach to close both the session
+    /// it just detached and any leftover from an earlier interrupted attempt.
+    /// Sessions still attached to a VM are never touched.
+    async fn close_detached_volume_sessions(
+        &self,
+        volume_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<usize, ChvError>;
+
     /// Ensure a network's bridge topology exists.
     async fn ensure_network_topology(
         &self,
@@ -472,10 +486,9 @@ impl NetworkUsageLookup for AlwaysInUse {
 pub struct ObservedVmAttachments {
     /// `(volume_id, attachment_handle)` pairs, in the source's record
     /// order. The handle is `Some` only when the source durably recorded
-    /// the stord attachment handle; a `None` handle still allows the
-    /// detach (stord keys a VM attachment by volume + vm, not by handle)
-    /// and lets the drain resolve the live handle from stord's session
-    /// table before detaching (#711).
+    /// the stord attachment handle. The delete drain no longer depends on
+    /// it: detach is keyed by volume + vm, and the drain then closes every
+    /// detached session for the volume from stord's session table (#711).
     pub volumes: Vec<(String, Option<String>)>,
     /// `nic_id`s, in attach order.
     pub nics: Vec<String>,
