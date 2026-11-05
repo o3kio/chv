@@ -54,6 +54,13 @@ RC releases are tagged as `v<version>-rc.1`, `v<version>-rc.2`, and so on.
 
 Download from the GitHub Pre-release page. The install command is identical to stable.
 
+GitHub rewrites release-asset filenames: characters outside
+`[A-Za-z0-9._-]` become `.`. An RC whose internal package version is
+`0.4.0~rc.1` is therefore published as
+`chv-controlplane_0.4.0.rc.1_amd64.deb`. The installed package's `Version`
+still reads `0.4.0~rc.1`, so dpkg/rpm ordering (`~rc.1` sorts below the
+stable release) is unchanged; only the filename on the release page differs.
+
 ## Nightly
 
 Nightly packages are built automatically from every merge to `main`.

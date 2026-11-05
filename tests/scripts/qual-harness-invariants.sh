@@ -515,4 +515,49 @@ for pkg_yaml in "${REPO_ROOT}"/packaging/nfpm/*.yaml; do
     done < <(sed -n 's|^[[:space:]]*-[[:space:]]*src:[[:space:]]*target/release/\([^[:space:]]*\)$|\1|p' "$pkg_yaml")
 done
 
+# ---------------------------------------------------------------------------
+# Release assets: GitHub sanitizes filenames, so package files must be
+# emitted with the same name the release page will serve. GitHub replaces
+# characters outside [A-Za-z0-9._-] with '.', which turned a published
+# `~rc.1` package into `.rc.1` while SHA256SUMS and the quick installer
+# still named the `~` form (run 42023294265).
+# ---------------------------------------------------------------------------
+build_packages="${REPO_ROOT}/scripts/build-packages.sh"
+check_package_files="${REPO_ROOT}/scripts/package/check-package-files.sh"
+grep -q 'safe_asset_name' "$build_packages" \
+    && pass "build-packages.sh derives a GitHub-safe asset filename" \
+    || fail "build-packages.sh emits filenames GitHub will rewrite"
+grep -q "tr -c 'A-Za-z0-9._-'" "$build_packages" \
+    && pass "build-packages.sh uses GitHub's character-replacement rule" \
+    || fail "build-packages.sh sanitization does not match GitHub's rule"
+grep -q 'ASSET_VERSION' "$check_package_files" \
+    && pass "check-package-files.sh validates the published asset name" \
+    || fail "check-package-files.sh validates a filename the release never serves"
+
+quick_deb_assets="$(source_path="$quick_installer" bash -c '
+    set +u
+    # shellcheck disable=SC1090
+    source "$source_path" >/dev/null 2>&1
+    PKG_KIND=deb
+    DEB_ARCH=amd64
+    ASSET_VERSION="$(package_asset_version "0.4.0~rc.1")"
+    expected_assets
+' 2>&1)"
+printf '%s\n' "$quick_deb_assets" | grep -qxF 'chv-controlplane_0.4.0.rc.1_amd64.deb' \
+    && pass "quick installer looks for the published (dot) RC asset name" \
+    || fail "quick installer looks for an RC asset name GitHub never serves"
+if printf '%s\n' "$quick_deb_assets" | grep -q '~'; then
+    fail "quick installer still expects a literal '~' release asset"
+else
+    pass "quick installer no longer constructs a '~' release asset name"
+fi
+[ "$(source_path="$quick_installer" bash -c '
+    set +u
+    # shellcheck disable=SC1090
+    source "$source_path" >/dev/null 2>&1
+    package_asset_version "0.4.0~rc.1"
+' 2>/dev/null)" = "0.4.0.rc.1" ] \
+    && pass "package_asset_version maps 0.4.0~rc.1 to the published 0.4.0.rc.1" \
+    || fail "package_asset_version does not match GitHub's filename sanitization"
+
 exit "$rc"

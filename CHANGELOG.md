@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package-file check requires its `.deb`/`.rpm`, and an offline invariant
   asserts every `target/release/*` binary named by `packaging/nfpm/*.yaml`
   is both uploaded and chmodded by the release workflow.
+- **Release assets (RC package filenames — GitHub sanitization)**: GitHub
+  replaces characters outside `[A-Za-z0-9._-]` in release-asset names with
+  `.`, so the published RC packages were named
+  `chv-controlplane_0.4.0.rc.1_amd64.deb` while the published `SHA256SUMS`
+  and the quick installer still referenced
+  `chv-controlplane_0.4.0~rc.1_amd64.deb`; a pinned quick-install could not
+  find an asset and checksum verification of downloaded files failed.
+  `build-packages.sh` now emits the GitHub-safe filename before checksums
+  are generated, `check-package-files.sh` validates that name, and the
+  quick installer resolves the published asset version separately from the
+  package's internal `Version` (which keeps `~` so `0.4.0~rc.1` still sorts
+  below `0.4.0`). Nightly assets get the same consistency fix.
 - **migration (detached agent-task cancellation across restarts — #656)**:
   `MigrateVm` is fire-and-forget, so the source *and* destination agents keep
   detached tasks after the control plane restarts, the reaper force-fails a

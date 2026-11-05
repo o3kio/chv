@@ -55,6 +55,11 @@ All other version references are derived from it:
 | `pr` | `X.Y.Z` | `<version>~pr<N>.<date>.g<sha>` |
 
 > **Notes**
+> - GitHub rewrites release-asset filenames: any character outside
+>   `[A-Za-z0-9._-]` becomes `.`. `scripts/build-packages.sh` therefore emits
+>   the GitHub-safe form (`0.4.0~rc.1` → `0.4.0.rc.1` in the filename) so the
+>   published assets and `SHA256SUMS` agree. The package's internal `Version`
+>   keeps `~` for correct ordering; only the asset filename changes.
 > - Debian uses `~` to ensure prereleases sort **before** the stable release in `dpkg --compare-versions`.
 > - RPM's `rpmvercmp` treats `~` the same way: `<version>~rc.1 < <version>`. The `version.sh --rpm` channel path emits the same `~` strings as `--deb`; its former `^` output (RPM's post-release operator, which sorts **after** the stable release) was removed so that nightly < RC < stable holds on both formats even if per-format version strings are ever adopted (#432).
 

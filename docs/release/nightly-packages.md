@@ -37,8 +37,10 @@ Until the package repository is fully configured, nightly packages are attached 
 #### Debian / Ubuntu
 
 ```bash
-# Download the latest .deb files from the Nightly release page
-curl -sL "https://github.com/o3kio/chv/releases/download/nightly/chv-controlplane_<version>~nightly.$(date +%Y%m%d).g$(curl -s https://api.github.com/repos/o3kio/chv/releases/tags/nightly | jq -r '.target_commitish' | head -c7)_amd64.deb" -o chv-controlplane.deb
+# Download the latest .deb files from the Nightly release page.
+# GitHub rewrites release-asset filenames, so the published name uses '.'
+# where the package's internal Version uses '~'.
+curl -sL "https://github.com/o3kio/chv/releases/download/nightly/chv-controlplane_<version>.nightly.$(date +%Y%m%d).g$(curl -s https://api.github.com/repos/o3kio/chv/releases/tags/nightly | jq -r '.target_commitish' | head -c7)_amd64.deb" -o chv-controlplane.deb
 
 # Or download manually from the browser, then install:
 sudo dpkg -i chv-controlplane_*.deb chv-node_*.deb chvctl_*.deb
@@ -107,7 +109,7 @@ Nightly packages use the same package name as stable releases, so your package m
 
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i chv-controlplane_<version>~nightly.NEW_amd64.deb
+sudo dpkg -i chv-controlplane_<version>.nightly.NEW_amd64.deb
 sudo apt-get install -f
 
 # Or via apt once the repo is configured

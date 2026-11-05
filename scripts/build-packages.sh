@@ -175,6 +175,25 @@ for pkg_yaml in packaging/nfpm/*.yaml; do
     done
 done
 
+# GitHub release assets sanitize characters outside [A-Za-z0-9._-] to '.',
+# so a file built as `chv-controlplane_0.4.0~rc.1_amd64.deb` is published as
+# `chv-controlplane_0.4.0.rc.1_amd64.deb`. Left alone, SHA256SUMS and the
+# quick installer then name files that do not exist on the release. Emit the
+# GitHub-safe name here (the package's internal Version keeps `~` for correct
+# dpkg/rpm ordering) so every consumer sees one name.
+safe_asset_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '.'
+}
+
+for pkg in "${OUTDIR}"/*.deb "${OUTDIR}"/*.rpm; do
+    [ -e "$pkg" ] || continue
+    base="$(basename "$pkg")"
+    safe_base="$(safe_asset_name "$base")"
+    if [ "$base" != "$safe_base" ]; then
+        mv -f -- "$pkg" "${OUTDIR}/${safe_base}"
+    fi
+done
+
 # Checksums
 echo "==> Generating SHA256 checksums..."
 cd "$OUTDIR"
