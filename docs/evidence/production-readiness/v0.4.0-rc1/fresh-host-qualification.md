@@ -56,9 +56,10 @@ _pending_
 | previous release tarball (`v0.3.0`) | `_pending_` |
 | pinned `scripts/quick-install.sh` | `_pending_` |
 
-The candidate binaries embed `CHV_GIT_SHA`, so the upgrade leg can distinguish
-the candidate build from the previous release even while both carry the same
-base version string. The harness's `--candidate-version` must match the
+The candidate binaries embed `CHV_GIT_SHA`, so the upgrade leg pins the exact
+candidate commit; that also distinguishes the pair in a cycle where both
+carry the same base version string (in this run the previous release `v0.3.0`
+carries a different base). The harness's `--candidate-version` must match the
 tarball's top-level directory and the binaries' embedded `VERSION` base; record
 the exact values from the run rather than assuming them.
 

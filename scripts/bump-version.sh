@@ -142,6 +142,10 @@ fi
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" README.md
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" docs/DEPLOYMENT.md
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" scripts/install.sh
+# The hosting pages advertise the latest *stable* installer. A stable bump
+# moves them; for a release candidate they must be reverted to the prior
+# stable pin after this script runs, because an RC tag is a pre-release and
+# the base version (e.g. 0.4.0) does not resolve until it is promoted.
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" scripts/hosting/cloudflare-worker.js
 sed -i "s/${OLD_VERSION_ESC}/${NEW_VERSION}/g" scripts/hosting/github-pages-index.html
 

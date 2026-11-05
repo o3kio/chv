@@ -381,11 +381,14 @@ grep -q '_pending_' "$fresh_report" \
 # The in-container marker and the host-side assertion are one contract; a
 # wording change on either side silently makes the leg unable to pass.
 install_sh_leg="${QUAL}/install-sh-leg.sh"
-encmarker='ENCKEY-LOADED (no plaintext/fallback warning in CP journal)'
+encmarker='ENCKEY-LOADED (no plaintext/fallback/no-key warning in CP journal)'
 marker_count="$(grep -cF "$encmarker" "$install_sh_leg" 2>/dev/null || true)"
 [ "${marker_count:-0}" -ge 2 ] \
     && pass "install-sh leg asserts the exact encryption success marker it emits" \
     || fail "install-sh leg's encryption marker and host assertion have drifted"
+grep -q 'CHV_ENCRYPTION_KEY is unset or empty' "$install_sh_leg" \
+    && pass "install-sh leg treats a no-key control plane as a failure" \
+    || fail "install-sh leg can pass while the control plane loaded no encryption key"
 grep -q 'QUICK_VERSION" = "$CANDIDATE_VERSION' "$fresh" \
     && pass "fresh-host quick leg uses candidate-mode checks when installing the candidate" \
     || fail "fresh-host quick leg weakens candidate checks unconditionally"

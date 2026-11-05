@@ -120,8 +120,9 @@ with existing deployments, and a dedicated key is required for all new
 deployments. At startup, `chv-controlplane` logs the selected key source at
 INFO (dedicated key, including an explicit `[secrets] credential_encryption`
 key) or, for this fallback, a WARN prefixed `SECURITY WARNING: ...`, so the
-key source is never implicit. A whitespace-only key is treated as unset and
-fails closed.
+key source is never implicit. A set-but-whitespace-only key fails closed;
+unlike a fully unset `CHV_ENCRYPTION_KEY`, it does not fall back to
+`CHV_JWT_SECRET`.
 
 On such a host, rotating `CHV_JWT_SECRET` — a routine, sanctioned action —
 invalidates every stored S3 credential: decryption fails closed

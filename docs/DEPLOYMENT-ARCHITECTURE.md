@@ -555,8 +555,10 @@ found it.
   requires re-qualification; no VM remains attached and the backing is
   retained under M2.5 in either case. Sessions orphaned by a crash on a
   **pre-upgrade** stord (the old detach left `runtime_status = "open"`) are
-  not retroactively swept, because they are indistinguishable from a live
-  opened-but-attach-pending session; they clear on volume destroy.
+  not reclaimed by the VM-delete sweep, because they are indistinguishable from
+  a live opened-but-attach-pending session; `DeleteVolume` closes every session
+  with no attached VM before destroying, so these orphans clear on volume
+  destroy. A session still attached to a VM keeps the destroy refusal.
 - **Multi-stord-per-host metrics** — more than one stord on a host must set
   distinct `metrics_bind` values (the harness now uses ephemeral ports; the
   operator requirement is documented in [DEPLOYMENT.md](DEPLOYMENT.md)).
