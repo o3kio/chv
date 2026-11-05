@@ -105,15 +105,23 @@ jobs:
       - name: Install build prerequisites
         run: |
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
+          # Shared runner images may have an unattended-upgrade pending; keep
+          # apt/dpkg and needrestart non-interactive so the job cannot block on
+          # a kernel-upgrade dialog (the first attempt was killed at 30 min).
+          apt_run() {
+            sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \
+              timeout 900 apt-get -y \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confold "$@"
+          }
           # The lane runs debootstrap + systemd-nspawn containers; install the
           # tooling rather than requiring every shared chv-kvm runner image to
           # pre-stage it. iproute2/sqlite3 are driver prerequisites, and the
           # fresh-host.sh preflight fails closed if any of them is absent.
-          sudo apt-get update
-          sudo apt-get install -y gettext-base debootstrap systemd-container iproute2 sqlite3
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 timeout 300 apt-get update
+          apt_run install gettext-base debootstrap systemd-container iproute2 sqlite3
           if ! command -v protoc >/dev/null 2>&1; then
-            sudo apt-get install -y protobuf-compiler
+            apt_run install protobuf-compiler
           fi
           if ! command -v nfpm >/dev/null 2>&1; then
             # Pin nfpm for a reproducible package build.
