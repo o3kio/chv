@@ -817,6 +817,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "lru",
+ "metrics",
  "nix",
  "prost",
  "serde",

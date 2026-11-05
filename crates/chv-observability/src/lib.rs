@@ -1,4 +1,4 @@
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
 use tracing::Span;
 
@@ -34,6 +34,16 @@ pub const CHV_GRPC_SERVER_DURATION_SECONDS: &str = "chv_grpc_server_duration_sec
 // ---------------------------------------------------------------------------
 pub const CHV_VM_OPS_TOTAL: &str = "chv_vm_ops_total";
 pub const CHV_VM_OP_DURATION_SECONDS: &str = "chv_vm_op_duration_seconds";
+
+/// Buckets for the VM lifecycle duration histogram.
+///
+/// The Prometheus alert and recording rules read
+/// `chv_vm_op_duration_seconds_bucket`; without explicit buckets the exporter
+/// renders histograms as summaries and those rules stay empty.
+const VM_OP_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 120.0,
+    300.0,
+];
 
 // ---------------------------------------------------------------------------
 // Multi-node metric names (Phase 10)
@@ -104,7 +114,22 @@ pub fn install_prometheus_recorder() -> Result<(), Box<dyn std::error::Error>> {
     if PROMETHEUS_HANDLE.get().is_some() {
         return Ok(());
     }
-    let recorder = PrometheusBuilder::new().build_recorder();
+    let builder = match PrometheusBuilder::new().set_buckets_for_metric(
+        Matcher::Full(CHV_VM_OP_DURATION_SECONDS.to_string()),
+        VM_OP_DURATION_BUCKETS,
+    ) {
+        Ok(builder) => builder,
+        Err(error) => {
+            // The bucket list is a non-empty constant, so this is defensive:
+            // never fail recorder installation over a bad bucket override.
+            tracing::error!(
+                %error,
+                "invalid VM op duration buckets; exporting the histogram as a summary"
+            );
+            PrometheusBuilder::new()
+        }
+    };
+    let recorder = builder.build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)?;
     let _ = PROMETHEUS_HANDLE.set(handle);
