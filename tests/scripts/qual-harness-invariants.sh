@@ -477,4 +477,42 @@ grep -q 'QUICK_VERSION" = "$CANDIDATE_VERSION' "$fresh" \
     && pass "fresh-host quick leg uses candidate-mode checks when installing the candidate" \
     || fail "fresh-host quick leg weakens candidate checks unconditionally"
 
+# ---------------------------------------------------------------------------
+# Release packaging: every nfpm package's binary must reach the Package job.
+# ---------------------------------------------------------------------------
+# The Package job runs `build-packages.sh --skip-build` on the
+# `release-binaries` artifact, so a binary that nfpm packages but the Build
+# job never uploads fails packaging outright (Release run 42018658104:
+# chv-monitor-agent). Likewise upload-artifact drops mode bits, so the
+# restore-permissions step must name that binary or it ships non-executable.
+release_workflow="${REPO_ROOT}/.github/workflows/release.yml"
+upload_block="$(awk '
+    /name: release-binaries/ { capture = 1 }
+    capture && /^      - name:/ && !/name: release-binaries/ { exit }
+    capture { print }
+' "$release_workflow")"
+chmod_block="$(awk '
+    /Restore binary executable permissions/ { capture = 1 }
+    capture && /^      - name:/ && !/Restore binary executable permissions/ { exit }
+    capture { print }
+' "$release_workflow")"
+[ -n "$upload_block" ] \
+    && pass "release workflow declares the release-binaries upload list" \
+    || fail "release workflow no longer uploads a release-binaries artifact"
+[ -n "$chmod_block" ] \
+    && pass "release workflow restores packaged binary mode bits" \
+    || fail "release workflow no longer restores binary executable permissions"
+for pkg_yaml in "${REPO_ROOT}"/packaging/nfpm/*.yaml; do
+    [ -e "$pkg_yaml" ] || continue
+    while IFS= read -r bin; do
+        [ -n "$bin" ] || continue
+        printf '%s\n' "$upload_block" | grep -q "target/release/${bin}\$" \
+            && pass "release-binaries uploads packaged binary ${bin}" \
+            || fail "release-binaries omits packaged binary ${bin} (packaging will fail)"
+        printf '%s\n' "$chmod_block" | grep -q "target/release/${bin}" \
+            && pass "release workflow restores mode bits on ${bin}" \
+            || fail "release workflow leaves ${bin} non-executable in packages"
+    done < <(sed -n 's|^[[:space:]]*-[[:space:]]*src:[[:space:]]*target/release/\([^[:space:]]*\)$|\1|p' "$pkg_yaml")
+done
+
 exit "$rc"

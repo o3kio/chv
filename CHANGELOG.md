@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (immutable) migration files into the configured directory — it never
   rewrites the preserved config — so the forward-only migration applies and
   the upgraded deployment comes up.
+- **Release workflow (optional guest monitor-agent package)**: the Build
+  job uploaded five binaries, but `packaging/nfpm/chv-monitor-agent.yaml`
+  packages a sixth (`chv-monitor-agent`, ADR-026/#602), so the Package job
+  died at `build-packages.sh --skip-build` with
+  `matching "./target/release/chv-monitor-agent": file does not exist` and
+  no `v0.4.0-rc.1` assets were published. The `release-binaries` artifact
+  and the executable-bit restore now include the monitor agent, the
+  package-file check requires its `.deb`/`.rpm`, and an offline invariant
+  asserts every `target/release/*` binary named by `packaging/nfpm/*.yaml`
+  is both uploaded and chmodded by the release workflow.
 - **migration (detached agent-task cancellation across restarts — #656)**:
   `MigrateVm` is fire-and-forget, so the source *and* destination agents keep
   detached tasks after the control plane restarts, the reaper force-fails a
