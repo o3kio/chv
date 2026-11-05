@@ -20,7 +20,8 @@ name: Fresh-host qualification
 #     is shared with the KVM lane (the container itself does not use it)
 #   - host ports 80/8080/8443/8444/9101-9103/9901 free (the container
 #     shares the host netns)
-#   - debootstrap, systemd-container, curl, and the packaging toolchain
+#   - the job installs debootstrap, systemd-container, iproute2 and sqlite3
+#     via apt when the runner image does not already provide them
 #
 # Evidence: results.tsv, summary.md, per-leg transcripts and boot logs are
 # uploaded on success and failure; missing results.tsv fails the upload.
@@ -103,15 +104,26 @@ jobs:
 
       - name: Install build prerequisites
         run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The lane runs debootstrap + systemd-nspawn containers; install the
+          # tooling rather than requiring every shared chv-kvm runner image to
+          # pre-stage it. iproute2/sqlite3 are driver prerequisites, and the
+          # fresh-host.sh preflight fails closed if any of them is absent.
+          sudo apt-get update
+          sudo apt-get install -y gettext-base debootstrap systemd-container iproute2 sqlite3
           if ! command -v protoc >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+            sudo apt-get install -y protobuf-compiler
           fi
-          sudo apt-get install -y gettext-base
           if ! command -v nfpm >/dev/null 2>&1; then
             # Pin nfpm for a reproducible package build.
             curl -sL "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_x86_64.tar.gz" | tar -xz -C /tmp nfpm
             sudo mv /tmp/nfpm /usr/local/bin/nfpm
           fi
+          for tool in debootstrap systemd-nspawn ss sqlite3; do
+            command -v "$tool" >/dev/null 2>&1 \
+              || { echo "::error::$tool is still unavailable after prerequisite install"; exit 1; }
+          done
           nfpm --version
 
       - name: Setup Node.js 22

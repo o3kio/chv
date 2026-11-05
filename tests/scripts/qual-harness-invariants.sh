@@ -349,6 +349,9 @@ grep -q 'workflow_dispatch' "$fresh_workflow" \
 grep -Fq '[self-hosted, linux, x64, chv-kvm]' "$fresh_workflow" \
     && pass "fresh-host workflow targets the self-hosted chv-kvm fleet" \
     || fail "fresh-host workflow lost the self-hosted runner labels"
+grep -q 'apt-get install -y .*debootstrap systemd-container' "$fresh_workflow" \
+    && pass "fresh-host workflow installs the container driver prerequisites" \
+    || fail "fresh-host workflow cannot stage debootstrap/systemd-nspawn"
 grep -q 'releases/download' "$fresh_workflow" \
     && pass "fresh-host workflow downloads the previous release" \
     || fail "fresh-host workflow does not stage the previous release"
