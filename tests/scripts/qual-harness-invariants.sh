@@ -541,6 +541,23 @@ grep -q "tr -c 'A-Za-z0-9._-'" "$smoke_webui" \
     && pass "smoke-webui.sh applies GitHub's filename sanitization" \
     || fail "smoke-webui.sh filename sanitization drifted from GitHub's rule"
 
+# The lifecycle upgrade test installs a synthetic 0.0.1 build. The workflows
+# copy it to dist/packages-old and then rebuild the real version into the same
+# dist/packages directory; without a clean in between, the 0.0.1 probe
+# packages were published as release assets and listed in SHA256SUMS
+# (observed on v0.3.0 and v0.4.0-rc.1).
+for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.yml"; do
+    wf_name="$(basename "$wf")"
+    ordered_clean="$(awk '
+        /cp dist\/packages\/\* dist\/packages-old\// { copied = NR }
+        /rm -rf dist\/packages[[:space:]]*$/ && !/packages-old/ { cleaned = NR }
+        END { if (copied && cleaned && cleaned > copied) print "ok" }
+    ' "$wf")"
+    [ "$ordered_clean" = "ok" ] \
+        && pass "${wf_name} removes 0.0.1 probe packages before the real build" \
+        || fail "${wf_name} would publish the 0.0.1 lifecycle probe packages"
+done
+
 quick_deb_assets="$(source_path="$quick_installer" bash -c '
     set +u
     # shellcheck disable=SC1090

@@ -138,8 +138,14 @@ jobs:
         run: |
           export PACKAGE_VERSION="0.0.1"
           ./scripts/build-packages.sh --skip-build
+          rm -rf dist/packages-old
           mkdir -p dist/packages-old
           cp dist/packages/* dist/packages-old/
+          # The 0.0.1 probe packages exist only so the upgrade test has an
+          # older release to install. Drop them before the real build:
+          # leaving them in dist/packages published 0.0.1 assets and listed
+          # them in SHA256SUMS (observed on v0.3.0 and v0.4.0-rc.1).
+          rm -rf dist/packages
 
       - name: Build new version packages
         run: |
