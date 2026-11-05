@@ -2152,13 +2152,12 @@ if [ -z "${F7_SESSIONS_LEFT}" ] || [ -z "${F7_SESSIONS_ATTACHED}" ]; then
 elif [ "${F7_SESSIONS_ATTACHED}" = "0" ] && [ "${F7_SESSIONS_LEFT}" = "0" ]; then
     qual_pass "final sweep: live stord sessions all closed (0 rows)"
 elif [ "${F7_SESSIONS_ATTACHED}" = "0" ]; then
-    # M4.7 deliberately restarts the agent (F2). Attachment handles are
-    # in-memory (M2.2a), so deleting a VM created before the restart
-    # detaches its volume but cannot close it: the row stays "open" with
-    # vm_id cleared. That is the documented residual (#405 code comment;
-    # also the M2.5 retention class), not a live attachment — assert the
-    # safety property (nothing still attached) and record the residue.
-    qual_warn "final sweep: ${F7_SESSIONS_LEFT} detached-open stord session(s) retained — documented M2.2a handle-persistence residual for VM(s) created before the agent restart: $(sqlite_query "$(stord_db)" 'SELECT volume_id, runtime_status FROM sessions' 2>/dev/null | head -3 | tr '\n' ' ')"
+    # Pre-#711: deleting a VM created before the agent restart detached its
+    # volume but could not close it, leaving a row with vm_id cleared. The
+    # #711 fix marks the row `detached` and sweeps it, so residue here is
+    # unexpected on a fixed candidate; keep it a warning rather than a gate
+    # (the lane predates the fix and this sweep is not volume-scoped).
+    qual_warn "final sweep: ${F7_SESSIONS_LEFT} detached stord session(s) retained — unexpected on the #711-fixed candidate (pre-fix this was the documented M2.2a residual): $(sqlite_query "$(stord_db)" 'SELECT volume_id, runtime_status FROM sessions' 2>/dev/null | head -3 | tr '\n' ' ')"
 else
     qual_error "final sweep: FORBIDDEN — ${F7_SESSIONS_ATTACHED} stord session(s) still ATTACHED to a VM: $(sqlite_query "$(stord_db)" "SELECT volume_id, vm_id, runtime_status FROM sessions WHERE vm_id IS NOT NULL AND vm_id != ''" 2>/dev/null | head -3)"
 fi

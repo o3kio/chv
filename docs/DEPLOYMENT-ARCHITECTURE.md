@@ -540,7 +540,7 @@ found it.
 - **#706 — audit crash window.** The audit insert happens after the mutation's
   handler returns, so a crash between commit and insert can leave a mutation
   unrecorded. The mTLS-interceptor denials (missing, unparseable, or revoked
-  certificate) write no audit row at all. Tracked for Phase 1.
+  certificate) write no audit row at all. Tracked in #706.
 - **#709 — fixed after the qualified candidate `e82d49a1`.** In that
   candidate the first-enrollment `ReportBootstrapResult` is sent on the
   pre-enrollment certificate and rejected by the peer-node-id check, so a
@@ -550,10 +550,13 @@ found it.
   for a release; until then this entry describes the qualified tree.
 - **#711 — fixed after the qualified candidate `e82d49a1`.** In that
   candidate a VM created before an agent restart is detached but its stord
-  session cannot be closed (the M2.2a residual). The fix (recover the
-  session from stord and close detached sessions after detach) is on the
-  v0.4.0-rc.1 branch and requires re-qualification; no VM remains attached
-  and the backing is retained under M2.5 in either case.
+  session cannot be closed (the M2.2a residual). The fix (mark detached
+  sessions and close them after detach) is on the v0.4.0-rc.1 branch and
+  requires re-qualification; no VM remains attached and the backing is
+  retained under M2.5 in either case. Sessions orphaned by a crash on a
+  **pre-upgrade** stord (the old detach left `runtime_status = "open"`) are
+  not retroactively swept, because they are indistinguishable from a live
+  opened-but-attach-pending session; they clear on volume destroy.
 - **Multi-stord-per-host metrics** — more than one stord on a host must set
   distinct `metrics_bind` values (the harness now uses ephemeral ports; the
   operator requirement is documented in [DEPLOYMENT.md](DEPLOYMENT.md)).

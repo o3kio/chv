@@ -146,8 +146,11 @@ release tag (branch names and `main`/`master`/`HEAD`/`latest` are refused),
 hashes it, then runs it with `--version <previous-release>` in a clean root.
 
 Asserted: the pinned script passes `bash -n`; the installer returns `rc=0`;
-the same bring-up contract as §3.1 passes (units, encryption key, login, node,
-WebUI, metrics); binaries report the release version that was installed.
+the bring-up contract as §3.1 passes (units, encryption key, login, node,
+WebUI, metrics), except the encryption-key journal check: for the v0.3.0
+binary it asserts only the absence of the plaintext/fallback warning, because
+v0.3.0 logs nothing on the dedicated-key path; binaries report the release
+version that was installed.
 
 ## 4. Results
 
