@@ -332,7 +332,9 @@ resolve_version() {
     # Offline/air-gapped fallback pin: used ONLY when the GitHub API cannot be
     # reached or queried (never silently — every use is logged as a warning
     # naming the version, so an operator can tell a stale pin from a resolved
-    # one). Keep in sync with the last qualified release.
+    # one). Keep in sync with the last *stable* release: an RC pre-release
+    # (e.g. v0.4.0-rc.1) does not move this pin, because its artifacts are
+    # published under the tag, not under the base version.
     local fallback_version="0.3.0"
 
     # A local tarball/directory needs no GitHub API lookup — and the 404

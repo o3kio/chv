@@ -2,7 +2,8 @@
 
 This guide deploys CHV on a single Linux host. The host runs the **control plane** (orchestration, API, Web UI) and Cloud Hypervisor (the VMM) as the VM runtime.
 
-> **Version:** 0.3.0  
+> **Version:** 0.4.0 (release candidate `v0.4.0-rc.1`; `VERSION` holds the base
+> `0.4.0` and the tag carries the `-rc.1` suffix)  
 > **Target:** Ubuntu 22.04/24.04 LTS or equivalent Linux with KVM support  
 > **Database:** SQLite (no external database service required)
 
@@ -28,10 +29,11 @@ Run the qualified all-in-one installer on a fresh Ubuntu server with root access
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
 ```
 
-Or install a specific version:
+Or install a specific version (the current release candidate is `0.4.0-rc.1`;
+`0.3.0` remains the latest stable):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.3.0 bash -s
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.1 bash -s
 ```
 
 The installer script requires **bash**: it uses `set -o pipefail`, which `sh`
@@ -88,8 +90,9 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh |
   image against an out-of-band digest; when unset the installer warns that
   TLS to `cloud-images.ubuntu.com` is the only assurance.
 - **Version fallback.** If the GitHub API cannot be reached, the installer
-  warns explicitly and falls back to the `0.3.0` offline pin instead of
-  silently claiming it resolved the latest release.
+  warns explicitly and falls back to the `0.3.0` offline pin (the last stable
+  release; an RC pre-release does not move it) instead of silently claiming it
+  resolved the latest release.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -139,7 +142,9 @@ GPG signature check in the installer.
 > not a pre-release; its assets include the `chv-0.3.0-linux-amd64.tar.gz`
 > tarball with a `.sha256` sidecar alongside the `.deb`/`.rpm` packages), so
 > this resolution leg is live — tagged releases are the artifact source, and
-> the rolling `nightly` pre-release is never selected. The
+> the rolling `nightly` pre-release is never selected. The current release
+> candidate `v0.4.0-rc.1` is a GitHub pre-release, so the stable resolver
+> correctly skips it; install it by pinning `0.4.0-rc.1` explicitly. The
 > `get.cellhv.com` hosting surface is **not stood up** (the name does not
 > resolve); see
 > [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
@@ -188,7 +193,7 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-instal
 Or pinned to a tagged release, with a dry run available:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.3.0
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --dry-run
 ```
 
