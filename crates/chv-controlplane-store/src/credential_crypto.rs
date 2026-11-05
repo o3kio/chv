@@ -67,9 +67,32 @@ pub enum EncryptError {
     EncryptionFailed(String),
 }
 
+/// Which secret the credential-encryption cipher was keyed from (#336).
+///
+/// The source is exposed so the control plane can log it at startup and so
+/// callers/tests can assert which branch key selection took. It is
+/// observability only: it does not change the derivation or the ciphertexts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialKeySource {
+    /// The dedicated credential-encryption key: `CHV_ENCRYPTION_KEY` /
+    /// `/etc/chv/encryption.env`, or an explicit `[secrets]
+    /// credential_encryption` key. This is the required source for new
+    /// deployments.
+    DedicatedKey,
+    /// Deprecated legacy fallback to the JWT signing secret
+    /// (`CHV_JWT_SECRET`). Retained for backward compatibility with
+    /// pre-#335 hosts and env-driven deployments; rotating the JWT secret
+    /// invalidates every credential encrypted under it.
+    JwtSecretFallback,
+    /// No key is configured. Credential writes fail closed and previously
+    /// encrypted rows cannot be decrypted.
+    NotConfigured,
+}
+
 #[derive(Clone)]
 pub struct CredentialEncryption {
     cipher: Option<Aes256Gcm>,
+    key_source: CredentialKeySource,
 }
 
 impl Default for CredentialEncryption {
@@ -88,14 +111,21 @@ impl CredentialEncryption {
         // reach it. It shares the JWT signing secret (chv-config): rotating
         // CHV_JWT_SECRET invalidates credentials encrypted under it — the
         // warn! below makes that hazard visible at startup instead of
-        // surfacing later as opaque S3 AuthFailed errors. Dropping the
-        // fallback entirely is a maintainer decision tracked in #336;
-        // do not add new consumers.
-        let (key_str, jwt_fallback) = match std::env::var("CHV_ENCRYPTION_KEY") {
-            Ok(key) => (key, false),
+        // surfacing later as opaque S3 AuthFailed errors.
+        //
+        // Decision (#336): the fallback is retained for backward
+        // compatibility with existing deployments; removing it is breaking
+        // and is deferred to a future release. The dedicated key is required
+        // for all new deployments, and the fallback is deprecated — do not
+        // add new consumers. See docs/runbooks/control-plane-dr.md for the
+        // 0600 encryption.env migration path.
+        let (key_str, key_source) = match std::env::var("CHV_ENCRYPTION_KEY") {
+            Ok(key) if !key.is_empty() => (key, CredentialKeySource::DedicatedKey),
+            Ok(_) => (String::new(), CredentialKeySource::NotConfigured),
             Err(_) => match std::env::var("CHV_JWT_SECRET") {
-                Ok(jwt) => (jwt, true),
-                Err(_) => (String::new(), false),
+                Ok(jwt) if !jwt.is_empty() => (jwt, CredentialKeySource::JwtSecretFallback),
+                Ok(_) => (String::new(), CredentialKeySource::NotConfigured),
+                Err(_) => (String::new(), CredentialKeySource::NotConfigured),
             },
         };
 
@@ -111,26 +141,38 @@ impl CredentialEncryption {
                  rows remain readable, and previously encrypted rows require \
                  the original key."
             );
-            return Self { cipher: None };
+            return Self {
+                cipher: None,
+                key_source: CredentialKeySource::NotConfigured,
+            };
         }
 
         // Key-source observability (#336): the operator must be able to tell
         // from the logs which secret the credential cipher was keyed from.
-        if jwt_fallback {
-            warn!(
-                "CHV_ENCRYPTION_KEY is unset; using the legacy CHV_JWT_SECRET \
-                 fallback: S3 credentials are being encrypted under the JWT \
-                 signing secret. Rotating CHV_JWT_SECRET will invalidate all \
-                 stored S3 credentials — decryption fails closed (AuthFailed) \
-                 and the credentials must be re-entered. See \
-                 docs/runbooks/control-plane-dr.md for how to mint a \
-                 dedicated CHV_ENCRYPTION_KEY and migrate off this fallback."
-            );
-        } else {
-            info!(
-                "CHV_ENCRYPTION_KEY is set; \
-                 S3 credentials will be encrypted with the dedicated key"
-            );
+        match key_source {
+            CredentialKeySource::JwtSecretFallback => {
+                warn!(
+                    "SECURITY WARNING: CHV_ENCRYPTION_KEY is unset; using the \
+                     deprecated legacy CHV_JWT_SECRET fallback: S3 credentials \
+                     are being encrypted under the JWT signing secret. Rotating \
+                     CHV_JWT_SECRET will invalidate all stored S3 credentials — \
+                     decryption fails closed (AuthFailed) and the credentials \
+                     must be re-entered. Migrate to a dedicated 0600 \
+                     /etc/chv/encryption.env now: copy the current \
+                     CHV_JWT_SECRET into CHV_ENCRYPTION_KEY to preserve existing \
+                     ciphertexts, restart chv-controlplane, then rotate \
+                     CHV_JWT_SECRET. See docs/runbooks/control-plane-dr.md."
+                );
+            }
+            CredentialKeySource::DedicatedKey => {
+                info!(
+                    "CHV_ENCRYPTION_KEY is set; \
+                     S3 credentials will be encrypted with the dedicated key"
+                );
+            }
+            CredentialKeySource::NotConfigured => {
+                // Unreachable: the empty-key branch above returns early.
+            }
         }
 
         // SHA-256 always produces 32 bytes, which is the exact key size for
@@ -139,14 +181,25 @@ impl CredentialEncryption {
         // failure path we fall back to a no-cipher state and log a clear
         // operator-visible warning instead of crashing the process. The
         // no-cipher state rejects credential writes (fail-closed).
-        Self::from_key(&key_str)
+        Self::from_key_with_source(&key_str, key_source)
+    }
+
+    /// Which secret this instance was keyed from (#336). Startup diagnostics
+    /// only; the value never includes key material.
+    pub fn key_source(&self) -> CredentialKeySource {
+        self.key_source
     }
 
     /// Builds a cipher from an explicit key secret, bypassing environment
-    /// lookup. Used by [`Self::new`] after key selection, by the
-    /// control-plane bootstrap when `[secrets] credential_encryption` is
-    /// configured (#662), and by the test-support constructors.
+    /// lookup. Used by the control-plane bootstrap when `[secrets]
+    /// credential_encryption` is configured (#662) and by the test-support
+    /// constructors. An explicit key is a dedicated key, so those instances
+    /// report [`CredentialKeySource::DedicatedKey`].
     pub fn from_key(key_str: &str) -> Self {
+        Self::from_key_with_source(key_str, CredentialKeySource::DedicatedKey)
+    }
+
+    fn from_key_with_source(key_str: &str, key_source: CredentialKeySource) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(key_str.as_bytes());
         let key_bytes = hasher.finalize();
@@ -154,6 +207,7 @@ impl CredentialEncryption {
         match Aes256Gcm::new_from_slice(&key_bytes) {
             Ok(cipher) => Self {
                 cipher: Some(cipher),
+                key_source,
             },
             Err(e) => {
                 warn!(
@@ -161,7 +215,10 @@ impl CredentialEncryption {
                     "failed to construct AES-256-GCM cipher from key; credential \
                      writes will be rejected (fail-closed) until this is fixed"
                 );
-                Self { cipher: None }
+                Self {
+                    cipher: None,
+                    key_source: CredentialKeySource::NotConfigured,
+                }
             }
         }
     }
@@ -170,7 +227,10 @@ impl CredentialEncryption {
     /// fail-closed write path without mutating process-global environment.
     #[cfg(any(test, feature = "test-util"))]
     pub fn without_key() -> Self {
-        Self { cipher: None }
+        Self {
+            cipher: None,
+            key_source: CredentialKeySource::NotConfigured,
+        }
     }
 
     /// Test-support constructor: a cipher keyed from an explicit secret,
@@ -445,6 +505,8 @@ mod tests {
         let _subscriber = tracing::subscriber::set_default(logs.clone());
         let crypto = CredentialEncryption::new();
 
+        assert_eq!(crypto.key_source(), CredentialKeySource::DedicatedKey);
+
         let warnings = logs.messages_at(tracing::Level::WARN);
         assert!(
             warnings.is_empty(),
@@ -485,6 +547,8 @@ mod tests {
         let _subscriber = tracing::subscriber::set_default(logs.clone());
         let crypto = CredentialEncryption::new();
 
+        assert_eq!(crypto.key_source(), CredentialKeySource::JwtSecretFallback);
+
         let warnings = logs.messages_at(tracing::Level::WARN);
         let warning = warnings
             .iter()
@@ -523,6 +587,34 @@ mod tests {
         );
     }
 
+    /// An explicit key (bootstrap `[secrets] credential_encryption` or the
+    /// test-support constructors) is a dedicated key, never the legacy
+    /// JWT-signing-secret source.
+    #[test]
+    fn explicit_key_reports_dedicated_source() {
+        assert_eq!(
+            CredentialEncryption::from_key("explicit-dedicated-key").key_source(),
+            CredentialKeySource::DedicatedKey
+        );
+    }
+
+    /// A present-but-empty CHV_ENCRYPTION_KEY must NOT silently fall through
+    /// to CHV_JWT_SECRET: that would re-introduce the rotation hazard from a
+    /// truncated encryption.env. It reports no key instead.
+    #[test]
+    fn empty_dedicated_key_does_not_fall_back_to_jwt() {
+        let _g = EnvGuard::lock();
+        std::env::set_var("CHV_ENCRYPTION_KEY", "");
+        std::env::set_var("CHV_JWT_SECRET", "jwt-secret-must-not-be-used");
+
+        let crypto = CredentialEncryption::new();
+        assert_eq!(crypto.key_source(), CredentialKeySource::NotConfigured);
+        assert!(matches!(
+            crypto.encrypt("must-not-encrypt"),
+            Err(EncryptError::KeyUnavailable)
+        ));
+    }
+
     #[test]
     fn test_decrypt_plaintext_backward_compatible() {
         let _g = EnvGuard::lock();
@@ -550,6 +642,7 @@ mod tests {
         std::env::remove_var("CHV_JWT_SECRET");
 
         let crypto = CredentialEncryption::new();
+        assert_eq!(crypto.key_source(), CredentialKeySource::NotConfigured);
         let plaintext = "no-encryption-active";
 
         let result = crypto.encrypt(plaintext);
