@@ -1764,6 +1764,19 @@ impl proto::lifecycle_service_server::LifecycleService for AgentServer {
                 .map_err(|e| Status::internal(format!("close_volume failed: {}", e)))?;
         }
 
+        // stord refuses to destroy while any session row exists. The cached
+        // handle above covers the normal path; this sweep reclaims an
+        // unattached row that has no cached handle — a pre-#711 detach, or a
+        // crash between open and attach — which would otherwise block the
+        // volume's destroy forever (#711 review). Rows still attached to a
+        // VM keep the refusal intact.
+        stord
+            .close_unattached_volume_sessions(&inner.volume_id, Some(&meta.operation_id))
+            .await
+            .map_err(|e| {
+                Status::internal(format!("close_unattached_volume_sessions failed: {}", e))
+            })?;
+
         stord
             .destroy_volume(
                 &inner.volume_id,
@@ -4877,6 +4890,9 @@ mod tests {
         /// When set, `attach_volume_to_vm` answers RPC-OK with an in-band
         /// error, the way stord reports a backend attach failure (#711).
         fail_attach: Arc<std::sync::atomic::AtomicBool>,
+        /// Durable session rows `list_volume_sessions` reports. Empty by
+        /// default; a test seeds an orphan to pin the volume-delete sweep.
+        sessions: Arc<std::sync::Mutex<Vec<chv_stord_api::chv_stord_api::VolumeSession>>>,
     }
 
     #[derive(Default)]
@@ -4892,7 +4908,9 @@ mod tests {
         ) -> Result<Response<chv_stord_api::chv_stord_api::ListVolumeSessionsResponse>, Status>
         {
             Ok(Response::new(
-                chv_stord_api::chv_stord_api::ListVolumeSessionsResponse { sessions: vec![] },
+                chv_stord_api::chv_stord_api::ListVolumeSessionsResponse {
+                    sessions: self.opens.sessions.lock().unwrap().clone(),
+                },
             ))
         }
 
@@ -4999,6 +5017,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((inner.volume_id.clone(), inner.attachment_handle.clone()));
+            self.opens.sessions.lock().unwrap().retain(|s| {
+                !(s.volume_id == inner.volume_id && s.attachment_handle == inner.attachment_handle)
+            });
             self.opens
                 .events
                 .lock()
@@ -6608,6 +6629,90 @@ mod tests {
             opens.events.lock().unwrap().as_slice(),
             ["destroy:vol-uncached".to_string()],
             "no close may happen without a cached handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_volume_closes_an_orphaned_open_session_before_destroy() {
+        // A crash between open and attach (or a pre-#711 detach) leaves
+        // `runtime_status = "open"` with an empty vm_id and no cached
+        // handle. stord refuses destroy while that row exists, so the
+        // delete path must close it first (#711 review).
+        let (server, opens, _dir) = create_volume_test_server().await;
+        opens
+            .sessions
+            .lock()
+            .unwrap()
+            .push(chv_stord_api::chv_stord_api::VolumeSession {
+                volume_id: "vol-orphan".to_string(),
+                vm_id: String::new(),
+                attachment_handle: "handle-orphan".to_string(),
+                export_kind: "local".to_string(),
+                export_path: "/tmp/vol-orphan.img".to_string(),
+                runtime_status: "open".to_string(),
+            });
+
+        let resp = proto::lifecycle_service_server::LifecycleService::delete_volume(
+            &server,
+            Request::new(delete_volume_request("vol-orphan", "")),
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "an orphaned open session must not block the delete: {:?}",
+            resp.err()
+        );
+        assert_eq!(
+            opens.closes.lock().unwrap().as_slice(),
+            [("vol-orphan".to_string(), "handle-orphan".to_string())],
+            "the unattached session must be closed"
+        );
+        assert_eq!(
+            opens.events.lock().unwrap().as_slice(),
+            [
+                "close:vol-orphan".to_string(),
+                "destroy:vol-orphan".to_string()
+            ],
+            "close must precede destroy"
+        );
+        assert!(
+            opens.sessions.lock().unwrap().is_empty(),
+            "the orphaned session row must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_volume_does_not_close_a_session_attached_to_a_vm() {
+        // The safety half of the sweep: a session that still names a VM is
+        // never closed here; stord's destroy refusal must stand.
+        let (server, opens, _dir) = create_volume_test_server().await;
+        opens
+            .sessions
+            .lock()
+            .unwrap()
+            .push(chv_stord_api::chv_stord_api::VolumeSession {
+                volume_id: "vol-live".to_string(),
+                vm_id: "vm-live".to_string(),
+                attachment_handle: "handle-live".to_string(),
+                export_kind: "local".to_string(),
+                export_path: "/tmp/vol-live.img".to_string(),
+                runtime_status: "attached".to_string(),
+            });
+
+        let resp = proto::lifecycle_service_server::LifecycleService::delete_volume(
+            &server,
+            Request::new(delete_volume_request("vol-live", "")),
+        )
+        .await;
+        assert!(resp.is_ok(), "the mock destroy succeeds: {:?}", resp.err());
+        assert!(
+            opens.closes.lock().unwrap().is_empty(),
+            "a session attached to a VM must not be closed by the delete sweep"
+        );
+        assert_eq!(
+            opens.sessions.lock().unwrap().len(),
+            1,
+            "the attached session must survive"
         );
     }
 

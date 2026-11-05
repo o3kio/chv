@@ -353,8 +353,10 @@ pub trait HostResourceController: Send + Sync + 'static {
     /// shape: `vm_id` empty, `runtime_status` `detached`, handle still
     /// present. The delete drain calls this after its own detach to close
     /// both the session it just detached and any leftover from an earlier
-    /// interrupted attempt. Sessions still attached to a VM, and `open`
-    /// sessions whose attach has not landed yet, are never touched.
+    /// interrupted attempt. Sessions still attached to a VM are never
+    /// selected, and stord's close guard refuses one that a concurrent
+    /// re-attach revived. `open` sessions whose attach has not landed are not
+    /// selected here; the volume-delete path reclaims those separately.
     async fn close_detached_volume_sessions(
         &self,
         volume_id: &str,

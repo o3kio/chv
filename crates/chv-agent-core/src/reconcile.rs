@@ -1001,6 +1001,20 @@ impl Reconciler {
                         .await
                     {
                         warn!(volume_id = %volume_id, vm_id = %vm_id, error = %e, "failed to attach volume");
+                        // Same unwind as the create paths: a failed attach
+                        // must not leave the session it opened behind, or a
+                        // later delete could find an undeletable stray row
+                        // (#711 review).
+                        if let Err(close_err) =
+                            stord.close_volume(&volume_id, &handle, Some(&op_id)).await
+                        {
+                            warn!(
+                                volume_id = %volume_id,
+                                vm_id = %vm_id,
+                                error = %close_err,
+                                "failed to close volume after failed reconcile re-attach"
+                            );
+                        }
                     } else {
                         // Volume health check (Sprint 11 A1)
                         match stord.get_volume_health(&volume_id).await {
@@ -3569,6 +3583,52 @@ mod tests {
                 ),
             ],
             "A2 must thread the disk spec's backend_class (defaulting to local when absent) and keep the relative `{{volume_id}}.img` re-attach locator"
+        );
+    }
+
+    /// #711 review: the A2 re-attach loop must unwind the session its own
+    /// open just created when the in-band attach fails, matching the create
+    /// paths; otherwise a stray `open` row can outlive the retry.
+    #[tokio::test]
+    async fn reconcile_volumes_closes_sessions_when_reattach_fails_in_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let stord_socket = dir.path().join("stord.sock");
+        let nwd_socket = dir.path().join("nwd.sock");
+        let opens = start_mock_stord(&stord_socket).await;
+        start_mock_nwd(&nwd_socket).await;
+        opens
+            .fail_attach
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut cache = class_test_cache();
+        cache
+            .volume_handles
+            .insert("vol-1".to_string(), "handle-vol-1".to_string());
+        cache
+            .volume_handles
+            .insert("vol-2".to_string(), "handle-vol-2".to_string());
+        let mut rec = Reconciler::new_legacy(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(std::sync::Arc::new(
+                chv_agent_runtime_ch::mock::MockCloudHypervisorAdapter::default(),
+            )),
+            stord_socket,
+            nwd_socket,
+            dir.path().to_path_buf(),
+            Arc::new(MigrationTaskRegistry::new()),
+        )
+        .await;
+        rec.reconcile_volumes().await.unwrap();
+
+        let mut closed = opens.closes.lock().unwrap().clone();
+        closed.sort();
+        assert_eq!(
+            closed,
+            vec![
+                ("vol-1".to_string(), "handle-vol-1".to_string()),
+                ("vol-2".to_string(), "handle-vol-2".to_string()),
+            ],
+            "each failed re-attach must close the session it opened"
         );
     }
 

@@ -582,6 +582,24 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
             .unwrap_or_else(|| operation_span(""));
 
         if let Some(s) = self.sessions.get(&req.volume_id, &req.attachment_handle) {
+            // Refuse while the session is still attached to a VM. The
+            // cooperative callers close only after detaching (or after a
+            // failed attach), so this is the defense that keeps a
+            // list-then-close sweep from yanking a session that a
+            // concurrent re-attach revived (#711 review).
+            if s.vm_id.as_deref().is_some_and(|vm_id| !vm_id.is_empty()) {
+                let vm_id = s.vm_id.clone().unwrap_or_default();
+                return Ok(Response::new(
+                    ChvError::InvalidArgument {
+                        field: "attachment_handle".to_string(),
+                        reason: format!(
+                            "session for volume {} is attached to VM {}; detach it before closing",
+                            req.volume_id, vm_id
+                        ),
+                    }
+                    .to_proto_result(),
+                ));
+            }
             if let Err(e) = self.backend.close(&s.volume_id, &s.attachment_handle).await {
                 return Ok(Response::new(e.to_proto_result()));
             }

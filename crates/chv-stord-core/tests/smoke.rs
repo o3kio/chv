@@ -247,6 +247,90 @@ async fn attach_and_detach_volume_smoke() {
 }
 
 #[tokio::test]
+async fn close_refuses_a_session_that_is_still_attached() {
+    let (_dir, _socket, mut client) = setup_server().await;
+
+    let open_resp = client
+        .open_volume(OpenVolumeRequest {
+            meta: None,
+            volume_id: "vol-close-guard".to_string(),
+            backend: Some(BackendLocator {
+                backend_class: "local".to_string(),
+                locator: "vol-close-guard.img".to_string(),
+                options: Default::default(),
+            }),
+            policy: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let handle = open_resp.attachment_handle;
+
+    let attach_resp = client
+        .attach_volume_to_vm(AttachVolumeToVmRequest {
+            meta: None,
+            volume_id: "vol-close-guard".to_string(),
+            vm_id: "vm-guard".to_string(),
+            attachment_handle: handle.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(attach_resp.result.unwrap().status, "OK");
+
+    // A close racing a re-attach must not yank the live session: stord
+    // refuses and the row survives, still attached.
+    let close_resp = client
+        .close_volume(CloseVolumeRequest {
+            meta: None,
+            volume_id: "vol-close-guard".to_string(),
+            attachment_handle: handle.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(close_resp.status, "error");
+    assert!(
+        close_resp.human_summary.contains("attached to VM vm-guard"),
+        "the refusal must name the live VM: {close_resp:?}"
+    );
+    let list_resp = client
+        .list_volume_sessions(ListVolumeSessionsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list_resp.sessions.len(), 1);
+    assert_eq!(list_resp.sessions[0].runtime_status, "attached");
+
+    // The cooperative path still works: detach first, then close.
+    client
+        .detach_volume_from_vm(DetachVolumeFromVmRequest {
+            meta: None,
+            volume_id: "vol-close-guard".to_string(),
+            vm_id: "vm-guard".to_string(),
+            force: false,
+        })
+        .await
+        .unwrap();
+    let close_resp = client
+        .close_volume(CloseVolumeRequest {
+            meta: None,
+            volume_id: "vol-close-guard".to_string(),
+            attachment_handle: handle,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(close_resp.status, "OK");
+    let list_resp = client
+        .list_volume_sessions(ListVolumeSessionsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(list_resp.sessions.is_empty());
+}
+
+#[tokio::test]
 async fn attach_volume_missing_session_returns_not_found() {
     let (_dir, _socket, mut client) = setup_server().await;
 

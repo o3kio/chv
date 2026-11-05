@@ -289,9 +289,12 @@ impl StordClient {
     /// session, no live `(volume, vm)` match remains in the session table.
     /// stord marks such rows `detached`, which is deliberately distinct from the
     /// `open` state of a volume that was opened but whose attach has not
-    /// landed yet. Filtering on `detached` means the sweep cannot close a
-    /// live session belonging to a concurrent create/attach (#711 review).
-    /// Attached and `open` sessions are never touched.
+    /// landed yet. Filtering on `detached` keeps the crash-window recovery
+    /// from touching a live attach-pending open. The list-then-close gap is
+    /// closed at stord's boundary: `close_volume` refuses a row whose `vm_id`
+    /// is non-empty, so a session re-attached between the list and the close
+    /// survives the sweep and surfaces as a failed close (#711 review).
+    /// Attached and `open` sessions are never selected.
     ///
     /// Returns the number of sessions closed. A failed close surfaces so the
     /// caller's existing retry/first-error policy applies.
@@ -317,6 +320,55 @@ impl StordClient {
                 session.volume_id == volume_id
                     && session.vm_id.is_empty()
                     && session.runtime_status.eq_ignore_ascii_case("detached")
+                    && !session.attachment_handle.is_empty()
+            })
+            .map(|session| session.attachment_handle)
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        let count = handles.len();
+        for handle in handles {
+            self.close_volume(volume_id, &handle, operation_id).await?;
+        }
+        Ok(count)
+    }
+
+    /// Close every session for `volume_id` that has no VM attached
+    /// (#711 review).
+    ///
+    /// [`destroy_volume`] refuses while *any* session row exists for the
+    /// volume. A crash between open and attach, or a detach performed by a
+    /// pre-#711 stord, leaves exactly this shape: `vm_id` empty (with
+    /// `runtime_status` `open` or `detached`) and the handle still present.
+    /// The VM-delete drain leaves `open` rows alone because it cannot tell
+    /// them from a live attach-pending open, so the volume-delete path must
+    /// reclaim them here or the volume could never be destroyed. Rows with a
+    /// non-empty `vm_id` are never touched, and stord's own close guard
+    /// refuses a row that a concurrent re-attach revived.
+    ///
+    /// Returns the number of sessions closed. A failed close surfaces so the
+    /// caller fails the delete rather than destroying under a live session.
+    pub async fn close_unattached_volume_sessions(
+        &mut self,
+        volume_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<usize, ChvError> {
+        let span = tracing::info_span!("close_unattached_volume_sessions", volume_id);
+        let mut handles: Vec<String> = self
+            .inner
+            .list_volume_sessions(tonic::Request::new(ListVolumeSessionsRequest {}))
+            .instrument(span)
+            .await
+            .map_err(|e| ChvError::BackendUnavailable {
+                backend: "stord".to_string(),
+                reason: format!("list_volume_sessions for {volume_id}: {e}"),
+            })?
+            .into_inner()
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                session.volume_id == volume_id
+                    && session.vm_id.is_empty()
                     && !session.attachment_handle.is_empty()
             })
             .map(|session| session.attachment_handle)
