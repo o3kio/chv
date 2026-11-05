@@ -548,11 +548,17 @@ impl MutationService for ControlPlaneMutationService {
                     .await
             }
             "detach" => {
+                // The explicit `vm_id` wins over the stored attachment, the
+                // same precedence as attach: after a failed node dispatch the
+                // CP has already cleared `attached_vm_id`, but stord's session
+                // still names the VM, and only an explicit id can detach it
+                // (#711 fifth review).
+                let target_vm_id = vm_id.or_else(|| row.vm_id.clone()).unwrap_or_default();
                 self.lifecycle_service
                     .detach_volume(proto::DetachVolumeRequest {
                         meta,
                         node_id: row.node_id.clone(),
-                        vm_id: row.vm_id.unwrap_or_default(),
+                        vm_id: target_vm_id,
                         volume_id: volume_id.clone(),
                         force,
                     })
@@ -897,6 +903,7 @@ mod tests {
     /// pinned at the same trait boundary production uses.
     struct RecordingLifecycle {
         attach_calls: std::sync::Arc<std::sync::Mutex<Vec<proto::AttachVolumeRequest>>>,
+        detach_calls: std::sync::Arc<std::sync::Mutex<Vec<proto::DetachVolumeRequest>>>,
         migrate_calls: std::sync::Arc<std::sync::Mutex<Vec<proto::MigrateVmRequest>>>,
     }
 
@@ -964,9 +971,15 @@ mod tests {
         }
         async fn detach_volume(
             &self,
-            _request: proto::DetachVolumeRequest,
+            request: proto::DetachVolumeRequest,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
-            unreachable!("no detach_volume in the A9 tests")
+            let operation_id = request
+                .meta
+                .as_ref()
+                .map(|m| m.operation_id.clone())
+                .unwrap_or_default();
+            self.detach_calls.lock().unwrap().push(request);
+            Ok(ok_ack(operation_id))
         }
         async fn resize_volume(
             &self,
@@ -1149,6 +1162,7 @@ mod tests {
             pool,
             std::sync::Arc::new(RecordingLifecycle {
                 attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                detach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 migrate_calls: migrate_calls.clone(),
             }),
         );
@@ -1202,6 +1216,7 @@ mod tests {
             pool,
             std::sync::Arc::new(RecordingLifecycle {
                 attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                detach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 migrate_calls: migrate_calls.clone(),
             }),
         );
@@ -1265,6 +1280,7 @@ mod tests {
             pool,
             std::sync::Arc::new(RecordingLifecycle {
                 attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                detach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 migrate_calls: migrate_calls.clone(),
             }),
         );
@@ -1374,6 +1390,7 @@ mod tests {
             pool,
             std::sync::Arc::new(RecordingLifecycle {
                 attach_calls: attach_calls.clone(),
+                detach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 migrate_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
@@ -1418,6 +1435,130 @@ mod tests {
             spec_json_for("vol-a9-std"),
             br#"{"locator":"vol-a9-std.img"}"#.to_vec(),
             "a standalone ('data') volume's attach mutation must carry the create carrier's relative locator (#533)"
+        );
+    }
+
+    /// #711 fifth review: a detach mutation must honor an explicit `vm_id`
+    /// over the stored attachment, like attach does. After a failed node
+    /// dispatch the CP has already cleared `attached_vm_id` while stord's
+    /// session still names the dead VM; without the explicit id the detach
+    /// no-ops and the volume stays undestroyable.
+    #[tokio::test]
+    async fn mutate_volume_detach_prefers_an_explicit_vm_id() {
+        let pool = chv_controlplane_store::test_util::create_test_pool().await;
+        sqlx::query(
+            "INSERT INTO nodes (node_id, hostname, display_name) VALUES ('node-detach', 'host', 'host')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for vm_id in [
+            "vm-stored",
+            "vm-explicit",
+            "vm-stored-both",
+            "vm-explicit-both",
+        ] {
+            sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES (?, ?)")
+                .bind(vm_id)
+                .bind(vm_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (volume_id, attached) in [
+            ("vol-detach-stored", Some("vm-stored")),
+            ("vol-detach-explicit", None),
+            ("vol-detach-both", Some("vm-stored-both")),
+        ] {
+            sqlx::query(
+                "INSERT INTO volumes (volume_id, node_id, display_name, capacity_bytes) \
+                 VALUES (?, 'node-detach', ?, 1024)",
+            )
+            .bind(volume_id)
+            .bind(volume_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO volume_desired_state \
+                 (volume_id, desired_generation, desired_status, attached_vm_id, read_only) \
+                 VALUES (?, 1, 'Active', ?, 0)",
+            )
+            .bind(volume_id)
+            .bind(attached)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let detach_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ControlPlaneMutationService::new(
+            pool,
+            std::sync::Arc::new(RecordingLifecycle {
+                attach_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                detach_calls: detach_calls.clone(),
+                migrate_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+        );
+
+        service
+            .mutate_volume(
+                "vol-detach-stored".to_string(),
+                "detach".to_string(),
+                false,
+                None,
+                None,
+                "test-user".to_string(),
+            )
+            .await
+            .expect("detach with the stored attachment must be accepted");
+        service
+            .mutate_volume(
+                "vol-detach-explicit".to_string(),
+                "detach".to_string(),
+                false,
+                None,
+                Some("vm-explicit".to_string()),
+                "test-user".to_string(),
+            )
+            .await
+            .expect("detach with an explicit vm_id must be accepted");
+        service
+            .mutate_volume(
+                "vol-detach-both".to_string(),
+                "detach".to_string(),
+                false,
+                None,
+                Some("vm-explicit-both".to_string()),
+                "test-user".to_string(),
+            )
+            .await
+            .expect("detach with both ids must be accepted");
+
+        let calls = detach_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "all detaches relayed: {calls:?}");
+        let vm_for = |volume_id: &str| {
+            calls
+                .iter()
+                .find(|c| c.volume_id == volume_id)
+                .unwrap_or_else(|| panic!("no detach mutation for {volume_id}: {calls:?}"))
+                .vm_id
+                .clone()
+        };
+        assert_eq!(
+            vm_for("vol-detach-stored"),
+            "vm-stored",
+            "no explicit id keeps the stored attachment"
+        );
+        assert_eq!(
+            vm_for("vol-detach-explicit"),
+            "vm-explicit",
+            "an explicit id wins even when the CP has cleared the stored attachment"
+        );
+        assert_eq!(
+            vm_for("vol-detach-both"),
+            "vm-explicit-both",
+            "an explicit id wins over a non-empty stored attachment (precedence, not fallback)"
         );
     }
 

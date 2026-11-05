@@ -1,6 +1,6 @@
 [package]
 name = "chv-agent-core"
-version = "0.3.0"
+version = "0.4.0"
 license = "Apache-2.0"
 edition = "2021"
 publish = false
@@ -43,6 +43,7 @@ toml = { workspace = true }
 sysinfo = "0.39"
 
 [dev-dependencies]
+metrics = { workspace = true }
 cellhv-nodecache-migration = { path = "../cellhv-nodecache-migration" }
 chv-agent-runtime-ch = { path = "../chv-agent-runtime-ch" }
 cellhv-core-api = { path = "../cellhv-core-api" }

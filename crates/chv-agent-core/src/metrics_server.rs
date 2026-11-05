@@ -148,6 +148,35 @@ fn collect_host_resources() -> HostResources {
     }
 }
 
+/// Append the process-global Prometheus registry to the hand-built agent
+/// exposition.
+///
+/// `VmOpGuard` records `chv_vm_ops_total` / `chv_vm_op_duration_seconds`
+/// through the `metrics` facade (issue #702), so their samples live in the
+/// registry installed by `chv_observability::init_logger`, not in the
+/// `chv_agent_*` lines assembled below. Rendering the registry here makes
+/// those series scrapeable while leaving the hand-built families untouched.
+///
+/// The hand-built families are not recorded through the facade, so the two
+/// halves have disjoint metric names and appending cannot duplicate a family.
+fn append_registry_metrics(mut body: String) -> String {
+    let Some(handle) = chv_observability::prometheus_handle() else {
+        return body;
+    };
+    let registry = handle.render();
+    if registry.is_empty() {
+        return body;
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&registry);
+    if !registry.ends_with('\n') {
+        body.push('\n');
+    }
+    body
+}
+
 /// Handler that renders metrics in Prometheus text exposition format.
 async fn metrics_handler(State(state): State<Arc<Mutex<MetricsState>>>) -> impl IntoResponse {
     let host = collect_host_resources();
@@ -295,6 +324,7 @@ async fn metrics_handler(State(state): State<Arc<Mutex<MetricsState>>>) -> impl 
         disk_pressure = if s.disk_pressure { 1 } else { 0 },
         mem_pressure = if s.memory_pressure { 1 } else { 0 },
     );
+    let body = append_registry_metrics(body);
     (
         axum::http::StatusCode::OK,
         [(
@@ -310,4 +340,135 @@ pub fn metrics_router(state: Arc<Mutex<MetricsState>>) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<Mutex<MetricsState>> {
+        let mut state = MetricsState::new("node-test".to_string());
+        // Exercise the journal segment too: appending the registry must not
+        // disturb the hand-built families.
+        state.core_journal = Some(CoreJournalMetrics {
+            scan_failures_total: 2,
+            healthy: true,
+            inspect_required: 1,
+        });
+        Arc::new(Mutex::new(state))
+    }
+
+    async fn scrape() -> String {
+        let response = metrics_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("utf-8 exposition")
+    }
+
+    /// The agent's `/metrics` must expose series that `VmOpGuard` records
+    /// through the `metrics` facade, not just the hand-built `chv_agent_*`
+    /// families (issue #702).
+    #[tokio::test]
+    async fn metrics_endpoint_includes_registry_recorded_vm_op_series() {
+        chv_observability::install_prometheus_recorder().expect("install prometheus recorder");
+        // Same facade path VmOpGuard uses on drop.
+        metrics::counter!(
+            chv_observability::CHV_VM_OPS_TOTAL,
+            "op" => "start",
+            "result" => "ok"
+        )
+        .increment(1);
+        metrics::histogram!(
+            chv_observability::CHV_VM_OP_DURATION_SECONDS,
+            "op" => "start"
+        )
+        .record(0.25);
+
+        let text = scrape().await;
+
+        assert!(
+            text.lines().any(|line| {
+                line.starts_with("chv_vm_ops_total{")
+                    && line.contains("op=\"start\"")
+                    && line.contains("result=\"ok\"")
+            }),
+            "registry-recorded VM op counter missing from /metrics, got:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE chv_vm_op_duration_seconds histogram"),
+            "registry-recorded VM op histogram missing from /metrics, got:\n{text}"
+        );
+        assert!(
+            text.lines().any(|line| {
+                line.starts_with("chv_vm_op_duration_seconds_bucket{")
+                    && line.contains("op=\"start\"")
+            }),
+            "VM op duration buckets missing from /metrics, got:\n{text}"
+        );
+
+        // The hand-built segments keep rendering unchanged.
+        for family in [
+            "chv_agent_node_state",
+            "chv_agent_vms_total",
+            "chv_agent_journal_scan_failures_total",
+            "chv_agent_journal_healthy",
+            "chv_agent_journal_inspect_required",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {family} ")),
+                "hand-built family {family} missing from /metrics, got:\n{text}"
+            );
+        }
+    }
+
+    /// The hand-built and registry halves must have disjoint metric names;
+    /// a duplicate family would make the scrape invalid.
+    #[tokio::test]
+    async fn metrics_endpoint_has_exactly_one_type_per_family() {
+        chv_observability::install_prometheus_recorder().expect("install prometheus recorder");
+        let text = scrape().await;
+
+        let mut type_counts: HashMap<&str, usize> = HashMap::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let family = rest
+                    .split_whitespace()
+                    .next()
+                    .expect("a TYPE line names its family");
+                *type_counts.entry(family).or_insert(0) += 1;
+            }
+        }
+
+        assert!(
+            !type_counts.is_empty(),
+            "# TYPE lines missing from /metrics, got:\n{text}"
+        );
+        let duplicates: Vec<_> = type_counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(family, count)| (*family, *count))
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "duplicate metric families in /metrics: {duplicates:?}\n{text}"
+        );
+    }
 }

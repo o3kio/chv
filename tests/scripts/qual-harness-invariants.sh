@@ -141,9 +141,9 @@ grep -q 'wait_vm_guest_stopped "\$F2_VM"' "$m47" \
 grep -q 'vm_id IS NOT NULL AND vm_id !=' "$m47" \
     && pass "m4.7 fails the final sweep on any still-attached stord session" \
     || fail "m4.7 lost the attached-session final-sweep gate"
-grep -q 'M2.2a handle-persistence residual' "$m47" \
-    && pass "m4.7 records detached-open sessions as the documented residual" \
-    || fail "m4.7 no longer discloses the M2.2a detached-session residual"
+grep -q 'unexpected on the #711-fixed candidate' "$m47" \
+    && pass "m4.7 records leftover detached sessions as an unexpected residual" \
+    || fail "m4.7 no longer discloses the post-#711 detached-session expectation"
 
 # ---------------------------------------------------------------------------
 # 4. teardown and lane hygiene
@@ -257,5 +257,224 @@ grep -q 'orphaned CHV nft tables' "${QUAL}/nightly-run.sh" \
 grep -q 'rm -rf -- "\$evidence_src"' "${QUAL}/nightly-run.sh" \
     && pass "nightly lane clears per-run scenario evidence" \
     || fail "nightly lane mixes evidence from previous runs"
+
+# ---------------------------------------------------------------------------
+# 6. fresh-host lane (#666 install/upgrade/uninstall + #556 quick-install)
+# ---------------------------------------------------------------------------
+# The gate is demonstrated by one driver, one workflow, and one evidence
+# template. These guards keep the lane from silently losing a leg, floating
+# the quick-install ref, or overstating the container as bare metal.
+fresh="${QUAL}/fresh-host.sh"
+fresh_workflow="${REPO_ROOT}/.github/workflows/fresh-host-qualification.yml"
+fresh_report="${REPO_ROOT}/docs/evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md"
+
+if [ -x "$fresh" ]; then
+    pass "fresh-host driver exists and is executable"
+else
+    fail "fresh-host driver is missing or not executable: ${fresh}"
+fi
+
+grep -q 'INSTALL_CHV_TARBALL_PATH=' "$fresh" \
+    && pass "fresh-host install leg uses a candidate tarball path" \
+    || fail "fresh-host install leg no longer drives INSTALL_CHV_TARBALL_PATH"
+for guard in INSTALL_CHV_NO_SEED=1 INSTALL_CHV_NO_BRIDGE=1; do
+    grep -q "$guard" "$fresh" \
+        && pass "fresh-host sets ${guard} (container constraints)" \
+        || fail "fresh-host lost ${guard}"
+done
+
+grep -q 'Persistent CHV data exists' "$fresh" \
+    && pass "fresh-host upgrade leg asserts the persistent-data fail-closed guard" \
+    || fail "fresh-host may silently overwrite persistent state on upgrade"
+grep -q 'PACKAGE_UPGRADE_RC' "$fresh" \
+    && pass "fresh-host upgrade leg exercises the package upgrade path" \
+    || fail "fresh-host has no supported in-place upgrade path with --packages"
+
+grep -q 'main|master|HEAD|latest' "$fresh" \
+    && pass "fresh-host refuses floating quick-install refs" \
+    || fail "fresh-host no longer rejects a floating quick-install ref"
+grep -Fq 'QUICK_REF="${QUICK_REF:-}"' "$fresh" \
+    && pass "fresh-host has no default quick-install ref" \
+    || fail "fresh-host could default to a floating quick-install ref"
+grep -q 'raw.githubusercontent.com/.*scripts/quick-install.sh' "$fresh" \
+    && pass "fresh-host fetches quick-install.sh at the pinned ref" \
+    || fail "fresh-host does not fetch the pinned quick-install.sh"
+grep -q 'check_bringup candidate http://127.0.0.1/$' "$fresh" \
+    && pass "fresh-host asserts the preserved nginx edge after a config-preserving upgrade" \
+    || fail "fresh-host would claim the candidate WebUI listener on a preserved v0.3.0 config"
+if grep -q 'METRICS controlplane=not-configured' "$fresh"; then
+    fail "fresh-host weakens the upgrade metrics check despite the binary's loopback default"
+else
+    pass "fresh-host keeps the documented default control-plane metrics listener asserted"
+fi
+grep -Fq 'expected_bin_version="${expected_bin_version%-rc.*}"' "$fresh" \
+    && pass "fresh-host compares RC binaries against their base VERSION" \
+    || fail "fresh-host can fail an RC quick leg because binaries report the base version"
+grep -q 'quick_install_version' "$fresh_workflow" \
+    && pass "fresh-host workflow can pin the quick leg to the published RC" \
+    || fail "fresh-host workflow cannot exercise the quick installer against the RC"
+grep -q 'QUICK_INSTALL_VERSION:-' "$fresh_workflow" \
+    && pass "fresh-host workflow defaults the quick leg to the previous release" \
+    || fail "fresh-host workflow has no quick-install version fallback"
+
+quick_installer="${REPO_ROOT}/scripts/quick-install.sh"
+grep -q 'QUICK_INSTALL_MIN_VERSION="0.4.0"' "$quick_installer" \
+    && pass "quick installer declares its minimum supported release" \
+    || fail "quick installer can install a release without the WebUI serving shape"
+grep -q 'require_supported_release' "$quick_installer" \
+    && pass "quick installer refuses releases older than its serving shape" \
+    || fail "quick installer silently installs a pre-0.4.0 host with no WebUI"
+grep -q '^ensure_runtime_contract()' "$quick_installer" \
+    && pass "quick installer applies the cross-leg runtime contract" \
+    || fail "quick installer can leave stord/nwd unable to start on the deb leg"
+grep -q 'usermod -aG chv-stord "\$CHV_USER"' "$quick_installer" \
+    && pass "quick installer grants chv the chv-stord group on both legs" \
+    || fail "quick installer writes a stord.toml the service user cannot read"
+grep -q 'systemd-tmpfiles --create "\$tmpfiles"' "$quick_installer" \
+    && pass "quick installer applies the tmpfiles entry that creates /run/netns" \
+    || fail "quick installer relies on a reboot before chv-nwd can start"
+
+# Exercise the real version gate, not just its presence: source the installer
+# (its B1 guard makes that side-effect free) and assert the boundary plus a
+# clean stderr. A malformed comparison (e.g. comparing a minor against a
+# full "4.0" string) still "refuses" but prints an integer-expression error,
+# which this catches.
+quick_version_matrix="$(source_path="$quick_installer" bash -c '
+    set +u
+    # shellcheck disable=SC1090
+    source "$source_path" >/dev/null 2>&1
+    for v in 0.3.0 0.3.9 0.4.0 0.4.0-rc.1 0.4.0-rc.9 0.10.0 1.0.0; do
+        if release_supported "$v"; then
+            printf "%s supported\n" "$v"
+        else
+            printf "%s refused\n" "$v"
+        fi
+    done
+' 2>&1)"
+if printf '%s\n' "$quick_version_matrix" | grep -q 'integer expression expected'; then
+    fail "quick installer version gate compares a malformed minor version"
+else
+    pass "quick installer version gate runs without integer-expression errors"
+fi
+for expect in '0.3.0 refused' '0.3.9 refused' '0.4.0 supported' \
+    '0.4.0-rc.1 supported' '0.4.0-rc.9 supported' '0.10.0 supported' \
+    '1.0.0 supported'; do
+    printf '%s\n' "$quick_version_matrix" | grep -qxF "$expect" \
+        && pass "quick installer version gate: ${expect}" \
+        || fail "quick installer version gate: expected '${expect}'"
+done
+
+postinst="${REPO_ROOT}/packaging/scripts/postinstall.sh"
+grep -q '^sync_legacy_migrations()' "$postinst" \
+    && pass "postinstall synchronizes migrations into a preserved install.sh tree" \
+    || fail "package upgrade over an install.sh deployment can keep a stale schema"
+grep -q 'systemd-tmpfiles --create /usr/lib/tmpfiles.d/chv-node.conf' "$postinst" \
+    && pass "postinstall applies the tmpfiles entry on a live host" \
+    || fail "package install can leave /run/netns missing until reboot"
+
+grep -q 'results.tsv' "$fresh" \
+    && pass "fresh-host writes the required results.tsv marker" \
+    || fail "fresh-host no longer writes results.tsv"
+grep -q 'UNINSTALL_RESIDUE=' "$fresh" \
+    && pass "fresh-host records uninstall residue instead of passing it" \
+    || fail "fresh-host hides install.sh-layout uninstall residue"
+grep -q "must_change_password = 0" "$fresh" \
+    && pass "fresh-host clears the bootstrap rotation flag before node visibility" \
+    || fail "fresh-host cannot see the enrolled node behind PASSWORD_CHANGE_REQUIRED"
+grep -q 'clear_admin_rotation_flag || true' "$fresh" \
+    && pass "fresh-host calls the rotation-flag fixture before login/node checks" \
+    || fail "fresh-host can leave the rotation flag set and fail the node check"
+grep -q 'deprecated legacy CHV_JWT_SECRET fallback' "$fresh" \
+    && pass "fresh-host detects the credential-key fallback in both releases" \
+    || fail "fresh-host encryption check can pass on the legacy fallback"
+grep -q 'failed to enable the one-shot service' "$fresh" \
+    && pass "fresh-host records a row when the one-shot service cannot be enabled" \
+    || fail "fresh-host can drop a leg without a results row"
+grep -q 'state_lines" -eq 4' "$fresh" \
+    && pass "fresh-host asserts all four upgrade state files were hashed" \
+    || fail "fresh-host upgrade state hash set can shrink silently"
+grep -q 'cached base extract failed' "$fresh" \
+    && pass "fresh-host records a failed cached-base extract instead of exiting" \
+    || fail "fresh-host mid-run base failure can lose leg accounting"
+grep -q 'documented fail-closed guard did not fire' "$fresh" \
+    && pass "fresh-host fails the upgrade leg when the candidate re-runs over persistent data" \
+    || fail "fresh-host can pass the upgrade leg without exercising the fail-closed guard"
+grep -q "sqlite3 -cmd '.timeout 5000'" "$fresh" \
+    && pass "fresh-host sqlite writes wait out a live control-plane lock" \
+    || fail "fresh-host sqlite writes can fail spuriously on SQLITE_BUSY"
+grep -qF 'journalctl -u "$u" -n 80 --no-pager' "$fresh" \
+    && pass "fresh-host records a failing unit's journal tail in the evidence" \
+    || fail "fresh-host failures are not diagnosable from the uploaded evidence"
+grep -q 'export GITHUB_REPO=' "$fresh" \
+    && pass "fresh-host exports GITHUB_REPO to the in-container child" \
+    || fail "fresh-host in-container quick installer falls back to o3kio/chv"
+grep -q 'command -v ss' "$fresh" \
+    && pass "fresh-host requires ss for the shared-netns port preflight" \
+    || fail "fresh-host port preflight can pass vacuously without ss"
+grep -q 'partial —' "$fresh" \
+    && pass "fresh-host summary marks a run with skipped legs as partial" \
+    || fail "fresh-host summary can headline PASS with skipped legs"
+
+[ -f "$fresh_workflow" ] \
+    && pass "fresh-host workflow exists" \
+    || fail "fresh-host workflow is missing"
+grep -q 'workflow_dispatch' "$fresh_workflow" \
+    && pass "fresh-host workflow is manually dispatched" \
+    || fail "fresh-host workflow is not manually dispatched"
+grep -Fq '[self-hosted, linux, x64, chv-kvm]' "$fresh_workflow" \
+    && pass "fresh-host workflow targets the self-hosted chv-kvm fleet" \
+    || fail "fresh-host workflow lost the self-hosted runner labels"
+grep -q 'apt_run install gettext-base debootstrap systemd-container' "$fresh_workflow" \
+    && pass "fresh-host workflow installs the container driver prerequisites" \
+    || fail "fresh-host workflow cannot stage debootstrap/systemd-nspawn"
+grep -q 'NEEDRESTART_SUSPEND=1' "$fresh_workflow" \
+    && pass "fresh-host workflow keeps apt and needrestart non-interactive" \
+    || fail "fresh-host workflow can block on an interactive apt/kernel prompt"
+grep -q 'releases/download' "$fresh_workflow" \
+    && pass "fresh-host workflow downloads the previous release" \
+    || fail "fresh-host workflow does not stage the previous release"
+grep -q 'sha256sum -c' "$fresh_workflow" \
+    && pass "fresh-host workflow verifies the previous release checksum" \
+    || fail "fresh-host workflow consumes the previous release without verifying its checksum"
+grep -q 'sudo cp .*candidate-digests' "$fresh_workflow" \
+    && pass "fresh-host workflow stages the digest file as root" \
+    || fail "fresh-host workflow cannot write the digest into the root-owned evidence dir"
+grep -q 'results.tsv' "$fresh_workflow" \
+    && pass "fresh-host workflow requires the results marker" \
+    || fail "fresh-host workflow does not require results.tsv"
+grep -q 'if-no-files-found: error' "$fresh_workflow" \
+    && pass "fresh-host workflow fails when results.tsv is missing" \
+    || fail "fresh-host workflow tolerates a missing results marker"
+
+[ -f "$fresh_report" ] \
+    && pass "fresh-host evidence template exists" \
+    || fail "fresh-host evidence template is missing"
+grep -q 'shares the \*\*host kernel\*\*' "$fresh_report" \
+    && pass "fresh-host report labels the shared host kernel honestly" \
+    || fail "fresh-host report does not disclose the shared host kernel"
+grep -q 'no `/dev/kvm`' "$fresh_report" \
+    && pass "fresh-host report discloses the missing /dev/kvm" \
+    || fail "fresh-host report hides the missing /dev/kvm"
+grep -q 'not a bare-metal host and not a cloud VM' "$fresh_report" \
+    && pass "fresh-host report refuses the bare-metal/cloud-VM claim" \
+    || fail "fresh-host report overstates the container as a real host"
+grep -q '_pending_' "$fresh_report" \
+    && pass "fresh-host evidence template keeps unexecuted results pending" \
+    || fail "fresh-host evidence template looks pre-filled with results"
+
+# The in-container marker and the host-side assertion are one contract; a
+# wording change on either side silently makes the leg unable to pass.
+install_sh_leg="${QUAL}/install-sh-leg.sh"
+encmarker='ENCKEY-LOADED (no plaintext/fallback/no-key warning in CP journal)'
+marker_count="$(grep -cF "$encmarker" "$install_sh_leg" 2>/dev/null || true)"
+[ "${marker_count:-0}" -ge 2 ] \
+    && pass "install-sh leg asserts the exact encryption success marker it emits" \
+    || fail "install-sh leg's encryption marker and host assertion have drifted"
+grep -q 'CHV_ENCRYPTION_KEY is unset or empty' "$install_sh_leg" \
+    && pass "install-sh leg treats a no-key control plane as a failure" \
+    || fail "install-sh leg can pass while the control plane loaded no encryption key"
+grep -q 'QUICK_VERSION" = "$CANDIDATE_VERSION' "$fresh" \
+    && pass "fresh-host quick leg uses candidate-mode checks when installing the candidate" \
+    || fail "fresh-host quick leg weakens candidate checks unconditionally"
 
 exit "$rc"

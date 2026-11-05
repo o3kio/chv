@@ -1,6 +1,6 @@
 [package]
 name = "chv-agent"
-version = "0.3.0"
+version = "0.4.0"
 license = "Apache-2.0"
 edition = "2021"
 publish = false
@@ -40,3 +40,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chv-monitoring-store = { path = "../../crates/chv-monitoring-store" }
+rcgen = { version = "0.14", features = ["pem"] }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }

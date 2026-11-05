@@ -3,7 +3,7 @@
 #
 # Usage (designed to be curl-pipe-bash'd from raw.githubusercontent.com):
 #   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
-#   curl -fsSL ... | sudo bash -s -- --version 0.3.0     # pin a release
+#   curl -fsSL ... | sudo bash -s -- --version 0.4.0-rc.1  # pin a release
 #   sudo ./scripts/quick-install.sh --uninstall          # remove software, keep data
 #   sudo ./scripts/quick-install.sh --uninstall --purge  # remove everything
 #   ./scripts/quick-install.sh --dry-run                 # resolve+verify assets only
@@ -14,6 +14,12 @@
 #   — [webui] enabled, NO nginx), plus the local agent enrolled against it
 #   (chv-agent + chv-stord + chv-nwd), systemd units, and config under
 #   /etc/chv.
+#
+# Minimum supported release: v0.4.0. Earlier releases predate this serving
+# shape (their control plane does not serve the WebUI and has no dedicated
+# metrics listener), so the script refuses them instead of installing a
+# host that comes up without a UI. During the v0.4.0-rc.N window the
+# default 'latest stable' is v0.3.0, so pin the pre-release explicitly.
 #
 # What this is NOT:
 #   The qualified deployment path. scripts/install.sh stays the production
@@ -112,7 +118,7 @@ CHV_ARCH=""
 DEB_ARCH=""          # dpkg architecture (amd64/arm64)
 RPM_ARCH=""          # rpm architecture (x86_64/aarch64)
 PKG_KIND=""          # deb | rpm | tarball
-VERSION=""           # resolved version, no leading 'v' (e.g. 0.3.0, 0.4.0-rc.1)
+VERSION=""           # resolved version, no leading 'v' (e.g. 0.4.0, 0.4.0-rc.1)
 PKG_VERSION=""       # package version (RC maps -rc.N -> ~rc.N)
 WORK_DIR=""
 FRESH_INSTALL="1"
@@ -140,7 +146,7 @@ CHV Quick Install — one-command lab installer (issue #482)
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s
-  curl -fsSL <url> | sudo bash -s -- --version 0.3.0   # pin a tagged release
+  curl -fsSL <url> | sudo bash -s -- --version 0.4.0-rc.1  # pin a tagged release
   sudo ./scripts/quick-install.sh --uninstall           # remove software, keep data
   sudo ./scripts/quick-install.sh --uninstall --purge   # remove everything
   ./scripts/quick-install.sh --dry-run                  # resolve + verify assets only
@@ -269,11 +275,10 @@ not supported. Check available releases at:
 resolve_release() {
     local pin="${ARG_VERSION:-${INSTALL_CHV_VERSION}}"
     pin="${pin#v}"
-
     if [ "$pin" = "nightly" ]; then
         fatal "Refusing to install the 'nightly' pre-release channel.
 The quick installer installs tagged, versioned releases only (no nightly
-default, no nightly pin). Use a pinned stable/RC version, e.g. --version 0.3.0."
+default, no nightly pin). Use a pinned stable/RC version, e.g. --version 0.4.0-rc.1."
     fi
 
     local api_path release_json
@@ -309,7 +314,48 @@ default, no nightly pin). Use a pinned stable/RC version, e.g. --version 0.3.0."
     RELEASE_ASSETS=$(printf '%s' "$release_json" | grep -o '"browser_download_url": *"[^"]*"' \
         | sed 's|.*/||; s/"$//')
 
+    require_supported_release
+
     info "Resolved release: v${VERSION} (package version: ${PKG_VERSION})"
+}
+
+# The quick path configures the #447 D3 serving shape: the control plane
+# serves the static WebUI itself and exposes its own dedicated metrics
+# listener. Releases before v0.4.0 have neither, so installing one here
+# leaves a 404 UI on :8080 (and no :9103 listener). Refuse rather than
+# produce a half-working install. Prereleases of the minimum (v0.4.0-rc.N)
+# carry the shape and are accepted.
+QUICK_INSTALL_MIN_VERSION="0.4.0"
+
+release_supported() {
+    local v="${1#v}" major minor min_major min_minor
+    v="${v%%-*}"                     # 0.4.0-rc.1 -> 0.4.0
+    case "$v" in
+        [0-9]*.[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    major="${v%%.*}"
+    minor="${v#*.}"
+    minor="${minor%%.*}"
+    min_major="${QUICK_INSTALL_MIN_VERSION%%.*}"
+    min_minor="${QUICK_INSTALL_MIN_VERSION#*.}"
+    min_minor="${min_minor%%.*}"
+    case "${major}${minor}" in
+        *[!0-9]*) return 1 ;;
+    esac
+    [ "$major" -gt "$min_major" ] && return 0
+    [ "$major" -eq "$min_major" ] && [ "$minor" -ge "$min_minor" ]
+}
+
+require_supported_release() {
+    release_supported "$VERSION" && return 0
+    fatal "CHV quick install requires v${QUICK_INSTALL_MIN_VERSION} or newer (resolved v${VERSION}).
+v${VERSION} predates the package-serving shape this path installs: its
+control plane does not serve the WebUI and has no dedicated metrics
+listener, so the install would come up with a 404 UI.
+Use the qualified installer (scripts/install.sh) for v${VERSION}, or pin a
+supported release, e.g. the current pre-release:
+  sudo bash -s -- --version 0.4.0-rc.1"
 }
 
 asset_exists() {
@@ -687,6 +733,31 @@ install_artifacts_tarball() {
         fatal "systemd-tmpfiles --create failed for chv-node.conf; the chv-nwd unit cannot start without /run/netns."
     fi
     systemctl daemon-reload
+}
+
+# -----------------------------------------------------------------------------
+# Cross-leg runtime contract
+# -----------------------------------------------------------------------------
+# A package postinst creates the service users, but not every supported
+# release grants the group membership this path relies on (v0.3.0's did not),
+# and the quick installer must be correct for the release it installs.
+# chv-stord.service runs as chv and reads /etc/chv/stord.toml, which this
+# installer writes root:chv-stord 0640, so chv must be in the chv-stord
+# group (install.sh does the same). The package ships the tmpfiles entry that
+# creates /run/netns; systemd-tmpfiles applies it at boot, but the quick path
+# starts units immediately, so apply it here for both legs.
+ensure_runtime_contract() {
+    if getent passwd "$CHV_USER" >/dev/null 2>&1 \
+        && getent group chv-stord >/dev/null 2>&1; then
+        if ! id -nG "$CHV_USER" | tr ' ' '\n' | grep -qx chv-stord; then
+            usermod -aG chv-stord "$CHV_USER"
+        fi
+    fi
+    local tmpfiles=/usr/lib/tmpfiles.d/chv-node.conf
+    if [ -f "$tmpfiles" ]; then
+        systemd-tmpfiles --create "$tmpfiles" \
+            || fatal "systemd-tmpfiles --create failed for ${tmpfiles}; the chv-nwd unit cannot start without /run/netns."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1435,7 +1506,7 @@ main() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --version)
-                [ $# -ge 2 ] || fatal "--version requires an argument (e.g. --version 0.3.0)"
+                [ $# -ge 2 ] || fatal "--version requires an argument (e.g. --version 0.4.0-rc.1)"
                 ARG_VERSION="$2"
                 shift 2
                 ;;
@@ -1501,6 +1572,7 @@ main() {
     check_existing_install
     install_dependencies
     install_artifacts
+    ensure_runtime_contract
     install_cloud_hypervisor
     generate_certs
     if [ "$FRESH_INSTALL" = "1" ]; then

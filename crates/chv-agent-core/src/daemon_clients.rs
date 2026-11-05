@@ -20,6 +20,30 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tracing::Instrument;
 
+/// stord returns RPC-OK with an in-band non-OK `Result` on backend failures.
+/// Callers must check it instead of treating transport success as an operation
+/// success (#711 review).
+fn check_stord_result(
+    result: Option<&chv_stord_api::chv_stord_api::Result>,
+    operation: &str,
+) -> Result<(), ChvError> {
+    if let Some(res) = result {
+        if !res.status.eq_ignore_ascii_case("ok")
+            && !res.status.eq_ignore_ascii_case("0")
+            && !res.status.is_empty()
+        {
+            return Err(ChvError::BackendUnavailable {
+                backend: "stord".to_string(),
+                reason: format!(
+                    "stord {operation} failed (code {}): {}",
+                    res.error_code, res.human_summary
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn with_operation_id<T>(req: T, operation_id: Option<&str>) -> tonic::Request<T> {
     let mut grpc_req = tonic::Request::new(req);
     if let Some(op_id) = operation_id {
@@ -182,6 +206,11 @@ impl StordClient {
                 reason: e.to_string(),
             })?
             .into_inner();
+        // stord answers RPC-OK with an in-band non-OK `Result` when the
+        // session is gone (e.g. swept) or the backend attach fails. Returning
+        // the empty export fields as success would silently build a VM with
+        // an empty disk path (#711 review).
+        check_stord_result(resp.result.as_ref(), "attach_volume_to_vm")?;
         Ok((resp.export_kind, resp.export_path))
     }
 
@@ -208,15 +237,17 @@ impl StordClient {
             "detach_volume_from_vm",
             operation_id = operation_id.unwrap_or("")
         );
-        self.inner
+        let resp = self
+            .inner
             .detach_volume_from_vm(with_operation_id(req, operation_id))
             .instrument(span)
             .await
             .map_err(|e| ChvError::BackendUnavailable {
                 backend: "stord".to_string(),
                 reason: e.to_string(),
-            })?;
-        Ok(())
+            })?
+            .into_inner();
+        check_stord_result(Some(&resp), "detach_volume_from_vm")
     }
 
     pub async fn close_volume(
@@ -237,15 +268,118 @@ impl StordClient {
             attachment_handle: attachment_handle.to_string(),
         };
         let span = tracing::info_span!("close_volume", operation_id = operation_id.unwrap_or(""));
-        self.inner
+        let resp = self
+            .inner
             .close_volume(with_operation_id(req, operation_id))
             .instrument(span)
             .await
             .map_err(|e| ChvError::BackendUnavailable {
                 backend: "stord".to_string(),
                 reason: e.to_string(),
-            })?;
-        Ok(())
+            })?
+            .into_inner();
+        check_stord_result(Some(&resp), "close_volume")
+    }
+
+    /// Close every session for `volume_id` that a detach marked `detached`
+    /// (#711 review).
+    ///
+    /// This is the crash-window recovery path: if the agent died (or a close
+    /// RPC failed) after detach cleared `vm_id` but before close removed the
+    /// session, no live `(volume, vm)` match remains in the session table.
+    /// stord marks such rows `detached`, which is deliberately distinct from the
+    /// `open` state of a volume that was opened but whose attach has not
+    /// landed yet. Filtering on `detached` keeps the crash-window recovery
+    /// from touching a live attach-pending open. The list-then-close gap is
+    /// closed at stord's boundary: `close_volume` refuses a row whose `vm_id`
+    /// is non-empty, so a session re-attached between the list and the close
+    /// survives the sweep and surfaces as a failed close (#711 review).
+    /// Attached and `open` sessions are never selected.
+    ///
+    /// Returns the number of sessions closed. A failed close surfaces so the
+    /// caller's existing retry/first-error policy applies.
+    pub async fn close_detached_volume_sessions(
+        &mut self,
+        volume_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<usize, ChvError> {
+        let span = tracing::info_span!("close_detached_volume_sessions", volume_id);
+        let mut handles: Vec<String> = self
+            .inner
+            .list_volume_sessions(tonic::Request::new(ListVolumeSessionsRequest {}))
+            .instrument(span)
+            .await
+            .map_err(|e| ChvError::BackendUnavailable {
+                backend: "stord".to_string(),
+                reason: format!("list_volume_sessions for {volume_id}: {e}"),
+            })?
+            .into_inner()
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                session.volume_id == volume_id
+                    && session.vm_id.is_empty()
+                    && session.runtime_status.eq_ignore_ascii_case("detached")
+                    && !session.attachment_handle.is_empty()
+            })
+            .map(|session| session.attachment_handle)
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        let count = handles.len();
+        for handle in handles {
+            self.close_volume(volume_id, &handle, operation_id).await?;
+        }
+        Ok(count)
+    }
+
+    /// Close every session for `volume_id` that has no VM attached
+    /// (#711 review).
+    ///
+    /// [`destroy_volume`] refuses while *any* session row exists for the
+    /// volume. A crash between open and attach, or a detach performed by a
+    /// pre-#711 stord, leaves exactly this shape: `vm_id` empty (with
+    /// `runtime_status` `open` or `detached`) and the handle still present.
+    /// The VM-delete drain leaves `open` rows alone because it cannot tell
+    /// them from a live attach-pending open, so the volume-delete path must
+    /// reclaim them here or the volume could never be destroyed. Rows with a
+    /// non-empty `vm_id` are never touched, and stord's own close guard
+    /// refuses a row that a concurrent re-attach revived.
+    ///
+    /// Returns the number of sessions closed. A failed close surfaces so the
+    /// caller fails the delete rather than destroying under a live session.
+    pub async fn close_unattached_volume_sessions(
+        &mut self,
+        volume_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<usize, ChvError> {
+        let span = tracing::info_span!("close_unattached_volume_sessions", volume_id);
+        let mut handles: Vec<String> = self
+            .inner
+            .list_volume_sessions(tonic::Request::new(ListVolumeSessionsRequest {}))
+            .instrument(span)
+            .await
+            .map_err(|e| ChvError::BackendUnavailable {
+                backend: "stord".to_string(),
+                reason: format!("list_volume_sessions for {volume_id}: {e}"),
+            })?
+            .into_inner()
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                session.volume_id == volume_id
+                    && session.vm_id.is_empty()
+                    && !session.attachment_handle.is_empty()
+            })
+            .map(|session| session.attachment_handle)
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        let count = handles.len();
+        for handle in handles {
+            self.close_volume(volume_id, &handle, operation_id).await?;
+        }
+        Ok(count)
     }
 
     /// #522 PR 1 (DP3): dispatch the stord destroy primitive. The
@@ -1506,6 +1640,9 @@ mod tests {
 
     #[derive(Default)]
     struct MockStord {
+        /// Sessions returned by `list_volume_sessions`; empty by default.
+        /// Used to pin the #711 `(volume_id, vm_id)` handle resolution.
+        sessions: Vec<chv_stord_api::chv_stord_api::VolumeSession>,
         /// When set, `trigger_disk_migration` captures the request and
         /// answers OK instead of `unimplemented` — the wire-contract pin
         /// for the agent→stord thread (issue #394 Option C).
@@ -1533,7 +1670,9 @@ mod tests {
         ) -> Result<Response<chv_stord_api::chv_stord_api::ListVolumeSessionsResponse>, Status>
         {
             Ok(Response::new(
-                chv_stord_api::chv_stord_api::ListVolumeSessionsResponse { sessions: vec![] },
+                chv_stord_api::chv_stord_api::ListVolumeSessionsResponse {
+                    sessions: self.sessions.clone(),
+                },
             ))
         }
         // Stub remaining methods
@@ -1547,7 +1686,11 @@ mod tests {
             &self,
             _req: Request<chv_stord_api::chv_stord_api::CloseVolumeRequest>,
         ) -> Result<Response<chv_stord_api::chv_stord_api::Result>, Status> {
-            Err(Status::unimplemented(""))
+            Ok(Response::new(chv_stord_api::chv_stord_api::Result {
+                status: "OK".to_string(),
+                error_code: "OK".to_string(),
+                human_summary: String::new(),
+            }))
         }
         // #522 PR 1: the daemon-client suite's mock does not drive the
         // destroy primitive (its coverage is the connect/open paths).
@@ -1574,7 +1717,11 @@ mod tests {
             &self,
             _req: Request<chv_stord_api::chv_stord_api::DetachVolumeFromVmRequest>,
         ) -> Result<Response<chv_stord_api::chv_stord_api::Result>, Status> {
-            Err(Status::unimplemented(""))
+            Ok(Response::new(chv_stord_api::chv_stord_api::Result {
+                status: "OK".to_string(),
+                error_code: "OK".to_string(),
+                human_summary: String::new(),
+            }))
         }
         async fn resize_volume(
             &self,
@@ -1822,6 +1969,84 @@ mod tests {
         assert!(client.health_probe().await.unwrap());
     }
 
+    /// #711 review: a session left open by a crash between detach and close
+    /// has `vm_id` cleared and is marked `detached`. The delete drain must
+    /// close exactly those rows for the volume, never a row still attached to
+    /// a VM and never a live `open` row whose attach has not landed yet.
+    #[tokio::test]
+    async fn stord_close_detached_volume_sessions_skips_live_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stord.sock");
+        let session = |volume_id: &str, vm_id: &str, handle: &str, status: &str| {
+            chv_stord_api::chv_stord_api::VolumeSession {
+                volume_id: volume_id.to_string(),
+                vm_id: vm_id.to_string(),
+                attachment_handle: handle.to_string(),
+                export_kind: "local".to_string(),
+                export_path: String::new(),
+                runtime_status: status.to_string(),
+            }
+        };
+        let mock = MockStord {
+            sessions: vec![
+                session("vol-0", "", "handle-orphan-1", "detached"),
+                session("vol-0", "", "handle-orphan-2", "detached"),
+                session("vol-0", "", "handle-open", "open"),
+                session("vol-0", "vm-live", "handle-attached", "attached"),
+                session("vol-1", "", "handle-other-volume", "detached"),
+            ],
+            ..Default::default()
+        };
+        let uds = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    chv_stord_api::chv_stord_api::storage_service_server::StorageServiceServer::new(
+                        mock,
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds))
+                .await
+                .ok();
+        });
+
+        let mut client = StordClient::connect(&socket).await.unwrap();
+        assert_eq!(
+            client
+                .close_detached_volume_sessions("vol-0", Some("op-1"))
+                .await
+                .unwrap(),
+            2,
+            "both detached vol-0 rows must be closed"
+        );
+    }
+
+    /// stord reports backend failures as RPC-OK with an in-band non-OK
+    /// `Result`; the client must surface that instead of treating transport
+    /// success as an operation success (#711 review).
+    #[test]
+    fn stord_in_band_error_is_surfaced() {
+        let failed = chv_stord_api::chv_stord_api::Result {
+            status: "FAILED".to_string(),
+            error_code: "E_BUSY".to_string(),
+            human_summary: "device busy".to_string(),
+        };
+        let err = check_stord_result(Some(&failed), "close_volume")
+            .expect_err("non-OK in-band result must fail");
+        assert!(
+            matches!(err, ChvError::BackendUnavailable { .. }),
+            "expected BackendUnavailable, got {err:?}"
+        );
+
+        let ok = chv_stord_api::chv_stord_api::Result {
+            status: "OK".to_string(),
+            error_code: "OK".to_string(),
+            human_summary: String::new(),
+        };
+        assert!(check_stord_result(Some(&ok), "close_volume").is_ok());
+        assert!(check_stord_result(None, "close_volume").is_ok());
+    }
+
     #[tokio::test]
     async fn nwd_health_probe_mock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1887,6 +2112,7 @@ mod tests {
             std::sync::Mutex<Option<chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mock = MockStord {
+            sessions: Vec::new(),
             capture_trigger: Some(captured.clone()),
             skew_no_echo: false,
             resource_exhausted_first: std::sync::atomic::AtomicU32::new(0),
@@ -1959,6 +2185,7 @@ mod tests {
             std::sync::Mutex<Option<chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mock = MockStord {
+            sessions: Vec::new(),
             capture_trigger: Some(captured.clone()),
             skew_no_echo: true,
             resource_exhausted_first: std::sync::atomic::AtomicU32::new(0),
@@ -2048,6 +2275,7 @@ mod tests {
             std::sync::Mutex<Option<chv_stord_api::chv_stord_api::TriggerDiskMigrationRequest>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mock = MockStord {
+            sessions: Vec::new(),
             capture_trigger: Some(captured.clone()),
             skew_no_echo: false,
             resource_exhausted_first: std::sync::atomic::AtomicU32::new(resource_exhausted_first),

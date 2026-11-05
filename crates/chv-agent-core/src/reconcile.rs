@@ -1001,6 +1001,20 @@ impl Reconciler {
                         .await
                     {
                         warn!(volume_id = %volume_id, vm_id = %vm_id, error = %e, "failed to attach volume");
+                        // Same unwind as the create paths: a failed attach
+                        // must not leave the session it opened behind, or a
+                        // later delete could find an undeletable stray row
+                        // (#711 review).
+                        if let Err(close_err) =
+                            stord.close_volume(&volume_id, &handle, Some(&op_id)).await
+                        {
+                            warn!(
+                                volume_id = %volume_id,
+                                vm_id = %vm_id,
+                                error = %close_err,
+                                "failed to close volume after failed reconcile re-attach"
+                            );
+                        }
                     } else {
                         // Volume health check (Sprint 11 A1)
                         match stord.get_volume_health(&volume_id).await {
@@ -1224,9 +1238,26 @@ async fn prepare_vm_resources(
             export_path = %export_path,
             "stord returned export path"
         );
-        stord
+        if let Err(e) = stord
             .attach_volume_to_vm(&disk.volume_id, vm_id, &handle, Some(&open_op_id))
-            .await?;
+            .await
+        {
+            // The open succeeded, so the session exists. Close it best-effort
+            // before returning: a stranded `open` row is spared by the
+            // detached sweep and blocks destroy_volume (#711 review).
+            if let Err(close_err) = stord
+                .close_volume(&disk.volume_id, &handle, Some(&open_op_id))
+                .await
+            {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    volume_id = %disk.volume_id,
+                    error = %close_err,
+                    "close after failed attach also failed; session may leak"
+                );
+            }
+            return Err(e);
+        }
         // TODO(Sprint 11): Wire set_device_policy when DiskSpec includes device policy configuration.
         disks.push(VmDiskConfig {
             path: PathBuf::from(export_path),
@@ -2179,7 +2210,14 @@ pub(crate) async fn cleanup_vm_resources(
 
     if !volumes.is_empty() {
         let mut stord = StordClient::connect(stord_socket).await?;
-        for (volume_id, handle) in &volumes {
+        for (volume_id, cached_handle) in &volumes {
+            // #711: the Core create path never records a handle in the
+            // cache, so a post-restart delete must recover the session from
+            // stord. Detach is idempotent and keyed by (volume, vm); once it
+            // clears `vm_id`, close the cached handle (legacy path) and every
+            // detached session for the volume. The latter also drains a
+            // session left behind by a crash (or failed close) between an
+            // earlier detach and close.
             if let Err(e) = stord
                 .detach_volume_from_vm(volume_id, vm_id, false, operation_id)
                 .await
@@ -2190,12 +2228,21 @@ pub(crate) async fn cleanup_vm_resources(
                 }
                 continue;
             }
-            if let Some(handle) = handle {
+            if let Some(handle) = cached_handle {
                 if let Err(e) = stord.close_volume(volume_id, handle, operation_id).await {
                     tracing::warn!(volume_id = %volume_id, error = %e, "cleanup: close_volume failed, continuing");
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
+                }
+            }
+            if let Err(e) = stord
+                .close_detached_volume_sessions(volume_id, operation_id)
+                .await
+            {
+                tracing::warn!(volume_id = %volume_id, error = %e, "cleanup: close_detached_volume_sessions failed, continuing");
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
         }
@@ -2704,6 +2751,10 @@ mod tests {
     #[derive(Clone, Default)]
     struct StordOpenLog {
         opens: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        /// #711 review: closes the agent issued, so a test can pin that a
+        /// failed attach unwinds the session it just opened.
+        closes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        fail_attach: Arc<std::sync::atomic::AtomicBool>,
     }
 
     struct MockStordOk {
@@ -2762,7 +2813,13 @@ mod tests {
             &self,
             req: Request<chv_stord_api::chv_stord_api::CloseVolumeRequest>,
         ) -> Result<Response<chv_stord_api::chv_stord_api::Result>, Status> {
-            stord_operation_id(req.into_inner().meta)?;
+            let inner = req.into_inner();
+            stord_operation_id(inner.meta)?;
+            self.opens
+                .closes
+                .lock()
+                .unwrap()
+                .push((inner.volume_id, inner.attachment_handle));
             Ok(Response::new(chv_stord_api::chv_stord_api::Result {
                 status: "ok".to_string(),
                 error_code: "".to_string(),
@@ -2802,6 +2859,25 @@ mod tests {
         {
             let inner = req.into_inner();
             stord_operation_id(inner.meta.clone())?;
+            if self
+                .opens
+                .fail_attach
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(Response::new(
+                    chv_stord_api::chv_stord_api::AttachVolumeToVmResponse {
+                        result: Some(chv_stord_api::chv_stord_api::Result {
+                            status: "error".to_string(),
+                            error_code: "attach_failed".to_string(),
+                            human_summary: "simulated backend attach failure".to_string(),
+                        }),
+                        volume_id: inner.volume_id.clone(),
+                        vm_id: inner.vm_id.clone(),
+                        export_kind: "".to_string(),
+                        export_path: "".to_string(),
+                    },
+                ));
+            }
             Ok(Response::new(
                 chv_stord_api::chv_stord_api::AttachVolumeToVmResponse {
                     result: Some(chv_stord_api::chv_stord_api::Result {
@@ -3418,6 +3494,40 @@ mod tests {
         );
     }
 
+    /// #711 review: a failed in-band attach in `prepare_vm_resources` must
+    /// close the session its own `open_volume` just created, or the
+    /// stranded `open` row blocks `destroy_volume` forever.
+    #[tokio::test]
+    async fn prepare_vm_closes_the_session_when_attach_fails_in_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let stord_socket = dir.path().join("stord.sock");
+        let nwd_socket = dir.path().join("nwd.sock");
+        let opens = start_mock_stord(&stord_socket).await;
+        start_mock_nwd(&nwd_socket).await;
+        opens
+            .fail_attach
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut rec = Reconciler::new_legacy(
+            Arc::new(tokio::sync::Mutex::new(class_test_cache())),
+            VmRuntime::new(std::sync::Arc::new(
+                chv_agent_runtime_ch::mock::MockCloudHypervisorAdapter::default(),
+            )),
+            stord_socket,
+            nwd_socket,
+            dir.path().to_path_buf(),
+            Arc::new(MigrationTaskRegistry::new()),
+        )
+        .await;
+        rec.reconcile_vms().await.unwrap();
+
+        assert_eq!(
+            opens.closes.lock().unwrap().as_slice(),
+            [("vol-1".to_string(), "handle-vol-1".to_string())],
+            "the first opened volume must be closed after its attach fails"
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_volumes_reattach_threads_backend_class_from_spec() {
         // #379 PR 1 pin (A2): the re-attach loop's open resolves the class
@@ -3473,6 +3583,52 @@ mod tests {
                 ),
             ],
             "A2 must thread the disk spec's backend_class (defaulting to local when absent) and keep the relative `{{volume_id}}.img` re-attach locator"
+        );
+    }
+
+    /// #711 review: the A2 re-attach loop must unwind the session its own
+    /// open just created when the in-band attach fails, matching the create
+    /// paths; otherwise a stray `open` row can outlive the retry.
+    #[tokio::test]
+    async fn reconcile_volumes_closes_sessions_when_reattach_fails_in_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let stord_socket = dir.path().join("stord.sock");
+        let nwd_socket = dir.path().join("nwd.sock");
+        let opens = start_mock_stord(&stord_socket).await;
+        start_mock_nwd(&nwd_socket).await;
+        opens
+            .fail_attach
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut cache = class_test_cache();
+        cache
+            .volume_handles
+            .insert("vol-1".to_string(), "handle-vol-1".to_string());
+        cache
+            .volume_handles
+            .insert("vol-2".to_string(), "handle-vol-2".to_string());
+        let mut rec = Reconciler::new_legacy(
+            Arc::new(tokio::sync::Mutex::new(cache)),
+            VmRuntime::new(std::sync::Arc::new(
+                chv_agent_runtime_ch::mock::MockCloudHypervisorAdapter::default(),
+            )),
+            stord_socket,
+            nwd_socket,
+            dir.path().to_path_buf(),
+            Arc::new(MigrationTaskRegistry::new()),
+        )
+        .await;
+        rec.reconcile_volumes().await.unwrap();
+
+        let mut closed = opens.closes.lock().unwrap().clone();
+        closed.sort();
+        assert_eq!(
+            closed,
+            vec![
+                ("vol-1".to_string(), "handle-vol-1".to_string()),
+                ("vol-2".to_string(), "handle-vol-2".to_string()),
+            ],
+            "each failed re-attach must close the session it opened"
         );
     }
 

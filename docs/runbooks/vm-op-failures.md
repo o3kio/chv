@@ -22,20 +22,12 @@ fixed attempt bound; an already-running VM returns success idempotently. There
 is no automatic resolution for a terminal `failed`/`unsupported` operation or
 for an ambiguous `InspectRequired` one.
 
-## Metrics availability caveat
+## Metrics availability
 
-**As shipped, the agent does not expose these series.** `VmOpGuard` records
-`chv_vm_ops_total` and `chv_vm_op_duration_seconds` into the global Prometheus
-registry, but the agent's `:9901` handler renders only the hand-built
-`chv_agent_*` families; `cmd/chv-agent` does not enable the `http-metrics`
-feature the other daemons use, and no other process records these names.
-
-Until [issue #702](https://github.com/o3kio/chv/issues/702) lands, the PromQL
-below returns no data from a packaged agent and `VmOpFailureRateHigh` cannot
-fire from agent scrapes. If this alert is paging you, the scrape target is
-running a build with #702 or an external exporter — confirm that first. Section
-2 onward (operation journal and logs) works today; use it while the series is
-missing.
+The agent's `/metrics` endpoint renders its hand-built `chv_agent_*` families
+plus the global Prometheus registry. `VmOpGuard` records
+`chv_vm_ops_total` and `chv_vm_op_duration_seconds` into that registry, so
+packaged agents expose both series from the default `127.0.0.1:9901` listener.
 
 ## Prerequisites
 
@@ -43,8 +35,8 @@ missing.
   plane.
 - Access to the agent metrics listener (packaged default
   `127.0.0.1:9901`) or Prometheus. See
-  [Metrics availability caveat](#metrics-availability-caveat) — the listener
-  currently exposes `chv_agent_*` only.
+  [Metrics availability](#metrics-availability) — the listener exposes
+  `chv_agent_*` plus the VM-op registry families.
 - Knowledge of the node's authority mode:
   `grep -E '^authority_mode' /etc/chv/agent.toml`.
   Shipped configurations select `core-managed`; a missing key defaults to
@@ -62,12 +54,12 @@ Also break down by node/scrape target. One `op` points at a specific path
 (e.g. all deletes fail after a storage change); all ops failing points at the
 node, the executor, or a shared dependency.
 
-On the node, confirm the listener is healthy. It currently renders
-`chv_agent_*` only — the VM-op families are not exported
-([metrics availability caveat](#metrics-availability-caveat), #702):
+On the node, confirm the listener is healthy and both the hand-built and
+registry segments are present:
 
 ```bash
-curl -s http://127.0.0.1:9901/metrics | grep -c '^chv_agent_'
+curl -s http://127.0.0.1:9901/metrics \
+  | grep -E '^(chv_agent_|chv_vm_ops_total|chv_vm_op_duration_seconds)'
 ```
 
 Then use §2 to read the real outcome from the operation journal.

@@ -20,7 +20,8 @@ name: Fresh-host qualification
 #     is shared with the KVM lane (the container itself does not use it)
 #   - host ports 80/8080/8443/8444/9101-9103/9901 free (the container
 #     shares the host netns)
-#   - debootstrap, systemd-container, gh, and the packaging toolchain
+#   - the job installs debootstrap, systemd-container, iproute2 and sqlite3
+#     via apt when the runner image does not already provide them
 #
 # Evidence: results.tsv, summary.md, per-leg transcripts and boot logs are
 # uploaded on success and failure; missing results.tsv fails the upload.
@@ -38,6 +39,11 @@ on:
         required: true
         default: false
         type: boolean
+      quick_install_version:
+        description: 'Release version the quick-install leg installs (default: previous_release; must be >= 0.4.0)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -57,6 +63,7 @@ jobs:
       CHV_QUAL_ROOT: /var/lib/chv/qual
       GITHUB_REPO: ${{ github.repository }}
       PREVIOUS_RELEASE: ${{ inputs.previous_release }}
+      QUICK_INSTALL_VERSION: ${{ inputs.quick_install_version }}
       EVIDENCE_DIR: /var/lib/chv/qual/ci-artifacts/fresh-host-${{ github.run_id }}
       GH_TOKEN: ${{ github.token }}
       CHV_GIT_SHA: ${{ github.sha }}
@@ -75,8 +82,8 @@ jobs:
             echo "::error::Fresh-host qualification requires passwordless sudo -E on the self-hosted runner."
             exit 1
           fi
-          if ! command -v gh >/dev/null 2>&1; then
-            echo "::error::gh is required to download the previous release (${PREVIOUS_RELEASE})."
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "::error::Fresh-host qualification needs curl to download the previous release (${PREVIOUS_RELEASE})."
             exit 1
           fi
 
@@ -103,15 +110,34 @@ jobs:
 
       - name: Install build prerequisites
         run: |
+          set -euo pipefail
+          # Shared runner images may have an unattended-upgrade pending; keep
+          # apt/dpkg and needrestart non-interactive so the job cannot block on
+          # a kernel-upgrade dialog (the first attempt was killed at 30 min).
+          apt_run() {
+            sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \
+              timeout 900 apt-get -y \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confold "$@"
+          }
+          # The lane runs debootstrap + systemd-nspawn containers; install the
+          # tooling rather than requiring every shared chv-kvm runner image to
+          # pre-stage it. iproute2/sqlite3 are driver prerequisites, and the
+          # fresh-host.sh preflight fails closed if any of them is absent.
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 timeout 300 apt-get update
+          apt_run install gettext-base debootstrap systemd-container iproute2 sqlite3
           if ! command -v protoc >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+            apt_run install protobuf-compiler
           fi
-          sudo apt-get install -y gettext-base
           if ! command -v nfpm >/dev/null 2>&1; then
             # Pin nfpm for a reproducible package build.
             curl -sL "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_x86_64.tar.gz" | tar -xz -C /tmp nfpm
             sudo mv /tmp/nfpm /usr/local/bin/nfpm
           fi
+          for tool in debootstrap systemd-nspawn ss sqlite3; do
+            command -v "$tool" >/dev/null 2>&1 \
+              || { echo "::error::$tool is still unavailable after prerequisite install"; exit 1; }
+          done
           nfpm --version
 
       - name: Setup Node.js 22
@@ -150,11 +176,15 @@ jobs:
           set -euo pipefail
           prev_dir="${RUNNER_TEMP}/fresh-host-previous/${PREVIOUS_RELEASE}"
           mkdir -p "$prev_dir"
-          gh release download "$PREVIOUS_RELEASE" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern 'chv-*-linux-amd64.tar.gz' \
-            --pattern 'chv-*-linux-amd64.tar.gz.sha256' \
-            --dir "$prev_dir" --clobber
+          previous_version="${PREVIOUS_RELEASE#v}"
+          tarball="chv-${previous_version}-linux-amd64.tar.gz"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${PREVIOUS_RELEASE}"
+          # Download by tag with curl rather than requiring the GitHub CLI on
+          # the self-hosted runner, then verify the published checksum before
+          # the upgrade leg consumes the tarball.
+          curl -fsSL "${base}/${tarball}" -o "${prev_dir}/${tarball}"
+          curl -fsSL "${base}/${tarball}.sha256" -o "${prev_dir}/${tarball}.sha256"
+          ( cd "$prev_dir" && sha256sum -c "${tarball}.sha256" )
           prev_tarball="$(find "$prev_dir" -maxdepth 1 -name 'chv-*-linux-amd64.tar.gz' -print -quit)"
           test -n "$prev_tarball"
           echo "PREVIOUS_TARBALL=${prev_tarball}" >> "$GITHUB_ENV"
@@ -164,6 +194,8 @@ jobs:
         run: |
           set -euo pipefail
           previous_version="${PREVIOUS_RELEASE#v}"
+          quick_version="${QUICK_INSTALL_VERSION:-$previous_version}"
+          quick_version="${quick_version#v}"
           args=(
             --candidate-tarball "dist/chv-$(cat VERSION)-linux-amd64.tar.gz"
             --candidate-version "$(cat VERSION)"
@@ -172,7 +204,7 @@ jobs:
             --previous-version "$previous_version"
             --packages dist/packages
             --quick-install "$GITHUB_SHA"
-            --quick-install-version "$previous_version"
+            --quick-install-version "$quick_version"
             --evidence-dir "$EVIDENCE_DIR"
           )
           if [ "${PREVIOUS_TARBALL:-}" != "" ]; then

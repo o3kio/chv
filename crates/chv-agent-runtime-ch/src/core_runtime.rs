@@ -735,6 +735,14 @@ impl CloudHypervisorCoreRuntime {
                 "no in-memory side-effect state for delete; draining stord/nwd handles from durable observed attachments (post-restart fallback)"
             );
             for (volume_id, handle) in &observed.volumes {
+                // #711: the Core create path never records a handle in the
+                // cache, so the fallback cannot rely on observed state alone.
+                // Detach is idempotent and keyed by (volume, vm); after it
+                // clears `vm_id`, close the recorded handle (if any) and
+                // every detached session for the volume. The latter closes
+                // this detach and any session left open by a crash (or
+                // failed close) between an earlier detach and close.
+                // Attached sessions are never touched.
                 if let Err(e) = self
                     .resources
                     .detach_volume_from_vm(volume_id, vm_id, false, Some(op_id))
@@ -742,11 +750,6 @@ impl CloudHypervisorCoreRuntime {
                 {
                     warn!(vm_id, volume_id, error = %e, "delete cleanup: detach_volume failed, continuing");
                 }
-                // A handle the source did not durably record cannot be
-                // closed (stord keys sessions by handle): the detach above
-                // still releases the VM-scoped attachment, and the open
-                // session remains the documented M2.2a handle-persistence
-                // residual.
                 if let Some(handle) = handle {
                     if let Err(e) = self
                         .resources
@@ -755,6 +758,13 @@ impl CloudHypervisorCoreRuntime {
                     {
                         warn!(vm_id, volume_id, error = %e, "delete cleanup: close_volume failed, continuing");
                     }
+                }
+                if let Err(e) = self
+                    .resources
+                    .close_detached_volume_sessions(volume_id, Some(op_id))
+                    .await
+                {
+                    warn!(vm_id, volume_id, error = %e, "delete cleanup: close_detached_volume_sessions failed, continuing");
                 }
             }
             for nic_id in &observed.nics {
@@ -791,6 +801,16 @@ impl CloudHypervisorCoreRuntime {
                 .await
             {
                 warn!(vm_id, volume_id, error = %e, "delete cleanup: close_volume failed, continuing");
+            }
+            // A failed close leaves a `detached` row that the fallback sweep
+            // only reaches after a restart. Sweep it now as well, mirroring
+            // the fallback arm (#711 review).
+            if let Err(e) = self
+                .resources
+                .close_detached_volume_sessions(volume_id, Some(op_id))
+                .await
+            {
+                warn!(vm_id, volume_id, error = %e, "delete cleanup: close_detached_volume_sessions failed, continuing");
             }
         }
         for nic_id in effects.nics.iter().rev() {

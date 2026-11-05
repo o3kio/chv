@@ -12,6 +12,19 @@ use crate::adapter::{
 /// class the runtime threaded into the open, and the option map.
 pub type RecordedOpenOptions = (String, String, HashMap<String, String>);
 
+/// One live stord session the mock controller knows about, used by the
+/// post-restart detached-session sweep (#711).
+#[derive(Debug, Clone)]
+pub struct MockVolumeSession {
+    pub volume_id: String,
+    pub vm_id: String,
+    pub attachment_handle: String,
+    /// Mirrors stord's `runtime_status`: `attached` while owned by a VM,
+    /// `open` for an opened-but-attach-pending volume, and `detached` after
+    /// a detach cleared `vm_id` (#711 review).
+    pub runtime_status: String,
+}
+
 /// Deterministic host-resource controller for tests.
 ///
 /// Records every controller call as a canonical log line (for example
@@ -43,6 +56,10 @@ pub struct MockHostResourceController {
     /// class-dependent locator shaping (the LVM dm-path token vs the
     /// historical `{volume_id}.img` under the VM dir).
     pub open_locators: Arc<Mutex<Vec<(String, String)>>>,
+    /// Live stord sessions the controller can resolve (#711). Empty by
+    /// default; tests add sessions explicitly to model a restart where the
+    /// cache handle died but stord's durable session row survived.
+    pub volume_sessions: Arc<Mutex<Vec<MockVolumeSession>>>,
 }
 
 impl MockHostResourceController {
@@ -57,7 +74,43 @@ impl MockHostResourceController {
             fail_next: Arc::new(Mutex::new(Some(fail_on.to_string()))),
             open_options: Arc::new(Mutex::new(Vec::new())),
             open_locators: Arc::new(Mutex::new(Vec::new())),
+            volume_sessions: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Register a live stord session for `(volume_id, vm_id)`, so a
+    /// handle-less fallback drain can resolve it exactly like stord's
+    /// durable session table does after an agent restart (#711). A
+    /// session is consumed by the mock detach (stord clears `vm_id`), so
+    /// a retry after a successful detach resolves nothing.
+    /// Seed a session that a crash left between detach and close: `vm_id`
+    /// empty, `runtime_status = "detached"`, handle still present (#711).
+    pub fn add_detached_session(&self, volume_id: &str, attachment_handle: &str) {
+        self.volume_sessions
+            .lock()
+            .unwrap()
+            .push(MockVolumeSession {
+                volume_id: volume_id.to_string(),
+                vm_id: String::new(),
+                attachment_handle: attachment_handle.to_string(),
+                runtime_status: "detached".to_string(),
+            });
+    }
+
+    pub fn add_volume_session(&self, volume_id: &str, vm_id: &str, attachment_handle: &str) {
+        self.volume_sessions
+            .lock()
+            .unwrap()
+            .push(MockVolumeSession {
+                volume_id: volume_id.to_string(),
+                vm_id: vm_id.to_string(),
+                attachment_handle: attachment_handle.to_string(),
+                runtime_status: if vm_id.is_empty() {
+                    "open".to_string()
+                } else {
+                    "attached".to_string()
+                },
+            });
     }
 
     /// Count successes already recorded for `name` and check the fail hook.
@@ -126,24 +179,63 @@ impl HostResourceController for MockHostResourceController {
     async fn detach_volume_from_vm(
         &self,
         volume_id: &str,
-        _vm_id: &str,
+        vm_id: &str,
         _force: bool,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
         self.begin_step("detach")?;
         self.record("detach", volume_id);
+        // stord clears the session's vm_id on detach and marks it detached;
+        // mirror that so the sweep can close it without matching a live open.
+        for session in self.volume_sessions.lock().unwrap().iter_mut() {
+            if session.volume_id == volume_id && session.vm_id == vm_id {
+                session.vm_id.clear();
+                session.runtime_status = "detached".to_string();
+            }
+        }
         Ok(())
     }
 
     async fn close_volume(
         &self,
         volume_id: &str,
-        _attachment_handle: &str,
+        attachment_handle: &str,
         _operation_id: Option<&str>,
     ) -> Result<(), ChvError> {
         self.begin_step("close")?;
         self.record("close", volume_id);
+        self.volume_sessions
+            .lock()
+            .unwrap()
+            .retain(|s| !(s.volume_id == volume_id && s.attachment_handle == attachment_handle));
         Ok(())
+    }
+
+    async fn close_detached_volume_sessions(
+        &self,
+        volume_id: &str,
+        _operation_id: Option<&str>,
+    ) -> Result<usize, ChvError> {
+        self.begin_step("close_detached")?;
+        let mut sessions = self.volume_sessions.lock().unwrap();
+        let count = sessions
+            .iter()
+            .filter(|s| {
+                s.volume_id == volume_id
+                    && s.vm_id.is_empty()
+                    && s.runtime_status.eq_ignore_ascii_case("detached")
+            })
+            .count();
+        sessions.retain(|s| {
+            !(s.volume_id == volume_id
+                && s.vm_id.is_empty()
+                && s.runtime_status.eq_ignore_ascii_case("detached"))
+        });
+        drop(sessions);
+        for _ in 0..count {
+            self.record("close", volume_id);
+        }
+        Ok(count)
     }
 
     async fn ensure_network_topology(

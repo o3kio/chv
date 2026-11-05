@@ -3,6 +3,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use chv_observability::HTTP_REQUEST_DURATION_SECONDS;
 use std::time::Instant;
 
 /// Label used for API-prefixed requests that matched no route. A single
@@ -41,7 +42,7 @@ pub async fn track_metrics(req: Request, next: Next) -> Response {
     metrics::counter!("http_requests_total", "method" => method.clone(), "status" => status)
         .increment(1);
     metrics::histogram!(
-        "http_request_duration_seconds",
+        HTTP_REQUEST_DURATION_SECONDS,
         "method" => method,
         "path" => path
     )

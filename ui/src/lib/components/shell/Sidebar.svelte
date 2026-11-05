@@ -127,7 +127,7 @@
       </div>
       <div class="min-w-0">
         <div class="text-xs font-semibold text-white truncate">Administrator</div>
-        <div class="text-[10px] text-[var(--color-neutral-500)] truncate">chv-v0.3.0-alpha</div>
+        <div class="text-[10px] text-[var(--color-neutral-500)] truncate">chv-v0.4.0-alpha</div>
       </div>
     </div>
   </div>

@@ -4,11 +4,19 @@ use control_plane_node_api::control_plane_node_api as proto;
 use std::sync::Arc;
 use tonic::transport::Channel;
 
+/// In-memory TLS identity material used while building a client.
+struct PemIdentity {
+    certificate_pem: Vec<u8>,
+    private_key_pem: Vec<u8>,
+    ca_pem: Option<Vec<u8>>,
+}
+
 pub struct ControlPlaneClient {
     reconcile: proto::reconcile_service_client::ReconcileServiceClient<Channel>,
     telemetry: proto::telemetry_service_client::TelemetryServiceClient<Channel>,
     inventory: proto::inventory_service_client::InventoryServiceClient<Channel>,
     monitoring: proto::monitoring_service_client::MonitoringServiceClient<Channel>,
+    enrollment: proto::enrollment_service_client::EnrollmentServiceClient<Channel>,
 }
 
 impl ControlPlaneClient {
@@ -19,6 +27,65 @@ impl ControlPlaneClient {
         ca_cert_path: Option<&std::path::Path>,
     ) -> Result<Self, ChvError> {
         let endpoint_str: String = endpoint.into();
+        let identity = if endpoint_str.starts_with("https://") {
+            match (tls_cert_path, tls_key_path) {
+                (Some(cert), Some(key)) => {
+                    let cert_pem = tokio::fs::read(cert).await.map_err(|e| ChvError::Io {
+                        path: cert.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                    let key_pem = tokio::fs::read(key).await.map_err(|e| ChvError::Io {
+                        path: key.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+                    let ca_pem = match ca_cert_path {
+                        Some(ca) => Some(tokio::fs::read(ca).await.map_err(|e| ChvError::Io {
+                            path: ca.to_string_lossy().to_string(),
+                            source: e,
+                        })?),
+                        None => None,
+                    };
+                    Some(PemIdentity {
+                        certificate_pem: cert_pem,
+                        private_key_pem: key_pem,
+                        ca_pem,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Self::connect(endpoint_str, identity).await
+    }
+
+    /// Build a client from already-loaded identity material.
+    ///
+    /// Used by first-enrollment bootstrap reporting: when persisting the newly
+    /// issued certificate/key fails, the agent still holds the issued identity
+    /// in memory and must use it for the failure report rather than fall back
+    /// to the pre-enrollment certificate.
+    pub async fn new_with_pem(
+        endpoint: impl Into<String>,
+        certificate_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        ca_pem: Option<Vec<u8>>,
+    ) -> Result<Self, ChvError> {
+        Self::connect(
+            endpoint.into(),
+            Some(PemIdentity {
+                certificate_pem,
+                private_key_pem,
+                ca_pem,
+            }),
+        )
+        .await
+    }
+
+    async fn connect(
+        endpoint_str: String,
+        identity: Option<PemIdentity>,
+    ) -> Result<Self, ChvError> {
         let is_https = endpoint_str.starts_with("https://");
         // Extract hostname from endpoint for TLS SNI verification
         let domain = endpoint_str
@@ -36,24 +103,15 @@ impl ControlPlaneClient {
         })?;
 
         if is_https {
-            if let (Some(cert), Some(key)) = (tls_cert_path, tls_key_path) {
-                let cert_pem = tokio::fs::read(cert).await.map_err(|e| ChvError::Io {
-                    path: cert.to_string_lossy().to_string(),
-                    source: e,
-                })?;
-                let key_pem = tokio::fs::read(key).await.map_err(|e| ChvError::Io {
-                    path: key.to_string_lossy().to_string(),
-                    source: e,
-                })?;
-                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+            if let Some(identity_pem) = identity {
+                let identity = tonic::transport::Identity::from_pem(
+                    identity_pem.certificate_pem,
+                    identity_pem.private_key_pem,
+                );
                 let mut tls = tonic::transport::ClientTlsConfig::new()
                     .domain_name(&domain)
                     .identity(identity);
-                if let Some(ca) = ca_cert_path {
-                    let ca_pem = tokio::fs::read(ca).await.map_err(|e| ChvError::Io {
-                        path: ca.to_string_lossy().to_string(),
-                        source: e,
-                    })?;
+                if let Some(ca_pem) = identity_pem.ca_pem {
                     tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(ca_pem));
                 }
                 endpoint = endpoint.tls_config(tls).map_err(|e| {
@@ -88,8 +146,48 @@ impl ControlPlaneClient {
             inventory: proto::inventory_service_client::InventoryServiceClient::new(
                 channel.clone(),
             ),
-            monitoring: proto::monitoring_service_client::MonitoringServiceClient::new(channel),
+            monitoring: proto::monitoring_service_client::MonitoringServiceClient::new(
+                channel.clone(),
+            ),
+            enrollment: proto::enrollment_service_client::EnrollmentServiceClient::new(channel),
         })
+    }
+
+    /// Report the result of first-enrollment bootstrap.
+    ///
+    /// This RPC is served by the enrollment service but is deliberately
+    /// exposed on the steady-state client so first enrollment can report on
+    /// the *issued* node identity after the cache has been updated (#709).
+    pub async fn report_bootstrap_result(
+        &mut self,
+        meta: proto::RequestMeta,
+        node_id: &str,
+        bootstrap_status: &str,
+        message: &str,
+    ) -> Result<(), ChvError> {
+        let req = proto::ReportBootstrapResultRequest {
+            meta: Some(meta),
+            node_id: node_id.to_string(),
+            bootstrap_status: bootstrap_status.to_string(),
+            message: message.to_string(),
+        };
+        let resp = self
+            .enrollment
+            .report_bootstrap_result(req)
+            .await
+            .map_err(|e| ChvError::ControlPlaneUnavailable {
+                reason: e.to_string(),
+            })?;
+        let inner = resp.into_inner();
+        let result = inner.result.ok_or_else(|| ChvError::Internal {
+            reason: "missing result meta".to_string(),
+        })?;
+        if result.status != "ok" {
+            return Err(ChvError::ControlPlaneUnavailable {
+                reason: result.human_summary,
+            });
+        }
+        Ok(())
     }
 
     /// Ingest one node metric batch (campaign #602 PR-2). Purely
