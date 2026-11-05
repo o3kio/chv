@@ -4,6 +4,13 @@ use control_plane_node_api::control_plane_node_api as proto;
 use std::sync::Arc;
 use tonic::transport::Channel;
 
+/// In-memory TLS identity material used while building a client.
+struct PemIdentity {
+    certificate_pem: Vec<u8>,
+    private_key_pem: Vec<u8>,
+    ca_pem: Option<Vec<u8>>,
+}
+
 pub struct ControlPlaneClient {
     reconcile: proto::reconcile_service_client::ReconcileServiceClient<Channel>,
     telemetry: proto::telemetry_service_client::TelemetryServiceClient<Channel>,
@@ -38,7 +45,11 @@ impl ControlPlaneClient {
                         })?),
                         None => None,
                     };
-                    Some((cert_pem, key_pem, ca_pem))
+                    Some(PemIdentity {
+                        certificate_pem: cert_pem,
+                        private_key_pem: key_pem,
+                        ca_pem,
+                    })
                 }
                 _ => None,
             }
@@ -62,14 +73,18 @@ impl ControlPlaneClient {
     ) -> Result<Self, ChvError> {
         Self::connect(
             endpoint.into(),
-            Some((certificate_pem, private_key_pem, ca_pem)),
+            Some(PemIdentity {
+                certificate_pem,
+                private_key_pem,
+                ca_pem,
+            }),
         )
         .await
     }
 
     async fn connect(
         endpoint_str: String,
-        identity: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)>,
+        identity: Option<PemIdentity>,
     ) -> Result<Self, ChvError> {
         let is_https = endpoint_str.starts_with("https://");
         // Extract hostname from endpoint for TLS SNI verification
@@ -88,12 +103,15 @@ impl ControlPlaneClient {
         })?;
 
         if is_https {
-            if let Some((cert_pem, key_pem, ca_pem)) = identity {
-                let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+            if let Some(identity_pem) = identity {
+                let identity = tonic::transport::Identity::from_pem(
+                    identity_pem.certificate_pem,
+                    identity_pem.private_key_pem,
+                );
                 let mut tls = tonic::transport::ClientTlsConfig::new()
                     .domain_name(&domain)
                     .identity(identity);
-                if let Some(ca_pem) = ca_pem {
+                if let Some(ca_pem) = identity_pem.ca_pem {
                     tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(ca_pem));
                 }
                 endpoint = endpoint.tls_config(tls).map_err(|e| {
