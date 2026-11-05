@@ -458,9 +458,19 @@ grep -q 'no `/dev/kvm`' "$fresh_report" \
 grep -q 'not a bare-metal host and not a cloud VM' "$fresh_report" \
     && pass "fresh-host report refuses the bare-metal/cloud-VM claim" \
     || fail "fresh-host report overstates the container as a real host"
-grep -q '_pending_' "$fresh_report" \
-    && pass "fresh-host evidence template keeps unexecuted results pending" \
-    || fail "fresh-host evidence template looks pre-filled with results"
+# The report is evidence only after the post-publication run; it must be
+# filled from a green artifact, not left as a template.
+if grep -q '_pending_' "$fresh_report"; then
+    fail "fresh-host evidence report is still a pending template"
+else
+    pass "fresh-host evidence report is filled from the qualification run"
+fi
+grep -q 'Fresh-host qualification: PASS' "$fresh_report" \
+    && pass "fresh-host evidence report records a passing run" \
+    || fail "fresh-host evidence report does not record a passing run"
+grep -q 'actions/runs/[0-9]\+' "$fresh_report" \
+    && pass "fresh-host evidence report links the qualification run" \
+    || fail "fresh-host evidence report has no run link"
 
 # The in-container marker and the host-side assertion are one contract; a
 # wording change on either side silently makes the leg unable to pass.

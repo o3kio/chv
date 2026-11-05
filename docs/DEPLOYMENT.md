@@ -173,12 +173,16 @@ in the install output. You will be required to change it on first login.
 
 ## Quick Install (single command, from GitHub releases)
 
-> **Deployment status:** [CODE-SUPPORTED, UNQUALIFIED]. This path has no
-> qualification leg yet — no m4.x campaign or container smoke test
-> exercises it. It shares install.sh's conventions (users, `/etc/chv`
-> layout, systemd units, chown discipline) but rides the #447
-> package-serving shape. `scripts/install.sh` remains the qualified
-> deployment path.
+> **Deployment status:** [CONTAINER-VERIFIED]. The fresh-host qualification
+> lane (run
+> [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140))
+> installed the published `v0.4.0-rc.1` release with this one-liner in a clean
+> Ubuntu noble container and asserted bring-up, login, enrollment, WebUI and
+> metrics (all four legs green; see the
+> [evidence report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md)).
+> The container shares the host kernel/network namespace and has no `/dev/kvm`,
+> so this is not bare-metal evidence. `scripts/install.sh` remains the
+> qualified (KVM-verified) deployment path.
 
 A curl-pipe-bash installer for trying CHV on a fresh Linux host — one
 command yields the control plane with the WebUI served by the binary
@@ -266,12 +270,15 @@ After it completes, open `http://<host-ip>:8080/` and log in as
 
 ### Tier-label gate
 
-The label stays [CODE-SUPPORTED, UNQUALIFIED] until this path's own
-qualification leg passes — the fresh-host end-to-end smoke tracked in
-#556 (run the one-liner on a clean Linux host and assert package
-install, config generation, service bring-up, agent enrollment, and
-WebUI serving), in the same gate shape as the container package-smoke
-leg that ran in #549 (2026-10-08).
+The label moved [CODE-SUPPORTED, UNQUALIFIED] → [CONTAINER-VERIFIED] when the
+fresh-host end-to-end smoke tracked in #556 passed: the published one-liner
+was run on a clean Ubuntu noble container and asserted package install,
+config generation, service bring-up, agent enrollment, WebUI serving, and all
+four `/metrics` listeners (run
+[42042149140](https://github.com/o3kio/chv/actions/runs/42042149140), tag
+`v0.4.0-rc.1`). This is the same gate shape as the container package-smoke leg
+that ran in #549 (2026-10-08). The scope is the container contract — not
+bare-metal behavior and not guest execution.
 
 ---
 
