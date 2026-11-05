@@ -23,7 +23,7 @@ info "Checking for packages in ${PKGDIR}..."
 # ---------------------------------------------------------------------------
 # 1. Package files were produced
 # ---------------------------------------------------------------------------
-for pkg in chvctl chv-controlplane chv-node; do
+for pkg in chvctl chv-controlplane chv-node chv-monitor-agent; do
     deb_count=$(find "$PKGDIR" -maxdepth 1 -name "${pkg}_*.deb" | wc -l)
     rpm_count=$(find "$PKGDIR" -maxdepth 1 -name "${pkg}-*.rpm" | wc -l)
 

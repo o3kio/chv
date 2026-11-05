@@ -260,6 +260,7 @@ jobs:
             target/release/chvctl
             target/release/chv-agent
             target/release/chv-controlplane
+            target/release/chv-monitor-agent
             target/release/chv-nwd
             target/release/chv-stord
 
@@ -323,6 +324,7 @@ jobs:
           chmod +x target/release/chvctl \
                   target/release/chv-agent \
                   target/release/chv-controlplane \
+                  target/release/chv-monitor-agent \
                   target/release/chv-nwd \
                   target/release/chv-stord
 
