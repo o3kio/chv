@@ -780,10 +780,13 @@ dependencies = [
  "chv-monitoring-store",
  "chv-observability",
  "control-plane-node-api",
+ "rcgen",
  "rustls",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
  "uuid",
 ]
