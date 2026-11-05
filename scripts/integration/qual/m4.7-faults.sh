@@ -87,9 +87,9 @@
 #       a VM whose create is still in flight → converges to absence
 #       with no orphaned disk/tap; final global sweep: zero CH
 #       processes, zero tap- interfaces, disk row ↔ physical volume
-#       bijection, no stord session still attached to a VM (detached
-#       open sessions for VMs created before the agent restart are the
-#       documented M2.2a handle-persistence residual, recorded not gated),
+#       bijection, no stord session still attached to a VM (post-#711 the
+#       delete path sweeps detached rows, so a leftover detached session
+#       is an unexpected residual, warned not gated),
 #       every journaled op terminal, exactly one CreateVm op row per
 #       created VM.
 #

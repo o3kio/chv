@@ -1054,7 +1054,7 @@ else
     fi
 fi
 printf '%s\n' "$PREVIOUS_VERSION" > /var/lib/chv/fresh-host-upgrade-marker
-chv_sqlite() { runuser -u chv -- sqlite3 "$@"; }
+chv_sqlite() { runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$@"; }
 PROBE_USER="fresh-host-upgrade-probe"
 PROBE_ID="00000000-0000-0000-0000-000000000066"
 probe_pw="$(openssl rand -hex 12)"
@@ -1122,9 +1122,13 @@ rc=$?
 record "RERUN_RC=$rc"
 UPGRADED=0
 if [ "$rc" -eq 0 ]; then
-    ok "candidate install.sh upgraded in place (rc=0)"
-    UPGRADED=1
-    check_state_preserved "after-tarball-upgrade"
+    # The previous release left a database and VM state in place (the leg
+    # just seeded both), so the candidate installer must refuse. rc=0 means
+    # the documented fail-closed guard regressed; an in-place tarball
+    # "upgrade" is a contract violation, not a pass.
+    bad "candidate install.sh re-ran over persistent data (rc=0) — the documented fail-closed guard did not fire"
+    tail -n 30 /var/fresh-host-candidate-rerun.log >>"$OUT"
+    finish
 elif grep -q 'Persistent CHV data exists' /var/fresh-host-candidate-rerun.log; then
     ok "candidate install.sh fail-closed on persistent data (documented guard)"
     record "RERUN_GUARD=persistent-data"
@@ -1206,10 +1210,17 @@ else
 fi
 if [ "$QUICK_VERSION" = "$CANDIDATE_VERSION" ]; then
     # A manual run may point the quick leg at the candidate itself; only a
-    # different (older) release may use the weaker previous-mode assertion.
+    # strictly older release may use the weaker previous-mode assertion.
     check_bringup
-else
+elif [ "$(printf '%s\n%s\n' "$QUICK_VERSION" "$CANDIDATE_VERSION" | sort -V | head -1)" = "$QUICK_VERSION" ]; then
+    # QUICK_VERSION sorts strictly before the candidate: a previous release,
+    # whose dedicated-key path logs nothing, so only the absence of the
+    # fallback warning can be asserted.
     check_bringup previous
+else
+    # Newer than the candidate (manual misuse): assert the full candidate
+    # contract rather than silently weakening it.
+    check_bringup
 fi
 check_binaries_version "$QUICK_VERSION" ""
 finish

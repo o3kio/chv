@@ -123,9 +123,10 @@ container constraints, then creates identifiable state:
 
 Then re-runs the candidate `install.sh` over that state. Current `install.sh`
 deliberately fails closed on persistent data (`Persistent CHV data exists`),
-so the leg asserts that guard preserves every artifact above. It then applies
-the documented package upgrade path (`dpkg --force-confold -i` + `apt-get
-install -f`), restarts the services and re-asserts:
+so the leg asserts that guard preserves every artifact above. A candidate
+re-run that returns `rc=0` is recorded as a failure — the guard did not fire.
+It then applies the documented package upgrade path (`dpkg --force-confold -i`
++ `apt-get install -f`), restarts the services and re-asserts:
 
 - candidate binaries report the candidate version/commit;
 - the four units are `active/running` with zero restarts;
