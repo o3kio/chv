@@ -16,18 +16,19 @@ what to alert on, and how to investigate incidents.
 | `chv-nwd` | `/metrics` on a dedicated metrics listener | `metrics_bind`; code default `127.0.0.1:9102` |
 | `chv-webui-bff` | served on the `chv-controlplane` HTTP listener | via the control plane's HTTP routes, not a separate scrape target |
 
-`chv-controlplane`, `chv-stord`, and `chv-nwd` render the real process
-registry on their dedicated listener: every `metrics` counter and histogram the
-daemon records, plus build/process series (`chv_build_info`,
-`process_start_time_seconds`, `chv_process_uptime_seconds`). It is not a
-placeholder or a static page.
+`chv-controlplane`, `chv-stord`, `chv-nwd`, and `chv-agent` render the real
+process registry on their dedicated listener: every `metrics` counter and
+histogram the daemon records. The control plane, stord, and nwd listeners also
+add build/process series (`chv_build_info`, `process_start_time_seconds`,
+`chv_process_uptime_seconds`). It is not a placeholder or a static page.
 
-`chv-agent` has a **separate, older endpoint**: it hand-rolls its exposition
-(`chv_agent_*`, journal/monitoring counters) rather than rendering the shared
-process registry, and it does not emit the `chv_build_info` /
-`process_start_time_seconds` / `chv_process_uptime_seconds` preamble. Its
-metric vocabulary and labels are unchanged by #657; unifying the agent with the
-shared renderer is deferred to a follow-up.
+`chv-agent` keeps its historical hand-built exposition (`chv_agent_*`,
+journal/monitoring counters) and appends the process registry to it, so the
+agent's VM lifecycle series (`chv_vm_ops_total`, `chv_vm_op_duration_seconds`)
+are scrapeable from `:9901`. The agent endpoint does not emit the
+`chv_build_info` / `process_start_time_seconds` /
+`chv_process_uptime_seconds` preamble. Its hand-built metric vocabulary and
+labels are unchanged by #657.
 
 ### Scrape authentication model
 
@@ -71,17 +72,6 @@ changes it. The packages and `scripts/install.sh` leave the HTTP listener on
 
 SLIs are the measurable properties we use to assess service health. Each SLI is expressed
 as a PromQL expression that can be evaluated continuously.
-
-### Availability caveat (#702)
-
-> **Availability caveat ([#702](https://github.com/o3kio/chv/issues/702)).**
-> SLI-1 and SLI-2 are backed by `chv_vm_ops_total` /
-> `chv_vm_op_duration_seconds`. The shipped agent records those samples into
-> the global Prometheus registry but its `:9901` handler renders only the
-> hand-built `chv_agent_*` families, so packaged agents expose neither series.
-> Until #702 lands, SLI-1/SLI-2 have no data from agent scrapes and
-> `VmStartLatencyHighP99` / `VmOpFailureRateHigh` cannot fire. The
-> journal-based diagnosis in their runbooks works today.
 
 ### SLI-1: VM start latency (p99)
 
@@ -193,9 +183,8 @@ check the recording rules (`chv:*:5m`) to see whether you are on track to exhaus
 
 ### VM lifecycle (`chv-agent-runtime-ch`)
 
-**Not exported by the shipped agent yet — see [SLI availability caveat](#availability-caveat-702)
-and [#702](https://github.com/o3kio/chv/issues/702).** The rows below describe
-the series' shape once the exporter renders the global registry.
+Exported by the agent's `/metrics` endpoint from the global process registry
+(see [Metrics endpoints](#metrics-endpoints)).
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
