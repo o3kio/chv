@@ -258,4 +258,88 @@ grep -q 'rm -rf -- "\$evidence_src"' "${QUAL}/nightly-run.sh" \
     && pass "nightly lane clears per-run scenario evidence" \
     || fail "nightly lane mixes evidence from previous runs"
 
+# ---------------------------------------------------------------------------
+# 6. fresh-host lane (#666 install/upgrade/uninstall + #556 quick-install)
+# ---------------------------------------------------------------------------
+# The gate is demonstrated by one driver, one workflow, and one evidence
+# template. These guards keep the lane from silently losing a leg, floating
+# the quick-install ref, or overstating the container as bare metal.
+fresh="${QUAL}/fresh-host.sh"
+fresh_workflow="${REPO_ROOT}/.github/workflows/fresh-host-qualification.yml"
+fresh_report="${REPO_ROOT}/docs/evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md"
+
+if [ -x "$fresh" ]; then
+    pass "fresh-host driver exists and is executable"
+else
+    fail "fresh-host driver is missing or not executable: ${fresh}"
+fi
+
+grep -q 'INSTALL_CHV_TARBALL_PATH=' "$fresh" \
+    && pass "fresh-host install leg uses a candidate tarball path" \
+    || fail "fresh-host install leg no longer drives INSTALL_CHV_TARBALL_PATH"
+for guard in INSTALL_CHV_NO_SEED=1 INSTALL_CHV_NO_BRIDGE=1; do
+    grep -q "$guard" "$fresh" \
+        && pass "fresh-host sets ${guard} (container constraints)" \
+        || fail "fresh-host lost ${guard}"
+done
+
+grep -q 'Persistent CHV data exists' "$fresh" \
+    && pass "fresh-host upgrade leg asserts the persistent-data fail-closed guard" \
+    || fail "fresh-host may silently overwrite persistent state on upgrade"
+grep -q 'PACKAGE_UPGRADE_RC' "$fresh" \
+    && pass "fresh-host upgrade leg exercises the package upgrade path" \
+    || fail "fresh-host has no supported in-place upgrade path with --packages"
+
+grep -q 'main|master|HEAD|latest' "$fresh" \
+    && pass "fresh-host refuses floating quick-install refs" \
+    || fail "fresh-host no longer rejects a floating quick-install ref"
+grep -Fq 'QUICK_REF="${QUICK_REF:-}"' "$fresh" \
+    && pass "fresh-host has no default quick-install ref" \
+    || fail "fresh-host could default to a floating quick-install ref"
+grep -q 'raw.githubusercontent.com/.*scripts/quick-install.sh' "$fresh" \
+    && pass "fresh-host fetches quick-install.sh at the pinned ref" \
+    || fail "fresh-host does not fetch the pinned quick-install.sh"
+
+grep -q 'results.tsv' "$fresh" \
+    && pass "fresh-host writes the required results.tsv marker" \
+    || fail "fresh-host no longer writes results.tsv"
+grep -q 'UNINSTALL_RESIDUE=' "$fresh" \
+    && pass "fresh-host records uninstall residue instead of passing it" \
+    || fail "fresh-host hides install.sh-layout uninstall residue"
+
+[ -f "$fresh_workflow" ] \
+    && pass "fresh-host workflow exists" \
+    || fail "fresh-host workflow is missing"
+grep -q 'workflow_dispatch' "$fresh_workflow" \
+    && pass "fresh-host workflow is manually dispatched" \
+    || fail "fresh-host workflow is not manually dispatched"
+grep -Fq '[self-hosted, linux, x64, chv-kvm]' "$fresh_workflow" \
+    && pass "fresh-host workflow targets the self-hosted chv-kvm fleet" \
+    || fail "fresh-host workflow lost the self-hosted runner labels"
+grep -q 'gh release download' "$fresh_workflow" \
+    && pass "fresh-host workflow downloads the previous release" \
+    || fail "fresh-host workflow does not stage the previous release"
+grep -q 'results.tsv' "$fresh_workflow" \
+    && pass "fresh-host workflow requires the results marker" \
+    || fail "fresh-host workflow does not require results.tsv"
+grep -q 'if-no-files-found: error' "$fresh_workflow" \
+    && pass "fresh-host workflow fails when results.tsv is missing" \
+    || fail "fresh-host workflow tolerates a missing results marker"
+
+[ -f "$fresh_report" ] \
+    && pass "fresh-host evidence template exists" \
+    || fail "fresh-host evidence template is missing"
+grep -q 'shares the \*\*host kernel\*\*' "$fresh_report" \
+    && pass "fresh-host report labels the shared host kernel honestly" \
+    || fail "fresh-host report does not disclose the shared host kernel"
+grep -q 'no `/dev/kvm`' "$fresh_report" \
+    && pass "fresh-host report discloses the missing /dev/kvm" \
+    || fail "fresh-host report hides the missing /dev/kvm"
+grep -q 'not a bare-metal host and not a cloud VM' "$fresh_report" \
+    && pass "fresh-host report refuses the bare-metal/cloud-VM claim" \
+    || fail "fresh-host report overstates the container as a real host"
+grep -q '_pending_' "$fresh_report" \
+    && pass "fresh-host evidence template keeps unexecuted results pending" \
+    || fail "fresh-host evidence template looks pre-filled with results"
+
 exit "$rc"
