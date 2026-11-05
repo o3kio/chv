@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns remain enrollment-time values and have no readers; the code records
   that boundary.
 
+### Qualification
+- **Harness-only corrections (no product behavior).** The qualification
+  deploy leg now asserts the first-enrollment `node_bootstrap_results` row
+  (`success = 1` on the issued identity, #709), and the m4.8
+  metric-cardinality verdict compares the post-first-lifecycle warm sample
+  to the at-rest sample. The #702 registry families are fixed-label and
+  materialize on first use, so the old pre-work baseline counted that
+  one-time jump as unbounded growth. The absolute cap (≤ 200 series) is
+  retained.
+- The full real-KVM lane (m4.3–m4.8) is green on the rc.2 product+harness
+  tree in run
+  [42067288852](https://github.com/o3kio/chv/actions/runs/42067288852);
+  the deploy leg recorded the #709 bootstrap result row and the m4.7 F7
+  sweep recorded zero live stord sessions (#711). The tag adds
+  documentation only on top of the run tree.
+
 ## [0.4.0-rc.1] - 2026-11-05
 
 ### Fixed

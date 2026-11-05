@@ -500,12 +500,12 @@ is not supported.
 | Multi-host | **Unsupported/absent.** Control-plane→agent dispatch is a Unix-socket path; the agent has no TCP gRPC listener. ADR-029 is accepted as design but **not implemented**. | §3.3, §5 UC-6; [ADR-029](specs/adr/029-multi-host-dispatch.md) |
 | Volvisor | **Design-only.** ADR-028 selects Volvisor as the future storage authority; runtime integration is pending (pin/contract work upstream). The qualified storage path remains `chv-stord`. | [ADR-028](specs/adr/028-volvisor-storage-orchestration.md) |
 | Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" and labels it an **unevidenced recommendation**. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; [DEPLOYMENT.md](DEPLOYMENT.md) Prerequisites; ADR-011 |
-| Qualification status | The full real-KVM lane (m4.3–m4.8) is green on **run 41938443045** (`e82d49a1`); this closes #659's execution-evidence condition. The release candidate `v0.4.0-rc.1` (`c25360a8`) adds CI- and fresh-host-verified packaging/installer fixes on top of `e82d49a1`; the real-KVM lane was not re-run on the RC. #666's fresh-host demonstration passed on the RC in a clean container (run [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140)), which is [CONTAINER-VERIFIED], not bare metal; #556's published quick installer passed in the same run. | [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §4–§5; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md) |
+| Qualification status | The full real-KVM lane (m4.3–m4.8) is green on **run 41938443045** (`e82d49a1`) and on the `v0.4.0-rc.1` lineage (`c25360a8`) in **Stage A run 42055268623** for m4.3–m4.7. Stage A's m4.8 leg failed only the pre-#702 metric-cardinality baseline (the registry families materialize on first use); the harness verdict was corrected and the **rc.2 lane [42067288852](https://github.com/o3kio/chv/actions/runs/42067288852)** is green on the rc.2 product+harness tree (`c1effc71`; the tag adds docs only). #666's fresh-host demonstration passed on `v0.4.0-rc.1` in a clean container (run [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140)), which is [CONTAINER-VERIFIED], not bare metal; #556's published quick installer passed in the same run. The rc.2 post-publication fresh-host lane is run after publication and recorded in the living docs. | [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §4–§5; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md); Stage A run 42055268623 |
 
 **Pending:** Prompt 06 (reference deployment / field qualification) will add the
-first field-evidence tier and is not pre-claimed here. The published
-release support matrix ([release/v0.4.0-rc.1-support-matrix.md](release/v0.4.0-rc.1-support-matrix.md))
-carries the same claims with per-row evidence pointers; `v0.4.0-rc.1` is a
+first field-evidence tier and is not pre-claimed here. The current release
+support matrix ([release/v0.4.0-rc.2-support-matrix.md](release/v0.4.0-rc.2-support-matrix.md))
+carries the same claims with per-row evidence pointers; `v0.4.0-rc.2` is a
 pre-release, not a stable support announcement.
 
 ## 8. Open design decisions
@@ -583,19 +583,25 @@ found it.
   handler returns, so a crash between commit and insert can leave a mutation
   unrecorded. The mTLS-interceptor denials (missing, unparseable, or revoked
   certificate) write no audit row at all. Tracked in #706.
-- **#709 — fixed after the qualified candidate `e82d49a1`.** In that
-  candidate the first-enrollment `ReportBootstrapResult` is sent on the
-  pre-enrollment certificate and rejected by the peer-node-id check, so a
-  fresh install does not record bootstrap success and audits a spurious
-  denial. The fix (report on the issued node identity) is on the
-  v0.4.0-rc.1 branch and requires re-qualification before it can be claimed
-  for a release; until then this entry describes the qualified tree.
-- **#711 — fixed after the qualified candidate `e82d49a1`.** In that
-  candidate a VM created before an agent restart is detached but its stord
-  session cannot be closed (the M2.2a residual). The fix (mark detached
-  sessions and close them after detach) is on the v0.4.0-rc.1 branch and
-  requires re-qualification; no VM remains attached and the backing is
-  retained under M2.5 in either case. Sessions orphaned by a crash on a
+- **#709 — fixed in the rc.2 build.** In the `e82d49a1` candidate the
+  first-enrollment `ReportBootstrapResult` was sent on the pre-enrollment
+  certificate and rejected by the peer-node-id check, so a fresh install did
+  not record bootstrap success and audited a spurious denial. The fix
+  reports the result on the issued node identity. The rc.2 qualification
+  deploy leg now asserts `node_bootstrap_results.success = 1` for the node
+  after first enrollment (run
+  [42067288852](https://github.com/o3kio/chv/actions/runs/42067288852));
+  Stage A (`c25360a8`) exercised
+  enrollment but did not yet assert the row.
+- **#711 — fixed in the rc.2 build.** In the `e82d49a1` candidate a VM
+  created before an agent restart was detached but its stord session could
+  not be closed (the M2.2a residual). The fix marks the session `detached`
+  and closes it after detach. The rc.2 lane's F7 leg deletes a base VM
+  created before an agent restart and asserts zero live stord sessions (run
+  [42067288852](https://github.com/o3kio/chv/actions/runs/42067288852));
+  Stage A recorded the same zero-session result on `c25360a8`. No VM remains
+  attached and the backing is retained under M2.5 in either case. Sessions
+  orphaned by a crash on a
   **pre-upgrade** stord (the old detach left `runtime_status = "open"`) are
   not reclaimed by the VM-delete sweep, because they are indistinguishable from
   a live opened-but-attach-pending session; `DeleteVolume` closes every session
