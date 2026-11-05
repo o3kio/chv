@@ -364,4 +364,36 @@ mod tests {
         // A backwards wall-clock jump must not produce a negative start time.
         assert_eq!(process_start_unix(5.0, 10.0), 0.0);
     }
+
+    /// The gRPC and BFF HTTP recording rules read `_bucket` series, so those
+    /// histograms must render as real histograms rather than summaries.
+    #[test]
+    fn rule_backed_duration_histograms_render_buckets() {
+        crate::install_prometheus_recorder().expect("install prometheus recorder");
+        metrics::histogram!(
+            crate::CHV_GRPC_SERVER_DURATION_SECONDS,
+            "service" => "test.Service",
+            "method" => "Call",
+            "grpc_status" => "OK"
+        )
+        .record(0.012);
+        metrics::histogram!(
+            "http_request_duration_seconds",
+            "method" => "GET",
+            "path" => "/test"
+        )
+        .record(0.02);
+
+        let text = crate::prometheus_handle()
+            .expect("recorder installed")
+            .render();
+        assert!(
+            text.contains("chv_grpc_server_duration_seconds_bucket"),
+            "gRPC duration must render as a histogram, got:\n{text}"
+        );
+        assert!(
+            text.contains("http_request_duration_seconds_bucket"),
+            "HTTP duration must render as a histogram, got:\n{text}"
+        );
+    }
 }
