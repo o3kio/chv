@@ -438,9 +438,8 @@ download_and_verify() {
     done <<< "$assets"
 
     # Checksum verification, fail closed on any mismatch or missing entry.
-    # - packages: the release's SHA256SUMS (covers the .deb/.rpm set; note it
-    #   also covers stray 0.0.1 lifecycle-test packages the release job
-    #   sweeps up — we match EXACT filenames, never a glob)
+    # - packages: the release's SHA256SUMS (covers exactly the three package
+    #   files installed here; the release pipeline publishes one version)
     # - tarball: the .tar.gz.sha256 sidecar
     # The SHA256SUMS file is GPG/cosign-signed by the release pipeline when
     # signing keys are configured, but no signature asset is published on
@@ -450,10 +449,8 @@ download_and_verify() {
     case "$PKG_KIND" in
         deb|rpm)
             # Exact per-name field matching (awk '$2 == n'), never a regex:
-            # '.' in a pattern matches any character, and the release's
-            # SHA256SUMS also lists stray 0.0.1 lifecycle-test packages
-            # whose names differ from ours only in digits — matching must
-            # be unambiguous. Fail-closed: exactly three entries required.
+            # '.' in a pattern matches any character, so matching must be
+            # unambiguous. Fail-closed: exactly three entries required.
             local name count
             : > "${WORK_DIR}/local-SHA256SUMS"
             while IFS= read -r name; do
