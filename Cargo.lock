@@ -1346,6 +1346,7 @@ dependencies = [
  "chv-monitoring-core",
  "chv-monitoring-store",
  "chv-netbox-adapter",
+ "chv-observability",
  "chv-webui-bff",
  "chv-webui-bff-api",
  "hex",

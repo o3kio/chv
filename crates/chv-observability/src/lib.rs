@@ -57,14 +57,26 @@ const GRPC_SERVER_DURATION_BUCKETS: &[f64] = &[
 /// The BFF's HTTP request-duration histogram, registered by
 /// `chv-webui-bff::metrics_middleware` in the control-plane process.
 /// `monitoring/rules/recording.yml` reads its `_bucket` series.
-const HTTP_REQUEST_DURATION_SECONDS: &str = "http_request_duration_seconds";
+/// The BFF records this histogram (`crates/chv-webui-bff/src/metrics_middleware.rs`);
+/// the bucket override below must match the same series the recording rules
+/// read. Exported so the producer and the matcher cannot drift (#702 review).
+pub const HTTP_REQUEST_DURATION_SECONDS: &str = "http_request_duration_seconds";
 const HTTP_REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
 /// Configure one histogram's buckets without giving up the builder on the
-/// (impossible, because every call passes a non-empty constant) error path.
+/// error path. `set_buckets_for_metric` consumes the builder and rejects only
+/// an empty bucket list, so check that first: a later empty list must not
+/// discard the overrides already applied by earlier calls (#702 review).
 fn with_buckets(builder: PrometheusBuilder, metric: &str, buckets: &[f64]) -> PrometheusBuilder {
+    if buckets.is_empty() {
+        tracing::error!(
+            metric,
+            "empty duration buckets; exporting the histogram as a summary"
+        );
+        return builder;
+    }
     match builder.set_buckets_for_metric(Matcher::Full(metric.to_string()), buckets) {
         Ok(builder) => builder,
         Err(error) => {

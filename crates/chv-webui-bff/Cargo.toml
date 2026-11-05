@@ -30,6 +30,9 @@ chv-common = { path = "../chv-common" }
 # PR 1's DEFAULT_BACKEND_CLASS lives next to, so the BFF never hardcodes
 # a second copy.
 chv-hypervisor-api = { path = "../chv-hypervisor-api" }
+# The HTTP duration histogram name is shared with the recorder's bucket
+# override so the producer and matcher cannot drift (#702 review).
+chv-observability = { path = "../chv-observability" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
