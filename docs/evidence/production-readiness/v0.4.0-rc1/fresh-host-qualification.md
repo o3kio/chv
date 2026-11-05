@@ -13,7 +13,10 @@ covers the published one-line quick installer.
 run). The RC release tag is `v0.4.0-rc.1`; the source `VERSION` file must hold
 the base `0.4.0` because `release.yml` takes the `rc.1` prerelease suffix from
 the tag — `scripts/version.sh` renders the package version `0.4.0~rc.1`, and
-the tarball is `chv-0.4.0-rc.1-linux-amd64.tar.gz`. **Commit:** `_pending_`.
+the eventual release tarball is `chv-0.4.0-rc.1-linux-amd64.tar.gz`. The lane
+itself builds from the bare `VERSION`, so its local candidate tarball is
+`chv-0.4.0-linux-amd64.tar.gz` and `--candidate-version` is `0.4.0`.
+**Commit:** `_pending_`.
 
 ---
 
