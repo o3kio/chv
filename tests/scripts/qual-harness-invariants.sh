@@ -570,6 +570,10 @@ for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.ym
     else
         pass "${wf_name} does not pipe a newline into the asset-version sanitizer"
     fi
+    grep -Fq 'case "$base" in' "$wf" \
+        && grep -Fq '*-"${ASSET_VERSION}"-*.rpm' "$wf" \
+        && pass "${wf_name} matches the staged version with delimiters" \
+        || fail "${wf_name} accepts a package version by prefix (rc.1 vs rc.10)"
 done
 
 # Release-note install snippets must name the published (sanitized) asset,

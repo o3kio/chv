@@ -166,11 +166,19 @@ jobs:
         run: |
           RAW_VERSION="$(./scripts/version.sh --deb)"
           ASSET_VERSION="$(printf '%s' "$RAW_VERSION" | tr -c 'A-Za-z0-9._-' '.')"
-          bad="$(find dist/packages -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) -printf '%f\n' \
-            | grep -vF -- "$ASSET_VERSION" || true)"
+          bad=""
+          for pkg in dist/packages/*.deb dist/packages/*.rpm; do
+            [ -e "$pkg" ] || continue
+            base="$(basename "$pkg")"
+            # Delimiter-aware: an rc.1 prefix must not accept rc.10.
+            case "$base" in
+              *_"${ASSET_VERSION}"_*.deb|*-"${ASSET_VERSION}"-*.rpm) ;;
+              *) bad="${bad}${base}"$'\n' ;;
+            esac
+          done
           if [ -n "$bad" ]; then
             echo "Refusing to publish package(s) that are not ${ASSET_VERSION}:" >&2
-            printf '%s\n' "$bad" >&2
+            printf '%s' "$bad" >&2
             exit 1
           fi
 
