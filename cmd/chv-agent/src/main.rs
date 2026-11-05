@@ -539,10 +539,11 @@ fn bootstrap_result_meta(
 
 /// Persist the newly issued identity and record it in the NodeCache.
 ///
-/// Returns `true` only when all three files were durably written. A partial
-/// write is treated as failure: the caller must not trust a half-written
-/// credential or mark enrollment complete, and must report the failure using
-/// the issued identity still held in memory.
+/// Returns `true` only when all three files and the NodeCache record were
+/// durably written. A partial write or a cache-save failure is treated as
+/// failure: the caller must not trust a half-written credential, must not
+/// mark enrollment complete, and must report the failure using the issued
+/// identity still held in memory.
 async fn persist_enrollment_material(
     config: &AgentConfig,
     cache: &mut NodeCache,
@@ -580,10 +581,14 @@ async fn persist_enrollment_material(
     cache.last_certificate_rotation_unix_ms = Some(now_unix_ms());
     cache.enrollment_complete = true;
     if let Err(e) = cache.save(&config.cache_path).await {
+        // The files are durable, but without the cache record a restart
+        // cannot know it enrolled (and the bootstrap token is single-use).
+        // Report failure rather than claiming durable enrollment.
         warn!(error = %e, "failed to save cache after enrollment");
-    } else {
-        info!(node_id = %issued.node_id, "enrollment complete");
+        cache.enrollment_complete = false;
+        return false;
     }
+    info!(node_id = %issued.node_id, "enrollment complete");
     true
 }
 
@@ -598,17 +603,15 @@ async fn persist_enrollment_material(
 /// When persisting the issued material failed, the issued certificate may not
 /// be on disk, but the response still holds it. Report the failure with that
 /// in-memory identity: it is the credential the control plane just issued for
-/// this node, and using it keeps the peer-node-id binding intact. Only if that
-/// identity cannot even be constructed do we fall back to the enrollment
-/// channel as a last resort; that fallback is expected to be rejected by the
-/// control plane's peer identity check, and we deliberately do not weaken it
-/// with a server-side exemption.
+/// this node, and using it keeps the peer-node-id binding intact. The
+/// pre-enrollment channel is deliberately not used as a fallback: the control
+/// plane's peer identity check rejects it, so attempting it would only add a
+/// misleading denied audit row.
 async fn report_enrollment_result(
     config: &AgentConfig,
     cache: &NodeCache,
     issued: &BootstrapResponse,
     persisted: bool,
-    enrollment_client: &mut EnrollmentClient,
 ) {
     let (status, message) = if persisted {
         ("ok", "bootstrap complete")
@@ -672,19 +675,16 @@ async fn report_enrollment_result(
                     .await
             }
             Err(e) => {
+                // The issued identity is the only channel the control plane
+                // will accept for this node. Do not fall back to the
+                // pre-enrollment certificate: it is guaranteed to be rejected
+                // and would leave a misleading denied audit row.
                 warn!(
                     error = %e,
                     "issued identity unusable for bootstrap failure report; \
-                     attempting the pre-enrollment channel"
+                     not attempting the pre-enrollment channel"
                 );
-                enrollment_client
-                    .report_bootstrap_result(
-                        bootstrap_result_meta(&issued.node_id),
-                        &issued.node_id,
-                        status,
-                        message,
-                    )
-                    .await
+                Err(e)
             }
         }
     };
@@ -933,14 +933,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let persisted =
                                         persist_enrollment_material(&config, &mut cache, &resp)
                                             .await;
-                                    report_enrollment_result(
-                                        &config,
-                                        &cache,
-                                        &resp,
-                                        persisted,
-                                        &mut client,
-                                    )
-                                    .await;
+                                    report_enrollment_result(&config, &cache, &resp, persisted)
+                                        .await;
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "enrollment failed");
@@ -2323,36 +2317,11 @@ mod tests {
         )
     }
 
-    async fn test_enrollment_client(
-        dir: &std::path::Path,
-        endpoint: &str,
-        ca_pem: &[u8],
-        cert_pem: &[u8],
-        key_pem: &[u8],
-    ) -> EnrollmentClient {
-        let cert_path = dir.join("enrollment-client.crt");
-        let key_path = dir.join("enrollment-client.key");
-        let ca_path = dir.join("enrollment-ca.crt");
-        std::fs::write(&cert_path, cert_pem).unwrap();
-        std::fs::write(&key_path, key_pem).unwrap();
-        std::fs::write(&ca_path, ca_pem).unwrap();
-        EnrollmentClient::connect_with_tls(
-            endpoint,
-            Some(&cert_path),
-            Some(&key_path),
-            Some(&ca_path),
-        )
-        .await
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn first_enrollment_reports_success_on_issued_identity() {
         let ca = enrollment_test_ca("test-ca");
         let (issued_cert, issued_key, issued_der) =
             issue_enrollment_test_leaf(&ca, "qual-node-1", false);
-        let (enrollment_cert, enrollment_key, _) =
-            issue_enrollment_test_leaf(&ca, "qual-enroll", false);
         let (endpoint, reports, shutdown) = spawn_mock_control_plane(&ca, issued_der).await;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2369,18 +2338,10 @@ mod tests {
             ca_pem: ca.cert_pem.clone(),
         };
         let mut cache = NodeCache::new("qual-enroll");
-        let mut enrollment_client = test_enrollment_client(
-            dir.path(),
-            &endpoint,
-            &ca.cert_pem,
-            &enrollment_cert,
-            &enrollment_key,
-        )
-        .await;
 
         let persisted = persist_enrollment_material(&config, &mut cache, &issued).await;
         assert!(persisted, "issued material must persist");
-        report_enrollment_result(&config, &cache, &issued, persisted, &mut enrollment_client).await;
+        report_enrollment_result(&config, &cache, &issued, persisted).await;
 
         let reports = reports.lock().await;
         assert_eq!(reports.len(), 1, "exactly one successful report");
@@ -2405,8 +2366,6 @@ mod tests {
         let ca = enrollment_test_ca("test-ca");
         let (issued_cert, issued_key, issued_der) =
             issue_enrollment_test_leaf(&ca, "qual-node-1", false);
-        let (enrollment_cert, enrollment_key, _) =
-            issue_enrollment_test_leaf(&ca, "qual-enroll", false);
         let (endpoint, reports, shutdown) = spawn_mock_control_plane(&ca, issued_der).await;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2427,19 +2386,66 @@ mod tests {
             ca_pem: ca.cert_pem.clone(),
         };
         let mut cache = NodeCache::new("qual-enroll");
-        let mut enrollment_client = test_enrollment_client(
-            dir.path(),
-            &endpoint,
-            &ca.cert_pem,
-            &enrollment_cert,
-            &enrollment_key,
-        )
-        .await;
 
         let persisted = persist_enrollment_material(&config, &mut cache, &issued).await;
         assert!(!persisted, "persist failure must be detected");
         assert!(!cache.enrollment_complete, "failed persist must not enroll");
-        report_enrollment_result(&config, &cache, &issued, persisted, &mut enrollment_client).await;
+        report_enrollment_result(&config, &cache, &issued, persisted).await;
+
+        let reports = reports.lock().await;
+        assert_eq!(reports.len(), 1, "exactly one failure report");
+        assert_eq!(reports[0].node_id, "qual-node-1");
+        assert_eq!(reports[0].status, "failed");
+        assert_eq!(reports[0].message, "failed to persist enrollment material");
+        drop(reports);
+        let _ = shutdown.send(());
+    }
+
+    /// The identity files can land while the NodeCache record cannot be
+    /// written (disk full, permission change). Reporting success then would
+    /// leave the control plane claiming a durable enrollment the agent forgets
+    /// on restart — and the bootstrap token is single-use, so re-enrollment
+    /// fails. The persist step must fail closed instead.
+    #[tokio::test]
+    async fn cache_save_failure_is_reported_as_persist_failure() {
+        let ca = enrollment_test_ca("test-ca");
+        let (issued_cert, issued_key, issued_der) =
+            issue_enrollment_test_leaf(&ca, "qual-node-1", false);
+        let (endpoint, reports, shutdown) = spawn_mock_control_plane(&ca, issued_der).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the cache file belongs makes the atomic rename
+        // fail after the certificate/key/CA writes have succeeded.
+        let cache_path = dir.path().join("agent-cache.json");
+        std::fs::create_dir(&cache_path).unwrap();
+        let config = AgentConfig {
+            control_plane_addr: endpoint.clone(),
+            runtime_dir: dir.path().join("runtime"),
+            cache_path,
+            ..AgentConfig::default()
+        };
+        let issued = BootstrapResponse {
+            node_id: "qual-node-1".to_string(),
+            certificate_pem: issued_cert,
+            private_key_pem: issued_key,
+            ca_pem: ca.cert_pem.clone(),
+        };
+        let mut cache = NodeCache::new("qual-enroll");
+
+        let persisted = persist_enrollment_material(&config, &mut cache, &issued).await;
+        assert!(
+            !persisted,
+            "a cache-save failure must not be reported as durable enrollment"
+        );
+        assert!(
+            !cache.enrollment_complete,
+            "a cache-save failure must clear enrollment_complete"
+        );
+        assert!(
+            config.runtime_dir.join("agent.crt").exists(),
+            "the identity files may still be on disk; only the record failed"
+        );
+        report_enrollment_result(&config, &cache, &issued, persisted).await;
 
         let reports = reports.lock().await;
         assert_eq!(reports.len(), 1, "exactly one failure report");
