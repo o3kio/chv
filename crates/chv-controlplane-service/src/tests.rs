@@ -1089,6 +1089,104 @@ async fn test_enrollment_extended_inventory_persistence() {
     assert_eq!(labels.get("env").unwrap(), "prod");
 }
 
+/// Regression: an in-place upgrade must not leave the node row reporting the
+/// version installed at enrollment.
+///
+/// `nodes.agent_version` was written only by enrollment, while the agent's
+/// periodic `ReportServiceVersions` went to `node_versions` history. The node
+/// API reads `nodes.agent_version`, so rc.1 -> rc.2 upgrades kept showing
+/// rc.1 in the UI even though the running binaries reported rc.2 (observed on
+/// the published RC fresh-host run). The version report must refresh the row
+/// that the API actually reads.
+#[tokio::test]
+async fn report_service_versions_refreshes_the_node_row_agent_version() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let test_db = chv_controlplane_store::test_util::TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let node_id = NodeId::new("node-version-truth").unwrap();
+
+    NodeRepository::new(pool.clone())
+        .upsert_node(&NodeUpsertInput {
+            node_id: node_id.clone(),
+            hostname: "host-version-truth".into(),
+            display_name: "node-version-truth".into(),
+            certificate_serial: Some("deadbeef".into()),
+            agent_version: Some("0.4.0-rc.1".into()),
+            control_plane_version: Some("0.4.0-rc.1".into()),
+            enrolled_unix_ms: 1_000,
+            last_seen_unix_ms: 1_000,
+        })
+        .await
+        .unwrap();
+
+    let service = InventoryServiceImplementation::new(
+        NodeRepository::new(pool.clone()),
+        VtepRepository::new(pool.clone()),
+    );
+    InventoryService::report_service_versions(
+        &service,
+        proto::ReportServiceVersionsRequest {
+            meta: Some(proto::RequestMeta {
+                operation_id: "versions-after-upgrade".into(),
+                requested_by: "agent".into(),
+                target_node_id: "node-version-truth".into(),
+                desired_state_version: String::new(),
+                request_unix_ms: 2_000,
+            }),
+            versions: Some(proto::ServiceVersions {
+                node_id: "node-version-truth".into(),
+                chv_agent_version: "0.4.0-rc.2".into(),
+                chv_stord_version: "0.4.0-rc.2".into(),
+                chv_nwd_version: "0.4.0-rc.2".into(),
+                cloud_hypervisor_version: "53.0".into(),
+                host_bundle_version: "0.4.0-rc.2".into(),
+            }),
+        },
+    )
+    .await
+    .expect("version report must succeed");
+
+    let app = crate::api::router::admin_router(
+        test_app_state(pool.clone()),
+        crate::convergence_metrics::new_shared(),
+        chv_config::WebUiConfig::default(),
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/nodes")
+                .header("authorization", format!("Bearer {}", test_admin_token()))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        parsed["items"][0]["version"], "0.4.0-rc.2",
+        "the node API must report the agent's currently-running version, not the enrollment version"
+    );
+
+    // The version history still records the report (the audit trail), while
+    // the denormalized row is current.
+    let history: Vec<String> = sqlx::query_scalar(
+        "SELECT version FROM node_versions WHERE node_id = ? AND component_name = ?",
+    )
+    .bind("node-version-truth")
+    .bind(chv_controlplane_types::constants::COMPONENT_AGENT)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(history, vec!["0.4.0-rc.2".to_string()]);
+}
+
 #[tokio::test]
 async fn test_enrollment_registers_fabric_identity() {
     let test_db = chv_controlplane_store::test_util::TestDb::new().await;

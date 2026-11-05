@@ -160,6 +160,14 @@ VALUES (
 )
 "#;
 
+const UPDATE_NODE_AGENT_VERSION_SQL: &str = r#"
+UPDATE nodes SET
+    agent_version = $2,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', $3 / 1000.0, 'unixepoch')
+WHERE node_id = $1
+  AND (agent_version IS NULL OR agent_version <> $2)
+"#;
+
 const UPDATE_NODE_CERTIFICATE_SQL: &str = r#"
 UPDATE nodes SET
     certificate_serial = $2,
@@ -342,6 +350,34 @@ impl NodeRepository {
             .bind(hostname.unwrap_or(fallback))
             .bind(display_name.unwrap_or(fallback))
             .bind(seen_unix_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Refresh the denormalized `nodes.agent_version` that the node API and
+    /// the cluster summary read as the node's running version.
+    ///
+    /// Enrollment is the only other writer, so an in-place package upgrade
+    /// used to leave the node row reporting the version installed at
+    /// enrollment even after the agent came back on the new release. The
+    /// agent reports its service versions periodically
+    /// (`ReportServiceVersions`); that report is the authoritative "what is
+    /// running now" signal and must update this row.
+    ///
+    /// The `WHERE` clause makes a repeated identical report a no-op, so a
+    /// stable node does not rewrite the row (or its `updated_at`) every
+    /// report cycle.
+    pub async fn refresh_agent_version(
+        &self,
+        node_id: &NodeId,
+        agent_version: &str,
+        reported_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(UPDATE_NODE_AGENT_VERSION_SQL)
+            .bind(node_id.as_str())
+            .bind(agent_version)
+            .bind(reported_unix_ms)
             .execute(&self.pool)
             .await?;
         Ok(())
