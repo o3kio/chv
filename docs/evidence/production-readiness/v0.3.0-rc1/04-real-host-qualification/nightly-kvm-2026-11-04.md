@@ -292,6 +292,11 @@ desired one: the stale-state failure proves the lane needs host-state
 hygiene, and the other three are harness expectations that lag the shipped
 contracts. No candidate change is made by this branch.
 
+The next run ([41932437206](https://github.com/o3kio/chv/actions/runs/41932437206),
+`a86702a2`) confirmed all of them: m4.3, m4.4, m4.5, and m4.6 pass (rc=0),
+with four documented warnings — the M2.5 retained VM/volume rows after
+delete and one ARP-entry timing note — and no failures.
+
 ---
 
 ## 3. Fixes
@@ -398,7 +403,8 @@ sessions after delete-following-agent-restart).
 | [41912418366](https://github.com/o3kio/chv/actions/runs/41912418366) | full (m4.3–m4.8) | `4e2cb37b` | fail — m4.7 pass; m4.3/m4.4/m4.5/m4.8 stale stop/delete waits, m4.6 stale refusal shape (fix 8) |
 | [41926076717](https://github.com/o3kio/chv/actions/runs/41926076717) | full subset (m4.3–m4.6) | `b50747c1` | fail — stop/delete fixes hold; stale prior-lane bridge broke m4.4 reachability, plus adopted-VMM force-kill, quoted log field, and sync negative-TLS refusals (§2.5, fixes 9–12) |
 | [41932222532](https://github.com/o3kio/chv/actions/runs/41932222532) | full subset (m4.3–m4.6) | `7fdd0946` | fail — **Checkout**, 14 s, no scenario ran: root-owned `target/` from a pre-isolation build blocked `actions/checkout` cleanup (fix 13) |
-| _targeted re-run_ | full subset (m4.3–m4.6) | _this commit_ | _pending_ |
+| [41932437206](https://github.com/o3kio/chv/actions/runs/41932437206) | full subset (m4.3–m4.6) | `a86702a2` | **pass** — all four scenarios rc=0; 4 documented warnings (M2.5 retained VM/volume rows, one ARP timing note); no failures |
+| [41936507296](https://github.com/o3kio/chv/actions/runs/41936507296) | m4.8 only | `a86702a2` | **pass** — rc=0, 818 s; 6 soak cycles, stop converges in ~35 s with the VMM retained until delete; one documented M2.5 preamble warning |
 | _full lane_ | full (m4.3–m4.8) | _final fix commit_ | _pending_ |
 
 Only a row with `pass` and present per-scenario evidence is accepted; each
