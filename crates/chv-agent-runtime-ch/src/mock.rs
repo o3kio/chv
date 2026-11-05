@@ -19,6 +19,10 @@ pub struct MockVolumeSession {
     pub volume_id: String,
     pub vm_id: String,
     pub attachment_handle: String,
+    /// Mirrors stord's `runtime_status`: `attached` while owned by a VM,
+    /// `open` for an opened-but-attach-pending volume, and `detached` after
+    /// a detach cleared `vm_id` (#711 review).
+    pub runtime_status: String,
 }
 
 /// Deterministic host-resource controller for tests.
@@ -87,6 +91,11 @@ impl MockHostResourceController {
                 volume_id: volume_id.to_string(),
                 vm_id: vm_id.to_string(),
                 attachment_handle: attachment_handle.to_string(),
+                runtime_status: if vm_id.is_empty() {
+                    "open".to_string()
+                } else {
+                    "attached".to_string()
+                },
             });
     }
 
@@ -167,6 +176,7 @@ impl HostResourceController for MockHostResourceController {
         for session in self.volume_sessions.lock().unwrap().iter_mut() {
             if session.volume_id == volume_id && session.vm_id == vm_id {
                 session.vm_id.clear();
+                session.runtime_status = "detached".to_string();
             }
         }
         Ok(())
@@ -212,9 +222,17 @@ impl HostResourceController for MockHostResourceController {
         let mut sessions = self.volume_sessions.lock().unwrap();
         let count = sessions
             .iter()
-            .filter(|s| s.volume_id == volume_id && s.vm_id.is_empty())
+            .filter(|s| {
+                s.volume_id == volume_id
+                    && s.vm_id.is_empty()
+                    && s.runtime_status.eq_ignore_ascii_case("detached")
+            })
             .count();
-        sessions.retain(|s| !(s.volume_id == volume_id && s.vm_id.is_empty()));
+        sessions.retain(|s| {
+            !(s.volume_id == volume_id
+                && s.vm_id.is_empty()
+                && s.runtime_status.eq_ignore_ascii_case("detached"))
+        });
         drop(sessions);
         for _ in 0..count {
             self.record("close", volume_id);

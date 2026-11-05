@@ -211,14 +211,15 @@ async fn attach_and_detach_volume_smoke() {
         .into_inner();
     assert_eq!(detach_resp.status, "OK");
 
-    // Verify session is back to open
+    // Verify session is marked detached (distinct from an opened-but-not-
+    // attached session, so the agent's sweep cannot close a live open).
     let list_resp2 = client
         .list_volume_sessions(ListVolumeSessionsRequest {})
         .await
         .unwrap()
         .into_inner();
     assert_eq!(list_resp2.sessions[0].vm_id, "");
-    assert_eq!(list_resp2.sessions[0].runtime_status, "open");
+    assert_eq!(list_resp2.sessions[0].runtime_status, "detached");
 
     // Idempotent detach: no session with vm_id should still return OK
     let detach_resp2 = client

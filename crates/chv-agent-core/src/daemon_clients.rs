@@ -206,6 +206,11 @@ impl StordClient {
                 reason: e.to_string(),
             })?
             .into_inner();
+        // stord answers RPC-OK with an in-band non-OK `Result` when the
+        // session is gone (e.g. swept) or the backend attach fails. Returning
+        // the empty export fields as success would silently build a VM with
+        // an empty disk path (#711 review).
+        check_stord_result(resp.result.as_ref(), "attach_volume_to_vm")?;
         Ok((resp.export_kind, resp.export_path))
     }
 
@@ -320,14 +325,17 @@ impl StordClient {
             .filter(|handle| !handle.is_empty()))
     }
 
-    /// Close every open session for `volume_id` whose `vm_id` is already
-    /// cleared (#711 review).
+    /// Close every session for `volume_id` that a detach marked `detached`
+    /// (#711 review).
     ///
     /// This is the crash-window recovery path: if the agent died (or a close
     /// RPC failed) after detach cleared `vm_id` but before close removed the
-    /// session, `resolve_volume_handle` can no longer match the pair. The
-    /// leftover session is volume-scoped (it has no owning VM), so the delete
-    /// drain closes all of them. Attached sessions are never touched.
+    /// session, `resolve_volume_handle` can no longer match the pair. stord
+    /// marks such rows `detached`, which is deliberately distinct from the
+    /// `open` state of a volume that was opened but whose attach has not
+    /// landed yet. Filtering on `detached` means the sweep cannot close a
+    /// live session belonging to a concurrent create/attach (#711 review).
+    /// Attached and `open` sessions are never touched.
     ///
     /// Returns the number of sessions closed. A failed close surfaces so the
     /// caller's existing retry/first-error policy applies.
@@ -352,6 +360,7 @@ impl StordClient {
             .filter(|session| {
                 session.volume_id == volume_id
                     && session.vm_id.is_empty()
+                    && session.runtime_status.eq_ignore_ascii_case("detached")
                     && !session.attachment_handle.is_empty()
             })
             .map(|session| session.attachment_handle)
@@ -2010,28 +2019,30 @@ mod tests {
     }
 
     /// #711 review: a session left open by a crash between detach and close
-    /// has `vm_id` cleared. The delete drain must close exactly those rows
-    /// for the volume, never a row still attached to a VM.
+    /// has `vm_id` cleared and is marked `detached`. The delete drain must
+    /// close exactly those rows for the volume, never a row still attached to
+    /// a VM and never a live `open` row whose attach has not landed yet.
     #[tokio::test]
-    async fn stord_close_detached_volume_sessions_skips_attached_rows() {
+    async fn stord_close_detached_volume_sessions_skips_live_rows() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("stord.sock");
-        let session = |volume_id: &str, vm_id: &str, handle: &str| {
+        let session = |volume_id: &str, vm_id: &str, handle: &str, status: &str| {
             chv_stord_api::chv_stord_api::VolumeSession {
                 volume_id: volume_id.to_string(),
                 vm_id: vm_id.to_string(),
                 attachment_handle: handle.to_string(),
                 export_kind: "local".to_string(),
                 export_path: String::new(),
-                runtime_status: "open".to_string(),
+                runtime_status: status.to_string(),
             }
         };
         let mock = MockStord {
             sessions: vec![
-                session("vol-0", "", "handle-orphan-1"),
-                session("vol-0", "", "handle-orphan-2"),
-                session("vol-0", "vm-live", "handle-attached"),
-                session("vol-1", "", "handle-other-volume"),
+                session("vol-0", "", "handle-orphan-1", "detached"),
+                session("vol-0", "", "handle-orphan-2", "detached"),
+                session("vol-0", "", "handle-open", "open"),
+                session("vol-0", "vm-live", "handle-attached", "attached"),
+                session("vol-1", "", "handle-other-volume", "detached"),
             ],
             ..Default::default()
         };

@@ -798,7 +798,10 @@ impl<B: StorageBackend> proto::storage_service_server::StorageService for Storag
                 &req.volume_id,
                 &s.attachment_handle,
                 None,
-                "open".to_string(),
+                // Distinct from `open`: an opened-but-attach-pending session
+                // is also `vm_id = None`, and the agent's post-delete sweep
+                // must never close that live session (#711 review).
+                "detached".to_string(),
             );
 
             if !updated {

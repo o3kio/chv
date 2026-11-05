@@ -1152,10 +1152,10 @@ async fn delete_after_restart_drains_from_observed_attachments() {
 
 /// #711: the post-restart delete's cached handle is gone, but stord's
 /// durable session table still has the live attachment for `(volume,
-/// vm)`. The fallback drain detaches (clearing `vm_id`), then closes every
-/// detached session for the volume — restoring the tracked path's
-/// detach-then-close pair instead of leaving a detached
-/// `runtime_status = "open"` row behind.
+/// vm)`. The fallback drain detaches (clearing `vm_id` and marking the
+/// row `detached`), then closes every detached session for the volume —
+/// restoring the tracked path's detach-then-close pair instead of
+/// leaving a detached row behind.
 #[tokio::test]
 async fn delete_after_restart_closes_the_detached_session() {
     let h = harness(None);
