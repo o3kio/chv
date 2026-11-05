@@ -142,12 +142,15 @@ It then applies the documented package upgrade path (`dpkg --force-confold -i`
 - bring-up, login, node visibility and metrics still pass. Because the
   upgrade preserves the previous release's `controlplane.toml`, the serving
   surface is the one that config describes, not the candidate's own: the
-  WebUI is asserted on the preserved nginx edge (`http://127.0.0.1/`), and
-  the control-plane's dedicated `/metrics` listener is recorded as
-  `not-configured` (a pre-0.4.0 config has no `metrics_bind`). Agent, stord
-  and nwd metrics are still asserted. The evidence never attributes the
-  candidate's `[webui]`/`:9103` shape to a config the candidate did not
-  write.
+  WebUI is asserted on the preserved nginx edge (`http://127.0.0.1/`), since
+  a pre-0.4.0 config has no `[webui]` section and the candidate does not
+  serve the UI on `:8080` without one. The control-plane's dedicated
+  `/metrics` listener is still asserted: the candidate binds it on
+  `127.0.0.1:9103` by default when `metrics_bind` is absent (the prior
+  run's journal records the warning and the listener). The evidence never
+  attributes the candidate's `[webui]` shape to a config the candidate did
+  not write, and never weakens a check the binary's documented default
+  actually satisfies.
 
 If `--packages` is not supplied the leg fails after the guard check rather
 than pretending a tarball re-run upgraded the host.

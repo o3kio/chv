@@ -299,12 +299,14 @@ grep -Fq 'QUICK_REF="${QUICK_REF:-}"' "$fresh" \
 grep -q 'raw.githubusercontent.com/.*scripts/quick-install.sh' "$fresh" \
     && pass "fresh-host fetches quick-install.sh at the pinned ref" \
     || fail "fresh-host does not fetch the pinned quick-install.sh"
-grep -q 'check_bringup candidate http://127.0.0.1/ preserved' "$fresh" \
+grep -q 'check_bringup candidate http://127.0.0.1/$' "$fresh" \
     && pass "fresh-host asserts the preserved nginx edge after a config-preserving upgrade" \
     || fail "fresh-host would claim the candidate WebUI listener on a preserved v0.3.0 config"
-grep -q 'METRICS controlplane=not-configured' "$fresh" \
-    && pass "fresh-host records the absent candidate metrics listener as not-configured" \
-    || fail "fresh-host would fail an upgrade for a listener the preserved config disables"
+if grep -q 'METRICS controlplane=not-configured' "$fresh"; then
+    fail "fresh-host weakens the upgrade metrics check despite the binary's loopback default"
+else
+    pass "fresh-host keeps the documented default control-plane metrics listener asserted"
+fi
 grep -Fq 'expected_bin_version="${expected_bin_version%-rc.*}"' "$fresh" \
     && pass "fresh-host compares RC binaries against their base VERSION" \
     || fail "fresh-host can fail an RC quick leg because binaries report the base version"

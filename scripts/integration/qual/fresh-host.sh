@@ -729,19 +729,9 @@ check_webui() {
 }
 
 check_metrics() {
-    local mode="${1:-candidate}" spec name port code out
-    if [ "$mode" = "preserved" ]; then
-        # The upgrade leg keeps the previous release's controlplane.toml by
-        # contract. A pre-0.4.0 config has no metrics_bind, so the candidate
-        # binary intentionally runs without its dedicated listener. Record the
-        # surface instead of claiming a listener the preserved config disables.
-        record "METRICS controlplane=not-configured (preserved pre-0.4.0 controlplane.toml has no metrics_bind)"
-    fi
+    local spec name port code out
     for spec in controlplane:9103 agent:9901 stord:9101 nwd:9102; do
         name="${spec%%:*}"
-        if [ "$name" = "controlplane" ] && [ "$mode" = "preserved" ]; then
-            continue
-        fi
         port="${spec##*:}"
         out="/tmp/fresh-host-${name}-metrics.txt"
         code="$(http_code "http://127.0.0.1:${port}/metrics" "$out")"
@@ -780,7 +770,6 @@ check_binaries_version() {
 check_bringup() {
     local encryption_mode="${1:-candidate}"
     local webui_url="${2:-http://127.0.0.1:8080/}"
-    local metrics_mode="${3:-candidate}"
     section "bring-up contract"
     wait_units_active 180 || true
     check_units_contract
@@ -789,7 +778,7 @@ check_bringup() {
     check_admin_login || true
     check_webui "$webui_url"
     check_node_visible || true
-    check_metrics "$metrics_mode"
+    check_metrics
 }
 
 check_chv_ports_free() {
@@ -1207,10 +1196,11 @@ if [ "$UPGRADED" = "1" ]; then
     # The package upgrade preserves the previous release's controlplane.toml
     # by contract, so the candidate binary keeps the v0.3.0 serving surface:
     # the nginx edge at :80 serves the static UI, and the config has no
-    # [webui]/metrics_bind. Assert exactly that surface; do not claim the
-    # candidate's own :8080 UI or :9103 listener for a config it did not write.
+    # [webui]. Assert that edge rather than a :8080 UI the preserved config
+    # disables. Metrics stay asserted: the candidate binds its dedicated
+    # listener on 127.0.0.1:9103 by default when metrics_bind is absent.
     section "preserved-edge surface (upgrade keeps previous config)"
-    check_bringup candidate http://127.0.0.1/ preserved
+    check_bringup candidate http://127.0.0.1/
 else
     bad "upgrade did not complete; bring-up not asserted"
 fi
