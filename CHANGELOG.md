@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.2] - 2026-11-05
+
+### Fixed
+- **Node version truth after an in-place upgrade (#720)**: the node API and
+  cluster summary now report the agent version carried by the agent's
+  periodic `ReportServiceVersions` report. Only enrollment used to write
+  `nodes.agent_version`, so a package upgrade could leave the node row
+  showing the previous release while the running binaries reported the new
+  one (observed on the `v0.4.0-rc.1` fresh-host run). The refresh is a no-op
+  when the reported version is unchanged, and a regression test covers
+  `rc.1` → `rc.2` through `POST /v1/nodes`. The `node_inventory.chv_*_version`
+  columns remain enrollment-time values and have no readers; the code records
+  that boundary.
+
 ## [0.4.0-rc.1] - 2026-11-05
 
 ### Fixed
