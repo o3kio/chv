@@ -281,57 +281,13 @@ impl StordClient {
         check_stord_result(Some(&resp), "close_volume")
     }
 
-    /// Resolve the live attachment handle for `(volume_id, vm_id)` from
-    /// stord's session table (#711).
-    ///
-    /// The Core create path never records a handle in the agent cache, so a
-    /// post-restart delete cannot close a pre-restart volume from the cache
-    /// alone (the legacy map is persisted, but absent for Core-created
-    /// volumes). stord's session table survives an agent restart; this
-    /// read-only lookup recovers the handle BEFORE the detach clears the
-    /// session's `vm_id`, so the caller can detach and then close exactly
-    /// like the live path.
-    ///
-    /// Returns `Ok(None)` when stord has no session for the pair (already
-    /// detached/closed, or never attached). Transport/RPC failures surface
-    /// as [`ChvError::BackendUnavailable`] so each caller keeps its
-    /// existing failure policy (warn-and-continue for the best-effort
-    /// delete drain, collected first-error for the legacy cleanup).
-    pub async fn resolve_volume_handle(
-        &mut self,
-        volume_id: &str,
-        vm_id: &str,
-    ) -> Result<Option<String>, ChvError> {
-        let span = tracing::info_span!("resolve_volume_handle", volume_id, vm_id);
-        let sessions = self
-            .inner
-            .list_volume_sessions(tonic::Request::new(ListVolumeSessionsRequest {}))
-            .instrument(span)
-            .await
-            .map_err(|e| ChvError::BackendUnavailable {
-                backend: "stord".to_string(),
-                reason: format!("list_volume_sessions for {volume_id}/{vm_id}: {e}"),
-            })?
-            .into_inner()
-            .sessions;
-        Ok(sessions
-            .into_iter()
-            .find(|session| {
-                session.volume_id == volume_id
-                    && !session.vm_id.is_empty()
-                    && session.vm_id == vm_id
-            })
-            .map(|session| session.attachment_handle)
-            .filter(|handle| !handle.is_empty()))
-    }
-
     /// Close every session for `volume_id` that a detach marked `detached`
     /// (#711 review).
     ///
     /// This is the crash-window recovery path: if the agent died (or a close
     /// RPC failed) after detach cleared `vm_id` but before close removed the
-    /// session, `resolve_volume_handle` can no longer match the pair. stord
-    /// marks such rows `detached`, which is deliberately distinct from the
+    /// session, no live `(volume, vm)` match remains in the session table.
+    /// stord marks such rows `detached`, which is deliberately distinct from the
     /// `open` state of a volume that was opened but whose attach has not
     /// landed yet. Filtering on `detached` means the sweep cannot close a
     /// live session belonging to a concurrent create/attach (#711 review).
@@ -1959,63 +1915,6 @@ mod tests {
         // the kernel backlog even before the task accepts.
         let mut client = StordClient::connect(&socket).await.unwrap();
         assert!(client.health_probe().await.unwrap());
-    }
-
-    /// #711: the post-restart delete recovers the live handle from stord's
-    /// durable session table by `(volume_id, vm_id)`. Detached rows (empty
-    /// `vm_id`) and sessions for another VM/volume must never be selected.
-    #[tokio::test]
-    async fn stord_resolve_volume_handle_matches_the_attached_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("stord.sock");
-
-        let session = |volume_id: &str, vm_id: &str, handle: &str| {
-            chv_stord_api::chv_stord_api::VolumeSession {
-                volume_id: volume_id.to_string(),
-                vm_id: vm_id.to_string(),
-                attachment_handle: handle.to_string(),
-                export_kind: "local".to_string(),
-                export_path: String::new(),
-                runtime_status: if vm_id.is_empty() { "open" } else { "attached" }.to_string(),
-            }
-        };
-        let mock = MockStord {
-            sessions: vec![
-                session("vol-0", "", "handle-detached"),
-                session("vol-0", "vm-other", "handle-other"),
-                session("vol-1", "vm-1", "handle-wrong-volume"),
-                session("vol-0", "vm-1", "handle-live"),
-            ],
-            ..Default::default()
-        };
-
-        let uds = tokio::net::UnixListener::bind(&socket).unwrap();
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(
-                    chv_stord_api::chv_stord_api::storage_service_server::StorageServiceServer::new(
-                        mock,
-                    ),
-                )
-                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds))
-                .await
-                .ok();
-        });
-
-        let mut client = StordClient::connect(&socket).await.unwrap();
-        assert_eq!(
-            client.resolve_volume_handle("vol-0", "vm-1").await.unwrap(),
-            Some("handle-live".to_string())
-        );
-        assert_eq!(
-            client.resolve_volume_handle("vol-9", "vm-1").await.unwrap(),
-            None
-        );
-        assert_eq!(
-            client.resolve_volume_handle("vol-0", "").await.unwrap(),
-            None,
-            "a detached row has no live VM attachment to close"
-        );
     }
 
     /// #711 review: a session left open by a crash between detach and close

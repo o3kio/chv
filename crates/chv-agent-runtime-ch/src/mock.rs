@@ -12,8 +12,8 @@ use crate::adapter::{
 /// class the runtime threaded into the open, and the option map.
 pub type RecordedOpenOptions = (String, String, HashMap<String, String>);
 
-/// One live stord session the mock controller knows about, used by
-/// [`HostResourceController::resolve_volume_handle`] (#711).
+/// One live stord session the mock controller knows about, used by the
+/// post-restart detached-session sweep (#711).
 #[derive(Debug, Clone)]
 pub struct MockVolumeSession {
     pub volume_id: String,
@@ -83,6 +83,20 @@ impl MockHostResourceController {
     /// durable session table does after an agent restart (#711). A
     /// session is consumed by the mock detach (stord clears `vm_id`), so
     /// a retry after a successful detach resolves nothing.
+    /// Seed a session that a crash left between detach and close: `vm_id`
+    /// empty, `runtime_status = "detached"`, handle still present (#711).
+    pub fn add_detached_session(&self, volume_id: &str, attachment_handle: &str) {
+        self.volume_sessions
+            .lock()
+            .unwrap()
+            .push(MockVolumeSession {
+                volume_id: volume_id.to_string(),
+                vm_id: String::new(),
+                attachment_handle: attachment_handle.to_string(),
+                runtime_status: "detached".to_string(),
+            });
+    }
+
     pub fn add_volume_session(&self, volume_id: &str, vm_id: &str, attachment_handle: &str) {
         self.volume_sessions
             .lock()
@@ -171,8 +185,8 @@ impl HostResourceController for MockHostResourceController {
     ) -> Result<(), ChvError> {
         self.begin_step("detach")?;
         self.record("detach", volume_id);
-        // stord clears the session's vm_id on detach; mirror that so a
-        // post-detach `resolve_volume_handle` cannot hand out a handle.
+        // stord clears the session's vm_id on detach and marks it detached;
+        // mirror that so the sweep can close it without matching a live open.
         for session in self.volume_sessions.lock().unwrap().iter_mut() {
             if session.volume_id == volume_id && session.vm_id == vm_id {
                 session.vm_id.clear();
@@ -195,22 +209,6 @@ impl HostResourceController for MockHostResourceController {
             .unwrap()
             .retain(|s| !(s.volume_id == volume_id && s.attachment_handle == attachment_handle));
         Ok(())
-    }
-
-    async fn resolve_volume_handle(
-        &self,
-        volume_id: &str,
-        vm_id: &str,
-    ) -> Result<Option<String>, ChvError> {
-        self.begin_step("resolve")?;
-        self.record("resolve", volume_id);
-        Ok(self
-            .volume_sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|session| session.volume_id == volume_id && session.vm_id == vm_id)
-            .map(|session| session.attachment_handle.clone()))
     }
 
     async fn close_detached_volume_sessions(

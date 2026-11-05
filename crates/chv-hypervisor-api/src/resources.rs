@@ -346,34 +346,15 @@ pub trait HostResourceController: Send + Sync + 'static {
         operation_id: Option<&str>,
     ) -> Result<(), ChvError>;
 
-    /// Resolve the live attachment handle for `(volume_id, vm_id)` from
-    /// the storage daemon's durable session table (#711).
-    ///
-    /// The delete-time fallback drain's observed attachments carry a
-    /// handle only when one was durably cached; after an agent restart the
-    /// in-memory handle map is gone. This read-only lookup recovers the
-    /// handle from stord BEFORE [`Self::detach_volume_from_vm`] clears the
-    /// session's `vm_id`, restoring the detach-then-close sequence the
-    /// live path performs.
-    ///
-    /// Returns `Ok(None)` when no live session exists for the pair. RPC
-    /// failures must surface as `Err`: callers keep their existing policy
-    /// (the best-effort delete drain logs and continues; the legacy
-    /// cleanup records a first error).
-    async fn resolve_volume_handle(
-        &self,
-        volume_id: &str,
-        vm_id: &str,
-    ) -> Result<Option<String>, ChvError>;
-
-    /// Close every open stord session for `volume_id` whose owning VM has
-    /// already been cleared by a detach (#711).
+    /// Close every stord session for `volume_id` that a detach marked
+    /// `detached` (#711).
     ///
     /// A crash or failed close between detach and close leaves exactly this
-    /// shape: `vm_id` empty, `runtime_status` open, handle still present. The
-    /// delete drain calls this after its own detach to close both the session
-    /// it just detached and any leftover from an earlier interrupted attempt.
-    /// Sessions still attached to a VM are never touched.
+    /// shape: `vm_id` empty, `runtime_status` `detached`, handle still
+    /// present. The delete drain calls this after its own detach to close
+    /// both the session it just detached and any leftover from an earlier
+    /// interrupted attempt. Sessions still attached to a VM, and `open`
+    /// sessions whose attach has not landed yet, are never touched.
     async fn close_detached_volume_sessions(
         &self,
         volume_id: &str,
