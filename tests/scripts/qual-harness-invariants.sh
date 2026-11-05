@@ -332,6 +332,36 @@ grep -q 'systemd-tmpfiles --create "\$tmpfiles"' "$quick_installer" \
     && pass "quick installer applies the tmpfiles entry that creates /run/netns" \
     || fail "quick installer relies on a reboot before chv-nwd can start"
 
+# Exercise the real version gate, not just its presence: source the installer
+# (its B1 guard makes that side-effect free) and assert the boundary plus a
+# clean stderr. A malformed comparison (e.g. comparing a minor against a
+# full "4.0" string) still "refuses" but prints an integer-expression error,
+# which this catches.
+quick_version_matrix="$(source_path="$quick_installer" bash -c '
+    set +u
+    # shellcheck disable=SC1090
+    source "$source_path" >/dev/null 2>&1
+    for v in 0.3.0 0.3.9 0.4.0 0.4.0-rc.1 0.4.0-rc.9 0.10.0 1.0.0; do
+        if release_supported "$v"; then
+            printf "%s supported\n" "$v"
+        else
+            printf "%s refused\n" "$v"
+        fi
+    done
+' 2>&1)"
+if printf '%s\n' "$quick_version_matrix" | grep -q 'integer expression expected'; then
+    fail "quick installer version gate compares a malformed minor version"
+else
+    pass "quick installer version gate runs without integer-expression errors"
+fi
+for expect in '0.3.0 refused' '0.3.9 refused' '0.4.0 supported' \
+    '0.4.0-rc.1 supported' '0.4.0-rc.9 supported' '0.10.0 supported' \
+    '1.0.0 supported'; do
+    printf '%s\n' "$quick_version_matrix" | grep -qxF "$expect" \
+        && pass "quick installer version gate: ${expect}" \
+        || fail "quick installer version gate: expected '${expect}'"
+done
+
 postinst="${REPO_ROOT}/packaging/scripts/postinstall.sh"
 grep -q '^sync_legacy_migrations()' "$postinst" \
     && pass "postinstall synchronizes migrations into a preserved install.sh tree" \

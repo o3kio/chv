@@ -339,6 +339,7 @@ release_supported() {
     minor="${minor%%.*}"
     min_major="${QUICK_INSTALL_MIN_VERSION%%.*}"
     min_minor="${QUICK_INSTALL_MIN_VERSION#*.}"
+    min_minor="${min_minor%%.*}"
     case "${major}${minor}" in
         *[!0-9]*) return 1 ;;
     esac
