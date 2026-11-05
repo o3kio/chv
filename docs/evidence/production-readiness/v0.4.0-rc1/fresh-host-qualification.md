@@ -9,8 +9,10 @@ documented install → operate → upgrade → uninstall path to be demonstrated
 a fresh host for the candidate. [#556](https://github.com/o3kio/chv/issues/556)
 covers the published one-line quick installer.
 
-**Candidate:** `_pending_` (`VERSION` is still `0.3.0`; the commit below is the
-candidate identity). **Commit:** `_pending_`.
+**Candidate:** `_pending_` (candidate version and commit are recorded by the
+run). The RC release tag is `v0.4.0-rc.1`; the source `VERSION` file must hold
+the base `0.4.0` because `release.yml` derives the `-rc.1` package suffix from
+the tag. **Commit:** `_pending_`.
 
 ---
 
@@ -51,8 +53,10 @@ _pending_
 | pinned `scripts/quick-install.sh` | `_pending_` |
 
 The candidate binaries embed `CHV_GIT_SHA`, so the upgrade leg can distinguish
-the candidate build from the previous release even though both still report
-version `0.3.0`.
+the candidate build from the previous release even while both carry the same
+base version string. The harness's `--candidate-version` must match the
+tarball's top-level directory and the binaries' embedded `VERSION` base; record
+the exact values from the run rather than assuming them.
 
 ## 3. Legs and assertions
 
@@ -121,6 +125,10 @@ install -f`), restarts the services and re-asserts:
 
 - candidate binaries report the candidate version/commit;
 - the four units are `active/running` with zero restarts;
+- the active unit file (`FragmentPath`) is recorded for each unit. The
+  documented path re-uses the previous release's `/etc/systemd/system` units,
+  which shadow the packaged `/lib` copies; the evidence records that rather
+  than implying the packaged units were exercised;
 - the same config/cert/database/marker/operator/admin state is still present;
 - bring-up, login, WebUI, node visibility and metrics still pass.
 
@@ -148,20 +156,22 @@ WebUI, metrics); binaries report the release version that was installed.
 
 Summary line from `summary.md`: `_pending_`.
 
-## 5. What this proves
+## 5. What this lane will prove once §4 is green
 
-- The release tarball installs end-to-end on a clean Ubuntu noble filesystem
-  with the documented environment switches, and every daemon reaches
-  `active/running` without restarts.
-- The packaging static contract (units, conffiles, users, encryption key) is
-  correct for the candidate `.deb` set.
-- The candidate upgrade path preserves configuration, certificates, the
-  database, a pre-existing operator account and the seeded admin account, and
-  the upgraded deployment operates.
-- The documented uninstall removes software while preserving state, and
-  purge removes state; listeners are released.
-- The published quick installer at a pinned commit installs and operates the
-  release it advertises (#556).
+_Pending until the workflow run is recorded above._
+
+- `_pending_` The release tarball installs end-to-end on a clean Ubuntu noble
+  filesystem with the documented environment switches, and every daemon
+  reaches `active/running` without restarts.
+- `_pending_` The packaging static contract (units, conffiles, users,
+  encryption key) is correct for the candidate `.deb` set.
+- `_pending_` The candidate upgrade path preserves configuration, certificates,
+  the database, a pre-existing operator account and the seeded admin account,
+  and the upgraded deployment operates.
+- `_pending_` The documented uninstall removes software while preserving state,
+  and purge removes state; listeners are released.
+- `_pending_` The published quick installer at a pinned commit installs and
+  operates the release it advertises (#556).
 
 ## 6. What this does **not** prove
 
@@ -185,9 +195,13 @@ Summary line from `summary.md`: `_pending_`.
 
 ```bash
 # On the self-hosted chv-kvm runner, as root:
+# <candidate-version> is the tarball top-level version the build produced
+# (the VERSION base for the pre-tag gate run; the RC tag itself is
+# v0.4.0-rc.1). The quick-install leg intentionally installs the previous
+# published release, so v0.3.0 stays the quick-install version here.
 sudo ./scripts/integration/qual/fresh-host.sh \
-  --candidate-tarball dist/chv-0.3.0-linux-amd64.tar.gz \
-  --candidate-version 0.3.0 \
+  --candidate-tarball dist/chv-<candidate-version>-linux-amd64.tar.gz \
+  --candidate-version <candidate-version> \
   --candidate-sha "$(git rev-parse HEAD)" \
   --previous-release v0.3.0 \
   --previous-version 0.3.0 \

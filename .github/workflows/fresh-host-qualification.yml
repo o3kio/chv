@@ -186,7 +186,9 @@ jobs:
             CARGO_HOME="$CARGO_HOME" \
             CHV_QUAL_ROOT="$CHV_QUAL_ROOT" \
             ./scripts/integration/qual/fresh-host.sh "${args[@]}"
-          cp "${RUNNER_TEMP}/candidate-digests.txt" "${EVIDENCE_DIR}/candidate-digests.txt"
+          # The driver runs as root and only grants a+rX on the evidence dir;
+          # the runner user cannot write into it. Copy as root.
+          sudo cp "${RUNNER_TEMP}/candidate-digests.txt" "${EVIDENCE_DIR}/candidate-digests.txt"
 
       - name: Restore runner ownership after root staging
         if: always()

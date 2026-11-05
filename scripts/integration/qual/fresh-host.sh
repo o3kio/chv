@@ -151,9 +151,15 @@ ARTIFACT_DIGESTS="${EVIDENCE_DIR}/artifacts.sha256"
 printf 'leg\tstatus\trc\tduration_s\tlog\tevidence\n' > "$RESULTS"
 
 write_summary() {
-    local status="$1"
+    local status="$1" skipped="" skipped_n=0
+    if [ -s "$RESULTS" ]; then
+        skipped_n="$(awk -F'\t' 'NR > 1 && $2 == "skipped" { n++ } END { print n + 0 }' "$RESULTS")"
+    fi
+    if [ "$status" = "PASS" ] && [ "$skipped_n" -gt 0 ]; then
+        skipped=" (partial — ${skipped_n} leg(s) skipped)"
+    fi
     {
-        echo "# Fresh-host qualification: ${status}"
+        echo "# Fresh-host qualification: ${status}${skipped}"
         echo ""
         echo "- candidate version: \`${CANDIDATE_VERSION:-_pending_}\`"
         echo "- candidate commit: \`${CANDIDATE_SHA:-_not supplied_}\`"
@@ -262,6 +268,9 @@ command -v debootstrap >/dev/null 2>&1 || preflight_fail "debootstrap is require
 command -v systemd-nspawn >/dev/null 2>&1 || preflight_fail "systemd-nspawn is required (apt-get install systemd-container)"
 command -v curl >/dev/null 2>&1 || preflight_fail "curl is required"
 command -v sha256sum >/dev/null 2>&1 || preflight_fail "sha256sum is required"
+# `ss` is the only guard preventing a collision with a host listener on the
+# shared network namespace. Without it the preflight would pass vacuously.
+command -v ss >/dev/null 2>&1 || preflight_fail "ss is required to check host qualification ports (iproute2)"
 
 if [ "$SKIP_UPGRADE" = false ] && [ -z "$PREVIOUS_TARBALL" ]; then
     command -v gh >/dev/null 2>&1 \
@@ -359,9 +368,18 @@ done
 if [ -n "$NEED_PKGS" ]; then
     qual_info "installing host prerequisites:${NEED_PKGS}"
     # shellcheck disable=SC2086
-    apt-get update -qq && apt-get install -y -qq ${NEED_PKGS} >/dev/null
+    if ! { apt-get update -qq && apt-get install -y -qq ${NEED_PKGS} >/dev/null; }; then
+        preflight_fail "failed to install host prerequisites:${NEED_PKGS}"
+    fi
 fi
 
+# Rebuild the cached base if it is missing or unreadable. A partially-written
+# or corrupt cache must fail here with a clear message instead of producing an
+# opaque "no transcript" for every leg.
+if [ -s "$BASE_TARBALL" ] && ! tar -tzf "$BASE_TARBALL" >/dev/null 2>&1; then
+    qual_warn "cached base ${BASE_TARBALL} is unreadable; rebuilding it"
+    rm -f "$BASE_TARBALL"
+fi
 if [ ! -s "$BASE_TARBALL" ]; then
     qual_info "debootstrap ${SUITE} base (one-time, cached)"
     # curl is needed by quick-install.sh before it installs its own deps; the
@@ -372,8 +390,11 @@ if [ ! -s "$BASE_TARBALL" ]; then
         >"${CHV_QUAL_ROOT}/fresh-host-debootstrap.log" 2>&1 \
         || preflight_fail "debootstrap failed — see ${CHV_QUAL_ROOT}/fresh-host-debootstrap.log"
     rm -rf "${CHV_QUAL_ROOT}/nspawn-base/dev/.static/"
-    tar -C "${CHV_QUAL_ROOT}/nspawn-base" -czf "$BASE_TARBALL" .
+    tar -C "${CHV_QUAL_ROOT}/nspawn-base" -czf "$BASE_TARBALL" . \
+        || preflight_fail "failed to write cached base ${BASE_TARBALL}"
     rm -rf "${CHV_QUAL_ROOT}/nspawn-base"
+    tar -tzf "$BASE_TARBALL" >/dev/null 2>&1 \
+        || preflight_fail "cached base ${BASE_TARBALL} is unreadable after creation"
 fi
 qual_pass "cached ${SUITE} base present"
 
@@ -406,7 +427,8 @@ prepare_root() {
     CURRENT_ROOT="${CHV_QUAL_ROOT}/fresh-host-${leg}-root"
     rm -rf "$CURRENT_ROOT"
     mkdir -p "$CURRENT_ROOT"
-    tar -C "$CURRENT_ROOT" -xzf "$BASE_TARBALL"
+    tar -C "$CURRENT_ROOT" -xzf "$BASE_TARBALL" \
+        || preflight_fail "failed to extract cached base ${BASE_TARBALL}"
     rm -rf "${CURRENT_ROOT}/dev/.static/" 2>/dev/null || true
     rm -f "${CURRENT_ROOT}/etc/hostname" "${CURRENT_ROOT}/etc/machine-id"
     printf 'fresh-host-%s\n' "$leg" > "${CURRENT_ROOT}/etc/hostname"
@@ -461,6 +483,7 @@ prepare_root() {
         printf 'QUICK_VERSION=%q\n' "$QUICK_VERSION"
         printf 'QUICK_INSTALL_SCRIPT=/root/fresh-host/quick-install.sh\n'
         printf 'QUICK_INSTALL_LOCAL=/root/fresh-host/quick-install-local.sh\n'
+        printf 'GITHUB_REPO=%q\n' "$GITHUB_REPO"
     } > "${CURRENT_ROOT}/root/fresh-host/env"
     chmod 0644 "${CURRENT_ROOT}/root/fresh-host/env"
 }
@@ -577,6 +600,12 @@ check_encryption() {
     else
         bad "CHV_ENCRYPTION_KEY is missing or malformed"
     fi
+    if [ "${1:-}" = "static" ]; then
+        # The packages leg expects the units to be down without generated
+        # certs, so an empty journal proves nothing. Do not claim the check.
+        record "ENCRYPTION_JOURNAL=skipped (static packaging leg; services expected down)"
+        return 0
+    fi
     journal="$(journalctl -u chv-controlplane --no-pager 2>/dev/null || true)"
     if printf '%s' "$journal" | grep -q 'S3 credentials will be stored in plaintext'; then
         bad "control plane logged the plaintext-fallback warning"
@@ -586,6 +615,32 @@ check_encryption() {
 }
 
 TOKEN=""
+
+# The bootstrap admin is seeded with must_change_password=1, and install.sh
+# restores that flag before exiting. The BFF denies every non-auth route for
+# such a token (403 PASSWORD_CHANGE_REQUIRED), so node visibility cannot be
+# asserted until it is cleared. Clear it exactly as install.sh seeds it: a WAL
+# write as the service user. This is a recorded test-fixture concession, not a
+# claim about the operator's first-login flow.
+clear_admin_rotation_flag() {
+    local db=/var/lib/chv/controlplane.db
+    if [ ! -f "$db" ]; then
+        bad "admin rotation flag (control-plane database missing)"
+        return 1
+    fi
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        bad "admin rotation flag (sqlite3 missing)"
+        return 1
+    fi
+    if runuser -u chv -- sqlite3 "$db" \
+        "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
+        >/dev/null 2>&1; then
+        record "ADMIN_ROTATION_FLAG=cleared for the node-visibility check (test fixture)"
+        return 0
+    fi
+    bad "admin rotation flag (could not clear must_change_password)"
+    return 1
+}
 
 check_admin_login() {
     local pw code body
@@ -685,6 +740,7 @@ check_bringup() {
     wait_units_active 180 || true
     check_units_contract
     check_encryption
+    clear_admin_rotation_flag || true
     check_admin_login || true
     check_webui
     check_node_visible || true
@@ -747,9 +803,15 @@ TimeoutStartSec=${timeout}
 WantedBy=multi-user.target
 EOF
 
-    systemd-nspawn -q -D "$CURRENT_ROOT" --machine="${CURRENT_MACHINE}-setup" \
-        systemctl enable fresh-host-leg.service >/dev/null 2>&1 \
-        || qual_die "failed to enable the one-shot service for ${leg}"
+    if ! systemd-nspawn -q -D "$CURRENT_ROOT" --machine="${CURRENT_MACHINE}-setup" \
+        systemctl enable fresh-host-leg.service >/dev/null 2>&1; then
+        # Record the failure row too: a marker with no row for this leg lets
+        # the summary silently omit it. Leave CURRENT_ROOT set so the EXIT
+        # trap preserves it for post-mortem (QUAL_ERRORS is now non-zero).
+        qual_error "${leg}: failed to enable the one-shot service"
+        record_result "$leg" "fail" "1" "0" "" "evidence/${leg}-boot.log"
+        return 1
+    fi
 
     qual_info "booting ${leg} container (timeout ${timeout}s)"
     local started duration transcript rc status
@@ -766,7 +828,7 @@ EOF
         qual_pass "${leg}: transcript collected"
     else
         qual_error "${leg}: no transcript (boot log: ${EVIDENCE_DIR}/${leg}-boot.log)"
-        printf 'leg\tfail\t1\t%s\tevidence/%s-boot.log\t\n' "$duration" "$leg" >> "$RESULTS"
+        record_result "$leg" "fail" "1" "$duration" "evidence/${leg}-boot.log" ""
         return 1
     fi
 
@@ -914,7 +976,7 @@ done
 for u in chv chv-stord; do
     getent passwd "$u" >/dev/null 2>&1 && ok "service user exists: ${u}" || bad "service user missing: ${u}"
 done
-check_encryption
+check_encryption static
 section "packaged services (expected fail-closed without certs)"
 for u in chv-controlplane chv-agent chv-stord chv-nwd; do
     record "PACKAGED_UNIT ${u} enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)"
@@ -957,8 +1019,25 @@ done
 section "identifiable pre-upgrade state"
 STATE_DIR=/var/fresh-host-upgrade-state
 mkdir -p "$STATE_DIR"
-sha256sum /etc/chv/encryption.env /etc/chv/certs/ca.crt /etc/chv/certs/ca.key /etc/chv/controlplane.toml \
-    > "$STATE_DIR/before.sha256" 2>/dev/null || true
+missing_state=""
+for p in /etc/chv/encryption.env /etc/chv/certs/ca.crt /etc/chv/certs/ca.key /etc/chv/controlplane.toml; do
+    [ -e "$p" ] || missing_state="${missing_state} ${p}"
+done
+if [ -n "$missing_state" ]; then
+    # Do not silently shrink the preservation set: a missing artifact would
+    # otherwise drop out of before.sha256 and make the claim vacuous.
+    bad "pre-upgrade state is missing:${missing_state}"
+    : > "$STATE_DIR/before.sha256"
+else
+    sha256sum /etc/chv/encryption.env /etc/chv/certs/ca.crt /etc/chv/certs/ca.key /etc/chv/controlplane.toml \
+        > "$STATE_DIR/before.sha256"
+    state_lines="$(wc -l < "$STATE_DIR/before.sha256")"
+    if [ "$state_lines" -eq 4 ]; then
+        ok "hashed all 4 pre-upgrade state files"
+    else
+        bad "pre-upgrade state hash set has ${state_lines} entries, expected 4"
+    fi
+fi
 printf '%s\n' "$PREVIOUS_VERSION" > /var/lib/chv/fresh-host-upgrade-marker
 chv_sqlite() { runuser -u chv -- sqlite3 "$@"; }
 PROBE_USER="fresh-host-upgrade-probe"
@@ -1049,6 +1128,13 @@ elif grep -q 'Persistent CHV data exists' /var/fresh-host-candidate-rerun.log; t
         else
             bad "services failed to restart after package upgrade"
         fi
+        # Record which unit file is actually active: install.sh writes units
+        # to /etc/systemd/system, which shadow the packaged /lib copies on the
+        # documented tarball-install → package-upgrade path. This is expected,
+        # but the evidence must not imply the packaged units were exercised.
+        for u in chv-controlplane chv-agent chv-stord chv-nwd; do
+            record "UNIT_FRAGMENT ${u}=$(systemctl show -p FragmentPath --value "$u" 2>/dev/null || true)"
+        done
         UPGRADED=1
         check_state_preserved "after-package-upgrade"
     else

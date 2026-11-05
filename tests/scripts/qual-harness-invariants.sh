@@ -306,6 +306,15 @@ grep -q 'results.tsv' "$fresh" \
 grep -q 'UNINSTALL_RESIDUE=' "$fresh" \
     && pass "fresh-host records uninstall residue instead of passing it" \
     || fail "fresh-host hides install.sh-layout uninstall residue"
+grep -q "must_change_password = 0" "$fresh" \
+    && pass "fresh-host clears the bootstrap rotation flag before node visibility" \
+    || fail "fresh-host cannot see the enrolled node behind PASSWORD_CHANGE_REQUIRED"
+grep -q 'command -v ss' "$fresh" \
+    && pass "fresh-host requires ss for the shared-netns port preflight" \
+    || fail "fresh-host port preflight can pass vacuously without ss"
+grep -q 'partial —' "$fresh" \
+    && pass "fresh-host summary marks a run with skipped legs as partial" \
+    || fail "fresh-host summary can headline PASS with skipped legs"
 
 [ -f "$fresh_workflow" ] \
     && pass "fresh-host workflow exists" \
@@ -319,6 +328,9 @@ grep -Fq '[self-hosted, linux, x64, chv-kvm]' "$fresh_workflow" \
 grep -q 'gh release download' "$fresh_workflow" \
     && pass "fresh-host workflow downloads the previous release" \
     || fail "fresh-host workflow does not stage the previous release"
+grep -q 'sudo cp .*candidate-digests' "$fresh_workflow" \
+    && pass "fresh-host workflow stages the digest file as root" \
+    || fail "fresh-host workflow cannot write the digest into the root-owned evidence dir"
 grep -q 'results.tsv' "$fresh_workflow" \
     && pass "fresh-host workflow requires the results marker" \
     || fail "fresh-host workflow does not require results.tsv"
