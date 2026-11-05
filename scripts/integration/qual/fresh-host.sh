@@ -665,13 +665,29 @@ api_login() {
     return 1
 }
 
+# wait_api_login — retry the current ADMIN_PW until the API answers. The
+# control plane needs a moment after a fresh install or a package-upgrade
+# restart; a single immediate login would race the listener.
+wait_api_login() {
+    local i
+    for i in $(seq 1 60); do
+        if api_login "${ADMIN_PW:-}"; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 check_admin_login() {
-    if [ ! -s /etc/chv/initial_admin_password ]; then
-        bad "admin login round-trip (initial_admin_password missing)"
-        return 1
+    if [ -z "${ADMIN_PW:-}" ]; then
+        if [ ! -s /etc/chv/initial_admin_password ]; then
+            bad "admin login round-trip (initial_admin_password missing)"
+            return 1
+        fi
+        ADMIN_PW="$(cat /etc/chv/initial_admin_password)"
     fi
-    ADMIN_PW="$(cat /etc/chv/initial_admin_password)"
-    if api_login "$ADMIN_PW"; then
+    if wait_api_login; then
         ok "admin login round-trip"
         return 0
     fi
@@ -685,13 +701,13 @@ check_admin_login() {
 # asserted until the first-login rotation happens.
 #
 # Rotate through the documented API (`POST /v1/auth/change-password`) rather
-# than a direct `sqlite3` UPDATE against the live database. The old fixture
-# write was a second process writing WAL pages while the control plane was
-# serving; the v0.3.0 -> rc.2 version-assert run hit
-# "database disk image is malformed" seconds after it, and the product must
-# not be blamed for a test-only concurrent writer. The API path also proves
-# the operator can actually rotate the seeded credential, which the core
-# contract depends on.
+# than a direct `sqlite3` UPDATE against the live database. The earlier
+# fixture opened the live WAL database from a second process (UPDATE plus
+# COUNT(*) reads) while the control plane was serving; the v0.3.0 -> rc.2
+# version-assert runs (42116072364, 42118425284) then hit
+# "database disk image is malformed", and the product must not be blamed for
+# a test-only concurrent writer. The API path also proves the operator can
+# actually rotate the seeded credential, which the core contract depends on.
 rotate_admin_password() {
     local new_pw code body=/tmp/fresh-host-change-password.json
     if [ -z "$TOKEN" ]; then
@@ -711,6 +727,7 @@ rotate_admin_password() {
     ok "first-login password change accepted"
     # The change bumps token_version and revokes the token that made the
     # request; the node-visibility check needs a session minted after it.
+    ADMIN_PW="$new_pw"
     if api_login "$new_pw"; then
         ok "admin re-login with the rotated password"
         return 0
@@ -719,21 +736,41 @@ rotate_admin_password() {
     return 1
 }
 
-# Read-only control-plane diagnostics for a failed bring-up. The DB/WAL state
-# and the filesystem type are the two facts that distinguish a product defect
-# from a runner-storage problem, and the earlier timeout captured neither.
+# Read-only control-plane diagnostics for a failed bring-up. The DB/WAL state,
+# the open file descriptors and the filesystem type are the facts that
+# distinguish a product defect from a storage/runner problem.
+#
+# Never open the live WAL database from a second process here: a CLI
+# connection can checkpoint or delete the WAL the control plane is using and
+# destroy the state under investigation. Snapshot the raw files and inspect
+# the copy instead.
 diagnose_controlplane() {
-    local db=/var/lib/chv/controlplane.db
+    local db=/var/lib/chv/controlplane.db copy=/tmp/fresh-host-db-diagnostic pid
     record "--- control-plane database diagnostics ---"
     ls -l "$db" "$db-wal" "$db-shm" 2>&1 | while IFS= read -r line; do record "  ${line}"; done
-    if command -v sqlite3 >/dev/null 2>&1 && [ -f "$db" ]; then
-        record "  sqlite3 --version: $(sqlite3 --version 2>&1 | head -1)"
-        record "  PRAGMA integrity_check(5):"
-        runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$db" 'PRAGMA integrity_check(5);' 2>&1 \
+    pid="$(systemctl show -p MainPID --value chv-controlplane 2>/dev/null || true)"
+    record "  MainPID=${pid:-unknown}"
+    if [ -n "${pid:-}" ] && [ "$pid" != "0" ] && [ -d "/proc/${pid}/fd" ]; then
+        record "  open fds matching ${db} ('(deleted)' means the file was replaced/unlinked under the service):"
+        ls -l "/proc/${pid}/fd" 2>/dev/null | grep -F "$db" \
             | while IFS= read -r line; do record "    ${line}"; done
     fi
+    rm -rf "$copy"
+    mkdir -p "$copy"
+    if cp -a "$db" "$copy/controlplane.db" 2>/dev/null; then
+        cp -a "$db-wal" "$copy/controlplane.db-wal" 2>/dev/null || true
+        record "  snapshot: $(ls -l "$copy" | tail -n +2 | awk '{print $5, $9}' | tr '\n' ' ')"
+        if command -v sqlite3 >/dev/null 2>&1; then
+            record "  sqlite3 --version: $(sqlite3 --version 2>&1 | head -1)"
+            record "  PRAGMA integrity_check(5) on the snapshot:"
+            sqlite3 -cmd '.timeout 5000' "$copy/controlplane.db" 'PRAGMA integrity_check(5);' 2>&1 \
+                | while IFS= read -r line; do record "    ${line}"; done
+        fi
+    else
+        record "  could not snapshot the database"
+    fi
     record "  df -T /var/lib/chv: $(df -T /var/lib/chv 2>&1 | tail -1)"
-    record "  mount: $(findmnt -no FSTYPE,SOURCE,TARGET /var/lib/chv 2>/dev/null || echo unknown)"
+    record "  findmnt: $(findmnt -no FSTYPE,SOURCE,TARGET /var/lib/chv 2>/dev/null || echo unknown)"
     record "  dmesg tail:"
     dmesg 2>/dev/null | tail -20 | while IFS= read -r line; do record "    ${line}"; done
     record "--- end control-plane database diagnostics ---"
@@ -1146,30 +1183,63 @@ else
     fi
 fi
 printf '%s\n' "$PREVIOUS_VERSION" > /var/lib/chv/fresh-host-upgrade-marker
-chv_sqlite() { runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$@"; }
+
+# This leg drives the product only through its own API. The earlier fixture
+# opened the live WAL database with the sqlite3 CLI (a probe-user INSERT and
+# two COUNT(*) reads). That second process checkpointed/deleted the WAL under
+# the running control plane, and the v0.3.0 -> rc.2 version-assert runs
+# (42116072364, 42118425284) then failed with
+# "database disk image is malformed". A test-only concurrent writer must not
+# be able to convict the product, so the probe account is created and checked
+# over HTTP instead.
 PROBE_USER="fresh-host-upgrade-probe"
-PROBE_ID="00000000-0000-0000-0000-000000000066"
 probe_pw="$(openssl rand -hex 12)"
-probe_hash="$(htpasswd -nbBC 12 "$PROBE_USER" "$probe_pw" | sed 's/^[^:]*://')"
-if chv_sqlite /var/lib/chv/controlplane.db <<SQL
-INSERT OR REPLACE INTO users
-  (user_id, username, password_hash, role, display_name, must_change_password, created_at, updated_at)
-VALUES
-  ('${PROBE_ID}', '${PROBE_USER}', '${probe_hash}', 'operator', 'Fresh Host Upgrade Probe', 0,
-   strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'));
-SQL
-then
-    ok "created identifiable operator account ${PROBE_USER}"
+
+api_user_list() {
+    local body=/tmp/fresh-host-users.json code
+    code="$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/v1/users \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+    record "USERS_HTTP=${code}"
+    cat "$body" 2>/dev/null || true
+}
+
+create_probe_user() {
+    local body=/tmp/fresh-host-create-user.json code
+    code="$(curl -sS --max-time 15 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/v1/users/create \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H 'Content-Type: application/json' \
+        --data-binary "{\"username\":\"${PROBE_USER}\",\"password\":\"${probe_pw}\",\"role\":\"operator\",\"display_name\":\"Fresh Host Upgrade Probe\"}" 2>/dev/null || true)"
+    if [ "$code" = "200" ] && grep -q "\"username\":\"${PROBE_USER}\"" "$body" 2>/dev/null; then
+        ok "created identifiable operator account ${PROBE_USER}"
+        return 0
+    fi
+    bad "failed to create identifiable operator account (HTTP ${code:-no-response})"
+    record "CREATE_USER_BODY=$(cat "$body" 2>/dev/null || true)"
+    return 1
+}
+
+# The seeded admin must complete the documented first-login rotation before
+# the BFF permits non-auth routes, so this also exercises that flow on the
+# previous release (the upgrade must not break a rotated account).
+if check_admin_login && rotate_admin_password; then
+    create_probe_user || true
 else
-    bad "failed to create identifiable operator account"
+    bad "could not establish an authenticated admin session before the upgrade"
 fi
-probe_count="$(chv_sqlite /var/lib/chv/controlplane.db \
-    "SELECT COUNT(*) FROM users WHERE username='${PROBE_USER}';" 2>/dev/null || true)"
-record "PRE_UPGRADE_OPERATOR_COUNT=${probe_count:-unknown}"
-[ "${probe_count:-0}" = "1" ] && ok "pre-upgrade operator row present" || bad "pre-upgrade operator row missing"
+probe_users="$(api_user_list)"
+if printf '%s' "$probe_users" | grep -q "\"username\":\"${PROBE_USER}\""; then
+    record "PRE_UPGRADE_OPERATOR_COUNT=1"
+    ok "pre-upgrade operator row present"
+else
+    record "PRE_UPGRADE_OPERATOR_COUNT=0"
+    bad "pre-upgrade operator row missing"
+fi
 
 check_state_preserved() {
-    local phase="$1" want now
+    local phase="$1" want now users
     section "state preservation (${phase})"
     while read -r want path; do
         [ -n "${path:-}" ] || continue
@@ -1186,12 +1256,24 @@ check_state_preserved() {
     else
         bad "${phase}: marker file missing or changed"
     fi
-    probe_count="$(chv_sqlite /var/lib/chv/controlplane.db \
-        "SELECT COUNT(*) FROM users WHERE username='${PROBE_USER}';" 2>/dev/null || true)"
-    [ "${probe_count:-0}" = "1" ] && ok "${phase}: operator account preserved" || bad "${phase}: operator account lost"
-    admin_count="$(chv_sqlite /var/lib/chv/controlplane.db \
-        "SELECT COUNT(*) FROM users WHERE username='admin';" 2>/dev/null || true)"
-    [ "${admin_count:-0}" = "1" ] && ok "${phase}: admin account preserved" || bad "${phase}: admin account lost"
+    # Account preservation is asserted through the product API. A direct
+    # sqlite3 read of the live database is exactly what destabilised the WAL
+    # in the earlier runs.
+    if ! wait_api_login; then
+        bad "${phase}: could not authenticate to inspect accounts (HTTP ${LOGIN_HTTP:-no-response})"
+        return 1
+    fi
+    users="$(api_user_list)"
+    if printf '%s' "$users" | grep -q "\"username\":\"${PROBE_USER}\""; then
+        ok "${phase}: operator account preserved"
+    else
+        bad "${phase}: operator account lost"
+    fi
+    if printf '%s' "$users" | grep -q '"username":"admin"'; then
+        ok "${phase}: admin account preserved"
+    else
+        bad "${phase}: admin account lost"
+    fi
 }
 
 section "candidate install.sh re-run over persistent state"
