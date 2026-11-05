@@ -11,8 +11,9 @@ covers the published one-line quick installer.
 
 **Candidate:** `_pending_` (candidate version and commit are recorded by the
 run). The RC release tag is `v0.4.0-rc.1`; the source `VERSION` file must hold
-the base `0.4.0` because `release.yml` derives the `-rc.1` package suffix from
-the tag. **Commit:** `_pending_`.
+the base `0.4.0` because `release.yml` takes the `rc.1` prerelease suffix from
+the tag — `scripts/version.sh` renders the package version `0.4.0~rc.1`, and
+the tarball is `chv-0.4.0-rc.1-linux-amd64.tar.gz`. **Commit:** `_pending_`.
 
 ---
 
@@ -75,11 +76,14 @@ Asserted:
 - `install.sh` returns `rc=0`; four units (`chv-controlplane`, `chv-agent`,
   `chv-stord`, `chv-nwd`) are `active/running` with `NRestarts=0`.
 - `/etc/chv/encryption.env` is `0600 root:root` with a 64-hex
-  `CHV_ENCRYPTION_KEY`, and the control plane does **not** log the
-  plaintext-fallback warning.
+  `CHV_ENCRYPTION_KEY`, and the candidate control plane logs that it loaded the
+  dedicated key (never the plaintext/legacy-JWT-fallback warning).
 - Admin login round-trip against `POST /api/v1/auth/login`; the local agent is
-  enrolled and visible through `POST /v1/nodes`; the WebUI answers on
-  `127.0.0.1:8080`; the nginx edge answers on `127.0.0.1:80`.
+  enrolled and visible through `POST /v1/nodes` (node visibility is asserted
+  after the recorded test fixture clears the bootstrap admin's
+  `must_change_password` flag; the BFF 403s node routes for a rotation-pending
+  token); the WebUI answers on `127.0.0.1:8080`; the nginx edge answers on
+  `127.0.0.1:80`.
 - `/metrics` is HTTP 200 with a non-empty body on controlplane `:9103`,
   agent `:9901`, stord `:9101`, nwd `:9102`.
 - Every installed binary reports the candidate version and commit.

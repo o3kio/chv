@@ -309,6 +309,24 @@ grep -q 'UNINSTALL_RESIDUE=' "$fresh" \
 grep -q "must_change_password = 0" "$fresh" \
     && pass "fresh-host clears the bootstrap rotation flag before node visibility" \
     || fail "fresh-host cannot see the enrolled node behind PASSWORD_CHANGE_REQUIRED"
+grep -q 'clear_admin_rotation_flag || true' "$fresh" \
+    && pass "fresh-host calls the rotation-flag fixture before login/node checks" \
+    || fail "fresh-host can leave the rotation flag set and fail the node check"
+grep -q 'deprecated legacy CHV_JWT_SECRET fallback' "$fresh" \
+    && pass "fresh-host detects the credential-key fallback in both releases" \
+    || fail "fresh-host encryption check can pass on the legacy fallback"
+grep -q 'failed to enable the one-shot service' "$fresh" \
+    && pass "fresh-host records a row when the one-shot service cannot be enabled" \
+    || fail "fresh-host can drop a leg without a results row"
+grep -q 'state_lines" -eq 4' "$fresh" \
+    && pass "fresh-host asserts all four upgrade state files were hashed" \
+    || fail "fresh-host upgrade state hash set can shrink silently"
+grep -q 'cached base extract failed' "$fresh" \
+    && pass "fresh-host records a failed cached-base extract instead of exiting" \
+    || fail "fresh-host mid-run base failure can lose leg accounting"
+grep -q 'export GITHUB_REPO=' "$fresh" \
+    && pass "fresh-host exports GITHUB_REPO to the in-container child" \
+    || fail "fresh-host in-container quick installer falls back to o3kio/chv"
 grep -q 'command -v ss' "$fresh" \
     && pass "fresh-host requires ss for the shared-netns port preflight" \
     || fail "fresh-host port preflight can pass vacuously without ss"

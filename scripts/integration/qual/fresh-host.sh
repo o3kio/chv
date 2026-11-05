@@ -427,8 +427,13 @@ prepare_root() {
     CURRENT_ROOT="${CHV_QUAL_ROOT}/fresh-host-${leg}-root"
     rm -rf "$CURRENT_ROOT"
     mkdir -p "$CURRENT_ROOT"
-    tar -C "$CURRENT_ROOT" -xzf "$BASE_TARBALL" \
-        || preflight_fail "failed to extract cached base ${BASE_TARBALL}"
+    if ! tar -C "$CURRENT_ROOT" -xzf "$BASE_TARBALL"; then
+        # Do not exit mid-run: that would leave later legs with no row at all.
+        # Record this leg's failure and let the remaining accounting stand.
+        qual_error "${leg}: failed to extract cached base ${BASE_TARBALL}"
+        record_result "$leg" "fail" "1" "0" "" "cached base extract failed"
+        return 1
+    fi
     rm -rf "${CURRENT_ROOT}/dev/.static/" 2>/dev/null || true
     rm -f "${CURRENT_ROOT}/etc/hostname" "${CURRENT_ROOT}/etc/machine-id"
     printf 'fresh-host-%s\n' "$leg" > "${CURRENT_ROOT}/etc/hostname"
@@ -483,7 +488,7 @@ prepare_root() {
         printf 'QUICK_VERSION=%q\n' "$QUICK_VERSION"
         printf 'QUICK_INSTALL_SCRIPT=/root/fresh-host/quick-install.sh\n'
         printf 'QUICK_INSTALL_LOCAL=/root/fresh-host/quick-install-local.sh\n'
-        printf 'GITHUB_REPO=%q\n' "$GITHUB_REPO"
+        printf 'export GITHUB_REPO=%q\n' "$GITHUB_REPO"
     } > "${CURRENT_ROOT}/root/fresh-host/env"
     chmod 0644 "${CURRENT_ROOT}/root/fresh-host/env"
 }
@@ -587,7 +592,7 @@ check_units_contract() {
 }
 
 check_encryption() {
-    local stat journal
+    local mode="${1:-candidate}" stat journal
     stat="$(stat -c '%a %U:%G' /etc/chv/encryption.env 2>/dev/null || true)"
     record "ENCRYPTION_ENV=${stat:-missing}"
     if [ "$stat" = "600 root:root" ]; then
@@ -600,17 +605,25 @@ check_encryption() {
     else
         bad "CHV_ENCRYPTION_KEY is missing or malformed"
     fi
-    if [ "${1:-}" = "static" ]; then
+    if [ "$mode" = "static" ]; then
         # The packages leg expects the units to be down without generated
         # certs, so an empty journal proves nothing. Do not claim the check.
         record "ENCRYPTION_JOURNAL=skipped (static packaging leg; services expected down)"
         return 0
     fi
     journal="$(journalctl -u chv-controlplane --no-pager 2>/dev/null || true)"
-    if printf '%s' "$journal" | grep -q 'S3 credentials will be stored in plaintext'; then
-        bad "control plane logged the plaintext-fallback warning"
+    # The candidate's warning text differs from v0.3.0's. Match both so the
+    # check cannot pass just because the runtime changed its wording.
+    if printf '%s' "$journal" | grep -qE 'S3 credentials will be stored in plaintext|deprecated legacy CHV_JWT_SECRET fallback'; then
+        bad "control plane is not using a dedicated encryption key (plaintext/fallback warning logged)"
+    elif [ "$mode" = "previous" ]; then
+        # v0.3.0 logs nothing on the dedicated-key path; the absence of the
+        # warning is the strongest assertion that binary supports.
+        ok "previous release logged no plaintext/fallback warning"
+    elif printf '%s' "$journal" | grep -q 'credential encryption key source: dedicated key'; then
+        ok "control plane loaded the dedicated encryption key"
     else
-        ok "control plane loaded the encryption key (no plaintext warning)"
+        bad "candidate did not log the dedicated encryption key source"
     fi
 }
 
@@ -632,7 +645,7 @@ clear_admin_rotation_flag() {
         bad "admin rotation flag (sqlite3 missing)"
         return 1
     fi
-    if runuser -u chv -- sqlite3 "$db" \
+    if runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$db" \
         "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
         >/dev/null 2>&1; then
         record "ADMIN_ROTATION_FLAG=cleared for the node-visibility check (test fixture)"
@@ -736,10 +749,11 @@ check_binaries_version() {
 }
 
 check_bringup() {
+    local encryption_mode="${1:-candidate}"
     section "bring-up contract"
     wait_units_active 180 || true
     check_units_contract
-    check_encryption
+    check_encryption "$encryption_mode"
     clear_admin_rotation_flag || true
     check_admin_login || true
     check_webui
@@ -784,7 +798,7 @@ write_leg_script() {
 
 run_boot_leg() {
     local leg="$1" timeout="$2" body="$3"
-    prepare_root "$leg"
+    prepare_root "$leg" || return 1
     write_common
     write_leg_script "$leg" "$body"
     CURRENT_MACHINE="fresh-host-${leg}-$(date -u +%s)"
@@ -804,12 +818,13 @@ WantedBy=multi-user.target
 EOF
 
     if ! systemd-nspawn -q -D "$CURRENT_ROOT" --machine="${CURRENT_MACHINE}-setup" \
-        systemctl enable fresh-host-leg.service >/dev/null 2>&1; then
+        systemctl enable fresh-host-leg.service \
+        >"${EVIDENCE_DIR}/${leg}-boot.log" 2>&1; then
         # Record the failure row too: a marker with no row for this leg lets
         # the summary silently omit it. Leave CURRENT_ROOT set so the EXIT
         # trap preserves it for post-mortem (QUAL_ERRORS is now non-zero).
-        qual_error "${leg}: failed to enable the one-shot service"
-        record_result "$leg" "fail" "1" "0" "" "evidence/${leg}-boot.log"
+        qual_error "${leg}: failed to enable the one-shot service (see ${leg}-boot.log)"
+        record_result "$leg" "fail" "1" "0" "evidence/${leg}-boot.log" ""
         return 1
     fi
 
@@ -1089,8 +1104,15 @@ check_state_preserved() {
 
 section "candidate install.sh re-run over persistent state"
 mkdir -p /root/fresh-host/candidate
-tar -xzf "$CANDIDATE_TARBALL" -C /root/fresh-host/candidate
+if ! tar -xzf "$CANDIDATE_TARBALL" -C /root/fresh-host/candidate; then
+    bad "candidate tarball extraction failed"
+    finish
+fi
 INSTALLER="/root/fresh-host/candidate/chv-${CANDIDATE_VERSION}-linux-amd64/install.sh"
+if [ ! -f "$INSTALLER" ]; then
+    bad "candidate installer not found at ${INSTALLER} (top directory does not match --candidate-version ${CANDIDATE_VERSION})"
+    finish
+fi
 env INSTALL_CHV_TARBALL_PATH="$CANDIDATE_TARBALL" \
     INSTALL_CHV_VERSION="$CANDIDATE_VERSION" \
     INSTALL_CHV_TARBALL_SHA256="$CANDIDATE_SHA256" \
@@ -1182,7 +1204,7 @@ else
     tail -n 30 /var/fresh-host-quick.log >>"$OUT"
     finish
 fi
-check_bringup
+check_bringup previous
 check_binaries_version "$QUICK_VERSION" ""
 finish
 EOS
