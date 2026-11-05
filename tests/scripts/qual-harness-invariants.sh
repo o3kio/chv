@@ -533,6 +533,13 @@ grep -q "tr -c 'A-Za-z0-9._-'" "$build_packages" \
 grep -q 'ASSET_VERSION' "$check_package_files" \
     && pass "check-package-files.sh validates the published asset name" \
     || fail "check-package-files.sh validates a filename the release never serves"
+smoke_webui="${REPO_ROOT}/scripts/package/smoke-webui.sh"
+grep -q 'asset_version' "$smoke_webui" \
+    && pass "smoke-webui.sh selects the published asset name" \
+    || fail "smoke-webui.sh selects a '~' filename the build no longer emits"
+grep -q "tr -c 'A-Za-z0-9._-'" "$smoke_webui" \
+    && pass "smoke-webui.sh applies GitHub's filename sanitization" \
+    || fail "smoke-webui.sh filename sanitization drifted from GitHub's rule"
 
 quick_deb_assets="$(source_path="$quick_installer" bash -c '
     set +u

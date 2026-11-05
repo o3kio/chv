@@ -102,10 +102,14 @@ fi
 select_deb() {
     local name="$1"
     if [ -n "${PACKAGE_VERSION:-}" ]; then
-        local exact
-        exact="$(ls "${PKGDIR}/${name}_${PACKAGE_VERSION}"_*.deb 2>/dev/null | head -n1 || true)"
+        # GitHub (and build-packages.sh) use a filename-safe version:
+        # characters outside [A-Za-z0-9._-] are replaced with '.', so the
+        # internal 0.4.0~rc.1 package is stored as ..._0.4.0.rc.1_....
+        local asset_version exact
+        asset_version="$(printf '%s' "${PACKAGE_VERSION}" | tr -c 'A-Za-z0-9._-' '.')"
+        exact="$(ls "${PKGDIR}/${name}_${asset_version}"_*.deb 2>/dev/null | head -n1 || true)"
         if [ -z "${exact}" ]; then
-            echo "ERROR: PACKAGE_VERSION='${PACKAGE_VERSION}' set but no ${name}_${PACKAGE_VERSION}_*.deb under ${PKGDIR}" >&2
+            echo "ERROR: PACKAGE_VERSION='${PACKAGE_VERSION}' (asset version '${asset_version}') set but no ${name}_${asset_version}_*.deb under ${PKGDIR}" >&2
             return 1
         fi
         echo "${exact}"
