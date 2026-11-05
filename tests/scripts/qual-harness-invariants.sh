@@ -556,6 +556,9 @@ for wf in "$release_workflow" "${REPO_ROOT}/.github/workflows/package-nightly.ym
     [ "$ordered_clean" = "ok" ] \
         && pass "${wf_name} removes 0.0.1 probe packages before the real build" \
         || fail "${wf_name} would publish the 0.0.1 lifecycle probe packages"
+    grep -q 'Refusing to publish package' "$wf" \
+        && pass "${wf_name} fails closed on a foreign staged package version" \
+        || fail "${wf_name} has no runtime guard against publishing a foreign version"
 done
 
 # Release-note install snippets must name the published (sanitized) asset,

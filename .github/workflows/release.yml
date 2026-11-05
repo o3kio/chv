@@ -419,6 +419,25 @@ jobs:
         run: |
           ./scripts/package/lifecycle-rpm.sh --new-packages dist/packages --old-packages dist/packages-old
 
+      - name: Assert only the release version is staged
+        # The lifecycle probe (0.0.1) must never reach the published set.
+        # This is a runtime backstop for the workflow-ordering invariant:
+        # fail closed on any foreign version rather than publish it.
+        run: |
+          if [[ "${{ needs.build.outputs.channel }}" == "rc" ]]; then
+            RC_SUFFIX="${{ needs.build.outputs.pkg_version }}"
+            RC_SUFFIX="${RC_SUFFIX##*-rc.}"
+            export CHV_PKG_PRERELEASE="rc.${RC_SUFFIX}"
+          fi
+          ASSET_VERSION="$(./scripts/version.sh --deb | tr -c 'A-Za-z0-9._-' '.')"
+          bad="$(find dist/packages -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) -printf '%f\n' \
+            | grep -vF -- "$ASSET_VERSION" || true)"
+          if [ -n "$bad" ]; then
+            echo "Refusing to publish package(s) that are not ${ASSET_VERSION}:" >&2
+            printf '%s\n' "$bad" >&2
+            exit 1
+          fi
+
       - name: Generate SHA256 checksums
         run: |
           cd dist/packages
