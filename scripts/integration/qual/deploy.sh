@@ -643,6 +643,18 @@ wait_for "agent gRPC socket up" 30 test -S "${agent_dir}/api.sock" \
 TOKEN_STATE="$(sqlite_query "$DB" "SELECT used_at IS NOT NULL FROM bootstrap_tokens WHERE token_hash='${TOKEN_HASH}'")"
 assert_contains "one-time bootstrap token consumed" "$TOKEN_STATE" "1" || true
 
+# #709: on success the agent must report the first-enrollment bootstrap result
+# on the identity the control plane just issued. Pre-fix the report went out
+# on the pre-enrollment channel, the control plane's peer-node-id check
+# rejected it, and no row was written; a `success = 1` row is the direct
+# observable of the fix. The report is asynchronous, so poll briefly.
+bootstrap_result_recorded() {
+    [ "$(sqlite_query "$DB" "SELECT success FROM node_bootstrap_results WHERE node_id='${NODE_ID}'" 2>/dev/null | head -1)" = "1" ]
+}
+wait_for "first-enrollment bootstrap result recorded (success=1)" 30 bootstrap_result_recorded \
+    && qual_pass "first-enrollment bootstrap result recorded on the issued identity (#709)" \
+    || qual_error "first-enrollment bootstrap result NOT recorded for ${NODE_ID} (node_bootstrap_results: $(sqlite_query "$DB" "SELECT node_id, success FROM node_bootstrap_results" 2>/dev/null | tr '\n' ' '))"
+
 # No insecure-mode escape hatch anywhere in the environment.
 if env | grep -q '^CHV_ALLOW_INSECURE='; then
     qual_error "FORBIDDEN: CHV_ALLOW_INSECURE is set in the environment"
