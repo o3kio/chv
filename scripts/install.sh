@@ -94,6 +94,10 @@ RELEASE_GPG_HOME=""
 JWT_SECRET=""
 BOOTSTRAP_TOKEN=""
 CHV_NODE_ID=""
+# Set only when this run temporarily clears the bootstrap admin's
+# must_change_password flag. cleanup() must not mutate an existing deployment
+# when a re-run refuses at the persistent-data guard.
+ADMIN_FLAG_MANAGED=0
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -114,6 +118,51 @@ chv_sqlite() {
     else
         runuser -u "$CHV_USER" -- sqlite3 "$@"
     fi
+}
+
+# Run sqlite3 against the control-plane database with chv-controlplane
+# stopped, then bring the service back up.
+#
+# The sqlite3 CLI checkpoints and unlinks controlplane.db-wal/-shm when it is
+# the last connection to close. When the control plane is already running,
+# its pooled connections keep using the now-unlinked WAL inode: every write
+# the API acknowledges after that point is lost when the process exits. That
+# is exactly the v0.3.0/v0.4.0-rc.2 clean-install defect where a first-login
+# password rotation and a created user vanished on the next restart.
+#
+# A second writer is only safe while the service is not running. Restarting
+# afterwards reopens the database on the current path, so subsequent API
+# writes land in a live WAL again.
+chv_sqlite_offline() {
+    local was_active=0 rc=0 attempt=1
+    if systemctl is-active --quiet chv-controlplane 2>/dev/null; then
+        was_active=1
+        if ! systemctl stop chv-controlplane >/dev/null 2>&1; then
+            warn "Failed to stop chv-controlplane before an offline database write."
+            return 1
+        fi
+    fi
+
+    chv_sqlite "$@" || rc=$?
+
+    if [ "$was_active" -eq 1 ]; then
+        if ! systemctl start chv-controlplane >/dev/null 2>&1; then
+            warn "Failed to restart chv-controlplane after an offline database write."
+            rc=1
+        elif cmd_exists curl; then
+            while [ $attempt -le 30 ]; do
+                curl -sf "http://127.0.0.1:8080/health" &>/dev/null && break
+                sleep 1
+                ((attempt++))
+            done
+            if [ $attempt -gt 30 ]; then
+                warn "chv-controlplane did not become healthy after an offline database write."
+                rc=1
+            fi
+        fi
+    fi
+
+    return "$rc"
 }
 
 # Repair and then verify ownership of the control-plane DB and its WAL
@@ -1865,10 +1914,12 @@ seed_admin_user() {
 
     # Idempotency: if the admin user already exists, do nothing. We talk to the
     # SQLite DB directly because the API requires authentication (the very
-    # thing we're bootstrapping). Both reads and writes run as the service
-    # user so SQLite never leaves root-owned WAL sidecars (#669).
+    # thing we're bootstrapping). Reads and writes run as the service user and
+    # with the control plane stopped (see chv_sqlite_offline) so SQLite never
+    # leaves root-owned WAL sidecars (#669) or unlinks the WAL the running
+    # service still has open.
     if [ -f "$db_path" ] && \
-       [ "$(chv_sqlite "$db_path" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
+       [ "$(chv_sqlite_offline "$db_path" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
         info "Admin user already exists — skipping seed."
         return 0
     fi
@@ -1909,7 +1960,7 @@ print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode("utf-8"))
     # ${admin_user_id} and ${hashed_pw}. The bcrypt hash contains '$' but those
     # are protected by the surrounding single quotes inside the SQL itself
     # (heredoc expands shell vars but the SQL parser sees the literal string).
-    if ! chv_sqlite "$db_path" <<SQL
+    if ! chv_sqlite_offline "$db_path" <<SQL
 INSERT INTO users (user_id, username, password_hash, role, display_name, must_change_password, created_at, updated_at)
 VALUES ('${admin_user_id}', 'admin', '${hashed_pw}', 'admin', 'Administrator', 1,
         strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -1993,11 +2044,18 @@ wipe_deployment() {
 # Cleanup
 # -----------------------------------------------------------------------------
 reset_must_change_password() {
+    # Only undo a flag this run actually cleared. A plain re-run over
+    # persistent data must fail closed without changing the live deployment;
+    # resetting the flag here would revoke the operator's current session
+    # (403 PASSWORD_CHANGE_REQUIRED) even though the re-run did nothing.
+    [ "$ADMIN_FLAG_MANAGED" = "1" ] || return 0
     # Ensure the bootstrap admin is flagged for rotation on first login even
     # if we temporarily cleared it during install to allow API seeding.
-    # Run as the service user: this is a write to the live WAL database.
+    # chv_sqlite_offline stops the control plane for the write and restarts
+    # it afterwards, so the operator's post-install API writes land in a WAL
+    # bound to the current database path.
     if [ -f "${CHV_DB_PATH}" ] && cmd_exists sqlite3; then
-        if ! chv_sqlite "${CHV_DB_PATH}" \
+        if ! chv_sqlite_offline "${CHV_DB_PATH}" \
             "UPDATE users SET must_change_password = 1 WHERE username = 'admin';" 2>/dev/null; then
             warn "CRITICAL: Failed to reset must_change_password flag. Admin may not be forced to rotate password on first login."
         fi
@@ -2135,7 +2193,11 @@ seed_admin_user || fatal "Failed to seed bootstrap admin user."
 # middleware.  The flag is restored to 1 in cleanup() / reset_must_change_password()
 # so the operator is still forced to rotate on first UI login.
 info "Temporarily clearing must_change_password for install-time API seeding..."
-chv_sqlite "${CHV_DB_PATH}" \
+# Record the intent before the write: the SQL may have committed even when
+# the helper reports a restart/health failure, and cleanup must still restore
+# the flag.
+ADMIN_FLAG_MANAGED=1
+chv_sqlite_offline "${CHV_DB_PATH}" \
     "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
     || warn "Failed to clear must_change_password; API seeding may be blocked."
 ensure_chv_db_ownership
