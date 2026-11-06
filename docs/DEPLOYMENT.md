@@ -2,8 +2,8 @@
 
 This guide deploys CHV on a single Linux host. The host runs the **control plane** (orchestration, API, Web UI) and Cloud Hypervisor (the VMM) as the VM runtime.
 
-> **Version:** 0.4.0 (release candidate `v0.4.0-rc.6`; `VERSION` holds the base
-> `0.4.0` and the tag carries the `-rc.6` suffix)<br>
+> **Version:** 0.4.0 (release candidate `v0.4.0-rc.7`; `VERSION` holds the base
+> `0.4.0` and the tag carries the `-rc.7` suffix)<br>
 > **Target:** Ubuntu 22.04/24.04 LTS or equivalent Linux with KVM support<br>
 > **Database:** SQLite (no external database service required)
 
@@ -29,11 +29,11 @@ Run the qualified all-in-one installer on a fresh Ubuntu server with root access
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
 ```
 
-Or install a specific version (the current release candidate is `0.4.0-rc.6`;
+Or install a specific version (the current release candidate is `0.4.0-rc.7`;
 `0.3.0` remains the latest stable):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.6 bash -s
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.7 bash -s
 ```
 
 The installer script requires **bash**: it uses `set -o pipefail`, which `sh`
@@ -44,9 +44,16 @@ The installer script requires **bash**: it uses `set -o pipefail`, which `sh`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INSTALL_CHV_BRIDGE_NAME` | `chvbr0` | Linux bridge name |
-| `INSTALL_CHV_BRIDGE_CIDR` | `10.200.0.1/24` | Gateway IP / subnet |
-| `INSTALL_CHV_BRIDGE_IFACE` | `ens19` | Host interface attached to bridge (NAT upstream) |
+| `INSTALL_CHV_BRIDGE_NAME` | `chvbr0` | Legacy bridge name (used only when seeding is disabled) |
+| `INSTALL_CHV_BRIDGE_CIDR` | `10.200.0.1/24` | Default-network gateway IP / subnet |
+| `INSTALL_CHV_BRIDGE_IFACE` | `ens19` | Host interface used as the NAT upstream |
+
+With seeding enabled (the default), the installer does **not** create the
+legacy `chvbr0` bridge: the default network is materialized by `chv-nwd` on
+its own `br-<id>` and is the single owner of `10.200.0.1`. The installer keeps
+IPv4 forwarding and the NAT rule for the subnet, and fails unless exactly one
+interface owns the gateway (rc.6 blocker B3). Set
+`INSTALL_CHV_NO_SEED=1` to keep the legacy bridge bootstrap instead.
 
 Example with custom network:
 
@@ -143,8 +150,8 @@ GPG signature check in the installer.
 > tarball with a `.sha256` sidecar alongside the `.deb`/`.rpm` packages), so
 > this resolution leg is live — tagged releases are the artifact source, and
 > the rolling `nightly` pre-release is never selected. The current release
-> candidate `v0.4.0-rc.6` is a GitHub pre-release, so the stable resolver
-> correctly skips it; install it by pinning `0.4.0-rc.6` explicitly. The
+> candidate `v0.4.0-rc.7` is a GitHub pre-release, so the stable resolver
+> correctly skips it; install it by pinning `0.4.0-rc.7` explicitly. The
 > `get.cellhv.com` hosting surface is **not stood up** (the name does not
 > resolve); see
 > [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
@@ -157,7 +164,9 @@ The installer will:
 2. Download and install CHV binaries, Web UI assets, and database migrations
 3. Download and install the Cloud Hypervisor VMM
 4. Generate a self-signed TLS CA
-5. Create and configure the `chvbr0` bridge with NAT
+5. Create the default network through the API, which makes `chv-nwd` the single
+   owner of the `10.200.0.1/24` gateway on `br-<id>` (the legacy `chvbr0`
+   bridge is skipped while seeding; forwarding and NAT are still configured)
 6. Write `controlplane.toml`, `agent.toml`, `stord.toml`, and `nwd.toml`
 7. Install systemd services for all four CHV daemons
 8. Create a one-time bootstrap token (saved to `/etc/chv/bootstrap.token`)
@@ -185,12 +194,16 @@ in the install output. You will be required to change it on first login.
 > persisted across a control-plane restart, WAL retained). See the
 > [rc.1 evidence report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md)
 > and the [rc.5 evidence report](evidence/production-readiness/v0.4.0-rc5/fresh-host-qualification.md).
-> The rc.5 lane is evidence for the #727 installer fixes only: rc.5 was
-> superseded by rc.6 for the agent-restart defect, and **no rc.6
-> post-publication lane has run at tag time**. The container shares the host
-> kernel/network namespace and has no `/dev/kvm`, so this is not bare-metal
-> evidence. `scripts/install.sh` remains the qualified (KVM-verified)
-> deployment path.
+> The rc.5 lane is evidence for the #727 installer fixes only. rc.6 fixed the
+> restart defect but is **disqualified as the field/stable base** by its own
+> clean install (B1–B5: no `/dev/net/tun` device allowance, swallowed
+> `vm.boot` failure, duplicate default gateway, unwritable dnsmasq lease
+> file, and a `--wipe` identity conflict; B7: the install record named
+> `0.3.0` while installing the rc artifact); rc.7 fixes those. **Neither the
+> rc.6 nor the rc.7 post-publication lane has run at tag time.** The container
+> shares the host kernel/network namespace and has no `/dev/kvm`, so this is
+> not bare-metal evidence. `scripts/install.sh` remains the qualified
+> (KVM-verified) deployment path.
 >
 > **Do not install `v0.4.0-rc.2`, or use the `v0.4.0-rc.3` or `v0.4.0-rc.4`
 > quick installers.** rc.2 and the rc.3 quick installer have a
@@ -202,19 +215,34 @@ in the install output. You will be required to change it on first login.
 > `v0.4.0-rc.4` fixed that quick-installer defect (#725), but rc.4's quick
 > installer has two more: it can complete with no enrolled node, and a
 > documented re-run destroys the enrolled agent identity. Both are fixed in
-> `v0.4.0-rc.5` (#727) and retained in rc.6. The rc.4 tarball/package and
-> upgrade path is unaffected and passed its lane. See the
+> `v0.4.0-rc.5` (#727) and retained in rc.6 and rc.7. The rc.4 tarball/package
+> and upgrade path is unaffected and passed its lane. See the
 > [rc.5 release notes](release/v0.4.0-rc.5-release-notes.md) §2.
 >
-> **Do not use `v0.4.0-rc.5` as the stable base.** On rc.5,
+> **Do not use `v0.4.0-rc.5` or `v0.4.0-rc.6` as the stable base.** On rc.5,
 > `systemctl restart chv-agent` with a running VM killed the VMM after
 > `TimeoutStopSec`, and a plain stop/start could remove `/run/chv` and wedge
-> the node. **rc.6 fixes the restart, drain, and removal paths (#732)**; the
-> rc.6 release notes state the evidence boundary. The rc.5
-> post-publication lane
+> the node. **rc.6 fixed the restart, drain, and removal paths (#732)** but
+> its default clean install could not boot a VM with a NIC, could report a
+> failed boot as success, routed guest traffic to the wrong bridge, could not
+> serve DHCP, and could not complete a second `--wipe` install. **rc.7 fixes
+> B1–B5 and B7**; the [rc.6 blocker report](evidence/production-readiness/v0.4.0/field-qualification/01-rc6-blockers.md)
+> and [rc.7 release notes](release/v0.4.0-rc.7-release-notes.md) state the
+> evidence boundary. The rc.5 post-publication lane
 > ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210))
 > passed all four legs; see the
 > [rc.5 evidence report](evidence/production-readiness/v0.4.0-rc5/fresh-host-qualification.md).
+>
+> **Upgrading from rc.6 or earlier:** a package upgrade does not edit host
+> network configuration. The legacy `chvbr0` from those installers survives
+> and keeps the duplicate `10.200.0.1/24` route, so remove it once after the
+> upgrade (`ip link del chvbr0`; delete
+> `/etc/network/interfaces.d/chvbr0`, `/etc/systemd/network/10-chvbr0.netdev`,
+> `/etc/systemd/network/11-chvbr0.network`, and any `12-*.network` containing
+> `Bridge=chvbr0`). A plain installer re-run refuses while persistent data
+> exists, so perform the removal manually; a full `install.sh --wipe`
+> (destructive) is the alternative if the deployment is expendable. A clean
+> rc.7 install does this automatically.
 
 A curl-pipe-bash installer for trying CHV on a fresh Linux host — one
 command yields the control plane with the WebUI served by the binary
@@ -229,7 +257,7 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-instal
 Or pinned to a tagged release, with a dry run available:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0-rc.6
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0-rc.7
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --dry-run
 ```
 
@@ -252,7 +280,7 @@ package-serving shape where the control plane serves the WebUI itself
 that shape, so the script refuses them (`--version 0.3.0` fails closed)
 rather than install a host with a 404 UI. While v0.3.0 remains the latest
 stable during the v0.4.0-rc.N window, pin the pre-release explicitly:
-`--version 0.4.0-rc.6`.
+`--version 0.4.0-rc.7`.
 
 After it completes, open `http://<host-ip>:8080/` and log in as
 **admin** with the password from `/etc/chv/initial_admin_password`
@@ -311,9 +339,11 @@ four `/metrics` listeners (run
 `v0.4.0-rc.1`). The label remains [CONTAINER-VERIFIED] after the rc.5 re-run
 ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210), tag
 `v0.4.0-rc.5`), which passed all four legs after the rc.4 quick-install defect
-was fixed. That run is installer evidence only: rc.5 was superseded by rc.6
-for the agent-restart defect, and **no rc.6 post-publication lane has run at
-tag time**. This is the same gate shape as the container package-smoke leg
+was fixed. That run is installer evidence only. rc.5 was superseded by rc.6
+for the agent-restart defect; rc.6 is disqualified by its clean-install
+blocker report and superseded by rc.7. **Neither the rc.6 nor the rc.7
+post-publication lane has run at tag time.** This is the same gate shape as
+the container package-smoke leg
 that ran in #549 (2026-10-08). The scope is the container contract — not
 bare-metal behavior and not guest execution.
 
@@ -337,7 +367,8 @@ bare-metal behavior and not guest execution.
 │           │                        └─► chv-nwd   (daemon)   │
 │      nginx :80 (proxy edge — the binary serves the UI)      │
 │  ┌─────────────────────────────────────────────────────┐    │
-│  │  chvbr0 (10.200.0.1/24) ──NAT──► ens19 ──► internet │    │
+│  │  br-<id> (10.200.0.1/24) ─NAT─► ens19 ──► internet │    │
+│  │  (chv-nwd owns the seeded default network)          │    │
 │  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -543,6 +574,15 @@ sudo chown -R chv:chv /usr/local/share/chv/migrations
 ```
 
 ### 5. Bridge and NAT Network Setup
+
+The qualified installer leaves the seeded `default` network to `chv-nwd`: it
+creates `br-<id>` and assigns `10.200.0.1/24`, and the installer configures
+forwarding plus NAT. Creating a second bridge with the same address routes
+guest traffic to the dead device (rc.6 blocker B3), so do not also create
+`chvbr0` when the default network is seeded.
+
+If you are installing without the default network (`INSTALL_CHV_NO_SEED=1`),
+the legacy bridge bootstrap is:
 
 ```bash
 BRIDGE_NAME="chvbr0"
@@ -1102,7 +1142,16 @@ sudo systemctl start chv-controlplane
 
 ### Bridge / NAT Not Working
 ```bash
-# Verify bridge is up
+# Verify the default-network bridge is up (seeded default; chv-nwd owns it)
+ip -o -4 addr show | grep '10.200.0.1/'   # exactly one interface must match
+ip -o link show type bridge | grep -E 'br-|chvbr0'
+
+# Upgraded from rc.6 or earlier? The legacy chvbr0 is still there and owns
+# the same address. If the grep above prints two interfaces, remove it
+# (see the upgrade note above; a plain installer re-run refuses while
+# persistent data exists).
+
+# Legacy bridge (only when INSTALL_CHV_NO_SEED=1)
 ip addr show chvbr0
 
 # Verify IP forwarding
@@ -1132,6 +1181,20 @@ location /v1/ {
 ### Permission Denied on `/dev/kvm`
 - Ensure the `chv` user is in the `kvm` group: `groups chv`
 - If just added: `sudo systemctl restart chv-agent`
+
+### Cloud Hypervisor Fails to Open `/dev/net/tun`
+The agent ships a closed device cgroup with explicit allowances. Both
+`DeviceAllow=/dev/kvm rw` and `DeviceAllow=/dev/net/tun rw` are required in
+`chv-agent.service`; a local unit drop-in that lists only `/dev/kvm` (or an
+older unit) denies the NIC device, and `vm.boot` fails with
+`Couldn't open /dev/net/tun: Operation not permitted` (rc.6 blocker B1).
+`CapEff=0` and an ownerless nwd tap are expected; no `CAP_NET_ADMIN` is
+needed. Compare the installed unit with `packaging/systemd/chv-agent.service`,
+then `systemctl daemon-reload && systemctl restart chv-agent`.
+
+If a VM was already started under the broken unit, delete and recreate it:
+`start_vm` now fails visibly, and a retried start or stop/start cycle does not
+restore a missing `config.net` (rc.6 blocker B6).
 
 ---
 

@@ -1,0 +1,23 @@
+token_len=300
+=== create VM 2 via documented API ===
+create_http=200
+{"accepted":true,"next_refresh_path":"/api/v1/tasks/a6cd94425896c99a54269471e0236de3","summary":"Creating VM 'dev-vm-2'","task_id":"a6cd94425896c99a54269471e0236de3","vm_id":"4290fa2f3c082d909bc515a074a907e5"}VM2=4290fa2f3c082d909bc515a074a907e5
+=== vm2 state before start ===
+=== taps/bridges ===
+br-eac31935dc4f  DOWN           a2:1f:31:dc:41:bf <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+tap-ecb43e1c     DOWN           e6:d5:91:a2:f3:14 <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+=== documented start ===
+start_http=200
+{"accepted":true,"summary":"start vm accepted","task_id":"StartVm-14361ae4f29de73333b7be88fbdfc01e","vm_id":"4290fa2f3c082d909bc515a074a907e5"}t=3s vmm=Created console=0
+t=6s vmm=Created console=0
+t=9s vmm=Created console=0
+t=12s vmm=Created console=0
+t=15s vmm=Created console=0
+t=18s vmm=Created console=0
+t=21s vmm=Created console=0
+t=24s vmm=Created console=0
+t=27s vmm=Created console=0
+t=30s vmm=Created console=0
+=== agent log for VM2 ===
+[2m2026-11-06T15:00:29.187830Z[0m [32m INFO[0m [2mchv_agent_runtime_ch::process[0m[2m:[0m booting vm via ch api [3mvm_id[0m[2m=[0m4290fa2f3c082d909bc515a074a907e5 [3mop[0m[2m=[0m"legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:4290fa2f3c082d909bc515a074a907e5:operation:40:StartVm-14361ae4f29de73333b7be88fbdfc01e"
+[2m2026-11-06T15:00:29.205271Z[0m [33m WARN[0m [2mchv_agent_runtime_ch::process[0m[2m:[0m vm.boot returned non-success (VM may have auto-booted) [3mvm_id[0m[2m=[0m4290fa2f3c082d909bc515a074a907e5 [3mstatus[0m[2m=[0m500

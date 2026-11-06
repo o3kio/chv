@@ -16,6 +16,10 @@ bin/
 *.test
 *.out
 *.log
+# Field-qualification evidence: the raw logs are redacted, bounded artifacts
+# that must be committed with the report they support, so re-include them
+# under docs/evidence despite the generic rule above.
+!docs/evidence/**/*.log
 *.profraw
 coverage.html
 coverage.out

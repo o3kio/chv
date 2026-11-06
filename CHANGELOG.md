@@ -5,7 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0-rc.7] - 2026-11-06
+
+> **Final release candidate for `v0.4.0` and the base for the stable tag.**
+> Supersedes `v0.4.0-rc.6`, which is **disqualified**: a clean install from
+> the published rc.6 tarball reproduced four blocker-class defects and one
+> operational install defect (B1–B5; B6 is the visible consequence of
+> B1/B2). That same evidence exposed a second operational truth defect, B7.
+> rc.7 changes the packaged agent unit, the agent boot verdict, every nwd
+> dnsmasq spawn path, and three installer paths, plus the version string that
+> local release-directory mode prints. rc.6 remains published and is not
+> rewritten. Evidence:
+> [`01-rc6-blockers.md`](docs/evidence/production-readiness/v0.4.0/field-qualification/01-rc6-blockers.md).
+
+### Fixed
+- **A VM could not boot with a NIC (blocker; B1).** `DeviceAllow=/dev/kvm rw`
+  switches the agent to a closed device cgroup; `/dev/net/tun` was not
+  allow-listed, so cloud-hypervisor failed
+  `Couldn't open /dev/net/tun: Operation not permitted`, `vm.boot` returned
+  500, and the VM stayed `Created` with no NIC. The packaged agent unit and
+  its `docs/examples` copy now list `DeviceAllow=/dev/net/tun rw`. Tap
+  ownership was not the cause: CH runs as `chv` with `CapEff=0` and attaches
+  an ownerless nwd tap; no `CAP_NET_ADMIN` is required.
+- **`start_vm` reported success on a failed boot (blocker; B2).** A non-2xx
+  `vm.boot` was swallowed and the operation recorded `succeeded` while the
+  VMM stayed `Created`; the BFF displayed the desired state. A boot failure
+  is now a hard error unless a follow-up `vm.info` reports `Running` or
+  `Paused`. The error carries the VMM body and observed state, and the same
+  verdict applies on the re-spawn path.
+- **A retried start could report `Running` with no NIC and a dead console
+  (blocker; B6).** After a failed first boot, cloud-hypervisor could answer
+  `204` with an empty `config.net`; stop/start never healed it. The start
+  contract now compares `vm.info`'s `config.net` count with the `net` array
+  persisted in `vm-config.json` and fails with
+  `Delete and recreate the VM to recover.` No assertion is imposed on a VM
+  created without NICs or on legacy state with no readable payload.
+- **The default install had two owners of `10.200.0.1/24` (operational
+  defect, plan §6.2; B3).** The installer created the legacy `chvbr0` with
+  the gateway and the seeded default network was materialized by chv-nwd on
+  `br-<id>` with the same address; the kernel routed guest traffic to the
+  dead `chvbr0` and guest ARP failed. When seeding is enabled,
+  `setup_network` now keeps IPv4 forwarding and the NAT rule but removes any
+  legacy `chvbr0` bridge, its persisted networkd/ifupdown config, and its NAT
+  rules, then does not create it; `assert_single_gateway_owner` fails the
+  install unless exactly one interface owns the gateway.
+  `INSTALL_CHV_NO_SEED=1` retains the legacy bridge path. A package-only
+  upgrade does not edit host network configuration, so an rc.6 host needs the
+  one-time removal documented in the rc.7 release notes.
+- **DHCP could never serve a lease (blocker for the documented network
+  profile; B4).** dnsmasq had no writable lease file and its compiled
+  default (`/var/lib/misc/dnsmasq.leases`) is outside nwd's
+  `ProtectSystem=strict` writable roots, so it exited `Permission denied`.
+  `executor.rs`, `dhcp.rs`, and `dns.rs` now pass
+  `--dhcp-leasefile=/run/chv/nwd/dnsmasq-<network_id>.leases`; stop and
+  cleanup remove it with the other dnsmasq runtime files.
+- **`install.sh --wipe` could not install twice (blocker; B5).** `--wipe`
+  removed `/etc/chv` and regenerated the node identity while retaining
+  `core.db`, the runtime-authority lease, and the node-cache archive. The
+  new agent crash-looped on `Identity(Conflict)`. After every Core writer is
+  stopped and before the identity is regenerated, `--wipe` now removes
+  `core.db` plus its WAL/SHM/journal, the
+  `.core.db.cellhv-runtime-authority.lease`, the `node-cache-v1.archive`,
+  and its authority lock. `--wipe` is otherwise a full teardown: it also
+  removes `/etc/chv` (including its certificates) and the legacy agent
+  certificate copies. The authority-state step is scoped to those seven
+  paths, and normal stop/restart never removes them.
+- **The install record named the wrong version (operational truth defect;
+  B7).** In local release-directory/tarball mode the installer printed
+  `Version: 0.3.0` and wrote that line into the rc.6 install transcript while
+  installing `0.4.0-rc.6`: `resolve_version` reported the offline fallback pin
+  instead of the `chv-<version>-linux-amd64` artifact it was reading.
+  `version_from_release_dir()` now derives the artifact version from that
+  name; an explicit `INSTALL_CHV_VERSION` still wins, and `fallback_version`
+  remains `0.3.0` for the genuine offline/air-gapped path. The rc.6 line is
+  preserved as evidence and annotated in the blocker report.
+
+### Qualification
+- **Pre-window clean-install drill (rc.6, published artifact).** Run 3 on
+  `field-host-1` reached `rc=0`; the default start then produced
+  `boot_http=500`, `state_after=Created`, and a 0-byte console. A runtime
+  device-cgroup allowance for `/dev/net/tun` on the unchanged nwd tap proved
+  the full path (`start_http=200`, `carrier=1`, five tun fds, a
+  75,616-byte console, cloud-init `finished`). Duplicate-gateway, dnsmasq
+  lease, and `--wipe` identity evidence is in the blocker report. This is a
+  pre-window mechanism probe, **not** a field day.
+- Targeted Rust tests (`chv-agent-runtime-ch` 138, `chv-nwd-core` suites),
+  packaging contract tests 18/18, clippy `-D warnings`, and shell syntax
+  checks are green at the rc.7 commit. **No rc.7 real-KVM lane,
+  post-publication lane, or field day has run at tag time; none is
+  claimed.** The clean install, upgrade, DHCP lease, policy change, nwd
+  restart, and two consecutive `--wipe` installs are required
+  post-publication drills.
+
 ## [0.4.0-rc.6] - 2026-11-06
+
+> **Disqualified and superseded by `v0.4.0-rc.7`; do not use it as the field
+> or stable base.** A clean install from the published rc.6 tarball
+> reproduced four blocker-class defects and one operational install defect
+> (B1–B5): no `/dev/net/tun` device allowance, a swallowed `vm.boot`
+> failure, a duplicate default gateway, an unwritable dnsmasq lease file,
+> and a `--wipe` identity conflict. The entry below is the historical rc.6
+> record; its tag and assets are not rewritten.
 
 > **Final release candidate for `v0.4.0` and the base for the stable tag.**
 > Supersedes `v0.4.0-rc.5`, which failed the field plan's §6.4 "agent restart

@@ -1,0 +1,25 @@
+== operations: StartVm ==
+operation_id                                                                                                                                                            kind      status     retry_count  completed_at              error_json
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------  --------  ---------  -----------  ------------------------  ----------
+legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:7b0cd93e8481a5cee679dd1ca2bd4599:operation:40:StartVm-4ba2d2da86ffdff208963548ff59f791  start_vm  succeeded  1            2026-11-06T15:09:44.625Z            
+legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:a66c74e3741f2e5067c955ca5a02da23:operation:40:StartVm-c21a94a8761bd36db52d3e90fef0b2a4  start_vm  succeeded  1            2026-11-06T15:08:37.440Z            
+legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:08de2de5c3195fc9f4b2afa1c10f5017:operation:40:StartVm-e362d74eda1abed72c42061e832538c9  start_vm  succeeded  1            2026-11-06T15:05:32.655Z            
+legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:cf750cabb0aa2ba43b83313b84955c57:operation:40:StartVm-2d4bb5c34f9dcd6bf17c62075f2e2699  start_vm  succeeded  1            2026-11-06T15:04:27.491Z            
+legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:4290fa2f3c082d909bc515a074a907e5:operation:40:StartVm-14361ae4f29de73333b7be88fbdfc01e  start_vm  succeeded  1            2026-11-06T15:00:29.206Z            
+legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:5531bda5a80cea45770addaba999ba3c:operation:40:StartVm-b670fcd252c4689cf9e92170207ee9fd  start_vm  succeeded  1            2026-11-06T14:55:06.408Z            
+
+== events ==
+sequence  kind                 payload_json          
+--------  -------------------  ----------------------
+36        operation.succeeded  {"status":"succeeded"}
+35        operation.running    {"attempt":1}         
+34        operation.accepted   {}                    
+33        operation.succeeded  {"status":"succeeded"}
+32        operation.running    {"attempt":1}         
+31        operation.accepted   {}                    
+30        operation.succeeded  {"status":"succeeded"}
+29        operation.running    {"attempt":1}         
+28        operation.accepted   {}                    
+27        operation.succeeded  {"status":"succeeded"}
+26        operation.running    {"attempt":1}         
+25        operation.accepted   {}                    

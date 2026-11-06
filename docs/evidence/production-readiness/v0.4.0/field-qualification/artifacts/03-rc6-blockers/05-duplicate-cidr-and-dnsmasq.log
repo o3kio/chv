@@ -1,0 +1,96 @@
+# Duplicate 10.200.0.0/24: installer-created chvbr0 + nwd-created br-eac31935dc4f
+2026-11-06T15:19:21Z
+
+== interfaces ==
+chvbr0           UP             10.200.0.1/24 fe80::7cf2:ffff:fef1:9651/64 
+br-eac31935dc4f  UP             10.200.0.1/24 fe80::4ceb:7bff:febe:a794/64 
+
+== route table ==
+10.200.0.0/24 dev chvbr0 proto kernel scope link src 10.200.0.1 
+10.200.0.0/24 dev br-eac31935dc4f proto kernel scope link src 10.200.0.1 
+
+== route selection for a guest IP ==
+10.200.0.175 dev chvbr0 src 10.200.0.1 uid 0 
+    cache 
+
+== ARP state (host tries chvbr0 first) ==
+10.200.0.162 dev chvbr0 FAILED 
+10.200.0.149 dev chvbr0 FAILED 
+10.200.0.18 dev chvbr0 FAILED 
+10.200.0.161 dev chvbr0 FAILED 
+10.200.0.3 dev chvbr0 FAILED 
+10.200.0.203 dev chvbr0 FAILED 
+10.200.0.160 dev chvbr0 FAILED 
+
+== nwd tenant policy drops host-originated new connections (ICMP is not a valid probe) ==
+table inet chv-eac319350ba9fff7b0b957aedef20ba6 {
+	chain chv-policy-in {
+		ct state established,related accept
+		udp dport 67-68 accept
+		udp dport 53 accept
+		tcp dport 53 accept
+		counter packets 4 bytes 224 drop
+	}
+
+	chain chv-policy-fwd {
+		ct state established,related accept
+		udp dport 67-68 accept
+		udp dport 67-68 accept
+		udp dport 53 accept
+		tcp dport 53 accept
+		counter packets 9 bytes 600 drop
+	}
+
+	chain chv-policy-out {
+		ct state established,related accept
+		udp dport 67-68 accept
+		counter packets 7 bytes 648 drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname { "tap-ae0ea772", "tap-fe2beb44", "tap-c929e4a5", "tap-f4e64166", "tap-a4132e49", "tap-950c6469", "tap-ecb43e1c", "br-eac31935dc4f" } jump chv-policy-in
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		iifname { "tap-ae0ea772", "tap-fe2beb44", "tap-c929e4a5", "tap-f4e64166", "tap-a4132e49", "tap-950c6469", "tap-ecb43e1c", "br-eac31935dc4f" } jump chv-policy-fwd
+		oifname { "tap-ae0ea772", "tap-fe2beb44", "tap-c929e4a5", "tap-f4e64166", "tap-a4132e49", "tap-950c6469", "tap-ecb43e1c", "br-eac31935dc4f" } jump chv-policy-fwd
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+		oifname { "tap-ae0ea772", "tap-fe2beb44", "tap-c929e4a5", "tap-f4e64166", "tap-a4132e49", "tap-950c6469", "tap-ecb43e1c", "br-eac31935dc4f" } jump chv-policy-out
+	}
+}
+
+== dnsmasq leasefile failure ==
+2026-11-06T14:30:14+00:00 dev chv-nwd[4032254]: 2026-11-06T14:30:14.176177Z  WARN chv_nwd_core::executor: failed to start dnsmasq error=network unavailable: dnsmasq — dnsmasq failed:
+2026-11-06T14:30:14+00:00 dev chv-nwd[4032254]: dnsmasq: cannot open or create lease file /var/lib/misc/dnsmasq.leases: Permission denied
+2026-11-06T14:54:56+00:00 dev dnsmasq[4107279]: cannot open or create lease file /var/lib/misc/dnsmasq.leases: Permission denied
+2026-11-06T14:54:56+00:00 dev dnsmasq[4107279]: FAILED to start up
+2026-11-06T14:54:56+00:00 dev chv-nwd[4106695]: 2026-11-06T14:54:56.293056Z  WARN chv_nwd_core::executor: failed to start dnsmasq error=network unavailable: dnsmasq — dnsmasq failed:
+2026-11-06T14:54:56+00:00 dev chv-nwd[4106695]: dnsmasq: cannot open or create lease file /var/lib/misc/dnsmasq.leases: Permission denied
+
+== generated dnsmasq conf has no dhcp-leasefile ==
+-rw-r--r-- 1 chv chv 255 Nov  6 14:54 /run/chv/nwd/dnsmasq-eac319350ba9fff7b0b957aedef20ba6.conf
+--- /run/chv/nwd/dnsmasq-eac319350ba9fff7b0b957aedef20ba6.conf
+interface=br-eac31935dc4f
+bind-interfaces
+port=0
+dhcp-range=10.200.0.50,10.200.0.205,255.255.255.0,12h
+dhcp-option=3,10.200.0.1
+dhcp-option=6,1.1.1.1
+dhcp-hostsfile=/run/chv/nwd/dnsmasq-eac319350ba9fff7b0b957aedef20ba6.hosts
+except-interface=lo
+no-resolv
+
+== /var/lib/misc (dnsmasq default) ==
+drwxr-xr-x 2 root root 4096 Oct  1 22:47 /var/lib/misc
+
+== nwd unit sandbox ==
+7:User=chv
+24:# ProtectSystem=strict, weakening that specific sandbox wall. The exposure
+32:AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+39:ProtectSystem=strict
+41:ReadWritePaths=/run/chv/nwd /run/netns /var/lib/chv

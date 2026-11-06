@@ -1637,6 +1637,92 @@ impl ProcessCloudHypervisorAdapter {
             .await
     }
 
+    /// Read `vm.info` and return `(state, config.net length)`.
+    async fn vm_info_state_and_nics(
+        api_socket: &std::path::Path,
+    ) -> Result<(String, Option<usize>), ChvError> {
+        let (status, body) =
+            Self::ch_api_request_with_body(api_socket, "GET", "/api/v1/vm.info", None).await?;
+        if status != 200 {
+            return Err(ChvError::Internal {
+                reason: format!("vm.info returned status {status}: {body}"),
+            });
+        }
+        let info: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| ChvError::Internal {
+                reason: format!("failed to parse vm.info response: {e}: {body}"),
+            })?;
+        Ok((
+            info.get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or("Unknown")
+                .to_string(),
+            info.pointer("/config/net")
+                .and_then(|net| net.as_array())
+                .map(|net| net.len()),
+        ))
+    }
+
+    /// Turn a `vm.boot` response into the operation's verdict.
+    ///
+    /// A non-2xx boot is a hard failure unless `vm.info` proves the VM is
+    /// already `Running`/`Paused` (auto-boot or a racing retry). Before this
+    /// check the operation reported success while the VMM stayed `Created`
+    /// and the BFF displayed the desired state (rc.6 blocker B2).
+    ///
+    /// Independently, a VM created with NICs must have them after boot:
+    /// cloud-hypervisor can answer a retried `vm.boot` with 204 and an empty
+    /// `config.net` after a failed first boot, and stop/start never heals
+    /// that (rc.6 blocker B6). Failing here turns a silent divergence into a
+    /// visible operation error with the recovery (`delete` + recreate).
+    async fn confirm_boot_outcome(
+        vm_id: &str,
+        api_socket: &std::path::Path,
+        boot: Option<(u16, &str)>,
+    ) -> Result<(), ChvError> {
+        let expected = match api_socket.parent() {
+            Some(vm_dir) => requested_nic_count(vm_dir).await,
+            None => None,
+        };
+        let boot_failed = boot.is_some_and(|(status, _)| status != 200 && status != 204);
+        let nic_check_required = expected.is_some_and(|count| count > 0);
+        if !boot_failed && !nic_check_required {
+            return Ok(());
+        }
+
+        let (state, nics) = Self::vm_info_state_and_nics(api_socket).await?;
+        if boot_failed && !matches!(state.as_str(), "Running" | "Paused") {
+            let (status, body) = boot.expect("boot_failed implies a boot response");
+            return Err(ChvError::Internal {
+                reason: format!(
+                    "vm.boot failed for {vm_id}: status={status} body={body}; vm.info state={state}"
+                ),
+            });
+        }
+
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if expected == 0 {
+            return Ok(());
+        }
+        let actual = nics.ok_or_else(|| ChvError::Internal {
+            reason: format!(
+                "vm.boot for {vm_id} left state={state} but vm.info did not report config.net; \
+                 cannot verify the {expected} requested NIC(s)"
+            ),
+        })?;
+        if actual < expected {
+            return Err(ChvError::Internal {
+                reason: format!(
+                    "vm {vm_id} is {state} without all requested NICs: expected {expected}, \
+                     vm.info config.net has {actual}. Delete and recreate the VM to recover."
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_vm_config(&self, config: &VmConfig) -> Result<(), ChvError> {
         if !self.chv_binary.exists() {
             return Err(ChvError::InvalidArgument {
@@ -3625,10 +3711,19 @@ impl ProcessCloudHypervisorAdapter {
             ConsoleLogMode::Append,
         );
 
-        let status = Self::ch_api_request(&api_socket, "PUT", "/api/v1/vm.boot", None).await?;
-        if status != 200 && status != 204 {
-            warn!(vm_id = %vm_id, status = status, "vm.boot returned non-success after re-spawn (VM may have auto-booted)");
+        let (boot_status, boot_body) =
+            Self::ch_api_request_with_body(&api_socket, "PUT", "/api/v1/vm.boot", None).await?;
+        if boot_status != 200 && boot_status != 204 {
+            warn!(
+                vm_id = %vm_id,
+                status = boot_status,
+                "vm.boot returned non-success after re-spawn; verifying vm.info before failing"
+            );
         }
+        // The re-spawn path has the same contract as the normal start: a
+        // non-2xx boot is only success when vm.info proves Running/Paused,
+        // and a VM created with NICs must have them (rc.6 B2/B6).
+        Self::confirm_boot_outcome(vm_id, &api_socket, Some((boot_status, &boot_body))).await?;
         // G5: the re-spawned VMM re-created the vsock device from the
         // persisted payload — its host-side relay must be up again
         // (idempotent, gated on the same payload).
@@ -3872,6 +3967,26 @@ fn start_vm_action(state: &str) -> StartVmAction {
         "Running" | "Paused" => StartVmAction::AlreadyRunning,
         _ => StartVmAction::Boot,
     }
+}
+
+/// Expected NIC count recorded in the persisted `vm.create` payload.
+///
+/// `None` means the payload is missing or unreadable; callers must skip the
+/// post-boot assertion rather than invent a NIC requirement for adopted
+/// legacy state (a missing payload already degrades restart to a
+/// re-create-required error in `respawn_vmm`). A payload without a `net` key
+/// is a VM created with zero NICs.
+async fn requested_nic_count(vm_dir: &std::path::Path) -> Option<usize> {
+    let body = tokio::fs::read_to_string(vm_config_file(vm_dir))
+        .await
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some(
+        payload
+            .get("net")
+            .and_then(|net| net.as_array())
+            .map_or(0, |net| net.len()),
+    )
 }
 
 #[async_trait]
@@ -4300,6 +4415,9 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
                 // without its relay (e.g. the relay manager died with the
                 // previous agent process and the VM was re-adopted).
                 self.ensure_vsock_relay(vm_id, api_socket.parent()).await;
+                // A VM can be Running yet have no NIC after a failed first
+                // boot (rc.6 B6); do not report success over that state.
+                Self::confirm_boot_outcome(vm_id, &api_socket, None).await?;
                 // Idempotent success: VM is already in the desired state.
                 // The guard's succeeded flag must be set on every Ok return
                 // so RED metrics classify this as ok, not err.
@@ -4323,10 +4441,18 @@ impl CloudHypervisorAdapter for ProcessCloudHypervisorAdapter {
             }
         }
 
-        let status = Self::ch_api_request(&api_socket, "PUT", "/api/v1/vm.boot", None).await?;
-        if status != 200 && status != 204 {
-            warn!(vm_id = %vm_id, status = status, "vm.boot returned non-success (VM may have auto-booted)");
+        let (boot_status, boot_body) =
+            Self::ch_api_request_with_body(&api_socket, "PUT", "/api/v1/vm.boot", None).await?;
+        if boot_status != 200 && boot_status != 204 {
+            warn!(
+                vm_id = %vm_id,
+                status = boot_status,
+                "vm.boot returned non-success; verifying vm.info before failing"
+            );
         }
+        // Fail the operation unless the VM is actually Running/Paused and
+        // carries every requested NIC (rc.6 B2/B6).
+        Self::confirm_boot_outcome(vm_id, &api_socket, Some((boot_status, &boot_body))).await?;
 
         // A guest shutdown tears down Cloud Hypervisor's serial-console
         // endpoint along with the VM. The listener is recreated during
@@ -8334,6 +8460,155 @@ mod tests {
         }
     }
 
+    /// rc.6 B2/B6 start-outcome tests: a live, tracked (Owned) VM whose
+    /// fake VMM serves vm.info/vm.boot. The broadcaster is marked alive so
+    /// start does not try to reconnect a console the fake API does not
+    /// serve.
+    async fn insert_start_outcome_vm(
+        adapter: &ProcessCloudHypervisorAdapter,
+        vm_id: &str,
+        vm_dir: &std::path::Path,
+    ) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (fanout, _) = ConsoleFanout::new(Vec::new());
+        adapter.vms.write().await.insert(
+            vm_id.to_string(),
+            VmProcess {
+                api_socket: vm_dir.join("vm.sock"),
+                child: VmmChild::Owned(child),
+                console_io: std::fs::File::open("/dev/null").unwrap().into(),
+                serial_transport: SerialTransport::Pty,
+                console_fanout: fanout,
+                broadcaster_alive: Arc::new(AtomicBool::new(true)),
+                cpu_ticks: chv_monitoring_core::CounterState::new(),
+                last_cpu_at: None,
+                boot_watermark: AtomicU64::new(0),
+            },
+        );
+    }
+
+    /// rc.6 B2: a 500 from vm.boot must fail the operation when vm.info does
+    /// not prove the VM is running. Before this check the operation was
+    /// recorded succeeded and the BFF displayed the requested state while the
+    /// VMM stayed Created.
+    #[tokio::test]
+    async fn start_vm_fails_when_boot_is_rejected_and_vm_is_not_running() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-b2-rejected");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(vm_config_file(&vm_dir), r#"{"net":[{"tap":"tap-b2"}]}"#).unwrap();
+        let api = MockChApiHandle::spawn(&vm_dir.join("vm.sock"), 8);
+        api.set_vm_info_state("Created");
+        api.set_vm_info_nics(1);
+        api.set_vm_boot_response(500, r#"["Error from API","The VM could not boot"]"#);
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        insert_start_outcome_vm(&adapter, "vm-b2-rejected", &vm_dir).await;
+
+        let err = adapter.start_vm("vm-b2-rejected", None).await.unwrap_err();
+        match err {
+            ChvError::Internal { reason } => {
+                assert!(reason.contains("vm.boot failed"), "{reason}");
+                assert!(reason.contains("status=500"), "{reason}");
+                assert!(reason.contains("state=Created"), "{reason}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// A non-2xx vm.boot is still success when vm.info proves the VM is
+    /// Running: auto-boot and a racing retry are legitimate. The declared
+    /// NIC must also be present.
+    #[tokio::test]
+    async fn start_vm_accepts_rejected_boot_when_vm_info_reports_running() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-b2-autoboot");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(vm_config_file(&vm_dir), r#"{"net":[{"tap":"tap-b2"}]}"#).unwrap();
+        let api = MockChApiHandle::spawn(&vm_dir.join("vm.sock"), 8);
+        api.set_vm_info_state("Created");
+        api.set_vm_info_state_after_boot("Running");
+        api.set_vm_info_nics(1);
+        api.set_vm_boot_response(500, r#"["Error from API","already booted"]"#);
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        insert_start_outcome_vm(&adapter, "vm-b2-autoboot", &vm_dir).await;
+
+        adapter.start_vm("vm-b2-autoboot", None).await.unwrap();
+        assert_eq!(api.vm_info_requests(), 2, "boot outcome was verified");
+    }
+
+    /// rc.6 B6: a retried vm.boot can return 204 with no config.net after a
+    /// failed first boot. The operation must fail visibly instead of
+    /// reporting a Running VM that has no NIC.
+    #[tokio::test]
+    async fn start_vm_fails_when_boot_omits_the_requested_nic() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-b6-nonic");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(vm_config_file(&vm_dir), r#"{"net":[{"tap":"tap-b6"}]}"#).unwrap();
+        let api = MockChApiHandle::spawn(&vm_dir.join("vm.sock"), 8);
+        api.set_vm_info_state("Created");
+        api.set_vm_info_nics(0);
+        api.set_vm_boot_response(204, "");
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        insert_start_outcome_vm(&adapter, "vm-b6-nonic", &vm_dir).await;
+
+        let err = adapter.start_vm("vm-b6-nonic", None).await.unwrap_err();
+        match err {
+            ChvError::Internal { reason } => {
+                assert!(reason.contains("without all requested NICs"), "{reason}");
+                assert!(reason.contains("expected 1"), "{reason}");
+                assert!(reason.contains("config.net has 0"), "{reason}");
+                assert!(reason.contains("Delete and recreate"), "{reason}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// The same divergence on the idempotent path: the VMM is already
+    /// Running (after a failed first boot) with no NIC, so start must not
+    /// report success without checking.
+    #[tokio::test]
+    async fn start_vm_fails_when_a_running_vm_lost_its_requested_nic() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-b6-running-nonic");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(vm_config_file(&vm_dir), r#"{"net":[{"tap":"tap-b6"}]}"#).unwrap();
+        let api = MockChApiHandle::spawn(&vm_dir.join("vm.sock"), 8);
+        api.set_vm_info_state("Running");
+        api.set_vm_info_nics(0);
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        insert_start_outcome_vm(&adapter, "vm-b6-running-nonic", &vm_dir).await;
+
+        let err = adapter
+            .start_vm("vm-b6-running-nonic", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ChvError::Internal { ref reason } if reason.contains("without all requested NICs")),
+            "{err:?}"
+        );
+    }
+
+    /// A VM created without NICs must not require any: the assertion is
+    /// scoped to non-empty `net` arrays in the persisted payload.
+    #[tokio::test]
+    async fn start_vm_does_not_require_nics_for_a_nicless_vm() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-nicless");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(vm_config_file(&vm_dir), r#"{"net":[]}"#).unwrap();
+        let api = MockChApiHandle::spawn(&vm_dir.join("vm.sock"), 8);
+        api.set_vm_info_state("Running");
+        api.set_vm_info_nics(0);
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        insert_start_outcome_vm(&adapter, "vm-nicless", &vm_dir).await;
+
+        adapter.start_vm("vm-nicless", None).await.unwrap();
+    }
+
     /// Writes the stand-in "cloud-hypervisor" binary for the untracked-VMM
     /// tests: a copy of `sh` named `cloud-hypervisor`, so both the exe
     /// (/proc/<pid>/exe resolves to the copy) and the file name match the
@@ -8599,6 +8874,9 @@ mod tests {
     struct MockChApiHandle {
         requests: Arc<std::sync::Mutex<Vec<String>>>,
         vm_info_state: Arc<std::sync::Mutex<String>>,
+        vm_info_nics: Arc<std::sync::Mutex<usize>>,
+        vm_boot: Arc<std::sync::Mutex<(u16, String)>>,
+        vm_info_state_after_boot: Arc<std::sync::Mutex<Option<String>>>,
         paused: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     }
 
@@ -8612,10 +8890,16 @@ mod tests {
             let handle = MockChApiHandle {
                 requests: Arc::new(std::sync::Mutex::new(Vec::new())),
                 vm_info_state: Arc::new(std::sync::Mutex::new("Running".to_string())),
+                vm_info_nics: Arc::new(std::sync::Mutex::new(0)),
+                vm_boot: Arc::new(std::sync::Mutex::new((204, String::new()))),
+                vm_info_state_after_boot: Arc::new(std::sync::Mutex::new(None)),
                 paused: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             };
             let requests = handle.requests.clone();
             let vm_info_state = handle.vm_info_state.clone();
+            let vm_info_nics = handle.vm_info_nics.clone();
+            let vm_boot = handle.vm_boot.clone();
+            let vm_info_state_after_boot = handle.vm_info_state_after_boot.clone();
             let paused = handle.paused.clone();
             std::thread::spawn(move || {
                 for _ in 0..max_requests {
@@ -8641,13 +8925,39 @@ mod tests {
                                 }
                             }
                         }
-                        let body = format!(
-                            "{{\"state\":\"{}\"}}",
-                            vm_info_state.lock().unwrap().clone()
-                        );
+                        let body = serde_json::json!({
+                            "state": vm_info_state.lock().unwrap().clone(),
+                            "config": {
+                                "net": (0..*vm_info_nics.lock().unwrap())
+                                    .map(|i| serde_json::json!({ "tap": format!("tap{i}") }))
+                                    .collect::<Vec<_>>(),
+                            },
+                        })
+                        .to_string();
                         let _ = conn.write_all(
                             format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        );
+                    } else if request_line.starts_with("PUT /api/v1/vm.boot") {
+                        let (status, body) = vm_boot.lock().unwrap().clone();
+                        // A boot can change the state the next vm.info reports
+                        // (e.g. a 500 that still auto-booted to Running).
+                        if let Some(next) = vm_info_state_after_boot.lock().unwrap().take() {
+                            *vm_info_state.lock().unwrap() = next;
+                        }
+                        let reason = match status {
+                            200 => "OK",
+                            204 => "No Content",
+                            500 => "Internal Server Error",
+                            _ => "Response",
+                        };
+                        let _ = conn.write_all(
+                            format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n\r\n{}",
                                 body.len(),
                                 body
                             )
@@ -8667,6 +8977,19 @@ mod tests {
 
         fn set_vm_info_state(&self, state: &str) {
             *self.vm_info_state.lock().unwrap() = state.to_string();
+        }
+
+        /// State that `vm.info` reports after the next `vm.boot` response.
+        fn set_vm_info_state_after_boot(&self, state: &str) {
+            *self.vm_info_state_after_boot.lock().unwrap() = Some(state.to_string());
+        }
+
+        fn set_vm_info_nics(&self, nics: usize) {
+            *self.vm_info_nics.lock().unwrap() = nics;
+        }
+
+        fn set_vm_boot_response(&self, status: u16, body: &str) {
+            *self.vm_boot.lock().unwrap() = (status, body.to_string());
         }
 
         fn reboot_requests(&self) -> usize {

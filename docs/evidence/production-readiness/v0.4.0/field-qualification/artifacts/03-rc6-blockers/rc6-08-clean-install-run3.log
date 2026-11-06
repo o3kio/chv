@@ -1,0 +1,204 @@
+=== clean rc.6 install RUN 3 from published tarball (release-directory mode, documented complete removal) — 2026-11-06T14:54:30Z ===
+path: docs/install/uninstall.md complete removal -> install.sh (no --wipe; no persistent data)
+installer: /root/chv-field/rc6-clean/chv-0.4.0-rc.6-linux-amd64/install.sh
+installer_sha256: 63f465f0fe20aed3c6dad5854b9f08bd16a3a6862efc92f57012eeccf7fc6076
+base image: /root/ubuntu-noble-amd64.img sha256=3264d65d686319120dea5277b7c32c5f0e56b17a5a6d5ea4e46c2223d3e19362
+image change: guest /boot/grub/grub.cfg root=/dev/vda1, initrd lines removed (rc.1 M2.5 precedent)
+seed: default
+persistent data present? 
+[INFO] Detected architecture: x86_64 (image suffix: amd64)
+[INFO] Detected local release directory mode (binaries next to install.sh)
+[INFO] Installing system dependencies...
+[INFO] Setting up user and directories...
+[INFO] Cleaning previous installation...
+[INFO] No CHV runtime processes remain.
+[INFO] Validated no CHV processes or runtime socket listeners remain.
+[INFO] Previous installation cleaned.
+[INFO] Local tarball mode with no explicit version — using 0.3.0 for the extracted directory name.
+[INFO] Installing CHV version: 0.3.0
+[INFO] Using local release directory: /root/chv-field/rc6-clean/chv-0.4.0-rc.6-linux-amd64
+[WARN] Local release directory mode uses the files as-is; the installer
+[WARN] cannot establish their authenticity. Only use a directory you built
+[WARN] or verified yourself.
+[INFO] Installing CHV binaries...
+[INFO] Installing Web UI assets...
+[INFO] Installing database migrations...
+[INFO] Cloud Hypervisor already installed at the qualified pin (cloud-hypervisor v53.0
+Migration Protocol Versions: 0); keeping it.
+[INFO] ch-remote already installed at the qualified pin (ch-remote v53.0); keeping it.
+[INFO] Checking for base OS image...
+[INFO] Found pre-downloaded image at /root/ubuntu-noble-amd64.img, copying...
+[WARN] INSTALL_CHV_BASE_IMAGE_SHA256 is not set; trusting root-only pre-downloaded image /root/ubuntu-noble-amd64.img without an out-of-band digest.
+[INFO] Base image ready -> /var/lib/chv/images/ubuntu-noble-amd64.img
+[INFO] Using local firmware override /root/CLOUDHV.fd -> /var/lib/chv/hypervisor-fw
+[INFO] Checking for cloud-hypervisor firmware...
+[INFO] Firmware already exists at /var/lib/chv/hypervisor-fw, skipping download.
+[INFO] Generating TLS certificates...
+[INFO] Setting up bridge network chvbr0 (10.200.0.1/24) on ens19...
+# Warning: iptables-legacy tables present, use iptables-legacy-save to see them
+[INFO] Bridge chvbr0 ready (10.200.0.1/24), NAT via ens19.
+[INFO] Installing configuration files...
+[INFO] Node ID: f22b8cc7-cd0d-435f-8d7e-22f81b4b04da
+[INFO] Generating credential encryption key...
+[INFO] Creating bootstrap token...
+[INFO] Installing systemd services...
+[INFO] Installing systemd units from: /root/chv-field/rc6-clean/chv-0.4.0-rc.6-linux-amd64/systemd
+[INFO] Configuring nginx...
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+[INFO] Enabling and starting CHV services...
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-controlplane.service → /etc/systemd/system/chv-controlplane.service.
+[INFO] Waiting for control plane to apply database migrations (up to 30s)...
+[INFO] Control plane API is up (migrations applied).
+[INFO] Seeding bootstrap token via API...
+[INFO] Bootstrap token seeded via API successfully.
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-stord.service → /etc/systemd/system/chv-stord.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-nwd.service → /etc/systemd/system/chv-nwd.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-agent.service → /etc/systemd/system/chv-agent.service.
+[INFO] Agent started.  Giving it a few seconds to begin enrollment...
+[INFO] Seeding bootstrap admin user...
+
+================================================================================
+  CHV Bootstrap Admin Credentials
+================================================================================
+  Username:      admin
+  Password:      <redacted; rotated during the run>
+  Stored at:     /etc/chv/initial_admin_password (mode 0600, root only)
+  Rotation:      Required on first login (must_change_password=1).
+
+  RECORD THIS PASSWORD NOW. It will not be displayed again.
+================================================================================
+
+[INFO] Temporarily clearing must_change_password for install-time API seeding...
+[INFO] Importing base image via API...
+[INFO] Base image imported via API (image_id: 89ba9f59eebb7e5fbbe9061903f05d6a).
+[INFO] Seeding dev resources via API...
+[INFO] Default network created via API (id=eac319350ba9fff7b0b957aedef20ba6, 10.200.0.0/24, gateway 10.200.0.1).
+[INFO] Waiting for node to reach TenantReady (up to 60s)...
+[INFO] Node is TenantReady, proceeding with VM creation.
+[INFO] Test VM created via API (id=5531bda5a80cea45770addaba999ba3c, 1 CPU, 512 MB, 10 GB disk).
+
+===============================================
+  CHV All-in-One Installation Complete!
+===============================================
+
+Version:        0.3.0
+Node ID:        f22b8cc7-cd0d-435f-8d7e-22f81b4b04da
+Web UI:         http://<redacted-management-ip>/
+API:            http://127.0.0.1:8080/
+Database:       /var/lib/chv/controlplane.db
+Bridge:         chvbr0 (10.200.0.1/24)
+Upstream iface: ens19 (NAT enabled)
+
+Services:
+  systemctl status chv-controlplane
+  systemctl status chv-agent
+  systemctl status nginx
+
+Logs:
+  journalctl -u chv-controlplane -f
+  journalctl -u chv-agent -f
+
+Defaults:
+  Admin login:   admin / (see /etc/chv/initial_admin_password)
+                 The bootstrap password is in that file (mode 0600 root).
+                 You will be required to rotate it on first login.
+  Bootstrap token valid for 1 hour from installation.
+
+INSTALL_RC=0 elapsed_s=22
+
+=== clean-install RUN 3 verification — 2026-11-06T14:54:58Z ===
+--- units ---
+chv-controlplane active=active enabled=enabled fragment=/etc/systemd/system/chv-controlplane.service killmode=mixed mainpid=4107174
+chv-agent active=active enabled=enabled fragment=/etc/systemd/system/chv-agent.service killmode=process mainpid=4106796
+chv-stord active=active enabled=enabled fragment=/etc/systemd/system/chv-stord.service killmode=mixed mainpid=4106715
+chv-nwd active=active enabled=enabled fragment=/etc/systemd/system/chv-nwd.service killmode=mixed mainpid=4106695
+nginx active=active enabled=disabled fragment=/usr/lib/systemd/system/nginx.service killmode=mixed mainpid=4106503
+--- binaries ---
+chv-controlplane: chv-controlplane 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chv-agent: chv-agent 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chv-stord: chv-stord 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chv-nwd: chv-nwd 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+--- process cardinality ---
+      1 chv-agent
+      1 chv-controlplan
+      1 chv-nwd
+      1 chv-stord
+--- DB schema ---
+-rw------- 1 chv chv 1012K Nov  6 14:54 /var/lib/chv/controlplane.db
+70|70
+--- node ---
+Error: in prepare, no such column: state
+  SELECT node_id,hostname,state,health,agent_version,control_plane_version,last_
+                          ^--- error here
+--- image ---
+image_id|display_name|format|status|source_url
+89ba9f59eebb7e5fbbe9061903f05d6a|ubuntu-noble|raw|available|/var/lib/chv/images/ubuntu-noble-amd64.img
+{'format': 'qcow2', 'virtual-size': 3758096384, 'actual-size': 1879121920}
+3264d65d686319120dea5277b7c32c5f0e56b17a5a6d5ea4e46c2223d3e19362  /var/lib/chv/images/ubuntu-noble-amd64.img
+--- network ---
+Error: in prepare, no such column: cidr
+  SELECT network_id,display_name,cidr,status FROM networks;
+                   error here ---^
+chvbr0           UP             10.200.0.1/24 fe80::7cf2:ffff:fef1:9651/64 
+Error: Peer netns reference is invalid.
+Error: Peer netns reference is invalid.
+ns-eac319350ba9fff7b0b957aedef20ba6
+--- VM row ---
+Error: in prepare, no such column: requested_power_state
+  SELECT vm_id,display_name,requested_power_state,observed_power_state,node_id F
+              error here ---^
+--- VMM ---
+vm_dir=/var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c
+4107368
+state= Created
+disks= ['/var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/425931e7b1d6ebcccd5fc1ababf2e494.img', '/var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/seed.iso']
+net= [{'pci_segment': 0, 'tap': 'tap-ecb43e1c', 'mac': '02:29:8a:4b:3b:61', 'num_queues': 2, 'queue_size': 256, 'vhost_user': False, 'vhost_mode': 'Client', 'offload_tso': True, 'offload_ufo': True, 'offload_csum': True}]
+-rw-rw-r-- 1 chv chv 0 Nov  6 14:54 /var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/console.log
+--- dnsmasq status (expected non-blocker) ---
+[2m2026-11-06T14:54:56.279452Z[0m [32m INFO[0m [2mchv_nwd_core::executor[0m[2m:[0m ensuring topology [3mnetwork_id[0m[2m=[0meac319350ba9fff7b0b957aedef20ba6 [3mbridge[0m[2m=[0mbr-eac31935dc4f [3mnamespace[0m[2m=[0mns-eac319350ba9fff7b0b957aedef20ba6
+cannot open or create lease file /var/lib/misc/dnsmasq.leases: Permission denied
+[2m2026-11-06T14:54:56.293056Z[0m [33m WARN[0m [2mchv_nwd_core::executor[0m[2m:[0m failed to start dnsmasq [3merror[0m[2m=[0mnetwork unavailable: dnsmasq — dnsmasq failed:
+dnsmasq: cannot open or create lease file /var/lib/misc/dnsmasq.leases: Permission denied
+[2m2026-11-06T14:54:56.506652Z[0m [32m INFO[0m [2mchv_nwd_core::executor[0m[2m:[0m attached VM NIC [3mnetwork_id[0m[2m=[0meac319350ba9fff7b0b957aedef20ba6 [3mnic_id[0m[2m=[0m5531bda5a80cea45770addaba999ba3c-eac319350ba9fff7b0b957aedef20ba6 [3mtap[0m[2m=[0mtap-ecb43e1c
+--- verify done ---
+
+--- admin password rotation — 2026-11-06T14:55:05Z ---
+change_pw_http=200
+bootstrap_password_sha256=<redacted>
+admin_password_saved=/root/chv-field/state/admin_password
+--- node / vm / image / network ---
+nodes [{'node_id': 'f22b8cc7-cd0d-435f-8d7e-22f81b4b04da', 'name': 'dev', 'state': 'TenantReady', 'health': 'Healthy', 'version': '0.4.0'}]
+vm {'vm_id': '5531bda5a80cea45770addaba999ba3c', 'name': 'dev-vm-1', 'power_state': 'Running', 'health': 'Unknown', 'node_id': 'f22b8cc7-cd0d-435f-8d7e-22f81b4b04da'}
+nics [('10.200.0.160', 'eac319350ba9fff7b0b957aedef20ba6', '02:29:8a:4b:3b:61')]
+vols [('dev-vm-1-disk', '10.0 GiB', 'vda')]
+start_http=200
+t=3s vmm=Created tap=DOWN console_bytes=0
+t=6s vmm=Created tap=DOWN console_bytes=0
+t=9s vmm=Created tap=DOWN console_bytes=0
+t=12s vmm=Created tap=DOWN console_bytes=0
+t=15s vmm=Created tap=DOWN console_bytes=0
+t=18s vmm=Created tap=DOWN console_bytes=0
+t=21s vmm=Created tap=DOWN console_bytes=0
+t=24s vmm=Created tap=DOWN console_bytes=0
+t=27s vmm=Created tap=DOWN console_bytes=0
+t=30s vmm=Created tap=DOWN console_bytes=0
+t=33s vmm=Created tap=DOWN console_bytes=0
+t=36s vmm=Created tap=DOWN console_bytes=0
+
+--- 10.200.0.149 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 1011ms
+
+Starting chv-agent.service - CHV Node Agent...
+Started chv-agent.service - CHV Node Agent.
+[2m2026-11-06T14:54:38.222696Z[0m [32m INFO[0m [2mchv_agent[0m[2m:[0m chv-agent starting (version 0.4.0, commit df86e53, channel stable)
+[2m2026-11-06T14:54:38.223571Z[0m [33m WARN[0m [2mchv_agent_core::inventory[0m[2m:[0m failed to fetch fabric identity from nwd; reporting empty fabric identity [3merror[0m[2m=[0mnetwork unavailable: nwd — get_fabric_identity failed: invalid argument: fabric — fabric overlay requested but the fabric provider is disabled in nwd configuration (INVALID_ARGUMENT)
+[2m2026-11-06T14:54:38.255514Z[0m [32m INFO[0m [2mchv_agent[0m[2m:[0m state transition [3mfrom[0m[2m=[0mBootstrapping [3mto[0m[2m=[0mHostReady
+[2m2026-11-06T14:54:43.257871Z[0m [33m WARN[0m [2mchv_agent[0m[2m:[0m failed to send control-plane message, deferring [3merror[0m[2m=[0mcontrol plane unavailable: code: 'The service is currently unavailable', message: "tcp connect error", source: tonic::transport::Error(Transport, ConnectError(ConnectError("tcp connect error", 127.0.0.1:8443, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })))
+[2m2026-11-06T14:54:43.257889Z[0m [32m INFO[0m [2mchv_agent_core::connectivity[0m[2m:[0m control plane contact lost, attempting reconnection [3mconsecutive_failures[0m[2m=[0m1 [3mthreshold[0m[2m=[0m3
+[2m2026-11-06T14:54:43.258861Z[0m [33m WARN[0m [2mchv_agent[0m[2m:[0m control plane unavailable; deferring report [3merror[0m[2m=[0mcontrol plane unavailable: transport error
+[2m2026-11-06T14:54:56.830401Z[0m [32m INFO[0m [2mchv_agent_runtime_ch::process[0m[2m:[0m chv serial socket connected [3mvm_id[0m[2m=[0m"5531bda5a80cea45770addaba999ba3c" [3msocket[0m[2m=[0m/var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/serial.sock [3mop[0m[2m=[0m"legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:5531bda5a80cea45770addaba999ba3c:operation:32:bd77c9914013d745d5e1660c59015f8b"
+[2m2026-11-06T14:55:03.259790Z[0m [33m WARN[0m [2mchv_agent_core::inventory[0m[2m:[0m failed to fetch fabric identity from nwd; reporting empty fabric identity [3merror[0m[2m=[0mnetwork unavailable: nwd — get_fabric_identity failed: invalid argument: fabric — fabric overlay requested but the fabric provider is disabled in nwd configuration (INVALID_ARGUMENT)
+[2m2026-11-06T14:55:06.396254Z[0m [32m INFO[0m [2mchv_agent_runtime_ch::process[0m[2m:[0m booting vm via ch api [3mvm_id[0m[2m=[0m5531bda5a80cea45770addaba999ba3c [3mop[0m[2m=[0m"legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:5531bda5a80cea45770addaba999ba3c:operation:40:StartVm-b670fcd252c4689cf9e92170207ee9fd"
+[2m2026-11-06T14:55:06.407215Z[0m [33m WARN[0m [2mchv_agent_runtime_ch::process[0m[2m:[0m vm.boot returned non-success (VM may have auto-booted) [3mvm_id[0m[2m=[0m5531bda5a80cea45770addaba999ba3c [3mstatus[0m[2m=[0m500
+[2m2026-11-06T14:55:33.259383Z[0m [33m WARN[0m [2mchv_agent_core::inventory[0m[2m:[0m failed to fetch fabric identity from nwd; reporting empty fabric identity [3merror[0m[2m=[0mnetwork unavailable: nwd — get_fabric_identity failed: invalid argument: fabric — fabric overlay requested but the fabric provider is disabled in nwd configuration (INVALID_ARGUMENT)

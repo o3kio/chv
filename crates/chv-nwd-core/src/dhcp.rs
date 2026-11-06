@@ -17,6 +17,17 @@ fn hosts_path(network_id: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR).join(format!("dnsmasq-{}.hosts", network_id))
 }
 
+/// Lease file for one network's dnsmasq.
+///
+/// dnsmasq's compiled default is `/var/lib/misc/dnsmasq.leases`, which the
+/// nwd sandbox (`ProtectSystem=strict`, `ReadWritePaths=/run/chv/nwd ...`)
+/// cannot write: every start failed with `Permission denied` and DHCP never
+/// served a lease (rc.6 blocker B4). Every spawn path must name a file under
+/// the daemon's own writable runtime directory explicitly.
+pub(crate) fn lease_path(network_id: &str) -> PathBuf {
+    PathBuf::from(RUNTIME_DIR).join(format!("dnsmasq-{}.leases", network_id))
+}
+
 async fn is_dnsmasq_running(network_id: &str) -> bool {
     let pid_file = pid_path(network_id);
     let Ok(pid_str) = tokio::fs::read_to_string(&pid_file).await else {
@@ -159,10 +170,12 @@ pub async fn ensure_dhcp_scope(
         info!(network_id = %network_id, "DHCP scope updated, dnsmasq reloaded");
     } else {
         // Start new dnsmasq
+        let lease = lease_path(network_id);
         let out = Command::new("dnsmasq")
             .args([
                 &format!("--conf-file={}", conf.display()),
                 &format!("--pid-file={}", pid.display()),
+                &format!("--dhcp-leasefile={}", lease.display()),
             ])
             .output()
             .await

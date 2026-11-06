@@ -1,0 +1,150 @@
+token_len=300
+=== stop daf9d7f943cf1ce96e7198aa0022e283 ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-af29b95eb9ed36ddee5f82197f775b19","vm_id":"daf9d7f943cf1ce96e7198aa0022e283"}
+vmm_state=Running
+=== stop 7b0cd93e8481a5cee679dd1ca2bd4599 ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-4ef468c648b607d2519d8770afd2f83f","vm_id":"7b0cd93e8481a5cee679dd1ca2bd4599"}
+vmm_state=Running
+=== stop a66c74e3741f2e5067c955ca5a02da23 ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-52f3ee05bf137811014fad4f7ef8796e","vm_id":"a66c74e3741f2e5067c955ca5a02da23"}
+vmm_state=Running
+=== stop 08de2de5c3195fc9f4b2afa1c10f5017 ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-948e6da5c24ca2a65796eab52ccfe43d","vm_id":"08de2de5c3195fc9f4b2afa1c10f5017"}
+vmm_state=Running
+=== stop cf750cabb0aa2ba43b83313b84955c57 ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-ea49fd7951b60108161bb6a093404596","vm_id":"cf750cabb0aa2ba43b83313b84955c57"}
+vmm_state=Running
+=== stop 4290fa2f3c082d909bc515a074a907e5 ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-ca4cfc4fe5c07bcac3e8f65a582881b5","vm_id":"4290fa2f3c082d909bc515a074a907e5"}
+vmm_state=Running
+=== stop 5531bda5a80cea45770addaba999ba3c ===
+http=200
+{"accepted":true,"summary":"stop vm accepted","task_id":"StopVm-1a413a92bf97eea2d57bfa4b975fd6a4","vm_id":"5531bda5a80cea45770addaba999ba3c"}
+vmm_state=Running
+=== remaining CH processes ===
+4107368 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/vm.sock
+4117626 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/4290fa2f3c082d909bc515a074a907e5/vm.sock
+4118865 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/cf750cabb0aa2ba43b83313b84955c57/vm.sock
+4121772 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/08de2de5c3195fc9f4b2afa1c10f5017/vm.sock
+4122854 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/a66c74e3741f2e5067c955ca5a02da23/vm.sock
+4125150 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/7b0cd93e8481a5cee679dd1ca2bd4599/vm.sock
+4133619 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/daf9d7f943cf1ce96e7198aa0022e283/vm.sock
+=== poll stops (up to 90s) ===
+t=5s CH_processes=7
+t=10s CH_processes=7
+t=15s CH_processes=7
+t=20s CH_processes=7
+t=25s CH_processes=7
+t=30s CH_processes=7
+t=35s CH_processes=7
+t=40s CH_processes=7
+t=45s CH_processes=7
+t=50s CH_processes=7
+t=55s CH_processes=7
+t=60s CH_processes=7
+t=65s CH_processes=7
+t=70s CH_processes=7
+t=75s CH_processes=7
+t=80s CH_processes=7
+t=85s CH_processes=7
+t=90s CH_processes=7
+=== remaining ===
+4107368 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/vm.sock
+4117626 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/4290fa2f3c082d909bc515a074a907e5/vm.sock
+4118865 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/cf750cabb0aa2ba43b83313b84955c57/vm.sock
+4121772 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/08de2de5c3195fc9f4b2afa1c10f5017/vm.sock
+4122854 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/a66c74e3741f2e5067c955ca5a02da23/vm.sock
+4125150 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/7b0cd93e8481a5cee679dd1ca2bd4599/vm.sock
+4133619 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/daf9d7f943cf1ce96e7198aa0022e283/vm.sock
+=== agent journal (stop) ===
+2026-11-06T15:21:36+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:36.484906Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=daf9d7f943cf1ce96e7198aa0022e283 force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:daf9d7f943cf1ce96e7198aa0022e283:operation:39:StopVm-af29b95eb9ed36ddee5f82197f775b19"
+2026-11-06T15:21:38+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:38.489304Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=daf9d7f943cf1ce96e7198aa0022e283 path=/var/lib/chv/agent/vms/daf9d7f943cf1ce96e7198aa0022e283/console.log
+2026-11-06T15:21:38+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:38.495604Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=7b0cd93e8481a5cee679dd1ca2bd4599 force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:7b0cd93e8481a5cee679dd1ca2bd4599:operation:39:StopVm-4ef468c648b607d2519d8770afd2f83f"
+2026-11-06T15:21:40+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:40.500726Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=7b0cd93e8481a5cee679dd1ca2bd4599 path=/var/lib/chv/agent/vms/7b0cd93e8481a5cee679dd1ca2bd4599/console.log
+2026-11-06T15:21:40+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:40.506771Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=a66c74e3741f2e5067c955ca5a02da23 force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:a66c74e3741f2e5067c955ca5a02da23:operation:39:StopVm-52f3ee05bf137811014fad4f7ef8796e"
+2026-11-06T15:21:42+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:42.045239Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=a66c74e3741f2e5067c955ca5a02da23 path=/var/lib/chv/agent/vms/a66c74e3741f2e5067c955ca5a02da23/console.log
+2026-11-06T15:21:42+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:42.516390Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=08de2de5c3195fc9f4b2afa1c10f5017 force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:08de2de5c3195fc9f4b2afa1c10f5017:operation:39:StopVm-948e6da5c24ca2a65796eab52ccfe43d"
+2026-11-06T15:21:44+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:44.522868Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=08de2de5c3195fc9f4b2afa1c10f5017 path=/var/lib/chv/agent/vms/08de2de5c3195fc9f4b2afa1c10f5017/console.log
+2026-11-06T15:21:44+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:44.528003Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=cf750cabb0aa2ba43b83313b84955c57 force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:cf750cabb0aa2ba43b83313b84955c57:operation:39:StopVm-ea49fd7951b60108161bb6a093404596"
+2026-11-06T15:21:46+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:46.067333Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=cf750cabb0aa2ba43b83313b84955c57 path=/var/lib/chv/agent/vms/cf750cabb0aa2ba43b83313b84955c57/console.log
+2026-11-06T15:21:46+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:46.538596Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=4290fa2f3c082d909bc515a074a907e5 force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:4290fa2f3c082d909bc515a074a907e5:operation:39:StopVm-ca4cfc4fe5c07bcac3e8f65a582881b5"
+2026-11-06T15:21:48+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:48.087471Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=4290fa2f3c082d909bc515a074a907e5 path=/var/lib/chv/agent/vms/4290fa2f3c082d909bc515a074a907e5/console.log
+2026-11-06T15:21:48+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:48.549653Z  INFO chv_agent_runtime_ch::process: stopping vm vm_id=5531bda5a80cea45770addaba999ba3c force=false op="legacy:control-plane-node.v1:node:36:f22b8cc7-cd0d-435f-8d7e-22f81b4b04da:vm:32:5531bda5a80cea45770addaba999ba3c:operation:39:StopVm-1a413a92bf97eea2d57bfa4b975fd6a4"
+2026-11-06T15:21:50+00:00 dev chv-agent[4106796]: 2026-11-06T15:21:50.555635Z  INFO chv_agent_runtime_ch::process: truncated console.log on graceful stop vm_id=5531bda5a80cea45770addaba999ba3c path=/var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/console.log
+=== delete VMMs (diagnostic cleanup) ===
+-- daf9d7f943cf1ce96e7198aa0022e283
+-- 7b0cd93e8481a5cee679dd1ca2bd4599
+-- a66c74e3741f2e5067c955ca5a02da23
+-- 08de2de5c3195fc9f4b2afa1c10f5017
+-- cf750cabb0aa2ba43b83313b84955c57
+-- 4290fa2f3c082d909bc515a074a907e5
+-- 5531bda5a80cea45770addaba999ba3c
+
+=== force-terminate orphan VMMs (sockets already unlinked by diagnostic cleanup) ===
+2026-11-06T15:24:42Z
+pids: 4107368
+4117626
+4118865
+4121772
+4122854
+4125150
+4133619
+after TERM: CH_processes=7
+final CH processes:
+4107368 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/5531bda5a80cea45770addaba999ba3c/vm.sock
+4117626 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/4290fa2f3c082d909bc515a074a907e5/vm.sock
+4118865 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/cf750cabb0aa2ba43b83313b84955c57/vm.sock
+4121772 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/08de2de5c3195fc9f4b2afa1c10f5017/vm.sock
+4122854 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/a66c74e3741f2e5067c955ca5a02da23/vm.sock
+4125150 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/7b0cd93e8481a5cee679dd1ca2bd4599/vm.sock
+4133619 chv      /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/daf9d7f943cf1ce96e7198aa0022e283/vm.sock
+
+=== remove diagnostic taps ===
+del tap-ecb43e1c
+del tap-c929e4a5
+del tap-a4132e49
+del tap-f4e64166
+del tap-fe2beb44
+del tap-950c6469
+del tap-ae0ea772
+remaining taps:
+[]
+
+=== explicit SIGKILL of remaining VMMs ===
+2026-11-06T15:25:04Z
+kill -9 4117626
+kill -9 4118865
+kill -9 4121772
+kill -9 4122854
+kill -9 4125150
+kill -9 4133619
+remaining:
+(none)
+
+=== remove /tmp/opencode diagnostic scratch ===
+2026-11-06T15:25:09Z
+rm -rf /tmp/opencode/chvtest
+rm -rf /tmp/opencode/capproof
+rm -rf /tmp/opencode/capproof2
+rm -rf /tmp/opencode/seedmnt
+remaining named scratch:
+(cleanup complete)
+
+=== post-cleanup host state ===
+CH processes: 0
+agent: active
+node: 
+
+=== note on the delete attempt above ===
+The `ch-remote --api-socket ... delete` calls were a diagnostic cleanup shortcut,
+not the product delete path. They returned no error but left the VMMs alive, so
+the remaining processes were terminated with SIGKILL. The agent's own
+`delete_vm` does not use this path: it calls `shutdown_removed_vmm_or_kill` and
+verifies death (crates/chv-agent-runtime-ch/src/process.rs, delete_vm). This
+observation is therefore not evidence of a product delete defect.

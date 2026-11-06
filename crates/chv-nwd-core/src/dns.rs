@@ -140,12 +140,16 @@ pub async fn ensure_dns_scope(
         reload_dnsmasq(network_id).await;
         info!(network_id = %network_id, forwarder_count = forwarders.len(), "DNS scope updated, dnsmasq reloaded");
     } else {
-        // Start dnsmasq with the updated config
+        // Start dnsmasq with the updated config. The lease file must be
+        // explicit: dnsmasq's default (/var/lib/misc) is not writable in the
+        // nwd sandbox, and a denied lease file kills the daemon (rc.6 B4).
         let pid = pid_path(network_id);
+        let lease = crate::dhcp::lease_path(network_id);
         let out = Command::new("dnsmasq")
             .args([
                 &format!("--conf-file={}", conf.display()),
                 &format!("--pid-file={}", pid.display()),
+                &format!("--dhcp-leasefile={}", lease.display()),
             ])
             .output()
             .await

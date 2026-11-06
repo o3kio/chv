@@ -25,7 +25,7 @@ verify_install_state() {
     done
 
     local agent_unit="/lib/systemd/system/chv-agent.service"
-    for directive in User=chv Group=chv UMask=002 RuntimeDirectoryMode=0775 StateDirectoryMode=0700; do
+    for directive in User=chv Group=chv UMask=002 RuntimeDirectoryMode=0775 StateDirectoryMode=0700 'DeviceAllow=/dev/kvm rw' 'DeviceAllow=/dev/net/tun rw'; do
         if ! grep -qx "$directive" "$agent_unit"; then
             error "chv-agent.service missing security directive: $directive"
         fi

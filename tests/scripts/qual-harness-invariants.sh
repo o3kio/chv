@@ -370,7 +370,7 @@ grep -qF 'elif agent_identity_usable; then' "$quick_installer" \
     && grep -qF 'info "Existing install: enrolled agent identity preserved' "$quick_installer" \
     && pass "quick installer preserves a healthy enrolled identity on re-run" \
     || fail "quick installer deletes a healthy enrollment cache on re-run"
-# rc.6 nests the agent's RuntimeDirectory to chv/agent, so a stop no longer
+# Since rc.6, the agent's RuntimeDirectory is chv/agent, so a stop no longer
 # removes /run/chv; staging in start_agent (after the stop) remains the safe
 # order and is pinned so the certs are in place before the new process runs.
 start_services_body="$(awk '/^start_services\(\)/{f=1} f{print} f && /^}/{exit}' "$quick_installer")"
@@ -392,7 +392,7 @@ grep -q '^wait_for_daemon_sockets()' "$quick_installer" \
     && pass "quick installer waits for stord/nwd sockets before starting the agent" \
     || fail "quick installer can start the agent before stord/nwd listen"
 # The quick installer still stops the agent before restarting stord/nwd.
-# rc.6's nested RuntimeDirectory means the sockets now survive the stop, but
+# The nested RuntimeDirectory (since rc.6) means the sockets now survive the stop, but
 # the ordering remains harmless and is pinned as defense in depth.
 if awk '/systemctl stop chv-agent/{s=NR} /systemctl restart chv-stord chv-nwd/{r=NR} END {exit !(s && r && s < r)}' <<<"$start_agent_body"; then
     pass "quick installer stops the agent before restarting stord/nwd"
