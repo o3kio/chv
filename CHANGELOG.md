@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0-rc.6] - 2026-11-06
+
+> **Final release candidate for `v0.4.0` and the base for the stable tag.**
+> Supersedes `v0.4.0-rc.5`, which failed the field plan's §6.4 "agent restart
+> with running VMs" drill blocker-class (#732). rc.6 changes the agent
+> runtime, the packaged agent unit, and the final removal paths; the rc.2
+> real-KVM lane does not cover them. rc.5 remains published and is not
+> rewritten.
 
 ### Fixed
 - **Agent restart killed every running VM and wedged the node (blocker;
@@ -52,8 +59,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-run do not own those paths. A sandboxed test runs all three shipped copies
   (including `preremove.sh` under dash) against fake host tools and proves
   non-CHV objects survive. This closes the field-plan §6.9 "network residue
-  that survives documented cleanup" blocker found during the rc.6
-  pre-window drills.
+  that survives documented cleanup" blocker identified while qualifying the
+  rc.6 restart fix; the pre-window removal drill re-verifies the teardown
+  once rc.6 is published.
+
+### Qualification
+- **Blocker reproduction (published rc.5, field host).** Three runs:
+  `systemctl restart chv-agent` with one running VM took 76 s, expired
+  `TimeoutStopSec=75`, and systemd SIGKILLed the cgroup, killing
+  cloud-hypervisor; a direct `SIGTERM` blocked in the serial-console read; a
+  plain stop/start removed `/run/chv/{stord,nwd}` and left the node
+  `Failed`/`Degraded` with duplicate-spawn `Address already in use` errors.
+  Recorded in #732.
+- **Unit-half drill (pre-publication, not field evidence).** The rc.6 unit
+  on the published rc.5 binary: restart `rc=0` in 76 s (the old drain still
+  reached the timeout), VMM alive with the identical start time, stord/nwd
+  PIDs and socket inodes unchanged, adoption succeeded, zero duplicate
+  spawns, node `TenantReady`/`Healthy` at +1 s. This isolates the
+  `KillMode`/`RuntimeDirectory` change.
+- **Removal drill (fix branch).** `scripts/quick-install.sh --uninstall
+  --purge` terminated the live VMM and left no CHV bridge, tap, netns,
+  `inet chv-*` table, live or persisted NAT rule, sysctl/networkd config,
+  `/etc/chv`, `/var/lib/chv`, `/var/log/chv`, `/run/chv`, `/opt/chv`,
+  migrations, or nginx site. Stale failed-unit state is cleared by the final
+  paths; the pre-window drill re-runs this end to end once rc.6 is published.
+- Packaging tests 14/14 (all three shipped removal copies under dash and bash
+  `pipefail`), Rust agent 133/133, drain 8/8, invariants 174 ok / 0 fail;
+  each new regression test was mutation-verified against its fix. Required CI
+  was green on #733. **No real-KVM lane or post-publication lane has run on
+  the rc.6 runtime at tag time; none is claimed.**
 
 ## [0.4.0-rc.5] - 2026-11-06
 
