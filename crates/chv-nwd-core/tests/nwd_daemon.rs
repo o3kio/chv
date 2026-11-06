@@ -12,6 +12,7 @@ use chv_nwd_core::executor::{
 };
 use chv_nwd_core::fabric::{AppliedFabric, ApplyReport, FabricIdentity};
 use chv_nwd_core::handlers::NetworkServiceImpl;
+use chv_nwd_core::policy_store::PolicyStore;
 use chv_nwd_core::topology_store::TopologyStore;
 use chv_nwd_core::{NetworkServer, TopologyState, TopologyTable};
 use chv_observability::Metrics;
@@ -1338,6 +1339,112 @@ async fn topology_journal_recovers_after_restart_and_reopens_policy_updates() {
     );
 }
 
+/// §6.4 requires policy AND bridge to re-materialize after an nwd restart or
+/// network disruption. The topology journal alone restores ownership; the
+/// policy journal must restore the guard set, or a NIC attached after the
+/// restart would sit outside CHV default-deny (the base hooks are
+/// `policy accept`; only the guard dispatches into the policy chains).
+#[tokio::test]
+async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // First process lifetime: ensure the topology and apply a policy.
+    let mut first = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    first.set_topology_store(Arc::new(topologies.clone()));
+    first.set_policy_store(Arc::new(policies.clone()));
+    first
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-policy")),
+        }))
+        .await
+        .unwrap();
+    let applied = first
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-policy".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "policy-9".to_string(),
+                policy_json: br#"{"rules":[]}"#.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.status, "OK");
+    assert!(
+        policies.path_for("net-policy").exists(),
+        "a firewall policy must be journaled for restart recovery"
+    );
+
+    // Restart: fresh in-memory state, same durable journals.
+    calls.lock().unwrap().clear();
+    let table = Arc::new(TopologyTable::new());
+    let mut second = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+        }),
+        table.clone(),
+        Arc::new(Metrics::new()),
+    );
+    second.set_topology_store(Arc::new(topologies));
+    second.set_policy_store(Arc::new(policies));
+    second
+        .recover_topologies()
+        .await
+        .expect("the journals must replay cleanly");
+    assert!(table.get("net-policy").is_some());
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "fw:net-policy:br-net-policy"),
+        "recovery must re-apply the journaled firewall policy: {:?}",
+        calls.lock().unwrap()
+    );
+
+    // A NIC attach after the restart must re-scope the guard from the
+    // recovered policy, not silently skip because policy_state was lost.
+    calls.lock().unwrap().clear();
+    let attached = second
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                network_id: "net-policy".to_string(),
+                nic_id: "nic-1".to_string(),
+                vm_id: "vm-1".to_string(),
+                mac_address: "52:54:00:00:00:01".to_string(),
+                tap_name: "tap-nic-1".to_string(),
+                ip_address: "10.0.7.10".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(attached.result.unwrap().status, "OK");
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "fw:net-policy:br-net-policy"),
+        "attach after recovery must re-apply the recovered policy guard: {:?}",
+        calls.lock().unwrap()
+    );
+}
+
 /// A topology delete must remove the journal entry, or the next restart would
 /// resurrect the network the operator just deleted.
 #[tokio::test]
@@ -1346,6 +1453,7 @@ async fn topology_delete_removes_the_journal_entry() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
 
     let service = NetworkServiceImpl::new(
         Arc::new(MockExecutor),
@@ -1354,6 +1462,7 @@ async fn topology_delete_removes_the_journal_entry() {
     );
     let mut service = service;
     service.set_topology_store(Arc::new(store.clone()));
+    service.set_policy_store(Arc::new(policies.clone()));
 
     service
         .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
@@ -1363,6 +1472,18 @@ async fn topology_delete_removes_the_journal_entry() {
         .await
         .unwrap();
     assert!(store.path_for("net-delete").exists());
+    service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-delete".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap();
+    assert!(policies.path_for("net-delete").exists());
 
     let deleted = service
         .delete_network_topology(TonicRequest::new(DeleteNetworkTopologyRequest {
@@ -1377,6 +1498,10 @@ async fn topology_delete_removes_the_journal_entry() {
         !store.path_for("net-delete").exists(),
         "a successful delete must remove the durable journal entry"
     );
+    assert!(
+        !policies.path_for("net-delete").exists(),
+        "a successful delete must remove the durable policy entry"
+    );
 
     // A restart after the delete must not recover anything.
     let table = Arc::new(TopologyTable::new());
@@ -1386,6 +1511,7 @@ async fn topology_delete_removes_the_journal_entry() {
         Arc::new(Metrics::new()),
     );
     restarted.set_topology_store(Arc::new(store));
+    restarted.set_policy_store(Arc::new(policies));
     restarted.recover_topologies().await.unwrap();
     assert!(table.get("net-delete").is_none());
 }

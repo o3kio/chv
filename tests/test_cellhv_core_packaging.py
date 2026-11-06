@@ -115,10 +115,11 @@ class CellHvCorePackagingTests(unittest.TestCase):
 
     def test_nwd_unit_prepares_the_topology_journal_directory(self):
         # Field blocker B9: nwd journals applied bridge-only topologies under
-        # /var/lib/chv/nwd/topologies and replays them before serving. The
-        # unit must create that directory before ExecStart (StateDirectory
+        # /var/lib/chv/nwd/topologies (and the last requested policy under
+        # /var/lib/chv/nwd/policies) and replays both before serving. The
+        # unit must create those directories before ExecStart (StateDirectory
         # only creates /var/lib/chv), with the daemon's identity so the
-        # non-root process can write it under ProtectSystem=strict.
+        # non-root process can write them under ProtectSystem=strict.
         for relative in (
             "packaging/systemd/chv-nwd.service",
             "docs/examples/systemd/chv-nwd.service",
@@ -126,16 +127,23 @@ class CellHvCorePackagingTests(unittest.TestCase):
             unit = (ROOT / relative).read_text()
             self.assertIn(
                 "ExecStartPre=+/usr/bin/install -d -m 0700 -o chv -g chv "
-                "/var/lib/chv/nwd/topologies /var/lib/chv/nwd/dhcp",
+                "/var/lib/chv/nwd/topologies /var/lib/chv/nwd/policies "
+                "/var/lib/chv/nwd/dhcp",
                 unit,
             )
 
     def test_nwd_daemon_wires_the_durable_topology_journal(self):
         main = (ROOT / "cmd/chv-nwd/src/main.rs").read_text()
         self.assertIn(".with_topology_store(", main)
+        self.assertIn(".with_policy_store(", main)
         self.assertIn("TopologyStore::default_dir()", main)
+        self.assertIn("PolicyStore::default_dir()", main)
         server = (ROOT / "crates/chv-nwd-core/src/server.rs").read_text()
         self.assertIn("recover_topologies().await", server)
+        handlers = (ROOT / "crates/chv-nwd-core/src/handlers.rs").read_text()
+        # Recovery must restore the guard set, not just the topology row.
+        self.assertIn("recover_policies(&spec.network_id, &state)", handlers)
+        self.assertIn(".set_firewall_policy(network_id, &version, &json", handlers)
 
     def test_nwd_durable_network_state_is_removed_by_wipe_and_package_removal(self):
         # rc.8 B9: nwd now replays a durable bridge-only topology journal at

@@ -518,7 +518,7 @@ disruption to re-materialize the bridge and policy; plan §6.9 treats a failed
 documented recovery that needs hidden maintainer knowledge as blocker-class.
 The defect reproduces on the published artifact, not only in a unit test.
 
-**Fix in rc.8 (two layers).**
+**Fix in rc.8 (three layers).**
 
 1. **Durable bridge-only journal.** `crates/chv-nwd-core/src/topology_store.rs`
    atomically persists the exact `TopologySpec` protobuf under
@@ -531,7 +531,18 @@ The defect reproduces on the published artifact, not only in a unit test.
    rewriting an unchanged journal on every reconcile tick. Fabric topologies
    are deliberately **not** journaled: the stretched-L2 fabric is design-only
    and its provider owns its durable surface.
-2. **Agent startup replay.** The rc.7 → rc.8 upgrade starts with an empty
+2. **Durable firewall/NAT guard.** `crates/chv-nwd-core/src/policy_store.rs`
+   journals the last requested policy pair and version under
+   `/var/lib/chv/nwd/policies/<network_id>.json`, written under the same lock
+   as the in-memory `policy_state` mutation so concurrent firewall/NAT RPCs
+   cannot persist a half pair. Recovery restores the pair and re-applies it
+   fail-closed before serving; delete removes it. This is required by §6.4:
+   nftables survives a process restart but not a host reboot, and the
+   in-memory record is what re-scopes the interface guard on attach. The base
+   hooks are `policy accept` by design; only the guard dispatches guest
+   traffic into the policy chains, so a lost guard is an isolation gap, not
+   just a missing convenience.
+3. **Agent startup replay.** The rc.7 → rc.8 upgrade starts with an empty
    journal, while the Core store already holds the live networks. The agent
    queries nwd's owned topologies and re-ensures only the distinct
    bridge-only networks referenced by a live Core VM that nwd does not
@@ -544,10 +555,10 @@ The defect reproduces on the published artifact, not only in a unit test.
    cannot block agent startup.
 
 **Verification.** `crates/chv-nwd-core/tests/nwd_daemon.rs` covers restart →
-policy update, delete removes the journal, the idempotent path repairing a
-deleted journal entry, and the fabric exclusion;
-`crates/chv-agent-core/src/network_replay.rs` covers derivation, merge
-semantics, and the skip-already-owned filter.
+policy update, policy-guard recovery plus re-scope on attach, delete removing
+both journals, the idempotent path repairing a deleted journal entry, and the
+fabric exclusion; `crates/chv-agent-core/src/network_replay.rs` covers
+derivation, merge semantics, and the skip-already-owned filter.
 
 ## B9 follow-ups included in rc.8
 

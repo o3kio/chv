@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial table. Fabric topologies are deliberately not journaled: the
   stretched-L2 fabric is design-only and its provider owns its durable
   surface. The unit creates the journal directory (`0700 chv:chv`).
+- **A restart also forgot the firewall/NAT guard (B9 follow-up).** Recovering
+  the topology alone does not satisfy plan §6.4 ("policy and bridge
+  re-materialize"): nftables state survives a process restart but not a host
+  reboot, and the in-memory policy record is what re-scopes the interface
+  guard on a NIC attach. The last requested firewall/NAT policy and version
+  are now journaled under `/var/lib/chv/nwd/policies/<network_id>.json`,
+  restored and re-applied fail-closed before serving, and removed on
+  topology delete. Without it, a restart followed by an attach could leave
+  the new tap outside CHV default-deny (the base hooks are `policy accept`;
+  only the guard dispatches guest traffic into the policy chains).
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**
@@ -74,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path.
 
 ### Qualification
-- Targeted Rust tests (`chv-nwd-core` 106 lib + 13 daemon + 24 fabric,
+- Targeted Rust tests (`chv-nwd-core` 114 lib + 14 daemon + 24 fabric,
   `chv-agent-core` startup replay 9), packaging/architecture contract tests
   79/79, `cargo fmt`, clippy `-D warnings`, and shell syntax checks are green
   in the rc.8 candidate tree. **No rc.8 real-KVM lane, post-publication
@@ -89,6 +99,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a VM re-create (or a clean rc.8 install) repopulates the persistent
   file. The field drill uses cloud-init static addressing for the upgrade
   leg and exercises the reservation contract on the clean install.
+- One-time gap: the rc.7 → rc.8 upgrade starts with an empty policy journal.
+  The rc.7 nft guard persists in the kernel, so running guests stay filtered;
+  the journal is seeded by the first attach-time policy application (the core
+  runtime applies the NIC snapshot or the DP4 baseline before attach) or the
+  operator's first policy update. The upgrade drill performs that update
+  immediately and verifies the guard re-scopes. A clean rc.8 install has no
+  such gap.
 
 ## [0.4.0-rc.7] - 2026-11-06
 

@@ -1,6 +1,7 @@
 use crate::executor::NetworkExecutor;
 use crate::handlers::NetworkServiceImpl;
 use crate::link_monitor::{link_health_loop, LinkHealthSnapshot};
+use crate::policy_store::PolicyStore;
 use crate::state::TopologyTable;
 use crate::topology_store::TopologyStore;
 use chv_errors::ChvError;
@@ -42,6 +43,15 @@ impl<E: NetworkExecutor> NetworkServer<E> {
     /// do not exercise restart recovery leave it unset.
     pub fn with_topology_store(mut self, store: TopologyStore) -> Self {
         self.inner.set_topology_store(Arc::new(store));
+        self
+    }
+
+    /// Opt into the durable firewall/NAT policy journal (rc.8 B9 follow-up).
+    /// Recovery re-applies the last requested policy so a restart or reboot
+    /// restores the interface guard set instead of serving an unguarded
+    /// recovered topology.
+    pub fn with_policy_store(mut self, store: PolicyStore) -> Self {
+        self.inner.set_policy_store(Arc::new(store));
         self
     }
 

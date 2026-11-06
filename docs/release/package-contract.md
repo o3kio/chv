@@ -291,8 +291,8 @@ All daemons run as the `chv` system user:
   tradeoff is documented on the unit, #328; `CAP_NET_BIND_SERVICE` lets the
   dnsmasq child bind UDP/67, B8), address families restricted to
   `AF_UNIX AF_INET AF_INET6 AF_NETLINK`, read-write to `/run/chv/nwd`,
-  `/run/netns`, and `/var/lib/chv` (the durable topology journal and DHCP
-  reservations live under `/var/lib/chv/nwd`)
+  `/run/netns`, and `/var/lib/chv` (the durable topology, policy, and DHCP
+  state live under `/var/lib/chv/nwd`)
 - `chv-controlplane`: read-write to `/var/lib/chv`, `/run/chv/controlplane`; read-only to `/usr/share/chv`
 
 All units use:

@@ -1,5 +1,6 @@
 use crate::ebpf::{self, EbpfManager};
 use crate::executor::{FabricOwnership, NetworkExecutor, OverlayStatusInfo, TopologyApplyResult};
+use crate::policy_store::{PolicyStore, StoredPolicies};
 use crate::state::{TopologyState, TopologyTable};
 use crate::topology_store::TopologyStore;
 use chv_errors::ChvError;
@@ -8,6 +9,7 @@ use chv_observability::{operation_span, Metrics};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -36,6 +38,13 @@ pub struct NetworkServiceImpl<E: NetworkExecutor> {
     /// tests and in any composition that has not opted in; the production
     /// daemon always wires it (see `cmd/chv-nwd/src/main.rs`).
     topology_store: Option<Arc<TopologyStore>>,
+    /// Durable firewall/NAT policy journal (rc.8 B9 follow-up). Re-applied on
+    /// recovery so a restart or reboot restores the interface guard set
+    /// instead of leaving attached guests outside default-deny.
+    policy_store: Option<Arc<PolicyStore>>,
+    /// Serializes policy-journal updates with the in-memory `policy_state`
+    /// mutation so concurrent firewall/NAT RPCs cannot persist a half pair.
+    policy_persist: AsyncMutex<()>,
 }
 
 impl<E: NetworkExecutor> NetworkServiceImpl<E> {
@@ -50,6 +59,8 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             ebpf: Arc::new(ebpf::NoopEbpfManager),
             ebpf_load_failures: Arc::new(AtomicU32::new(0)),
             topology_store: None,
+            policy_store: None,
+            policy_persist: AsyncMutex::new(()),
         }
     }
 
@@ -57,6 +68,12 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
     /// calls this once before serving; tests that do not care leave it unset.
     pub fn set_topology_store(&mut self, store: Arc<TopologyStore>) {
         self.topology_store = Some(store);
+    }
+
+    /// Opt into the durable policy journal (rc.8 B9 follow-up). Production
+    /// wiring calls this alongside [`Self::set_topology_store`].
+    pub fn set_policy_store(&mut self, store: Arc<PolicyStore>) {
+        self.policy_store = Some(store);
     }
 
     /// Persist the applied bridge-only spec, or drop a stale bridge-only entry
@@ -79,6 +96,73 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             return Ok(());
         };
         store.remove(network_id).await
+    }
+
+    /// Drop the durable policy for a network. A failure fails the delete
+    /// closed: a stale policy re-applied after a restart against a re-created
+    /// network with the same id would be the #227 S5 residue class.
+    async fn forget_policies(&self, network_id: &str) -> Result<(), ChvError> {
+        let Some(store) = self.policy_store.as_ref() else {
+            return Ok(());
+        };
+        store.remove(network_id).await
+    }
+
+    /// Record the requested firewall half durably before the executor apply.
+    /// Mutating the in-memory pair and taking the persistence snapshot under
+    /// one lock keeps a concurrent NAT RPC from persisting a half pair. The
+    /// in-memory record is kept even when the journal write fails, so a later
+    /// NIC attach still re-scopes; the RPC itself reports the write failure.
+    async fn record_firewall_policy(
+        &self,
+        network_id: &str,
+        policy_json: &[u8],
+        policy_version: &str,
+    ) -> Result<(), ChvError> {
+        // Hold the lock across the persist: releasing it before the write
+        // would let a concurrent NAT snapshot land first and then be
+        // overwritten by this older firewall-only snapshot.
+        let _guard = self.policy_persist.lock().await;
+        let snapshot = {
+            let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
+            applied.firewall = Some(policy_json.to_vec());
+            applied.firewall_version = Some(policy_version.to_string());
+            StoredPolicies {
+                firewall: applied.firewall.clone(),
+                firewall_version: applied.firewall_version.clone(),
+                nat: applied.nat.clone(),
+                nat_version: applied.nat_version.clone(),
+            }
+        };
+        match self.policy_store.as_ref() {
+            Some(store) => store.persist(network_id, &snapshot).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Record the requested NAT half durably (see `record_firewall_policy`).
+    async fn record_nat_policy(
+        &self,
+        network_id: &str,
+        policy_json: &[u8],
+        policy_version: &str,
+    ) -> Result<(), ChvError> {
+        let _guard = self.policy_persist.lock().await;
+        let snapshot = {
+            let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
+            applied.nat = Some(policy_json.to_vec());
+            applied.nat_version = Some(policy_version.to_string());
+            StoredPolicies {
+                firewall: applied.firewall.clone(),
+                firewall_version: applied.firewall_version.clone(),
+                nat: applied.nat.clone(),
+                nat_version: applied.nat_version.clone(),
+            }
+        };
+        match self.policy_store.as_ref() {
+            Some(store) => store.persist(network_id, &snapshot).await,
+            None => Ok(()),
+        }
     }
 
     /// Heal the durable entry on the idempotent ensure path. Persist only when
@@ -143,12 +227,26 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             match self.executor.ensure_topology(&spec).await {
                 Ok(applied) => {
                     let state = Self::state_from_apply(&spec, &applied);
-                    self.topologies.upsert(state);
+                    self.topologies.upsert(state.clone());
                     info!(
                         network_id = %spec.network_id,
                         bridge = %spec.bridge_name,
                         "recovered journaled network topology"
                     );
+                    // Policy must re-materialize too (§6.4): nftables survives
+                    // a process restart but not a reboot, and the in-memory
+                    // record is what re-scopes the guard set on the next NIC
+                    // attach. Re-applying here is fail-closed: a policy that
+                    // cannot be restored aborts startup rather than serving an
+                    // unguarded tenant network.
+                    if let Err(e) = self.recover_policies(&spec.network_id, &state).await {
+                        error!(
+                            network_id = %spec.network_id,
+                            error = %e,
+                            "failed to recover journaled network policy"
+                        );
+                        failures.push(format!("{} policy: {e}", spec.network_id));
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -172,6 +270,73 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
                 ),
             })
         }
+    }
+
+    /// Restore and re-apply the last requested firewall/NAT policy for one
+    /// recovered topology. A half pair in the journal is treated as corruption
+    /// rather than silently dropped: a firewall payload without its version
+    /// (or vice versa) would otherwise leave the network unguarded.
+    async fn recover_policies(
+        &self,
+        network_id: &str,
+        state: &TopologyState,
+    ) -> Result<(), ChvError> {
+        let Some(store) = self.policy_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(policies) = store.load(network_id).await? else {
+            return Ok(());
+        };
+        if policies.is_empty() {
+            return Ok(());
+        }
+
+        let firewall = match (policies.firewall.clone(), policies.firewall_version.clone()) {
+            (Some(json), Some(version)) => Some((json, version)),
+            (None, None) => None,
+            _ => {
+                return Err(ChvError::Internal {
+                    reason: format!(
+                    "policy journal entry for {network_id} has a firewall payload/version mismatch"
+                ),
+                })
+            }
+        };
+        let nat = match (policies.nat.clone(), policies.nat_version.clone()) {
+            (Some(json), Some(version)) => Some((json, version)),
+            (None, None) => None,
+            _ => {
+                return Err(ChvError::Internal {
+                    reason: format!(
+                        "policy journal entry for {network_id} has a NAT payload/version mismatch"
+                    ),
+                })
+            }
+        };
+
+        {
+            let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
+            applied.firewall = policies.firewall;
+            applied.firewall_version = policies.firewall_version;
+            applied.nat = policies.nat;
+            applied.nat_version = policies.nat_version;
+        }
+
+        if let Some((json, version)) = firewall {
+            self.executor
+                .set_firewall_policy(network_id, &version, &json, &state.bridge_name)
+                .await?;
+        }
+        if let Some((json, version)) = nat {
+            self.executor
+                .set_nat_policy(network_id, &version, &json, &state.bridge_name)
+                .await?;
+        }
+        info!(
+            network_id = %network_id,
+            "recovered journaled network policy"
+        );
+        Ok(())
     }
 
     fn state_from_apply(
@@ -648,8 +813,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         if let Err(e) = self.forget_topology(&req.network_id).await {
             return Ok(Response::new(Self::err_result(&e)));
         }
-        // Drop any remembered policy so a stale firewall policy is not re-asserted
-        // if a new topology with the same network_id is created later (#227 S5).
+        // Drop the durable policy for the same reason: a stale policy
+        // re-applied after a restart against a re-created network with the
+        // same id would be the #227 S5 residue class. This also drops the
+        // in-memory record, which is only meaningful with a topology.
+        if let Err(e) = self.forget_policies(&req.network_id).await {
+            return Ok(Response::new(Self::err_result(&e)));
+        }
         self.policy_state.remove(&req.network_id);
 
         Ok(Response::new(Self::ok_result()))
@@ -940,15 +1110,16 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // boundary (fail-open, #227 S3). refresh_policy_scope re-applies the
         // desired policy, so the boundary converges on the next attach.
         //
-        // The entry is mutated in place under the DashMap shard lock: a
-        // read-clone-modify-insert here could LOSE the concurrent NAT half of
-        // the pair (the two RPCs may overlap), leaving a newly attached NIC
-        // outside the firewall boundary. Mutating the shared value directly
-        // makes the fw+nat pair merge atomically.
+        // The same record is written to the durable policy journal, so an nwd
+        // restart (or host reboot) restores the guard set instead of serving a
+        // recovered topology with no policy. The in-memory pair and the
+        // persisted snapshot are mutated under one lock, so a concurrent NAT
+        // RPC cannot lose the firewall half (and vice versa).
+        if let Err(e) = self
+            .record_firewall_policy(&req.network_id, &policy.policy_json, &policy.policy_version)
+            .await
         {
-            let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
-            applied.firewall = Some(policy.policy_json.clone());
-            applied.firewall_version = Some(policy.policy_version.clone());
+            return Ok(Response::new(Self::err_result(&e)));
         }
 
         match self
@@ -1001,13 +1172,16 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
 
         // Record the DESIRED NAT policy state regardless of apply outcome for
         // the same reason as set_firewall_policy (re-scope convergence, #227
-        // S3). A failed or partial NAT apply must not leave policy_state empty.
-        // Mutated in place under the shard lock (see set_firewall_policy) so a
-        // concurrent firewall RPC cannot lose either half of the pair.
+        // S3), and persist it to the durable policy journal so restart/reboot
+        // recovery restores the NAT guard as well. The in-memory pair and the
+        // persisted snapshot are mutated under one lock (see
+        // set_firewall_policy) so a concurrent firewall RPC cannot lose either
+        // half of the pair.
+        if let Err(e) = self
+            .record_nat_policy(&req.network_id, &policy.policy_json, &policy.policy_version)
+            .await
         {
-            let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
-            applied.nat = Some(policy.policy_json.clone());
-            applied.nat_version = Some(policy.policy_version.clone());
+            return Ok(Response::new(Self::err_result(&e)));
         }
 
         match self

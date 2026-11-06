@@ -6,6 +6,7 @@ pub mod fabric;
 pub mod firewall;
 pub mod handlers;
 pub mod link_monitor;
+pub mod policy_store;
 pub mod server;
 pub mod state;
 pub mod topology_store;
