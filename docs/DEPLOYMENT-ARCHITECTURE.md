@@ -495,20 +495,21 @@ is not supported.
 | Migration | **Pause-first stop-the-world is the only operator-facing mode** (#656/#683); the live/concurrent-write path is rejected. The underlying quiescent-source stord↔stord disk transfer over mTLS is qualified (m4.6). The pause-first BFF/CP/agent orchestration is CI-verified but not separately real-KVM-qualified. Multi-host migration unproven. | m4.6; [live-migration spec](specs/component/live-migration-spec.md); #578/#582 |
 | Lifecycle authority | Exactly one durable CellHV Core authority per node; legacy/control-plane paths are compatibility adapters only. | Declaration §3; prompt-02 |
 | Backup/restore | **Hard-fenced (`501 NOT_IMPLEMENTED`).** No execution engine or restore validation exists; tenant-data backup is the operator's responsibility. | Declaration §3; this document §5 UC-9 |
-| Upgrade | Package upgrade (deb/rpm) is CI-verified; migrations are forward-only and **downgrade is unsupported**. Rolling node upgrade is absent (the `SystemdNodeUpgrader` stack was deleted in #213; ADR-007 is not implemented). The fresh-host install + package upgrade + uninstall path (#666) and the published quick installer (#556) passed on `v0.4.0-rc.1` in a clean container — [CONTAINER-VERIFIED], not bare-metal evidence. `v0.4.0-rc.2`'s clean-install path has a blocker-class data-loss defect (acknowledged API writes lost on restart/upgrade, #722), fixed in `scripts/install.sh` for `v0.4.0-rc.3`; the rc.3 quick installer still had it, fixed in `v0.4.0-rc.4` (#725). The rc.4 post-publication lane is run after publication and is not pre-claimed here. | §6; `scripts/package/lifecycle-{deb,rpm}.sh`; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md); [rc.4 release notes](release/v0.4.0-rc.4-release-notes.md) |
+| Upgrade | Package upgrade (deb/rpm) is CI-verified; migrations are forward-only and **downgrade is unsupported**. Rolling node upgrade is absent (the `SystemdNodeUpgrader` stack was deleted in #213; ADR-007 is not implemented). The fresh-host install + package upgrade + uninstall path (#666) and the published quick installer (#556) passed on `v0.4.0-rc.1` in a clean container — [CONTAINER-VERIFIED], not bare-metal evidence. `v0.4.0-rc.2`'s clean-install path has a blocker-class data-loss defect (acknowledged API writes lost on restart/upgrade, #722), fixed in `scripts/install.sh` for `v0.4.0-rc.3`; the rc.3 quick installer still had it, fixed in `v0.4.0-rc.4` (#725). rc.4's quick installer itself has two blocker-class defects (a fresh install can complete with no enrolled node; a documented re-run destroys the enrolled identity), fixed in `v0.4.0-rc.5` (#727); the rc.4 tarball/package and upgrade path is unaffected and passed its lane. The rc.5 post-publication lane is run after publication and is not pre-claimed here. | §6; `scripts/package/lifecycle-{deb,rpm}.sh`; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md); [rc.5 release notes](release/v0.4.0-rc.5-release-notes.md) |
 | Scale | **No concurrency, density, throughput, or requests-per-second claim.** M4.8 numbers are baselines on the qualification host only. | m4.8; m4.9 §3 |
 | Multi-host | **Unsupported/absent.** Control-plane→agent dispatch is a Unix-socket path; the agent has no TCP gRPC listener. ADR-029 is accepted as design but **not implemented**. | §3.3, §5 UC-6; [ADR-029](specs/adr/029-multi-host-dispatch.md) |
 | Volvisor | **Design-only.** ADR-028 selects Volvisor as the future storage authority; runtime integration is pending (pin/contract work upstream). The qualified storage path remains `chv-stord`. | [ADR-028](specs/adr/028-volvisor-storage-orchestration.md) |
 | Hardware minimums | **No qualified minimum.** [DEPLOYMENT.md](DEPLOYMENT.md) states "Minimum 4 cores, 8 GB RAM, 50 GB disk" and labels it an **unevidenced recommendation**. ADR-011's "approximately 20 nodes" is a design target, not a qualified scale claim. | This document; [DEPLOYMENT.md](DEPLOYMENT.md) Prerequisites; ADR-011 |
-| Qualification status | The full real-KVM lane (m4.3–m4.8) is green on **run 41938443045** (`e82d49a1`) and on the `v0.4.0-rc.1` lineage (`c25360a8`) in **Stage A run 42055268623** for m4.3–m4.7. Stage A's m4.8 leg failed only the pre-#702 metric-cardinality baseline (the registry families materialize on first use); the harness verdict was corrected and the **rc.2 lane [42067288852](https://github.com/o3kio/chv/actions/runs/42067288852)** is green on the rc.2 product+harness tree (`c1effc71`; the tag adds docs only). rc.3 and rc.4 change no runtime code, so that lane remains the runtime evidence; the installer fixes (#722/#725) are covered by the fresh-host lane instead. #666's fresh-host demonstration passed on `v0.4.0-rc.1` in a clean container (run [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140)), which is [CONTAINER-VERIFIED], not bare metal; #556's published quick installer passed in the same run. The rc.3 post-publication lane ([42139285660](https://github.com/o3kio/chv/actions/runs/42139285660)) is green on the tarball/package path, but its quick leg did not run the persistence gate and the rc.3 quick installer is defective. The rc.4 post-publication lane is run after publication and is not pre-claimed here. | [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §4–§5; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md); Stage A run 42055268623 |
+| Qualification status | The full real-KVM lane (m4.3–m4.8) is green on **run 41938443045** (`e82d49a1`) and on the `v0.4.0-rc.1` lineage (`c25360a8`) in **Stage A run 42055268623** for m4.3–m4.7. Stage A's m4.8 leg failed only the pre-#702 metric-cardinality baseline (the registry families materialize on first use); the harness verdict was corrected and the **rc.2 lane [42067288852](https://github.com/o3kio/chv/actions/runs/42067288852)** is green on the rc.2 product+harness tree (`c1effc71`; the tag adds docs only). rc.3, rc.4, and rc.5 change no runtime code, so that lane remains the runtime evidence; the installer fixes (#722/#725/#727) are covered by the fresh-host lane instead. #666's fresh-host demonstration passed on `v0.4.0-rc.1` in a clean container (run [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140)), which is [CONTAINER-VERIFIED], not bare metal; #556's published quick installer passed in the same run. The rc.3 post-publication lane ([42139285660](https://github.com/o3kio/chv/actions/runs/42139285660)) is green on the tarball/package path, but its quick leg did not run the persistence gate and the rc.3 quick installer is defective. The rc.4 post-publication lane ([42148690329](https://github.com/o3kio/chv/actions/runs/42148690329)) passed tarball, packages, and upgrade, but its quick leg failed `node enrolled and visible`; the rc.4 quick installer is defective and fixed in rc.5 (#727). The rc.5 post-publication lane is run after publication and is not pre-claimed here. | [nightly note](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/nightly-kvm-2026-11-04.md) §4–§5; [fresh-host report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md); Stage A run 42055268623 |
 
 **Pending:** Prompt 06 (reference deployment / field qualification) will add the
 first field-evidence tier and is not pre-claimed here. The current release
-support matrix ([release/v0.4.0-rc.4-support-matrix.md](release/v0.4.0-rc.4-support-matrix.md))
-carries the same claims with per-row evidence pointers; `v0.4.0-rc.4` is a
+support matrix ([release/v0.4.0-rc.5-support-matrix.md](release/v0.4.0-rc.5-support-matrix.md))
+carries the same claims with per-row evidence pointers; `v0.4.0-rc.5` is a
 pre-release, not a stable support announcement. `v0.4.0-rc.2` is retained only
-as a historical, disclosed-defective build, and `v0.4.0-rc.3`'s quick
-installer is likewise disclosed as defective and superseded by rc.4.
+as a historical, disclosed-defective build; the rc.3 quick installer is
+likewise disclosed as defective and superseded by rc.4, and rc.4's quick
+installer is disclosed as defective and superseded by rc.5.
 
 ## 8. Open design decisions
 
@@ -662,6 +663,19 @@ found it.
   delete-path kill-refusal (#351, #415), and the chvctl↔BFF contract drift
   (#372, #519–#521) are fixed on `main`. The pre-fix data caveats above
   remain.
+- **Installer defect lineage (#722/#725/#727) — fixed in the final RC.**
+  `v0.3.0`, `v0.4.0-rc.1`, and `v0.4.0-rc.2` could lose API writes
+  acknowledged during the install process lifetime (a direct `sqlite3` write
+  unlinked the WAL the live control plane still held open); fixed in
+  `scripts/install.sh` for rc.3 (#722) and in the quick installer for rc.4
+  (#725). rc.4's quick installer then had two further blocker-class defects:
+  a fresh install could complete with no enrolled node (the agent started
+  before the offline admin writes), and a documented re-run destroyed the
+  enrolled agent identity (deleted cache + consumed one-time token +
+  `RuntimeDirectory=chv` wiping `/run/chv`). Both are fixed in rc.5 (#727).
+  Upgrading fixes the installers and the running process's durability; it
+  cannot restore writes already lost. The tarball/package path was unaffected
+  by the rc.4 quick-install defects and passed the rc.4 lane.
 
 **Documentation drift recorded at authoring time (not all of it is fixed in
 this pass):**
@@ -717,7 +731,7 @@ deploy them; do not file evidence against them.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and data flow | The deleted upgrade stack and the removed `chvctl upgrade` surface are recorded there in past tense; this document supersedes on deployment matters. |
 | [specs/adr/](specs/adr/) | Design authority | ADRs are decisions; this document records their qualification tier (for example ADR-021 is DESIGN-ONLY). |
 | [evidence/](evidence/) (frozen prompt-04 milestones) | Proof | Every [QUALIFIED — KVM-VERIFIED] label here cites a milestone doc. |
-| [prompts/production-readiness/](prompts/production-readiness/) | Campaign definitions | Prompt 06 is pending and will extend §5 and §7 when it has field evidence. The published [v0.4.0-rc.4 support matrix](release/v0.4.0-rc.4-support-matrix.md) and [release notes](release/v0.4.0-rc.4-release-notes.md) restate this document's claims; the RC is a **pre-release**, not a stable support announcement. |
+| [prompts/production-readiness/](prompts/production-readiness/) | Campaign definitions | Prompt 06 is pending and will extend §5 and §7 when it has field evidence. The published [v0.4.0-rc.5 support matrix](release/v0.4.0-rc.5-support-matrix.md) and [release notes](release/v0.4.0-rc.5-release-notes.md) restate this document's claims; the RC is a **pre-release**, not a stable support announcement. |
 
 ---
 
