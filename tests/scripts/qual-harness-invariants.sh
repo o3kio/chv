@@ -299,7 +299,7 @@ grep -Fq 'QUICK_REF="${QUICK_REF:-}"' "$fresh" \
 grep -q 'raw.githubusercontent.com/.*scripts/quick-install.sh' "$fresh" \
     && pass "fresh-host fetches quick-install.sh at the pinned ref" \
     || fail "fresh-host does not fetch the pinned quick-install.sh"
-grep -q 'check_bringup candidate http://127.0.0.1/$' "$fresh" \
+grep -q 'check_bringup candidate http://127.0.0.1/' "$fresh" \
     && pass "fresh-host asserts the preserved nginx edge after a config-preserving upgrade" \
     || fail "fresh-host would claim the candidate WebUI listener on a preserved v0.3.0 config"
 if grep -q 'METRICS controlplane=not-configured' "$fresh"; then
@@ -378,12 +378,18 @@ grep -q 'results.tsv' "$fresh" \
 grep -q 'UNINSTALL_RESIDUE=' "$fresh" \
     && pass "fresh-host records uninstall residue instead of passing it" \
     || fail "fresh-host hides install.sh-layout uninstall residue"
-grep -q "must_change_password = 0" "$fresh" \
-    && pass "fresh-host clears the bootstrap rotation flag before node visibility" \
-    || fail "fresh-host cannot see the enrolled node behind PASSWORD_CHANGE_REQUIRED"
-grep -q 'clear_admin_rotation_flag || true' "$fresh" \
-    && pass "fresh-host calls the rotation-flag fixture before login/node checks" \
+grep -q 'POST http://127.0.0.1:8080/v1/auth/change-password' "$fresh" \
+    && pass "fresh-host rotates the bootstrap password through the API" \
+    || fail "fresh-host clears PASSWORD_CHANGE_REQUIRED with a live database write"
+grep -q 'rotate_admin_password || true' "$fresh" \
+    && pass "fresh-host calls the API rotation before login/node checks" \
     || fail "fresh-host can leave the rotation flag set and fail the node check"
+grep -q 'check_credential_persistence' "$fresh" \
+    && pass "fresh-host asserts clean-install writes survive a restart" \
+    || fail "fresh-host would miss the unlinked-WAL data-loss regression"
+grep -q 'controlplane.db-wal (deleted)' "$fresh" \
+    && pass "fresh-host checks for an unlinked database WAL" \
+    || fail "fresh-host would not diagnose an unlinked database WAL"
 grep -q 'deprecated legacy CHV_JWT_SECRET fallback' "$fresh" \
     && pass "fresh-host detects the credential-key fallback in both releases" \
     || fail "fresh-host encryption check can pass on the legacy fallback"
@@ -399,9 +405,12 @@ grep -q 'cached base extract failed' "$fresh" \
 grep -q 'documented fail-closed guard did not fire' "$fresh" \
     && pass "fresh-host fails the upgrade leg when the candidate re-runs over persistent data" \
     || fail "fresh-host can pass the upgrade leg without exercising the fail-closed guard"
-grep -q "sqlite3 -cmd '.timeout 5000'" "$fresh" \
-    && pass "fresh-host sqlite writes wait out a live control-plane lock" \
-    || fail "fresh-host sqlite writes can fail spuriously on SQLITE_BUSY"
+grep -q 'runuser -u chv -- sqlite3' "$fresh" \
+    && fail "fresh-host writes to the live database from a second process" \
+    || pass "fresh-host never writes to the live database from a second process"
+grep -Fq '$copy/controlplane.db' "$fresh" \
+    && pass "fresh-host diagnoses a database snapshot, not the live file" \
+    || fail "fresh-host may inspect the live WAL database"
 grep -qF 'journalctl -u "$u" -n 80 --no-pager' "$fresh" \
     && pass "fresh-host records a failing unit's journal tail in the evidence" \
     || fail "fresh-host failures are not diagnosable from the uploaded evidence"

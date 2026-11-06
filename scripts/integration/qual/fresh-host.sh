@@ -647,74 +647,223 @@ check_encryption() {
 }
 
 TOKEN=""
+ADMIN_PW=""
+LOGIN_HTTP=""
 
-# The bootstrap admin is seeded with must_change_password=1, and install.sh
-# restores that flag before exiting. The BFF denies every non-auth route for
-# such a token (403 PASSWORD_CHANGE_REQUIRED), so node visibility cannot be
-# asserted until it is cleared. Clear it exactly as install.sh seeds it: a WAL
-# write as the service user. This is a recorded test-fixture concession, not a
-# claim about the operator's first-login flow.
-clear_admin_rotation_flag() {
-    local db=/var/lib/chv/controlplane.db
-    if [ ! -f "$db" ]; then
-        bad "admin rotation flag (control-plane database missing)"
-        return 1
-    fi
-    if ! command -v sqlite3 >/dev/null 2>&1; then
-        bad "admin rotation flag (sqlite3 missing)"
-        return 1
-    fi
-    if runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$db" \
-        "UPDATE users SET must_change_password = 0 WHERE username = 'admin';" \
-        >/dev/null 2>&1; then
-        record "ADMIN_ROTATION_FLAG=cleared for the node-visibility check (test fixture)"
-        return 0
-    fi
-    bad "admin rotation flag (could not clear must_change_password)"
-    return 1
-}
-
-check_admin_login() {
-    local pw code body
-    if [ ! -s /etc/chv/initial_admin_password ]; then
-        bad "admin login round-trip (initial_admin_password missing)"
-        return 1
-    fi
-    pw="$(cat /etc/chv/initial_admin_password)"
-    body=/tmp/fresh-host-login.json
-    code="$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
+# api_login <password> — control-plane API login; sets TOKEN on success.
+api_login() {
+    local pw="$1" body=/tmp/fresh-host-login.json
+    LOGIN_HTTP="$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
         -X POST http://127.0.0.1:8080/api/v1/auth/login \
         -H 'Content-Type: application/json' \
         --data-binary "{\"username\":\"admin\",\"password\":\"${pw}\"}" 2>/dev/null || true)"
-    if [ "$code" = "200" ] && grep -q '"token"' "$body" 2>/dev/null; then
+    if [ "$LOGIN_HTTP" = "200" ] && grep -q '"token"' "$body" 2>/dev/null; then
         TOKEN="$(grep -o '"token":"[^"]*"' "$body" | head -1 | sed 's/^"token":"//; s/"$//')"
-        if [ -n "$TOKEN" ]; then
-            ok "admin login round-trip"
-            return 0
-        fi
+        [ -n "$TOKEN" ]
+        return
     fi
-    bad "admin login round-trip (HTTP ${code:-no-response})"
     return 1
 }
 
-check_node_visible() {
-    local body i
-    if [ -z "$TOKEN" ]; then
-        bad "node enrolled and visible (no auth token)"
-        return 1
-    fi
-    for i in $(seq 1 45); do
-        body="$(curl -sS --max-time 10 -X POST http://127.0.0.1:8080/v1/nodes \
-            -H "Authorization: Bearer ${TOKEN}" \
-            -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
-        if printf '%s' "$body" | grep -q '"node_id"'; then
-            record "NODES=${body}"
-            ok "node enrolled and visible"
+# wait_api_login — retry the current ADMIN_PW until the API answers. The
+# control plane needs a moment after a fresh install or a package-upgrade
+# restart; a single immediate login would race the listener.
+wait_api_login() {
+    local i
+    for i in $(seq 1 60); do
+        if api_login "${ADMIN_PW:-}"; then
             return 0
         fi
         sleep 2
     done
-    bad "node enrolled and visible (timeout)"
+    return 1
+}
+
+check_admin_login() {
+    if [ -z "${ADMIN_PW:-}" ]; then
+        if [ ! -s /etc/chv/initial_admin_password ]; then
+            bad "admin login round-trip (initial_admin_password missing)"
+            return 1
+        fi
+        ADMIN_PW="$(cat /etc/chv/initial_admin_password)"
+    fi
+    if wait_api_login; then
+        ok "admin login round-trip"
+        return 0
+    fi
+    bad "admin login round-trip (HTTP ${LOGIN_HTTP:-no-response})"
+    return 1
+}
+
+# The bootstrap admin is seeded with must_change_password=1 and install.sh
+# restores that flag before exiting. The BFF denies every non-auth route for
+# such a token (403 PASSWORD_CHANGE_REQUIRED), so node visibility cannot be
+# asserted until the first-login rotation happens.
+#
+# Rotate through the documented API (`POST /v1/auth/change-password`) rather
+# than a direct `sqlite3` UPDATE against the live database. The earlier
+# fixture opened the live WAL database from a second process (UPDATE plus
+# COUNT(*) reads) while the control plane was serving; the v0.3.0 -> rc.2
+# version-assert runs (42116072364, 42118425284) then hit
+# "database disk image is malformed", and the product must not be blamed for
+# a test-only concurrent writer. The API path also proves the operator can
+# actually rotate the seeded credential, which the core contract depends on.
+rotate_admin_password() {
+    local new_pw code body=/tmp/fresh-host-change-password.json
+    if [ -z "$TOKEN" ]; then
+        bad "first-login password change (no admin token)"
+        return 1
+    fi
+    new_pw="FreshHost-$(openssl rand -hex 12)"
+    code="$(curl -sS --max-time 15 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/v1/auth/change-password \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H 'Content-Type: application/json' \
+        --data-binary "{\"current_password\":\"${ADMIN_PW}\",\"new_password\":\"${new_pw}\"}" 2>/dev/null || true)"
+    if [ "$code" != "200" ] || ! grep -q '"ok":true' "$body" 2>/dev/null; then
+        bad "first-login password change (HTTP ${code:-no-response})"
+        return 1
+    fi
+    ok "first-login password change accepted"
+    # The change bumps token_version and revokes the token that made the
+    # request; the node-visibility check needs a session minted after it.
+    ADMIN_PW="$new_pw"
+    if api_login "$new_pw"; then
+        ok "admin re-login with the rotated password"
+        return 0
+    fi
+    bad "admin re-login with the rotated password (HTTP ${LOGIN_HTTP:-no-response})"
+    return 1
+}
+
+# A clean install must preserve the documented first-login credential across a
+# control-plane restart. v0.3.0 and v0.4.0-rc.2 seeded the admin with a second
+# sqlite3 writer while the service was live; that writer unlinked the WAL the
+# service had open, so the rotation was acknowledged and then silently lost on
+# the next restart. rc.3 writes with the service stopped
+# (scripts/install.sh chv_sqlite_offline). Assert both the durable result and
+# the direct cause: no pooled connection may hold a "(deleted)" WAL.
+check_credential_persistence() {
+    local before_pid after_pid
+    section "credential persistence across control-plane restart"
+    if [ -z "${ADMIN_PW:-}" ]; then
+        bad "credential persistence (no rotated admin password)"
+        return 1
+    fi
+    before_pid="$(systemctl show -p MainPID --value chv-controlplane 2>/dev/null || true)"
+    if systemctl restart chv-controlplane >/dev/null 2>&1; then
+        ok "control plane restarted"
+    else
+        bad "control plane failed to restart"
+        return 1
+    fi
+    after_pid="$(systemctl show -p MainPID --value chv-controlplane 2>/dev/null || true)"
+    if [ -n "${before_pid:-}" ] && [ "$before_pid" != "0" ] \
+        && [ -n "${after_pid:-}" ] && [ "$after_pid" != "$before_pid" ]; then
+        ok "control plane came back with a new process (${before_pid} -> ${after_pid})"
+    else
+        bad "control plane did not restart (PID ${before_pid:-unknown} -> ${after_pid:-unknown})"
+    fi
+    if wait_api_login; then
+        ok "rotated admin credential survived the restart"
+    else
+        bad "rotated admin credential was lost across the restart (HTTP ${LOGIN_HTTP:-no-response})"
+    fi
+    if [ -d "/proc/${after_pid:-}/fd" ] \
+        && ls -l "/proc/${after_pid}/fd" 2>/dev/null | grep -qF 'controlplane.db-wal (deleted)'; then
+        bad "control plane holds an unlinked database WAL after the restart"
+    else
+        ok "control plane holds the on-disk database WAL after the restart"
+    fi
+}
+
+# Read-only control-plane diagnostics for a failed bring-up. The DB/WAL state,
+# the open file descriptors and the filesystem type are the facts that
+# distinguish a product defect from a storage/runner problem.
+#
+# Never open the live WAL database from a second process here: a CLI
+# connection can checkpoint or delete the WAL the control plane is using and
+# destroy the state under investigation. Snapshot the raw files and inspect
+# the copy instead.
+diagnose_controlplane() {
+    local db=/var/lib/chv/controlplane.db copy=/tmp/fresh-host-db-diagnostic pid
+    record "--- control-plane database diagnostics ---"
+    ls -l "$db" "$db-wal" "$db-shm" 2>&1 | while IFS= read -r line; do record "  ${line}"; done
+    pid="$(systemctl show -p MainPID --value chv-controlplane 2>/dev/null || true)"
+    record "  MainPID=${pid:-unknown}"
+    if [ -n "${pid:-}" ] && [ "$pid" != "0" ] && [ -d "/proc/${pid}/fd" ]; then
+        record "  open fds matching ${db} ('(deleted)' means the file was replaced/unlinked under the service):"
+        ls -l "/proc/${pid}/fd" 2>/dev/null | grep -F "$db" \
+            | while IFS= read -r line; do record "    ${line}"; done
+    fi
+    rm -rf "$copy"
+    mkdir -p "$copy"
+    if cp -a "$db" "$copy/controlplane.db" 2>/dev/null; then
+        cp -a "$db-wal" "$copy/controlplane.db-wal" 2>/dev/null || true
+        record "  snapshot: $(ls -l "$copy" | tail -n +2 | awk '{print $5, $9}' | tr '\n' ' ')"
+        if command -v sqlite3 >/dev/null 2>&1; then
+            record "  sqlite3 --version: $(sqlite3 --version 2>&1 | head -1)"
+            record "  PRAGMA integrity_check(5) on the snapshot:"
+            sqlite3 -cmd '.timeout 5000' "$copy/controlplane.db" 'PRAGMA integrity_check(5);' 2>&1 \
+                | while IFS= read -r line; do record "    ${line}"; done
+        fi
+    else
+        record "  could not snapshot the database"
+    fi
+    record "  df -T /var/lib/chv: $(df -T /var/lib/chv 2>&1 | tail -1)"
+    record "  findmnt: $(findmnt -no FSTYPE,SOURCE,TARGET /var/lib/chv 2>/dev/null || echo unknown)"
+    record "  dmesg tail:"
+    dmesg 2>/dev/null | tail -20 | while IFS= read -r line; do record "    ${line}"; done
+    record "--- end control-plane database diagnostics ---"
+}
+
+# check_node_visible [expected_version]
+#
+# The base assertion is that the node is listed at all. The optional
+# expected_version covers the in-place-upgrade contract (#720): the node row
+# must follow the agent's own ReportServiceVersions report, which the agent
+# sends every 6th 5 s reconcile tick (~30 s). After a v0.3.0 -> 0.4.0 package
+# upgrade the row still carries the enrollment version when the check starts,
+# so a version assertion has to poll past at least one report interval; an
+# immediate read would pass visibility while silently proving nothing about
+# the refresh.
+check_node_visible() {
+    local expect_version="${1:-}" body code i out=/tmp/fresh-host-nodes.json
+    if [ -z "$TOKEN" ]; then
+        bad "node enrolled and visible (no auth token)"
+        return 1
+    fi
+    for i in $(seq 1 75); do
+        code="$(curl -sS --max-time 10 -o "$out" -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/nodes \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+        body="$(cat "$out" 2>/dev/null || true)"
+        if printf '%s' "$body" | grep -q '"node_id"'; then
+            record "NODES_HTTP=${code}"
+            record "NODES=${body}"
+            if [ -z "$expect_version" ]; then
+                ok "node enrolled and visible"
+                return 0
+            fi
+            if printf '%s' "$body" | grep -q "\"version\":\"${expect_version}\""; then
+                ok "node visible and reports version ${expect_version}"
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    record "NODES_LAST_HTTP=${code:-no-response}"
+    record "NODES_LAST=${body:-<no body>}"
+    record "--- journalctl -u chv-controlplane (last 80 lines) ---"
+    journalctl -u chv-controlplane -n 80 --no-pager 2>/dev/null \
+        | while IFS= read -r line; do record "  ${line}"; done
+    record "--- end controlplane journal ---"
+    diagnose_controlplane
+    if [ -n "$expect_version" ]; then
+        bad "node did not report version ${expect_version} within 150 s (last HTTP ${code:-no-response}: ${body:-<no body>})"
+    else
+        bad "node enrolled and visible (timeout)"
+    fi
     return 1
 }
 
@@ -770,14 +919,15 @@ check_binaries_version() {
 check_bringup() {
     local encryption_mode="${1:-candidate}"
     local webui_url="${2:-http://127.0.0.1:8080/}"
+    local expected_node_version="${3:-}"
     section "bring-up contract"
     wait_units_active 180 || true
     check_units_contract
     check_encryption "$encryption_mode"
-    clear_admin_rotation_flag || true
     check_admin_login || true
+    rotate_admin_password || true
     check_webui "$webui_url"
-    check_node_visible || true
+    check_node_visible "$expected_node_version" || true
     check_metrics
 }
 
@@ -929,7 +1079,8 @@ else
     tail -n 30 /var/fresh-host-install.log >>"$OUT"
     finish
 fi
-check_bringup
+check_bringup candidate http://127.0.0.1:8080/ "$CANDIDATE_VERSION"
+check_credential_persistence
 check_binaries_version "$CANDIDATE_VERSION" "$CANDIDATE_SHA"
 section "WebUI edge"
 wait_http_200 "nginx edge serves the WebUI" http://127.0.0.1/ /tmp/fresh-host-edge.html 60 || true
@@ -1051,6 +1202,22 @@ for b in chv-controlplane chv-agent chv-stord chv-nwd; do
     record "PREVIOUS_VERSION ${b}=$("/usr/bin/${b}" --version 2>/dev/null | head -1 || true)"
 done
 
+# v0.3.0 and v0.4.0-rc.1/rc.2 seeded the admin with a second sqlite3 writer
+# while the control plane was live, which unlinked the WAL that service still
+# had open. Those releases therefore lose API writes made in that process
+# lifetime on the next restart - including the restart the upgrade performs.
+# rc.3 fixed the installer. Restart the previous release once here so this leg
+# measures upgrade preservation, not a known defect of the release being
+# upgraded *from*; the clean-install leg asserts the candidate does not need
+# this repair.
+if systemctl restart chv-controlplane >/dev/null 2>&1; then
+    ok "restarted the previous release to reopen its database WAL"
+else
+    bad "could not restart the previous release control plane"
+fi
+wait_cmd "previous release control plane healthy after restart" 60 \
+    curl -sf http://127.0.0.1:8080/health || true
+
 section "identifiable pre-upgrade state"
 STATE_DIR=/var/fresh-host-upgrade-state
 mkdir -p "$STATE_DIR"
@@ -1074,30 +1241,63 @@ else
     fi
 fi
 printf '%s\n' "$PREVIOUS_VERSION" > /var/lib/chv/fresh-host-upgrade-marker
-chv_sqlite() { runuser -u chv -- sqlite3 -cmd '.timeout 5000' "$@"; }
+
+# This leg drives the product only through its own API. The earlier fixture
+# opened the live WAL database with the sqlite3 CLI (a probe-user INSERT and
+# two COUNT(*) reads). That second process checkpointed/deleted the WAL under
+# the running control plane, and the v0.3.0 -> rc.2 version-assert runs
+# (42116072364, 42118425284) then failed with
+# "database disk image is malformed". A test-only concurrent writer must not
+# be able to convict the product, so the probe account is created and checked
+# over HTTP instead.
 PROBE_USER="fresh-host-upgrade-probe"
-PROBE_ID="00000000-0000-0000-0000-000000000066"
 probe_pw="$(openssl rand -hex 12)"
-probe_hash="$(htpasswd -nbBC 12 "$PROBE_USER" "$probe_pw" | sed 's/^[^:]*://')"
-if chv_sqlite /var/lib/chv/controlplane.db <<SQL
-INSERT OR REPLACE INTO users
-  (user_id, username, password_hash, role, display_name, must_change_password, created_at, updated_at)
-VALUES
-  ('${PROBE_ID}', '${PROBE_USER}', '${probe_hash}', 'operator', 'Fresh Host Upgrade Probe', 0,
-   strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'));
-SQL
-then
-    ok "created identifiable operator account ${PROBE_USER}"
+
+api_user_list() {
+    local body=/tmp/fresh-host-users.json code
+    code="$(curl -sS --max-time 10 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/v1/users \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+    record "USERS_HTTP=${code}"
+    cat "$body" 2>/dev/null || true
+}
+
+create_probe_user() {
+    local body=/tmp/fresh-host-create-user.json code
+    code="$(curl -sS --max-time 15 -o "$body" -w '%{http_code}' \
+        -X POST http://127.0.0.1:8080/v1/users/create \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H 'Content-Type: application/json' \
+        --data-binary "{\"username\":\"${PROBE_USER}\",\"password\":\"${probe_pw}\",\"role\":\"operator\",\"display_name\":\"Fresh Host Upgrade Probe\"}" 2>/dev/null || true)"
+    if [ "$code" = "200" ] && grep -q "\"username\":\"${PROBE_USER}\"" "$body" 2>/dev/null; then
+        ok "created identifiable operator account ${PROBE_USER}"
+        return 0
+    fi
+    bad "failed to create identifiable operator account (HTTP ${code:-no-response})"
+    record "CREATE_USER_BODY=$(cat "$body" 2>/dev/null || true)"
+    return 1
+}
+
+# The seeded admin must complete the documented first-login rotation before
+# the BFF permits non-auth routes, so this also exercises that flow on the
+# previous release (the upgrade must not break a rotated account).
+if check_admin_login && rotate_admin_password; then
+    create_probe_user || true
 else
-    bad "failed to create identifiable operator account"
+    bad "could not establish an authenticated admin session before the upgrade"
 fi
-probe_count="$(chv_sqlite /var/lib/chv/controlplane.db \
-    "SELECT COUNT(*) FROM users WHERE username='${PROBE_USER}';" 2>/dev/null || true)"
-record "PRE_UPGRADE_OPERATOR_COUNT=${probe_count:-unknown}"
-[ "${probe_count:-0}" = "1" ] && ok "pre-upgrade operator row present" || bad "pre-upgrade operator row missing"
+probe_users="$(api_user_list)"
+if printf '%s' "$probe_users" | grep -q "\"username\":\"${PROBE_USER}\""; then
+    record "PRE_UPGRADE_OPERATOR_COUNT=1"
+    ok "pre-upgrade operator row present"
+else
+    record "PRE_UPGRADE_OPERATOR_COUNT=0"
+    bad "pre-upgrade operator row missing"
+fi
 
 check_state_preserved() {
-    local phase="$1" want now
+    local phase="$1" want now users
     section "state preservation (${phase})"
     while read -r want path; do
         [ -n "${path:-}" ] || continue
@@ -1114,12 +1314,24 @@ check_state_preserved() {
     else
         bad "${phase}: marker file missing or changed"
     fi
-    probe_count="$(chv_sqlite /var/lib/chv/controlplane.db \
-        "SELECT COUNT(*) FROM users WHERE username='${PROBE_USER}';" 2>/dev/null || true)"
-    [ "${probe_count:-0}" = "1" ] && ok "${phase}: operator account preserved" || bad "${phase}: operator account lost"
-    admin_count="$(chv_sqlite /var/lib/chv/controlplane.db \
-        "SELECT COUNT(*) FROM users WHERE username='admin';" 2>/dev/null || true)"
-    [ "${admin_count:-0}" = "1" ] && ok "${phase}: admin account preserved" || bad "${phase}: admin account lost"
+    # Account preservation is asserted through the product API. A direct
+    # sqlite3 read of the live database is exactly what destabilised the WAL
+    # in the earlier runs.
+    if ! wait_api_login; then
+        bad "${phase}: could not authenticate to inspect accounts (HTTP ${LOGIN_HTTP:-no-response})"
+        return 1
+    fi
+    users="$(api_user_list)"
+    if printf '%s' "$users" | grep -q "\"username\":\"${PROBE_USER}\""; then
+        ok "${phase}: operator account preserved"
+    else
+        bad "${phase}: operator account lost"
+    fi
+    if printf '%s' "$users" | grep -q '"username":"admin"'; then
+        ok "${phase}: admin account preserved"
+    else
+        bad "${phase}: admin account lost"
+    fi
 }
 
 section "candidate install.sh re-run over persistent state"
@@ -1200,7 +1412,9 @@ if [ "$UPGRADED" = "1" ]; then
     # disables. Metrics stay asserted: the candidate binds its dedicated
     # listener on 127.0.0.1:9103 by default when metrics_bind is absent.
     section "preserved-edge surface (upgrade keeps previous config)"
-    check_bringup candidate http://127.0.0.1/
+    # The node row starts at the previous release's version and must follow
+    # the upgraded agent's report (#720); poll past one ~30 s report interval.
+    check_bringup candidate http://127.0.0.1/ "$CANDIDATE_VERSION"
 else
     bad "upgrade did not complete; bring-up not asserted"
 fi
@@ -1239,6 +1453,7 @@ if [ "$QUICK_VERSION" = "$CANDIDATE_VERSION" ]; then
     # A manual run may point the quick leg at the candidate itself; only a
     # strictly older release may use the weaker previous-mode assertion.
     check_bringup
+    check_credential_persistence
 elif [ "$(printf '%s\n%s\n' "$QUICK_VERSION" "$CANDIDATE_VERSION" | sort -V | head -1)" = "$QUICK_VERSION" ]; then
     # QUICK_VERSION sorts strictly before the candidate: a previous release,
     # whose dedicated-key path logs nothing, so only the absence of the
