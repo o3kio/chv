@@ -1419,15 +1419,37 @@ start_services() {
 
     systemctl enable chv-stord chv-nwd chv-agent
     if [ "$FRESH_INSTALL" = "1" ]; then
-        systemctl start chv-stord chv-nwd chv-agent
+        systemctl start chv-stord chv-nwd
     else
-        systemctl restart chv-stord chv-nwd chv-agent 2>/dev/null \
-            || systemctl start chv-stord chv-nwd chv-agent
+        systemctl restart chv-stord chv-nwd 2>/dev/null \
+            || systemctl start chv-stord chv-nwd
     fi
 
     if [ ! -e /dev/kvm ]; then
         warn "/dev/kvm is not present (no KVM, or a container without device passthrough)."
         warn "The agent will enroll, but VMs cannot run on this host."
+    fi
+}
+
+# Start the local agent only after the bootstrap admin is seeded.
+#
+# The agent makes a single enrollment attempt at startup and does not retry
+# it (cmd/chv-agent/src/main.rs). seed_admin_user runs direct SQLite writes
+# with the control plane stopped (chv_sqlite_offline, #722). If the agent is
+# already running, that stop lands inside its enrollment window: the RPC
+# fails with a transport error, the agent keeps its pre-enrollment
+# certificate (CN=chv-agent) plus the configured UUID node_id, and every
+# subsequent publish is rejected as an impersonation attempt. The install
+# then completes with no enrolled node — the rc.4 quick-install defect.
+# scripts/install.sh avoids the same window with a fixed 5 s grace; starting
+# the agent after the offline writes removes the race instead of narrowing
+# it.
+start_agent() {
+    info "Starting the local agent..."
+    if [ "$FRESH_INSTALL" = "1" ]; then
+        systemctl start chv-agent
+    else
+        systemctl restart chv-agent 2>/dev/null || systemctl start chv-agent
     fi
 }
 
@@ -1669,9 +1691,11 @@ main() {
     if [ "$FRESH_INSTALL" = "1" ]; then
         start_services
         seed_admin_user || fatal "Failed to seed bootstrap admin user."
+        start_agent
         wait_for_enrollment
     else
         start_services
+        start_agent
         wait_for_enrollment
     fi
 

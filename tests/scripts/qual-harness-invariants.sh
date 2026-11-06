@@ -345,6 +345,20 @@ grep -qF '${copy}/controlplane.db' "$quick_installer" \
 grep -qF 'chv_sqlite_offline "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users' "$quick_installer" \
     && pass "quick installer checks admin existence with the control plane stopped" \
     || fail "quick installer reads the admin row from the live WAL"
+# The agent makes exactly one enrollment attempt at startup. Starting it
+# before seed_admin_user's offline stops kills that attempt with a transport
+# error, and the node never enrolls (the rc.4 quick-install defect).
+if grep -qF 'systemctl start chv-stord chv-nwd' "$quick_installer" \
+    && ! grep -qF 'systemctl start chv-stord chv-nwd chv-agent' "$quick_installer"; then
+    pass "quick installer starts the agent after the offline admin writes"
+else
+    fail "quick installer starts the agent before the control plane is stopped for admin seeding"
+fi
+if awk '/^main\(\)/{m=1} m && /^        start_agent$/ && !a {a=NR} m && /seed_admin_user \|\| fatal/{s=NR} END {exit !(s && a && s < a)}' "$quick_installer"; then
+    pass "quick installer starts the agent after seeding the admin in the fresh path"
+else
+    fail "quick installer can start the agent before admin seeding (enrollment race)"
+fi
 
 # Exercise the real version gate, not just its presence: source the installer
 # (its B1 guard makes that side-effect free) and assert the boundary plus a
