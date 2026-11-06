@@ -340,7 +340,7 @@ chv_network_ids() {
         fi
         if cmd_exists nft; then
             nft list tables 2>/dev/null \
-                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p'
+                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' || true
         fi
         if cmd_exists ip; then
             # A netns name alone is weaker evidence than a CHV nft table or
@@ -350,9 +350,27 @@ chv_network_ids() {
             # from being deleted.
             ip netns list 2>/dev/null \
                 | awk '{print $1}' \
-                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p'
+                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p' || true
         fi
     } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u
+}
+
+chv_network_cidr() {
+    # Best-effort recovery of a network's CIDR from the control-plane
+    # database. It lets removal delete the current `! -d <cidr>` NAT form
+    # when the bridge is already gone and no surviving rule names it.
+    local net_id="$1" net_cidr=""
+    if cmd_exists sqlite3 && [ -f "${CHV_DB_PATH}" ]; then
+        if id -u "$CHV_USER" >/dev/null 2>&1 \
+            && { cmd_exists runuser || cmd_exists sudo; }; then
+            net_cidr="$(chv_sqlite "${CHV_DB_PATH}" \
+                "SELECT cidr FROM network_desired_state WHERE network_id = '$net_id';" 2>/dev/null || true)"
+        else
+            net_cidr="$(sqlite3 "${CHV_DB_PATH}" \
+                "SELECT cidr FROM network_desired_state WHERE network_id = '$net_id';" 2>/dev/null || true)"
+        fi
+    fi
+    printf '%s\n' "$net_cidr" | awk 'NF { print $1; exit }'
 }
 
 # Remove one CHV bridge plus the host state that would recreate or outlive it:
@@ -361,7 +379,7 @@ chv_network_ids() {
 # the uplink enslaved to chvbr0 must survive, and the persisted-rule match is
 # exact.
 remove_chv_bridge_and_nat() {
-    local bridge="$1" cidr tap f rules_file
+    local bridge="$1" hint="${2:-}" cidr cidrs tap f rules_file
     rules_file="${CHV_IPTABLES_RULES_V4:-${CHV_HOST_ETC}/iptables/rules.v4}"
     if cmd_exists ip; then
         # The kernel route carries the network CIDR without re-deriving it
@@ -378,39 +396,52 @@ remove_chv_bridge_and_nat() {
         ip link del dev "$bridge" 2>/dev/null || true
     fi
 
-    # A bridge can already be gone (residue from a failed install/removal)
-    # while its NAT rules survive. Recover the CIDR from a rule that still
-    # names this bridge; otherwise the live rule is missed and the
-    # netfilter-persistent save below re-persists it.
-    if [ -z "${cidr:-}" ] && cmd_exists iptables; then
-        cidr="$(iptables -t nat -S POSTROUTING 2>/dev/null \
-            | awk -v b="! -o $bridge " 'index($0, b) {
-                for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit }
-            }' || true)"
+    # The bridge may already be gone (residue from a failed install/removal)
+    # while its NAT rules survive. Collect every CIDR from a rule that still
+    # names this bridge: knowing one CIDR also exposes the historical
+    # `! -d <cidr>` form. A database hint covers a host whose only surviving
+    # rule is the current `! -d` form, which does not name the bridge.
+    cidrs="$(
+        {
+            if cmd_exists iptables; then
+                iptables -t nat -S POSTROUTING 2>/dev/null \
+                    | awk -v b="! -o $bridge " 'index($0, b) {
+                        for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
+                    }' || true
+            fi
+            if [ -f "$rules_file" ]; then
+                awk -v b="! -o $bridge " 'index($0, b) {
+                    for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
+                }' "$rules_file" || true
+            fi
+        } | sort -u || true
+    )"
+    if [ -z "$cidrs" ] && [ -n "${cidr:-}" ]; then
+        cidrs="$cidr"
     fi
-    if [ -z "${cidr:-}" ] && [ -f "$rules_file" ]; then
-        cidr="$(awk -v b="! -o $bridge " 'index($0, b) {
-            for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit }
-        }' "$rules_file" || true)"
+    if [ -z "$cidrs" ] && [ -n "$hint" ]; then
+        cidrs="$hint"
     fi
 
-    if [ -n "${cidr:-}" ] && cmd_exists iptables; then
-        while iptables -t nat -C POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null; do
-            iptables -t nat -D POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null || break
-        done
-        while iptables -t nat -C POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null; do
-            iptables -t nat -D POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null || break
-        done
-    fi
+    for cidr in $cidrs; do
+        if cmd_exists iptables; then
+            while iptables -t nat -C POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null; do
+                iptables -t nat -D POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null || break
+            done
+            while iptables -t nat -C POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null; do
+                iptables -t nat -D POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null || break
+            done
+        fi
 
-    if [ -n "${cidr:-}" ] && [ -f "$rules_file" ]; then
-        awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
-            -v o="-A POSTROUTING -s $cidr ! -o $bridge -j MASQUERADE" \
-            '$0 != d && $0 != o' "$rules_file" \
-            > "${rules_file}.chv-clean" \
-            && mv "${rules_file}.chv-clean" "$rules_file" \
-            || rm -f "${rules_file}.chv-clean"
-    fi
+        if [ -f "$rules_file" ]; then
+            awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
+                -v o="-A POSTROUTING -s $cidr ! -o $bridge -j MASQUERADE" \
+                '$0 != d && $0 != o' "$rules_file" \
+                > "${rules_file}.chv-clean" \
+                && mv "${rules_file}.chv-clean" "$rules_file" \
+                || rm -f "${rules_file}.chv-clean"
+        fi
+    done
 
     # Persistent bridge configuration: install.sh writes a networkd netdev/
     # network pair (plus an uplink Bridge= drop-in) or an ifupdown stanza.
@@ -429,14 +460,14 @@ remove_chv_bridge_and_nat() {
 }
 
 delete_chv_network_state() {
-    local id bridge table baseline_bridge
+    local id bridge table baseline_bridge baseline_cidr baseline_addr
     while IFS= read -r id; do
         [ -n "$id" ] || continue
         case "$id" in
             ''|*[!A-Za-z0-9_.-]*) continue ;;
         esac
         bridge="$(chv_bridge_name_for_network "$id")"
-        remove_chv_bridge_and_nat "$bridge"
+        remove_chv_bridge_and_nat "$bridge" "$(chv_network_cidr "$id")"
         if cmd_exists ip; then
             ip netns del "ns-$id" 2>/dev/null || true
         fi
@@ -449,9 +480,16 @@ delete_chv_network_state() {
     # derive from. Delete the configured name and the historical default; the
     # uplink stays up.
     baseline_bridge="${INSTALL_CHV_BRIDGE_NAME:-chvbr0}"
-    remove_chv_bridge_and_nat "$baseline_bridge"
+    baseline_cidr="$(chv_network_cidr default)"
+    if [ -z "$baseline_cidr" ]; then
+        # Mirror the bridge_net install.sh derives when it writes the rule, so
+        # a bridge-gone host still has a CIDR for the current `! -d` form.
+        baseline_addr="${INSTALL_CHV_BRIDGE_CIDR%/*}"
+        baseline_cidr="${baseline_addr%.*}.0/${INSTALL_CHV_BRIDGE_CIDR#*/}"
+    fi
+    remove_chv_bridge_and_nat "$baseline_bridge" "$baseline_cidr"
     if [ "$baseline_bridge" != "chvbr0" ]; then
-        remove_chv_bridge_and_nat chvbr0
+        remove_chv_bridge_and_nat chvbr0 "$baseline_cidr"
     fi
     rm -f "${CHV_HOST_ETC}/sysctl.d/99-chv-forward.conf" 2>/dev/null || true
     if cmd_exists netfilter-persistent; then

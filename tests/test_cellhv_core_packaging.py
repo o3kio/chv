@@ -264,6 +264,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
             for name in (
                 "chv_bridge_name_for_network",
                 "chv_network_ids",
+                "chv_network_cidr",
                 "remove_chv_bridge_and_nat",
                 "delete_chv_network_state",
             )
@@ -414,6 +415,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "CHV_DB_PATH=/nonexistent.db\n"
                 "CHV_USER=chv-no-such-user\n"
                 "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
+                "INSTALL_CHV_BRIDGE_CIDR=10.200.0.1/24\n"
                 f"CHV_HOST_ETC='{etc}'\n"
                 f"CHV_IPTABLES_RULES_V4='{rules}'\n"
                 f"{functions}\n"
@@ -502,6 +504,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
         for relative, shell in cases:
             with self.subTest(script=relative):
                 self._exercise_database_id_source(relative, shell)
+        self._assert_install_baseline_cidr_fallback()
         self._assert_preremove_upgrade_is_a_noop()
 
     def _exercise_database_id_source(self, relative, shell):
@@ -511,6 +514,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
             for name in (
                 "chv_bridge_name_for_network",
                 "chv_network_ids",
+                "chv_network_cidr",
                 "remove_chv_bridge_and_nat",
                 "delete_chv_network_state",
             )
@@ -525,31 +529,95 @@ class CellHvCorePackagingTests(unittest.TestCase):
             db = tmp_path / "controlplane.db"
             db.write_text("")  # existence is what chv_network_ids checks
             rules = tmp_path / "rules.v4"
-            rules.write_text("")
+            # Only the current `! -d` form survives for `gonecur`, so no rule
+            # names its bridge and the route lookup fails: the database hint
+            # is the only remaining source of the CIDR.
+            rules.write_text(
+                "*nat\n"
+                "-A POSTROUTING -s 10.205.0.0/24 ! -d 10.205.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE\n"
+                "COMMIT\n"
+            )
+            iptables_state = tmp_path / "iptables.state"
+            iptables_state.write_text(
+                "POSTROUTING -s 10.205.0.0/24 ! -d 10.205.0.0/24 -j MASQUERADE\n"
+            )
             etc = tmp_path / "etc"
-            etc.mkdir()
+            (etc / "sysctl.d").mkdir(parents=True)
+            (etc / "sysctl.d/99-chv-forward.conf").write_text(
+                "net.ipv4.ip_forward=1\n"
+            )
 
-            # No nft tables and no namespaces are reported, so the only way
-            # `dbonly` can be removed is the database row.
+            # No nft tables and no namespaces are reported, so `dbonly` and
+            # `gonecur` can only come from the database. Every link lookup
+            # fails, like iproute2 on a removed bridge.
             ip = bin_dir / "ip"
             ip.write_text(
-                "#!/bin/bash\n" f"printf 'ip %s\\n' \"$*\" >> {log}\n"
+                "#!/bin/bash\n"
+                f"printf 'ip %s\\n' \"$*\" >> {log}\n"
+                'case "$*" in\n'
+                "  'netns list') printf '%s\\n' ns-other ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n"
             )
             nft = bin_dir / "nft"
             nft.write_text(
-                "#!/bin/bash\n" f"printf 'nft %s\\n' \"$*\" >> {log}\n"
+                "#!/bin/bash\n"
+                f"printf 'nft %s\\n' \"$*\" >> {log}\n"
+                'if [ "$1 $2" = "list tables" ]; then\n'
+                "  printf '%s\\n' 'table inet filter'\n"
+                "fi\n"
             )
             sqlite3 = bin_dir / "sqlite3"
             sqlite3.write_text(
                 "#!/bin/bash\n"
                 f"printf 'sqlite3 %s\\n' \"$*\" >> {log}\n"
-                "printf 'dbonly\\n'\n"
+                'query="$*"\n'
+                'case "$query" in\n'
+                "  *\"SELECT cidr FROM network_desired_state WHERE network_id = 'gonecur'\"*)\n"
+                "    printf '%s\\n' 10.205.0.0/24 ;;\n"
+                "  *\"SELECT cidr FROM network_desired_state WHERE network_id = 'default'\"*)\n"
+                "    printf '%s\\n' 10.200.0.0/24 ;;\n"
+                '  *"SELECT network_id FROM network_desired_state"*)\n'
+                "    printf '%s\\n' dbonly gonecur ;;\n"
+                "  *) : ;;\n"
+                "esac\n"
+            )
+            iptables = bin_dir / "iptables"
+            iptables.write_text(
+                "#!/bin/bash\n"
+                f"printf 'iptables %s\\n' \"$*\" >> {log}\n"
+                'action="$3"\n'
+                "shift 3\n"
+                'rule="$*"\n'
+                'case "$action" in\n'
+                f'  -C) grep -Fxq "$rule" {iptables_state} ;;\n'
+                f"  -A) grep -Fxq \"$rule\" {iptables_state} || printf '%s\\\\n' \"$rule\" >> {iptables_state} ;;\n"
+                "  -D)\n"
+                f'    grep -Fxq "$rule" {iptables_state} || exit 1\n'
+                f'    grep -Fxv "$rule" {iptables_state} > {iptables_state}.tmp || true\n'
+                f'    mv {iptables_state}.tmp {iptables_state}\n'
+                "    ;;\n"
+                f"  -S) sed 's/^/-A /' {iptables_state} ;;\n"
+                "esac\n"
+            )
+            netfilter_persistent = bin_dir / "netfilter-persistent"
+            netfilter_persistent.write_text(
+                "#!/bin/bash\n"
+                f"printf 'netfilter-persistent %s\\n' \"$*\" >> {log}\n"
             )
             chown = bin_dir / "chown"
             chown.write_text(
                 "#!/bin/bash\n" f"printf 'chown %s\\n' \"$*\" >> {log}\n"
             )
-            for tool in (ip, nft, sqlite3, chown):
+            for tool in (
+                ip,
+                nft,
+                sqlite3,
+                iptables,
+                netfilter_persistent,
+                chown,
+            ):
                 tool.chmod(0o755)
 
             pipefail = "-o pipefail" if "bash" in (shell or "") else ""
@@ -564,6 +632,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 f"CHV_DB_PATH='{db}'\n"
                 "CHV_USER=chv-no-such-user\n"
                 "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
+                "INSTALL_CHV_BRIDGE_CIDR=10.200.0.1/24\n"
                 f"CHV_HOST_ETC='{etc}'\n"
                 f"CHV_IPTABLES_RULES_V4='{rules}'\n"
                 f"{functions}\n"
@@ -577,34 +646,162 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 text=True,
             )
             calls = log.read_text()
+            persisted = rules.read_text()
 
         self.assertIn("sqlite3", calls, relative)
         self.assertIn("ip netns del ns-dbonly", calls, relative)
         self.assertIn("nft delete table inet chv-dbonly", calls, relative)
         self.assertIn("ip link del dev br-dbonly", calls, relative)
+        # `gonecur` has no route and no rule naming its bridge; only the
+        # database row can supply the CIDR for the current NAT form.
+        self.assertIn("ip netns del ns-gonecur", calls, relative)
+        self.assertIn("nft delete table inet chv-gonecur", calls, relative)
+        self.assertIn("ip link del dev br-gonecur", calls, relative)
+        self.assertIn(
+            "iptables -t nat -D POSTROUTING -s 10.205.0.0/24 "
+            "! -d 10.205.0.0/24 -j MASQUERADE",
+            calls,
+            relative,
+        )
+        self.assertNotIn("10.205.0.0/24", persisted, relative)
+        self.assertIn(
+            "-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE", persisted, relative
+        )
+        # The baseline bridge has no route either, so the `default` row's
+        # CIDR drives the attempted current-form deletion.
+        self.assertIn(
+            "iptables -t nat -C POSTROUTING -s 10.200.0.0/24 "
+            "! -d 10.200.0.0/24 -j MASQUERADE",
+            calls,
+            relative,
+        )
+        self.assertIn("netfilter-persistent save", calls, relative)
         if relative == "packaging/scripts/preremove.sh":
             # A root sqlite3 open can create root-owned WAL sidecars; the
             # preremove path hands them back to the service user.
             self.assertIn("chown chv:chv", calls, relative)
             self.assertIn("controlplane.db-wal", calls, relative)
 
-    def _assert_preremove_upgrade_is_a_noop(self):
-        # dpkg/rpm call preremove.sh with `upgrade` (or `1`) on upgrade. The
-        # restarted agent adopts live VMs, so no service stop or host teardown
-        # may run.
+    def _assert_install_baseline_cidr_fallback(self):
+        # install.sh writes the baseline NAT rule from INSTALL_CHV_BRIDGE_CIDR.
+        # If the database has no `default` row and the bridge is already gone,
+        # that value is the only source of the subnet.
+        source = (ROOT / "scripts/install.sh").read_text()
+        functions = "\n".join(
+            re.search(rf"^{name}\(\) \{{.*?\n\}}", source, re.S | re.M).group(0)
+            for name in (
+                "chv_bridge_name_for_network",
+                "chv_network_ids",
+                "chv_network_cidr",
+                "remove_chv_bridge_and_nat",
+                "delete_chv_network_state",
+            )
+        )
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
             bin_dir = tmp_path / "bin"
             bin_dir.mkdir()
             log = tmp_path / "calls.log"
             log.write_text("")
-            for name in ("ip", "nft", "systemctl", "kill", "ps"):
+            etc = tmp_path / "etc"
+            (etc / "sysctl.d").mkdir(parents=True)
+            rules = tmp_path / "rules.v4"
+            rules.write_text("*nat\nCOMMIT\n")
+            ip = bin_dir / "ip"
+            ip.write_text(
+                "#!/bin/bash\n"
+                f"printf 'ip %s\\n' \"$*\" >> {log}\n"
+                "exit 1\n"
+            )
+            nft = bin_dir / "nft"
+            nft.write_text(
+                "#!/bin/bash\n"
+                f"printf 'nft %s\\n' \"$*\" >> {log}\n"
+            )
+            iptables = bin_dir / "iptables"
+            iptables.write_text(
+                "#!/bin/bash\n"
+                f"printf 'iptables %s\\n' \"$*\" >> {log}\n"
+                'case "$3" in\n'
+                "  -C) exit 1 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n"
+            )
+            for tool in (ip, nft, iptables):
+                tool.chmod(0o755)
+            script = (
+                "set -euo pipefail\n"
+                'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
+                'have() { command -v "$1" >/dev/null 2>&1; }\n'
+                "CHV_DB_PATH=/nonexistent.db\n"
+                "CHV_USER=chv-no-such-user\n"
+                "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
+                "INSTALL_CHV_BRIDGE_CIDR=10.206.0.1/24\n"
+                f"CHV_HOST_ETC='{etc}'\n"
+                f"CHV_IPTABLES_RULES_V4='{rules}'\n"
+                f"{functions}\n"
+                "delete_chv_network_state\n"
+            )
+            subprocess.run(
+                ["bash", "-c", script],
+                env=dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}"),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            calls = log.read_text()
+        self.assertIn(
+            "iptables -t nat -C POSTROUTING -s 10.206.0.0/24 "
+            "! -d 10.206.0.0/24 -j MASQUERADE",
+            calls,
+        )
+
+    def _assert_preremove_upgrade_is_a_noop(self):
+        # dpkg/rpm call preremove.sh with `upgrade` (or `1`) on upgrade. The
+        # restarted agent adopts live VMs, so no service stop or host teardown
+        # may run. Every command that could mutate the host is faked and the
+        # env seams point at the sandbox, so a regression cannot touch the
+        # test host before this assertion fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            log = tmp_path / "calls.log"
+            log.write_text("")
+            etc = tmp_path / "etc"
+            (etc / "sysctl.d").mkdir(parents=True)
+            rules = tmp_path / "rules.v4"
+            rules.write_text("*nat\nCOMMIT\n")
+            for name in (
+                "ip",
+                "nft",
+                "systemctl",
+                "kill",
+                "ps",
+                "rm",
+                "mv",
+                "chown",
+                "iptables",
+                "iptables-save",
+                "netfilter-persistent",
+                "sqlite3",
+                "runuser",
+                "sudo",
+                "sleep",
+                "id",
+            ):
                 tool = bin_dir / name
                 tool.write_text(
                     "#!/bin/bash\n" f"printf '{name} %s\\n' \"$*\" >> {log}\n"
                 )
                 tool.chmod(0o755)
-            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+            env = dict(
+                os.environ,
+                PATH=f"{bin_dir}:{os.environ['PATH']}",
+                CHV_HOST_ETC=str(etc),
+                CHV_IPTABLES_RULES_V4=str(rules),
+                CHV_DB_PATH=str(tmp_path / "nonexistent.db"),
+            )
             for action in ("upgrade", "1"):
                 subprocess.run(
                     ["sh", str(ROOT / "packaging/scripts/preremove.sh"), action],
