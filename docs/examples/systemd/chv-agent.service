@@ -14,7 +14,14 @@ ExecStart=/usr/bin/chv-agent /etc/chv/agent.toml
 # mode after bind; no timing-dependent unit chmod is required.
 Restart=on-failure
 RestartSec=5
-KillMode=mixed
+# VMs outlive the agent by design: cloud-hypervisor is a child of this unit,
+# and the restarted agent adopts the living VMM through its API socket.
+# `KillMode=process` kills only the agent on stop/restart; `mixed` (the
+# previous setting) sends SIGKILL to the whole cgroup as soon as the main
+# process exits, which killed every running VM on `systemctl restart
+# chv-agent`. Stopping this unit therefore leaves running VMs running — stop
+# the VMs through the API if that is the intent.
+KillMode=process
 # The agent's core executor drains in-flight journal operations for up to
 # CORE_EXECUTOR_DRAIN_BUDGET (60s) on SIGTERM before it marks anything
 # restart-interrupted. SIGKILL before that budget elapses strands in-flight
@@ -22,7 +29,13 @@ KillMode=mixed
 # InspectRequired path on `systemctl restart`) — so the stop timeout must
 # exceed the drain budget with margin.
 TimeoutStopSec=75
-RuntimeDirectory=chv
+# Nested, not the parent: `RuntimeDirectory=chv` made systemd remove
+# /run/chv recursively on every stop/restart, unlinking the separately
+# managed chv-stord/chv-nwd sockets while those daemons kept running. The
+# supervisor then could not adopt them, double-spawned duplicates that died
+# on the already-bound metrics ports, and the node stayed Failed. Only the
+# agent's own directory may be removed by the agent's lifecycle.
+RuntimeDirectory=chv/agent
 RuntimeDirectoryMode=0775
 StateDirectory=chv/agent
 StateDirectoryMode=0700

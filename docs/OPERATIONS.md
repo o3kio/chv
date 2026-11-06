@@ -753,6 +753,37 @@ mints none by construction. An agent whose
 Enable the agent gate on every source node, or do not combine the
 control-plane flag with diskless VMs.
 
+### Restarting the Agent With Running VMs
+
+`chv-agent` supervises the agent process only; the VMMs are child processes
+that outlive it by design (`KillMode=process`). A
+`systemctl restart chv-agent` therefore leaves running VMs running: the
+shutdown drain closes the serial console cleanly, and the new agent adopts
+each live VMM through its API socket. `systemctl stop chv-agent` also leaves
+the VMs running — there is no agent to reconcile them until it is started
+again; stop the VMs through the API if that is the intent.
+
+- Restart one agent at a time. The node reports `Unreachable`/`Degraded`
+  while the agent is down and converges back to `TenantReady`/`Healthy`.
+- Do not restart while a Core operation is in flight: the 75 s
+  `TimeoutStopSec` exists to let the executor drain, and a SIGKILL before
+  that budget strands the operation as `InspectRequired` (below). The VMs
+  are not killed by that path, but the operation still needs manual
+  resolution.
+- The agent owns only `/run/chv/agent`; `chv-stord` and `chv-nwd` own their
+  own runtime directories, so an agent restart does not unlink their
+  sockets.
+- Verify after a restart: exactly one `chv-stord` and one `chv-nwd`, node
+  `TenantReady`/`Healthy`, and each VMM still present with the same PID.
+
+Removal is different: package remove/purge, `scripts/install.sh --wipe`, and
+`scripts/quick-install.sh --uninstall` are final, so they terminate the
+CHV-owned VMMs that outlive the agent and delete the host network state nwd
+created (per-network bridges, namespaces, tap slaves, `inet chv-*` nftables
+tables, and the baseline bridge). A plain package removal still preserves
+`/var/lib/chv`, `/etc/chv`, and `/var/log/chv`; see
+[uninstall.md](install/uninstall.md).
+
 ### Stuck Operations After Agent Crash (InspectRequired)
 
 When the agent process dies while a Core operation is in flight, the next

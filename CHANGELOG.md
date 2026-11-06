@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Agent restart killed every running VM and wedged the node (blocker;
+  #732).** On the rc.5 unit, `systemctl restart chv-agent` with a running VM
+  took 76 s, hit `TimeoutStopSec=75`, and systemd SIGKILLed the cgroup —
+  killing cloud-hypervisor. Three independent causes: (a) `KillMode=mixed`
+  SIGKILLs the rest of the cgroup when the main process exits; (b) the
+  graceful shutdown drain half-closed the serial socket (`SHUT_WR`) but
+  never unblocked the dedicated `spawn_blocking` reader, so Tokio's runtime
+  drop waited forever; (c) `RuntimeDirectory=chv` made systemd remove
+  `/run/chv` recursively, unlinking the separately-managed
+  `chv-stord`/`chv-nwd` sockets — the supervisor then double-spawned
+  duplicates that died on the already-bound metrics ports, leaving the node
+  `Failed` and `CreateVm` refused. A plain stop/start reproduced (c) without
+  any crash. The unit now uses `KillMode=process` (VMs outlive the agent and
+  are adopted on restart) and `RuntimeDirectory=chv/agent`, and the drain now
+  `shutdown(SHUT_RD)`s each console socket after draining so the readers see
+  EOF and the serial drain no longer holds the process open until
+  `TimeoutStopSec`. Regression tests cover the live-reader unblock and pin
+  the unit contract.
+- **Removal left running VMs and host network state behind (blocker).**
+  `KillMode=process` deliberately lets VMMs outlive `chv-agent`, but the
+  removal paths did not stop them: package remove/purge, `install.sh --wipe`,
+  and `quick-install.sh --uninstall` now terminate CHV-owned
+  cloud-hypervisor processes before the binaries and data go away. Those
+  paths — and `preremove.sh` on remove/purge, never on upgrade — also tear
+  down the host state nwd materializes outside `/var/lib/chv`: per-network
+  bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables,
+  derived from the control-plane database plus the CHV-owned object names.
+  Previously a documented complete removal left all of it running. This
+  closes the field-plan §6.9 "network residue that survives documented
+  cleanup" blocker found during the rc.6 pre-window drills.
+
 ## [0.4.0-rc.5] - 2026-11-06
 
 > **Final release candidate for `v0.4.0`.** The rc.5 runtime is unchanged

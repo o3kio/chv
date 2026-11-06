@@ -370,9 +370,9 @@ grep -qF 'elif agent_identity_usable; then' "$quick_installer" \
     && grep -qF 'info "Existing install: enrolled agent identity preserved' "$quick_installer" \
     && pass "quick installer preserves a healthy enrolled identity on re-run" \
     || fail "quick installer deletes a healthy enrollment cache on re-run"
-# The agent unit's RuntimeDirectory=chv removes /run/chv on stop, so certs
-# staged before a restart are wiped. Stage them in start_agent, after the
-# stop, and never in start_services.
+# rc.6 nests the agent's RuntimeDirectory to chv/agent, so a stop no longer
+# removes /run/chv; staging in start_agent (after the stop) remains the safe
+# order and is pinned so the certs are in place before the new process runs.
 start_services_body="$(awk '/^start_services\(\)/{f=1} f{print} f && /^}/{exit}' "$quick_installer")"
 start_agent_body="$(awk '/^start_agent\(\)/{f=1} f{print} f && /^}/{exit}' "$quick_installer")"
 if grep -qF 'cp "${CHV_CONFIG_DIR}/certs/agent-client.crt" /run/chv/agent/agent.crt' <<<"$start_services_body"; then
@@ -391,9 +391,9 @@ grep -q '^wait_for_daemon_sockets()' "$quick_installer" \
     && grep -Eq '^[[:space:]]+wait_for_daemon_sockets$' "$quick_installer" \
     && pass "quick installer waits for stord/nwd sockets before starting the agent" \
     || fail "quick installer can start the agent before stord/nwd listen"
-# Stopping the agent removes RuntimeDirectory=chv, i.e. /run/chv/stord and
-# /run/chv/nwd too. On a re-run the stop must precede the stord/nwd restart,
-# otherwise the agent's supervisor finds no socket and spawns duplicates.
+# The quick installer still stops the agent before restarting stord/nwd.
+# rc.6's nested RuntimeDirectory means the sockets now survive the stop, but
+# the ordering remains harmless and is pinned as defense in depth.
 if awk '/systemctl stop chv-agent/{s=NR} /systemctl restart chv-stord chv-nwd/{r=NR} END {exit !(s && r && s < r)}' <<<"$start_agent_body"; then
     pass "quick installer stops the agent before restarting stord/nwd"
 else

@@ -2725,7 +2725,11 @@ impl ProcessCloudHypervisorAdapter {
     ///    buffered guest output into the console fan-out (scrollback +
     ///    console.log) so the descriptors' close at process exit is a
     ///    FIN, not an RST;
-    /// 4. yield once more so any healer that was mid-reconnect when the
+    /// 4. shut down each connection's read side — the live VMM keeps its
+    ///    own write side open, so the dedicated blocking readers would
+    ///    otherwise stay parked in `read()` and Tokio's runtime drop
+    ///    would wait on them until systemd's stop timeout;
+    /// 5. yield once more so any healer that was mid-reconnect when the
     ///    latch was set can acquire the (now released) vm-map lock, see
     ///    the latch, and cleanly abandon its fresh connection before
     ///    the process goes away.
@@ -2784,6 +2788,31 @@ impl ProcessCloudHypervisorAdapter {
                     bytes = drained.len(),
                     "drained buffered console output during agent shutdown"
                 );
+            }
+            // Unblock the dedicated blocking-pool readers. The SHUT_WR
+            // above only tells the VMM that no more bytes will be sent;
+            // with a live VM the peer keeps its write side open, so each
+            // `spawn_blocking` reader stays parked in `read()` for the
+            // life of the guest. Tokio's `Runtime::drop` waits for
+            // blocking tasks, so the process would never exit: the stop
+            // would burn the full `TimeoutStopSec` and systemd would
+            // SIGKILL the agent (under the old `KillMode=mixed`, the
+            // VMs with it) — the exact opposite of this hook's contract.
+            // SHUT_RD is description-level, so it also wakes
+            // the readers' dups: their reads return EOF, the broadcaster
+            // observes the draining latch, and the runtime can drop.
+            // Buffered output was drained above, before the read side is
+            // shut, so this does not truncate the shutdown capture.
+            for vm_id in &socket_vm_ids {
+                let Some(proc) = vms.get(vm_id) else {
+                    continue;
+                };
+                if let Err(e) = nix::sys::socket::shutdown(
+                    proc.console_io.as_raw_fd(),
+                    nix::sys::socket::Shutdown::Read,
+                ) {
+                    debug!(vm_id = %vm_id, error = %e, "console read-shutdown failed (VMM gone?)");
+                }
             }
         }
         // Final yield: healers blocked on the vm-map lock when the drain
@@ -6958,6 +6987,97 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// A graceful stop must not park forever on a live console connection.
+    /// The drain half-closes the agent's write side so the VMM observes
+    /// EOF, but a live VMM keeps its own write side open; the dedicated
+    /// blocking reader therefore stays in `read()`. Tokio's runtime drop
+    /// waits for blocking tasks, so the agent would hang until systemd's
+    /// `TimeoutStopSec` (and, under the old `KillMode=mixed`, take the VMs
+    /// down with it). The drain's `SHUT_RD` (description-level, so it
+    /// reaches the reader's dup) must end those reads without the peer
+    /// closing first.
+    #[tokio::test]
+    async fn drain_unblocks_live_console_reader_without_peer_close() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-drain-reader");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let sock_path = dir.path().join("serial.sock");
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        let (fanout, _) = ConsoleFanout::new(Vec::new());
+        let broadcaster_alive = Arc::new(AtomicBool::new(false));
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        let _ = child.wait().await;
+
+        let client = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+        let console_io: OwnedFd = client.into();
+        let broadcaster_fd = ProcessCloudHypervisorAdapter::dup_cloexec(&console_io).unwrap();
+        {
+            let mut map = adapter.vms.write().await;
+            map.insert(
+                "vm-drain-reader".to_string(),
+                VmProcess {
+                    api_socket: vm_dir.join("vm.sock"),
+                    child: VmmChild::Owned(child),
+                    console_io,
+                    serial_transport: SerialTransport::Socket(sock_path.clone()),
+                    console_fanout: fanout.clone(),
+                    broadcaster_alive: broadcaster_alive.clone(),
+                    cpu_ticks: chv_monitoring_core::CounterState::new(),
+                    last_cpu_at: None,
+                    boot_watermark: AtomicU64::new(0),
+                },
+            );
+        }
+        broadcaster_alive.store(true, Ordering::SeqCst);
+        ProcessCloudHypervisorAdapter::spawn_pty_broadcaster(
+            adapter.vms.clone(),
+            "vm-drain-reader".to_string(),
+            broadcaster_fd,
+            SerialTransport::Socket(sock_path.clone()),
+            fanout,
+            broadcaster_alive.clone(),
+            adapter.console_draining.clone(),
+        );
+
+        // Accept the agent's connection but do NOT close it: this is the
+        // live-VMM shape the half-close alone cannot unblock.
+        let conn = loop {
+            match listener.accept() {
+                Ok((conn, _)) => break conn,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        // Let the broadcaster enter its blocking read.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            broadcaster_alive.load(Ordering::SeqCst),
+            "broadcaster must be live before the drain"
+        );
+
+        let started = std::time::Instant::now();
+        adapter.drain_and_close_consoles().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broadcaster_alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !broadcaster_alive.load(Ordering::SeqCst),
+            "the shutdown drain must unblock the console reader, not wait for the VMM to close"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the drain must not park on a live console connection"
+        );
+        drop(conn);
     }
 
     /// `vm.reboot` in cloud-hypervisor v43 tears the VM down and
