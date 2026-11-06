@@ -405,3 +405,221 @@ that rc.7 fixes the defects on a published artifact until that run exists.
 - `artifacts/03-rc6-blockers/wipe-identity-conflict-DEFECT.txt` — run-2
   `--wipe` identity conflict summary; full state is preserved at
   `/root/chv-field/preserved/rc6-clean-run2-wipe-conflict/`.
+
+---
+
+# Part 2 — `v0.4.0-rc.7` pre-window drill findings (B8, B9)
+
+**Recorded:** 2026-11-06 (UTC)
+**Host:** `field-host-1` (virtualized KVM cloud VM, never described as bare metal)
+**Candidate:** published `v0.4.0-rc.7`, annotated tag object
+`e0da45d70e58f64f8d0e60b0ac76298974edffe8`, commit
+`1b8f68f17378d135cb0bbd72f46932e4e7240199`
+**Path:** package upgrade from the published rc.7 `.deb` set over the rc.6
+tarball install; authority `core-managed`; node
+`f22b8cc7-cd0d-435f-8d7e-22f81b4b04da`; network
+`eac319350ba9fff7b0b957aedef20ba6` (`10.200.0.0/24`, gateway `10.200.0.1`,
+DHCP `.50`–`.205`).
+
+## Status and decision
+
+**`v0.4.0-rc.7` is disqualified as the field-window and stable base.** Two
+defects reproduced on the published artifact after the documented upgrade and
+restart are blocker-class under field plan §6.9. rc.7 remains published; its
+tag and assets are **not** rewritten. `v0.4.0-rc.8` is the successor and the
+final release candidate.
+
+| # | Finding | Class | Breaks |
+|---|---|---|---|
+| B8 | `chv-nwd` runs as non-root `chv` with only `CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN`; dnsmasq cannot bind UDP/67 because `net.ipv4.ip_unprivileged_port_start=1024`, so the documented DHCP path is dead | blocker | documented network profile; §6.3 connectivity; §6.9 |
+| B9 | `TopologyTable` is in-memory only; after a documented nwd restart the next policy update fails `set_firewall_policy failed: not found: topology <id> (NOT_FOUND)` and the operation ends `DISPATCH_FAILED` even though the bridge, TAPs, and nft table still exist | blocker | documented recovery; §6.4 nwd-restart drill; §6.9 |
+
+Two follow-ups were found while reviewing the B9 fix. They are operational
+defects under §6.2, not additional blocker-class findings:
+
+| # | Follow-up | Class | Effect |
+|---|---|---|---|
+| F1 | DHCP MAC→IP reservations lived under `/run/chv/nwd`, which `RuntimeDirectory=` wipes on every restart | operational defect (§6.2) | a restarted dnsmasq stopped reserving the Core-assigned address |
+| F2 | A topology journal or reservation set survived `--wipe` and package removal | operational defect (§6.2) | a clean install could replay a deleted deployment's networks |
+
+## B8 — dnsmasq cannot bind the DHCP server socket as non-root
+
+**Observed on the published rc.7 artifact.** The installed unit carried
+exactly:
+
+```
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+```
+
+The live process's `CapEff`/`CapAmb` decoded to
+`cap_net_admin,cap_net_raw,cap_sys_admin`; the kernel floor was
+`net.ipv4.ip_unprivileged_port_start = 1024`. Running dnsmasq as `chv` with
+that exact capability set and the nwd-generated DHCP configuration produced:
+
+```
+dnsmasq: failed to bind DHCP server socket: Permission denied
+```
+
+exit status `2`, no pid file. Re-running the same command with
+`CAP_NET_BIND_SERVICE` added bound the socket and logged
+`DHCP, sockets bound exclusively to interface br-eac31935dc4f` until the
+transient unit was stopped. Evidence:
+`artifacts/05-rc7-prewindow-drills/11-b8-capability-repro.log` (script
+`11-b8-capability-repro.sh`).
+
+The upgrade drill also showed the dnsmasq process absent across a 40 s poll
+after a policy change (`08-policy-change-and-b4-on-upgraded-host.log`), and
+the nwd log carried no successful spawn. **Correction:** that script's
+`pgrep -c dnsmasq` line matched the host's two libvirt `default`-network
+dnsmasq processes; the exact CHV-owned count is zero (the correction note is
+appended to `10-b9-repro.log`). B8 stands.
+
+**Fix in rc.8.** The unit's ambient and bounding sets add
+`CAP_NET_BIND_SERVICE`, which the dnsmasq child inherits and which grants
+nothing beyond binding privileged ports. dnsmasq start remains a hard failure
+in `ensure_topology`: a topology that reports success with no DHCP server is
+the silent-success class behind B4 and B8. Packaging tests pin the exact cap
+set in both the packaged and example units.
+
+## B9 — an nwd restart loses the topology table; the next policy update fails `NOT_FOUND`
+
+**Observed on the published rc.7 artifact.** With the topology present, a
+policy update succeeded (`UpdateNetworkPolicy` task
+`fc68d8e5ce7c627d7c6ec1f05fd85c12`, `Succeeded`). The documented
+`systemctl restart chv-nwd` changed the main PID `133166` → `174335`. No
+re-ensure followed: in `core-managed` mode `reconcile_networks` returns early
+through `require_mutation()`, so reconcile is observe-only and the in-memory
+`TopologyTable` stays empty. The next policy update (task
+`ecdc0f0d0deb4eed927b22b1e59e475f`) stayed `RetryPending` through
+`MAX_DISPATCH_RETRIES` and then failed:
+
+```
+status: Failed
+error_code: DISPATCH_FAILED
+error_message: permanently failed after 3 retries: ... apply_network_policy
+  failed: ... network unavailable: nwd — set_firewall_policy failed:
+  not found: topology eac319350ba9fff7b0b957aedef20ba6 (NOT_FOUND)
+```
+
+The bridge, TAPs, and `inet chv-eac319350ba9fff7b0b957aedef20ba6` table were
+still present across the restart; only nwd's ownership record was lost. The
+nft guard therefore remained but the operator could no longer change policy
+without hidden maintainer knowledge: `core-managed` reconcile is observe-only,
+so an agent restart did not re-ensure the network either; only a new
+materialization (for example a VM create on that network) did. Evidence:
+`artifacts/05-rc7-prewindow-drills/10-b9-repro.log` (script
+`10-b9-repro.sh`) and `09-nwd-restart-contract-repro.log` (the same contract
+before the restart: the create succeeds, but nwd has no dnsmasq and no
+topology state to recover).
+
+**Why this is blocker-class.** Plan §6.4 requires an nwd restart / network
+disruption to re-materialize the bridge and policy; plan §6.9 treats a failed
+documented recovery that needs hidden maintainer knowledge as blocker-class.
+The defect reproduces on the published artifact, not only in a unit test.
+
+**Fix in rc.8 (two layers).**
+
+1. **Durable bridge-only journal.** `crates/chv-nwd-core/src/topology_store.rs`
+   atomically persists the exact `TopologySpec` protobuf under
+   `/var/lib/chv/nwd/topologies/<network_id>.pb` after a successful apply,
+   removes it on delete, and `NetworkServer::serve` replays every entry
+   before binding its socket. Writes fsync both the file and the directory;
+   delete fsyncs the unlink; a corrupt or ambiguous entry fails startup
+   loudly instead of serving a partial table. The idempotent ensure path
+   reads the current entry and repairs a missing or divergent one without
+   rewriting an unchanged journal on every reconcile tick. Fabric topologies
+   are deliberately **not** journaled: the stretched-L2 fabric is design-only
+   and its provider owns its durable surface.
+2. **Agent startup replay.** The rc.7 → rc.8 upgrade starts with an empty
+   journal, while the Core store already holds the live networks. The agent
+   queries nwd's owned topologies and re-ensures only the distinct
+   bridge-only networks referenced by a live Core VM that nwd does not
+   already own, with bounded retries, before serving. Skipping an
+   already-owned network matters: nwd recovers its journal before serving,
+   and a VM definition is a create-time snapshot, so replaying it could roll
+   a later CIDR/gateway change back. This both closes the upgrade gap and
+   seeds the journal for later nwd-only restarts. A failed ownership query
+   falls back to replaying every network; the replay is best-effort and
+   cannot block agent startup.
+
+**Verification.** `crates/chv-nwd-core/tests/nwd_daemon.rs` covers restart →
+policy update, delete removes the journal, the idempotent path repairing a
+deleted journal entry, and the fabric exclusion;
+`crates/chv-agent-core/src/network_replay.rs` covers derivation, merge
+semantics, and the skip-already-owned filter.
+
+## B9 follow-ups included in rc.8
+
+- **F1 — persistent DHCP reservations.** The `dhcp-hostsfile` now lives under
+  `/var/lib/chv/nwd/dhcp/`, is created only when absent, and is removed only
+  by topology teardown. A failed unlink fails the delete closed (the
+  idempotent retry clears it) instead of leaving a MAC→IP map a re-created
+  network would inherit. Lease files intentionally stay under `/run` (B4).
+- **F2 — durable state follows teardown.** `install.sh --wipe`/re-run
+  cleanup, the packaged `preremove.sh` (remove/purge only, never upgrade),
+  and `dev-install.sh` remove `${CHV_DATA_DIR:-/var/lib/chv}/nwd`.
+  `scripts/integration/qual/m4.4-network.sh` asserts the persistent hosts
+  path.
+
+## Upgrade order and one-time gap
+
+The package scripts deliberately do not restart services.
+`chv-agent.service` already orders `After=chv-nwd.service`, so
+`systemctl restart chv-nwd chv-agent` is the documented rc.7 → rc.8 upgrade
+step; nwd must be restarted before or with the agent so the startup replay
+reaches rc.8 nwd and seeds the journal. Reservations written by rc.7 under
+`/run/chv/nwd` are not migrated (one-time gap): the upgrade restart
+re-creates the topology but not the per-NIC reservations; a DHCP guest keeps
+its current lease until renewal, and a VM re-create (or a clean rc.8 install)
+repopulates the persistent file. The upgrade drill uses cloud-init static
+addressing; the reservation-survives-restart contract is exercised on the
+clean install.
+
+## Claim boundary
+
+No field-window day has run and no stable tag exists. These are pre-window
+findings from a published artifact, not field results. The rc.7 tag and
+assets remain published and unchanged; rc.8 is the successor. Nothing here
+claims that rc.8 fixes the defects on a published artifact until the rc.8
+upgrade, clean install, DHCP lease, policy-change-plus-restart, and two
+consecutive `--wipe` drills run after publication. That claim is made only by
+the rc.8 drill evidence record, not by this report.
+
+## Evidence index — rc.7 pre-window drills
+
+All paths below are under
+`artifacts/05-rc7-prewindow-drills/`. Logs were copied from the field host and
+scrubbed for credentials and management addresses; only `127.0.0.1` (the BFF
+loopback), the drill subnet `10.200.0.0/24`, and the dnsmasq test options
+(`1.1.1.1`, netmask `255.255.255.0`) appear.
+
+- `01-pre-upgrade.log` — pre-upgrade host state, rc.7 artifact presence, and
+  the service/config baseline.
+- `02-pre-upgrade-workload.log` — operator login proves the password hash and
+  role survived the write; running-VM baseline.
+- `03-rc6-tun-workaround.log` — the rc.6 `/dev/net/tun` residue/cleanup path
+  before the rc.7 upgrade.
+- `04-rc7-package-upgrade.log` — the published rc.7 `.deb` upgrade.
+- `05-unit-shadow-and-restart.log` — the tarball `/etc` unit shadows the
+  package unit; the services restarted with the rc.7 units.
+- `06-post-upgrade-verification.log` — config/certificate hashes, node id,
+  database rows, operator login, and the adopted running VM survived.
+- `07-legacy-bridge-removal.log` — one-time removal of the rc.6 `chvbr0`;
+  exactly one owner of `10.200.0.1`.
+- `08-policy-change-and-b4-on-upgraded-host.log` — live policy update; no
+  CHV dnsmasq appears (B8); nft policy is applied.
+- `09-nwd-restart-contract-repro.log` — a VM create materializes the
+  topology; nwd has no dnsmasq or durable topology state before the B9
+  restart.
+- `10-b9-repro.log` + `10-b9-repro.sh` — the B9 sequence: policy update
+  succeeds, nwd restarts (PID `133166` → `174335`), no re-ensure, the next
+  update exhausts retries and fails `DISPATCH_FAILED` / `NOT_FOUND`; includes
+  the `pgrep -c dnsmasq` correction.
+- `11-b8-capability-repro.log` + `11-b8-capability-repro.sh` — B8 in both
+  directions: the rc.7 cap set fails to bind UDP/67 with the exact dnsmasq
+  error; the rc.8 cap set binds exclusively to the bridge.
+
+The committed logs are the raw pre-publication drill output; the rc.8
+post-publication drill evidence is a separate record created only after the
+rc.8 drill runs.

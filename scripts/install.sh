@@ -513,6 +513,13 @@ delete_chv_network_state() {
                 nft delete table inet "$table" 2>/dev/null || true
             done || true
     fi
+
+    # Durable nwd network state (rc.8): the bridge-only topology journal is
+    # replayed at nwd start, and the DHCP hostsfile holds MAC→IP reservations.
+    # Both are derived from the deployment being torn down; leaving them would
+    # resurrect deleted bridges/reservations on a clean install (a `--wipe`
+    # reinstall must not recover the previous run's networks).
+    rm -rf "${CHV_DATA_DIR:-/var/lib/chv}/nwd"
 }
 
 validate_no_chv_processes() {

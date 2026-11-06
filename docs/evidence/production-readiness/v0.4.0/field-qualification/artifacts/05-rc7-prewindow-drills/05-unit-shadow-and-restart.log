@@ -1,0 +1,76 @@
+=== unit-shadow remediation and documented restart — 2026-11-06T17:05:10Z ===
+pre_vmm_pid=130075
+--- active FragmentPath before remediation ---
+FragmentPath=/etc/systemd/system/chv-controlplane.service
+FragmentPath=/etc/systemd/system/chv-agent.service
+FragmentPath=/etc/systemd/system/chv-stord.service
+FragmentPath=/etc/systemd/system/chv-nwd.service
+--- workaround drop-in present? ---
+total 4
+-rw-r--r-- 1 root root 186 Nov  6 17:03 zz-rc6-tun-workaround.conf
+--- systemctl revert (removes /etc shadow units and drop-ins) ---
+revert chv-controlplane:
+Removed "/etc/systemd/system/chv-controlplane.service".
+Removed "/etc/systemd/system/multi-user.target.wants/chv-controlplane.service".
+rc=0
+revert chv-agent:
+Removed "/etc/systemd/system/chv-agent.service.d/zz-rc6-tun-workaround.conf".
+Removed "/etc/systemd/system/chv-agent.service.d".
+Removed "/etc/systemd/system/chv-agent.service".
+Removed "/etc/systemd/system/multi-user.target.wants/chv-agent.service".
+rc=0
+revert chv-stord:
+Removed "/etc/systemd/system/chv-stord.service".
+Removed "/etc/systemd/system/multi-user.target.wants/chv-stord.service".
+rc=0
+revert chv-nwd:
+Removed "/etc/systemd/system/chv-nwd.service".
+Removed "/etc/systemd/system/multi-user.target.wants/chv-nwd.service".
+rc=0
+--- remaining /etc units ---
+zsh:18: no matches found: /etc/systemd/system/chv-*.service
+none
+--- enable + fragment paths after revert ---
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-controlplane.service → /usr/lib/systemd/system/chv-controlplane.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-agent.service → /usr/lib/systemd/system/chv-agent.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-stord.service → /usr/lib/systemd/system/chv-stord.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/chv-nwd.service → /usr/lib/systemd/system/chv-nwd.service.
+FragmentPath=/usr/lib/systemd/system/chv-controlplane.service
+FragmentPath=/usr/lib/systemd/system/chv-agent.service
+FragmentPath=/usr/lib/systemd/system/chv-stord.service
+FragmentPath=/usr/lib/systemd/system/chv-nwd.service
+--- packaged agent DeviceAllow now active ---
+DevicePolicy=auto
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/kvm rw
+--- enable symlink targets ---
+lrwxrwxrwx 1 root root 41 Nov  6 17:05 /etc/systemd/system/multi-user.target.wants/chv-agent.service -> /usr/lib/systemd/system/chv-agent.service
+lrwxrwxrwx 1 root root 48 Nov  6 17:05 /etc/systemd/system/multi-user.target.wants/chv-controlplane.service -> /usr/lib/systemd/system/chv-controlplane.service
+lrwxrwxrwx 1 root root 39 Nov  6 17:05 /etc/systemd/system/multi-user.target.wants/chv-nwd.service -> /usr/lib/systemd/system/chv-nwd.service
+lrwxrwxrwx 1 root root 41 Nov  6 17:05 /etc/systemd/system/multi-user.target.wants/chv-stord.service -> /usr/lib/systemd/system/chv-stord.service
+=== documented restart: systemctl restart chv-controlplane chv-agent chv-stord chv-nwd ===
+RESTART_RC=0 elapsed_s=0
+--- unit state after restart ---
+MainPID=133163 ExecMainStartTimestamp=Fri 2026-11-06 17:05:12 UTC ActiveState=active SubState=running 
+MainPID=133209 ExecMainStartTimestamp=Fri 2026-11-06 17:05:12 UTC ActiveState=active SubState=running 
+MainPID=133205 ExecMainStartTimestamp=Fri 2026-11-06 17:05:12 UTC ActiveState=active SubState=running 
+MainPID=133166 ExecMainStartTimestamp=Fri 2026-11-06 17:05:12 UTC ActiveState=active SubState=running 
+--- VM process after restart (must still be 130075) ---
+130075 /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/8036de061349b9801b27010339931e78/vm.sock
+132736 /usr/bin/zsh -c set -u cd /root/chv-field/artifacts/rc7-drills LOG=05-unit-shadow-and-restart.log exec > >(tee -a "$LOG") 2>&1 echo "=== unit-shadow remediation and documented restart — $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" VM="$(cat /root/chv-field/state/rc7_drill_vmid)" PRE_VMM_PID="$(cat /var/lib/chv/agent/vms/$VM/ch.pid)" echo "pre_vmm_pid=$PRE_VMM_PID" echo "--- active FragmentPath before remediation ---" systemctl show -p FragmentPath chv-controlplane chv-agent chv-stord chv-nwd | grep . echo "--- workaround drop-in present? ---" ls -l /etc/systemd/system/chv-agent.service.d/ 2>/dev/null || echo none echo "--- systemctl revert (removes /etc shadow units and drop-ins) ---" for u in chv-controlplane chv-agent chv-stord chv-nwd; do echo "revert $u:"; systemctl revert "$u" 2>&1; echo "rc=$?"; done rm -rf /etc/systemd/system/chv-agent.service.d systemctl daemon-reload echo "--- remaining /etc units ---" ls /etc/systemd/system/chv-*.service 2>/dev/null || echo none echo "--- enable + fragment paths after revert ---" systemctl enable chv-controlplane chv-agent chv-stord chv-nwd 2>&1 | tail -5 systemctl show -p FragmentPath chv-controlplane chv-agent chv-stord chv-nwd | grep . echo "--- packaged agent DeviceAllow now active ---" systemctl show chv-agent -p DeviceAllow -p DevicePolicy echo "--- enable symlink targets ---" ls -l /etc/systemd/system/multi-user.target.wants/chv-*.service echo "=== documented restart: systemctl restart chv-controlplane chv-agent chv-stord chv-nwd ===" T0=$(date +%s) systemctl restart chv-controlplane chv-agent chv-stord chv-nwd RC=$? T1=$(date +%s) echo "RESTART_RC=$RC elapsed_s=$((T1-T0))" echo "--- unit state after restart ---" for u in chv-controlplane chv-agent chv-stord chv-nwd; do systemctl show "$u" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp | tr '\n' ' '; echo; done echo "--- VM process after restart (must still be $PRE_VMM_PID) ---" pgrep -af cloud-hypervisor || true echo "--- VMM state ---" /usr/local/bin/ch-remote --api-socket /var/lib/chv/agent/vms/$VM/vm.sock info 2>/dev/null | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print("state=",d.get("state"),"net_count=",len((d.get("config",{}).get("net") or [])))' echo "--- console bytes (must be > pre-upgrade) ---" wc -c < /var/lib/chv/agent/vms/$VM/console.log echo "--- agent adoption / version log ---" journalctl -u chv-agent --since '-3min' --no-pager 2>/dev/null | grep -iE 'starting|adopt|version' | tail -10 echo "UNIT_REMEDIATION_AND_RESTART_DONE"
+--- VMM state ---
+state= Running net_count= 1
+--- console bytes (must be > pre-upgrade) ---
+72659
+--- agent adoption / version log ---
+Nov 06 17:03:26 dev systemd[1]: chv-agent.service: Found left-over process 130075 (cloud-hyperviso) in control group while starting unit. Ignoring.
+Nov 06 17:03:26 dev systemd[1]: Starting chv-agent.service - CHV Node Agent...
+Nov 06 17:03:26 dev systemd[1]: chv-agent.service: Found left-over process 130075 (cloud-hyperviso) in control group while starting unit. Ignoring.
+Nov 06 17:03:26 dev chv-agent[131054]: 2026-11-06T17:03:26.105321Z  INFO chv_agent: chv-agent starting (version 0.4.0, commit df86e53, channel stable)
+Nov 06 17:03:26 dev chv-agent[131054]: 2026-11-06T17:03:26.106502Z  INFO chv_agent_runtime_ch::process: adopted running vm after agent restart; console capture resumed vm_id=8036de061349b9801b27010339931e78 pid=130075
+Nov 06 17:05:12 dev systemd[1]: chv-agent.service: Found left-over process 130075 (cloud-hyperviso) in control group while starting unit. Ignoring.
+Nov 06 17:05:12 dev systemd[1]: Starting chv-agent.service - CHV Node Agent...
+Nov 06 17:05:12 dev systemd[1]: chv-agent.service: Found left-over process 130075 (cloud-hyperviso) in control group while starting unit. Ignoring.
+Nov 06 17:05:12 dev chv-agent[133209]: 2026-11-06T17:05:12.569882Z  INFO chv_agent: chv-agent starting (version 0.4.0, commit 1b8f68f, channel stable)
+Nov 06 17:05:12 dev chv-agent[133209]: 2026-11-06T17:05:12.570753Z  INFO chv_agent_runtime_ch::process: adopted running vm after agent restart; console capture resumed vm_id=8036de061349b9801b27010339931e78 pid=130075
+UNIT_REMEDIATION_AND_RESTART_DONE

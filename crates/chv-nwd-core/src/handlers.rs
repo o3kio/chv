@@ -1,6 +1,7 @@
 use crate::ebpf::{self, EbpfManager};
 use crate::executor::{FabricOwnership, NetworkExecutor, OverlayStatusInfo, TopologyApplyResult};
 use crate::state::{TopologyState, TopologyTable};
+use crate::topology_store::TopologyStore;
 use chv_errors::ChvError;
 use chv_nwd_api::chv_nwd_api as proto;
 use chv_observability::{operation_span, Metrics};
@@ -8,7 +9,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Last successfully applied CHV firewall/NAT policy for a network, used to
 /// re-scope the CHV-owned interface guard set when a VM NIC attaches so the
@@ -31,6 +32,10 @@ pub struct NetworkServiceImpl<E: NetworkExecutor> {
     ebpf: Arc<dyn EbpfManager>,
     /// Counter tracking eBPF program load failures.
     ebpf_load_failures: Arc<AtomicU32>,
+    /// Durable bridge-only topology journal (rc.8 blocker B9). `None` in unit
+    /// tests and in any composition that has not opted in; the production
+    /// daemon always wires it (see `cmd/chv-nwd/src/main.rs`).
+    topology_store: Option<Arc<TopologyStore>>,
 }
 
 impl<E: NetworkExecutor> NetworkServiceImpl<E> {
@@ -44,6 +49,148 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             policy_state: Arc::new(DashMap::new()),
             ebpf: Arc::new(ebpf::NoopEbpfManager),
             ebpf_load_failures: Arc::new(AtomicU32::new(0)),
+            topology_store: None,
+        }
+    }
+
+    /// Opt into the durable bridge-only topology journal. Production wiring
+    /// calls this once before serving; tests that do not care leave it unset.
+    pub fn set_topology_store(&mut self, store: Arc<TopologyStore>) {
+        self.topology_store = Some(store);
+    }
+
+    /// Persist the applied bridge-only spec, or drop a stale bridge-only entry
+    /// when the topology is now fabric-backed. Fabric plans are deliberately
+    /// not journaled: the stretched-L2 provider owns its durable surface and
+    /// claiming recovery here would be false.
+    async fn journal_topology(&self, spec: &proto::TopologySpec) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        if spec.fabric.is_some() {
+            store.remove(&spec.network_id).await
+        } else {
+            store.persist(spec).await
+        }
+    }
+
+    async fn forget_topology(&self, network_id: &str) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        store.remove(network_id).await
+    }
+
+    /// Heal the durable entry on the idempotent ensure path. Persist only when
+    /// the journal is missing or differs from the applied spec: core-native
+    /// re-ensures every network on each reconciliation tick, and an
+    /// unconditional rewrite would fsync the journal every ~10 s per network.
+    async fn repair_topology(&self, spec: &proto::TopologySpec) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        if spec.fabric.is_some() {
+            return store.remove(&spec.network_id).await;
+        }
+        match store.load(&spec.network_id).await {
+            Ok(Some(journaled)) if &journaled == spec => Ok(()),
+            Ok(_) => store.persist(spec).await,
+            Err(e) => {
+                // A corrupt entry is healed by the authoritative applied
+                // spec; an I/O failure resurfaces on the persist below.
+                warn!(
+                    network_id = %spec.network_id,
+                    error = %e,
+                    "topology journal entry unreadable on the idempotent ensure path; rewriting it"
+                );
+                store.persist(spec).await
+            }
+        }
+    }
+
+    /// Re-apply every journaled bridge-only topology before the server starts
+    /// accepting RPCs (rc.8 blocker B9). The in-memory [`TopologyTable`] is
+    /// rebuilt from the journal, so a later `SetFirewallPolicy` finds the
+    /// topology instead of failing `NOT_FOUND`.
+    ///
+    /// Every entry is attempted even when one fails; the first failure still
+    /// aborts startup, because serving with a partial table is exactly the
+    /// silent-degradation failure this journal exists to eliminate.
+    pub async fn recover_topologies(&self) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        let specs = store.load_all().await?;
+        if specs.is_empty() {
+            return Ok(());
+        }
+        info!(
+            count = specs.len(),
+            dir = %store.dir().display(),
+            "recovering journaled network topologies"
+        );
+
+        let mut failures = Vec::new();
+        for spec in specs {
+            if spec.fabric.is_some() {
+                warn!(
+                    network_id = %spec.network_id,
+                    "journaled fabric topology is not recovered; the stretched-L2 \
+                     provider owns that durable surface"
+                );
+                continue;
+            }
+            match self.executor.ensure_topology(&spec).await {
+                Ok(applied) => {
+                    let state = Self::state_from_apply(&spec, &applied);
+                    self.topologies.upsert(state);
+                    info!(
+                        network_id = %spec.network_id,
+                        bridge = %spec.bridge_name,
+                        "recovered journaled network topology"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        network_id = %spec.network_id,
+                        error = %e,
+                        "failed to recover journaled network topology"
+                    );
+                    failures.push(format!("{}: {e}", spec.network_id));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ChvError::Internal {
+                reason: format!(
+                    "failed to recover {} journaled network topology(ies): {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+            })
+        }
+    }
+
+    fn state_from_apply(
+        spec: &proto::TopologySpec,
+        applied: &TopologyApplyResult,
+    ) -> TopologyState {
+        let vni = if spec.vni > 0 { Some(spec.vni) } else { None };
+        TopologyState {
+            network_id: spec.network_id.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            bridge_name: spec.bridge_name.clone(),
+            namespace_name: spec.namespace_name.clone(),
+            subnet_cidr: spec.subnet_cidr.clone(),
+            gateway_ip: spec.gateway_ip.clone(),
+            runtime_status: "ensured".to_string(),
+            vni,
+            tenant_mtu: applied.tenant_mtu,
+            fabric_plan_generation: applied.fabric_plan_generation,
+            binding_generation: applied.binding_generation,
         }
     }
 
@@ -129,6 +276,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             Ok(s) => s,
             Err(e) => return Ok(Response::new(Self::err_result(&e))),
         };
+
+        // The id becomes a journal file name (and already appears in nwd's
+        // runtime file names); reject traversal/injection before any host
+        // command runs.
+        if let Err(e) = crate::topology_store::validate_network_id(&spec.network_id) {
+            return Ok(Response::new(Self::err_result(&e)));
+        }
 
         // IFNAMSIZ limit: Linux interface names must be <= 15 bytes
         if spec.bridge_name.len() > 15 {
@@ -221,6 +375,14 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 && existing.binding_generation == new_binding_generation
                 && !explicit_mtu_changed
             {
+                // B9: the table can already hold the topology while the
+                // journal is missing (a persist that failed after the apply,
+                // or an operator-cleaned journal). Repair it on the
+                // idempotent path instead of returning OK with no durable
+                // record.
+                if let Err(e) = self.repair_topology(&spec).await {
+                    return Ok(Response::new(Self::err_result(&e)));
+                }
                 return Ok(Response::new(Self::ok_result()));
             }
 
@@ -294,14 +456,8 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         let fabric_intent = spec.fabric.is_some();
         let result = self.executor.ensure_topology(&spec).await;
         match result {
-            Ok(TopologyApplyResult {
-                namespace_handle: _,
-                bridge_handle: _,
-                tenant_mtu,
-                fabric_plan_generation,
-                binding_generation,
-            }) => {
-                if fabric_plan_generation.is_some() {
+            Ok(applied) => {
+                if applied.fabric_plan_generation.is_some() {
                     self.metrics.increment_nwd_fabric_apply("success");
                 }
                 // Tenant MTU change (m8): the running dnsmasq still
@@ -309,9 +465,10 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 // ports (TAPs, fabric consumer veth) still carry the old
                 // MTU. Re-assert both before persisting the new state.
                 // Bounded: only when a previously applied MTU changed.
-                if let (Some(old_mtu), Some(new_mtu)) =
-                    (existing.as_ref().and_then(|s| s.tenant_mtu), tenant_mtu)
-                {
+                if let (Some(old_mtu), Some(new_mtu)) = (
+                    existing.as_ref().and_then(|s| s.tenant_mtu),
+                    applied.tenant_mtu,
+                ) {
                     if old_mtu != new_mtu {
                         if let Err(e) = self
                             .executor
@@ -328,20 +485,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                         }
                     }
                 }
-                let vni = if spec.vni > 0 { Some(spec.vni) } else { None };
-                let state = TopologyState {
-                    network_id: spec.network_id.clone(),
-                    tenant_id: spec.tenant_id.clone(),
-                    bridge_name: spec.bridge_name.clone(),
-                    namespace_name: spec.namespace_name.clone(),
-                    subnet_cidr: spec.subnet_cidr.clone(),
-                    gateway_ip: spec.gateway_ip.clone(),
-                    runtime_status: "ensured".to_string(),
-                    vni,
-                    tenant_mtu,
-                    fabric_plan_generation,
-                    binding_generation,
-                };
+                // Journal BEFORE the in-memory upsert: if the write fails,
+                // the retry cannot short-circuit on a topology whose durable
+                // record is missing.
+                if let Err(e) = self.journal_topology(&spec).await {
+                    return Ok(Response::new(Self::err_result(&e)));
+                }
+                let state = Self::state_from_apply(&spec, &applied);
                 self.topologies.upsert(state);
                 Ok(Response::new(Self::ok_result()))
             }
@@ -490,6 +640,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             self.executor
                 .delete_local_topology_by_derived_names(&req.network_id)
                 .await;
+        }
+        // B9: remove the journal entry once the host topology is gone (or was
+        // already gone). A failure here leaves a durable record that would
+        // resurrect the topology on the next restart, so the delete fails
+        // closed and the idempotent retry clears it.
+        if let Err(e) = self.forget_topology(&req.network_id).await {
+            return Ok(Response::new(Self::err_result(&e)));
         }
         // Drop any remembered policy so a stale firewall policy is not re-asserted
         // if a new topology with the same network_id is created later (#227 S5).

@@ -66,7 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("stretched-L2 fabric provider disabled; fabric RPCs fail closed");
     }
 
-    let server = NetworkServer::new(executor, chv_observability::Metrics::new());
+    // rc.8 blocker B9: journal every bridge-only topology under
+    // /var/lib/chv/nwd/topologies and replay it before serving, so a
+    // documented nwd restart re-materializes the in-memory topology instead
+    // of failing the next policy update with `not found: topology`.
+    let server = NetworkServer::new(executor, chv_observability::Metrics::new())
+        .with_topology_store(chv_nwd_core::topology_store::TopologyStore::default_dir());
 
     let socket_path = config.socket_path.clone();
     let mut sigterm = signal(SignalKind::terminate())?;

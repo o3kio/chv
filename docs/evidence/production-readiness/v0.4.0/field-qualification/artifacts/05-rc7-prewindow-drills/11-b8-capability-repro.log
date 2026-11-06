@@ -1,0 +1,53 @@
+=== rc.7 blocker B8 reproduction (dnsmasq UDP/67 as non-root chv) — 2026-11-06T17:32:56Z ===
+host: rc.7 packages on field-host-1; nwd unit caps as installed by rc.7
+=== installed nwd capability set ===
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+nwd_pid=174335
+CapInh:	0000000000203000
+CapPrm:	0000000000203000
+CapEff:	0000000000203000
+CapBnd:	0000000000203000
+CapAmb:	0000000000203000
+nwd_effective=0x0000000000203000=cap_net_admin,cap_net_raw,cap_sys_admin
+
+=== kernel privileged-port floor ===
+net.ipv4.ip_unprivileged_port_start = 1024
+
+=== rc.7 caps: CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN (no NET_BIND_SERVICE) ===
+conf:
+  interface=br-eac31935dc4f
+  bind-interfaces
+  port=0
+  dhcp-range=10.200.0.50,10.200.0.205,255.255.255.0,12h
+  dhcp-option=3,10.200.0.1
+  dhcp-option=6,1.1.1.1
+  except-interface=lo
+  no-resolv
+Running as unit: b8-repro-rc7.service; invocation ID: 3c693d9a7e124aeb990f75f8a6164bf1
+
+dnsmasq: failed to bind DHCP server socket: Permission denied
+Finished with result: exit-code
+Main processes terminated with: code=exited/status=2
+Service runtime: 7ms
+CPU time consumed: 4ms
+Memory peak: 256.0K
+Memory swap peak: 0B
+dnsmasq_exit_rc7=2
+
+=== rc.8 caps: the same set plus CAP_NET_BIND_SERVICE (fix control) ===
+Running as unit: b8-repro-rc8.service; invocation ID: f724c3a6e8da43f6858df1164a975495
+dnsmasq: started, version 2.91 DNS disabled
+dnsmasq: compile time options: IPv6 GNU-getopt DBus no-UBus i18n IDN2 DHCP DHCPv6 no-Lua TFTP conntrack ipset nftset auth DNSSEC loop-detect inotify dumpfile
+dnsmasq-dhcp: DHCP, IP range 10.200.0.50 -- 10.200.0.205, lease time 12h
+dnsmasq-dhcp: DHCP, sockets bound exclusively to interface br-eac31935dc4f
+dnsmasq: exiting on receipt of SIGTERM
+Finished with result: timeout
+Main processes terminated with: code=exited/status=0
+Service runtime: 5.041s
+CPU time consumed: 8ms
+Memory peak: 1.5M
+Memory swap peak: 0B
+dnsmasq_exit_rc8=1 (the transient unit is stopped after RuntimeMaxSec)
+pid_file_present=no
+B8_CAPABILITY_REPRO_DONE

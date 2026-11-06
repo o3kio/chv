@@ -751,7 +751,10 @@ impl LinuxExecutor {
         let _ = tokio::fs::create_dir_all(&runtime_dir).await;
 
         let conf_path = runtime_dir.join(format!("dnsmasq-{}.conf", network_id));
-        let hosts_path = runtime_dir.join(format!("dnsmasq-{}.hosts", network_id));
+        // Persistent (B9 follow-up): the reservations must survive the
+        // RuntimeDirectory wipe on an nwd restart, or a restart silently
+        // un-reserves the Core-assigned guest address.
+        let hosts_path = crate::dhcp::hosts_path(network_id);
         let pid_path = runtime_dir.join(format!("dnsmasq-{}.pid", network_id));
         let lease_path = runtime_dir.join(format!("dnsmasq-{}.leases", network_id));
 
@@ -759,8 +762,24 @@ impl LinuxExecutor {
             return Ok(());
         }
 
-        // Create empty hostsfile if not exists
-        let _ = tokio::fs::write(&hosts_path, "").await;
+        // Create the hostsfile only when absent: a restart must restore the
+        // reservations recorded by `add_dhcp_host`, not truncate them.
+        if tokio::fs::metadata(&hosts_path).await.is_err() {
+            if let Some(parent) = hosts_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ChvError::Io {
+                        path: parent.to_string_lossy().to_string(),
+                        source: e,
+                    })?;
+            }
+            tokio::fs::write(&hosts_path, "")
+                .await
+                .map_err(|e| ChvError::Io {
+                    path: hosts_path.to_string_lossy().to_string(),
+                    source: e,
+                })?;
+        }
 
         let (range_start, range_end, netmask) = Self::derive_dhcp_range(cidr)?;
 
@@ -840,7 +859,6 @@ impl LinuxExecutor {
         let runtime_dir = PathBuf::from("/run/chv/nwd");
         let pid_path = runtime_dir.join(format!("dnsmasq-{}.pid", network_id));
         let conf_path = runtime_dir.join(format!("dnsmasq-{}.conf", network_id));
-        let hosts_path = runtime_dir.join(format!("dnsmasq-{}.hosts", network_id));
         let lease_path = runtime_dir.join(format!("dnsmasq-{}.leases", network_id));
 
         // SIGTERM, then a bounded wait for the process to actually exit
@@ -882,26 +900,45 @@ impl LinuxExecutor {
 
         let _ = tokio::fs::remove_file(&pid_path).await;
         let _ = tokio::fs::remove_file(&conf_path).await;
-        let _ = tokio::fs::remove_file(&hosts_path).await;
+        // The hostsfile is persistent state (see `dhcp::STATE_DIR`); topology
+        // teardown removes it explicitly. An MTU re-assert restarts dnsmasq
+        // through here and must keep the reservations.
         let _ = tokio::fs::remove_file(&lease_path).await;
     }
 
     async fn add_dhcp_host(network_id: &str, mac_address: &str, ip_address: &str) {
-        let hosts_path = format!("/run/chv/nwd/dnsmasq-{}.hosts", network_id);
+        let hosts_path = crate::dhcp::hosts_path(network_id);
         let pid_path = std::path::PathBuf::from(format!("/run/chv/nwd/dnsmasq-{}.pid", network_id));
 
+        if let Some(parent) = hosts_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
         let content = tokio::fs::read_to_string(&hosts_path)
             .await
             .unwrap_or_default();
         let entry = format!("{},{}\n", mac_address, ip_address);
 
         if !content.contains(mac_address) {
-            if let Ok(mut file) = tokio::fs::OpenOptions::new()
+            match tokio::fs::OpenOptions::new()
+                .create(true)
                 .append(true)
                 .open(&hosts_path)
                 .await
             {
-                let _ = file.write_all(entry.as_bytes()).await;
+                Ok(mut file) => {
+                    let _ = file.write_all(entry.as_bytes()).await;
+                }
+                Err(e) => {
+                    // The reservation is not applied for the running
+                    // dnsmasq either; say so instead of silently serving a
+                    // pool address.
+                    tracing::warn!(
+                        network_id = %network_id,
+                        path = %hosts_path.display(),
+                        error = %e,
+                        "failed to persist DHCP host reservation"
+                    );
+                }
             }
         }
 
@@ -1145,19 +1182,21 @@ impl NetworkExecutor for LinuxExecutor {
             binding_generation = Some(applied.binding_generation);
         }
 
-        // Start dnsmasq for DHCP
+        // Start dnsmasq for DHCP. This is a hard failure: a topology that
+        // reports success while the DHCP server never bound is exactly the
+        // silent-success class that let rc.6/rc.7 claim a working network
+        // profile with no DHCP (B4, and its incomplete fix exposed by B8).
+        // The apply is idempotent, so the caller's retry is safe once the
+        // cause (capability, port conflict, missing binary) is cleared.
         if !spec.subnet_cidr.is_empty() && !spec.gateway_ip.is_empty() {
-            if let Err(e) = Self::start_dnsmasq(
+            Self::start_dnsmasq(
                 &spec.network_id,
                 &spec.bridge_name,
                 &spec.subnet_cidr,
                 &spec.gateway_ip,
                 tenant_mtu,
             )
-            .await
-            {
-                warn!(error = %e, "failed to start dnsmasq");
-            }
+            .await?;
         }
 
         // Namespace
@@ -1230,6 +1269,11 @@ impl NetworkExecutor for LinuxExecutor {
         }
 
         Self::stop_dnsmasq(network_id).await;
+        // Topology teardown also drops the persisted DHCP reservations; a
+        // re-created network must not inherit the old MAC→IP map. A failed
+        // unlink leaves durable residue, so the delete fails closed and the
+        // idempotent retry clears it (the journal entry is still present).
+        crate::dhcp::remove_hosts(network_id).await?;
 
         if Self::namespace_exists(&state.namespace_name).await {
             if let Err(e) = Self::run_ip(&["netns", "del", &state.namespace_name]).await {
@@ -1271,6 +1315,15 @@ impl NetworkExecutor for LinuxExecutor {
         );
 
         Self::stop_dnsmasq(network_id).await;
+        // Derived-names teardown is warn-only by contract (no state row is
+        // evidence about what exists), but residue stays visible.
+        if let Err(e) = crate::dhcp::remove_hosts(network_id).await {
+            warn!(
+                network_id,
+                error = %e,
+                "derived-names teardown: failed to remove persisted DHCP reservations"
+            );
+        }
 
         let namespace_name = format!("ns-{network_id}");
         if Self::namespace_exists(&namespace_name).await {

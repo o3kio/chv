@@ -5,6 +5,17 @@ use tracing::info;
 
 const RUNTIME_DIR: &str = "/run/chv/nwd";
 
+/// Persistent DHCP state (rc.8 blocker B9 follow-up). `RuntimeDirectory=` is
+/// wiped on every nwd stop/restart, so a MAC→IP reservation kept under
+/// `/run/chv/nwd` died with the process: the restarted dnsmasq no longer
+/// reserved the Core-assigned address, and a DHCP guest could renew onto a
+/// different address with no matching firewall policy. Reservations are
+/// desired-state derived from the VM NIC attachments, so they belong beside
+/// the topology journal in the daemon's persistent state directory. Lease
+/// files stay in `/run` (B4): a restarted client re-acquires, but the
+/// authoritative address stays reserved.
+pub(crate) const STATE_DIR: &str = "/var/lib/chv/nwd/dhcp";
+
 fn conf_path(network_id: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR).join(format!("dnsmasq-{}.conf", network_id))
 }
@@ -13,8 +24,47 @@ fn pid_path(network_id: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR).join(format!("dnsmasq-{}.pid", network_id))
 }
 
-fn hosts_path(network_id: &str) -> PathBuf {
-    PathBuf::from(RUNTIME_DIR).join(format!("dnsmasq-{}.hosts", network_id))
+/// Persistent `dhcp-hostsfile` for one network. Shared by the topology
+/// executor's `start_dnsmasq` path and the `EnsureDhcpScope` path so both
+/// daemons (there is only one dnsmasq per network) read the same reservations.
+pub(crate) fn hosts_path(network_id: &str) -> PathBuf {
+    PathBuf::from(STATE_DIR).join(format!("dnsmasq-{}.hosts", network_id))
+}
+
+/// Remove a network's persisted reservations. Called only by topology
+/// teardown: an MTU re-assert restarts dnsmasq and must keep the file.
+/// Fails closed on a real I/O error (the caller treats it as a failed
+/// delete), because a surviving reservation would be inherited by a network
+/// re-created under the same id.
+pub(crate) async fn remove_hosts(network_id: &str) -> Result<(), ChvError> {
+    let path = hosts_path(network_id);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(ChvError::Io {
+                path: path.to_string_lossy().to_string(),
+                source: e,
+            })
+        }
+    }
+    // Mirror the topology journal: an unlink that is not durable could
+    // reappear after a host crash, and a network re-created under the same id
+    // would inherit the old MAC→IP map.
+    sync_state_dir().await
+}
+
+async fn sync_state_dir() -> Result<(), ChvError> {
+    match tokio::fs::File::open(STATE_DIR).await {
+        Ok(dir) => dir.sync_all().await.map_err(|e| ChvError::Io {
+            path: STATE_DIR.to_string(),
+            source: e,
+        }),
+        Err(e) => Err(ChvError::Io {
+            path: STATE_DIR.to_string(),
+            source: e,
+        }),
+    }
 }
 
 /// Lease file for one network's dnsmasq.
@@ -123,6 +173,7 @@ pub async fn ensure_dhcp_scope(
     let pid = pid_path(network_id);
 
     let _ = tokio::fs::create_dir_all(RUNTIME_DIR).await;
+    let _ = tokio::fs::create_dir_all(STATE_DIR).await;
 
     // Read existing config to detect if scope changed
     let existing = tokio::fs::read_to_string(&conf).await.unwrap_or_default();
@@ -339,6 +390,19 @@ fn derive_gateway(cidr: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dhcp_hostsfile_is_persistent_not_runtime() {
+        // rc.8 B9 follow-up: an nwd restart wipes RuntimeDirectory, so a hosts
+        // file under /run would silently drop every MAC→IP reservation.
+        let path = hosts_path("eac319350ba9fff7b0b957aedef20ba6");
+        assert_eq!(
+            path,
+            PathBuf::from("/var/lib/chv/nwd/dhcp/dnsmasq-eac319350ba9fff7b0b957aedef20ba6.hosts")
+        );
+        assert!(path.starts_with(STATE_DIR));
+        assert!(!path.starts_with(RUNTIME_DIR));
+    }
 
     #[test]
     fn test_cidr_to_netmask() {

@@ -48,6 +48,24 @@ impl AgentResourceController {
             nwd_socket,
         }
     }
+
+    /// Network ids nwd currently owns in its in-memory topology table.
+    ///
+    /// The startup replay uses this to leave an already-owned topology alone:
+    /// nwd recovers its journal before it starts serving, and re-applying a
+    /// live topology from a VM definition (a snapshot taken at create time)
+    /// could roll a later network CIDR/gateway change back. A failed query is
+    /// not fatal for the caller; it falls back to replaying every network,
+    /// which is what the pre-journal upgrade needs.
+    pub async fn network_topology_ids(&self) -> Result<Vec<String>, ChvError> {
+        let mut client = NwdClient::connect(&self.nwd_socket).await?;
+        let response = client.list_namespace_state().await?;
+        Ok(response
+            .items
+            .into_iter()
+            .map(|item| item.network_id)
+            .collect())
+    }
 }
 
 #[async_trait]

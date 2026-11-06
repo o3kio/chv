@@ -5,7 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0-rc.8] - 2026-11-06
+
+> **Final release candidate for `v0.4.0` and the base for the stable tag.**
+> Supersedes `v0.4.0-rc.7`, which is **disqualified**: the rc.7 pre-window
+> upgrade drill on `field-host-1` reproduced two blocker-class defects.
+> dnsmasq could not bind the DHCP server port because the non-root nwd unit
+> lacked `CAP_NET_BIND_SERVICE` (B8), and an nwd restart discarded the
+> in-memory topology table so the next policy update failed
+> `not found: topology <id>` (B9, a failed documented recovery under plan
+> §6.4/§6.9). rc.7 remains published and is not rewritten. Details and
+> evidence are in
+> [`01-rc6-blockers.md`](docs/evidence/production-readiness/v0.4.0/field-qualification/01-rc6-blockers.md).
+>
+> **Upgrade order:** rc.7 → rc.8 requires `chv-nwd` to be restarted before
+> (or with) `chv-agent`, so the agent's startup replay reaches rc.8 nwd and
+> seeds the journal. `chv-agent.service` already orders after
+> `chv-nwd.service`; a combined `systemctl restart chv-nwd chv-agent` is
+> correct.
+
+### Fixed
+- **DHCP could not bind its server socket (blocker; B8).** `chv-nwd` runs as
+  non-root `chv` with only `CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN`;
+  `net.ipv4.ip_unprivileged_port_start` is 1024, so every dnsmasq spawn
+  exited `failed to bind DHCP server socket: Permission denied`. The unit's
+  ambient and bounding sets now include `CAP_NET_BIND_SERVICE`, which the
+  dnsmasq child inherits and which grants nothing beyond binding privileged
+  ports. dnsmasq start remains a hard failure in `ensure_topology`: a
+  topology that reports success with no DHCP server is the silent-success
+  class behind B4/B8.
+- **An nwd restart lost every topology and broke policy updates (blocker;
+  B9).** `TopologyTable` was in-memory only, so after any documented nwd
+  restart the next `SetFirewallPolicy` failed
+  `set_firewall_policy failed: not found: topology <id> (NOT_FOUND)` and the
+  operation ended `DISPATCH_FAILED`. nwd now journals the exact bridge-only
+  `TopologySpec` protobuf atomically under
+  `/var/lib/chv/nwd/topologies/<network_id>.pb` after a successful apply,
+  removes it on delete, and replays the journal before binding its socket.
+  A corrupt or ambiguous entry fails startup loudly rather than serving a
+  partial table. Fabric topologies are deliberately not journaled: the
+  stretched-L2 fabric is design-only and its provider owns its durable
+  surface. The unit creates the journal directory (`0700 chv:chv`).
+- **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
+  asks nwd which topologies it already owns and replays only the distinct
+  bridge-only networks referenced by a live Core VM that nwd does **not**
+  own, with bounded retries, before serving. Skipping an already-owned
+  network matters: nwd recovers its journal before serving, and a VM
+  definition is a create-time snapshot, so replaying it could roll a later
+  CIDR/gateway change back. This seeds the journal for later nwd-only
+  restarts, so the first policy update after the upgrade no longer fails
+  `NOT_FOUND`. A failed ownership query falls back to replaying every
+  network; the replay is best-effort and cannot block agent startup.
+- **DHCP MAC→IP reservations died on nwd restart (B9 follow-up).** The
+  `dhcp-hostsfile` lived under `/run/chv/nwd`, which systemd's
+  `RuntimeDirectory=` wipes on every stop/restart; the restarted dnsmasq
+  then no longer reserved the Core-assigned address. Reservations now live
+  under `/var/lib/chv/nwd/dhcp/`, are created only when absent, and are
+  removed only by topology teardown. A failed reservation unlink fails the
+  delete closed (the idempotent retry clears it) rather than leaving a
+  MAC→IP map a re-created network would inherit. Lease files stay under
+  `/run` by design (B4).
+- **Durable nwd state survived `--wipe` and package removal (B9
+  follow-up).** A journal or reservation set from a deleted deployment would
+  resurrect its bridges on a clean install. `install.sh --wipe`/re-run
+  cleanup, the packaged `preremove.sh` (remove/purge only, never upgrade),
+  and `dev-install.sh` now remove `${CHV_DATA_DIR:-/var/lib/chv}/nwd`.
+  `scripts/integration/qual/m4.4-network.sh` asserts the persistent hosts
+  path.
+
+### Qualification
+- Targeted Rust tests (`chv-nwd-core` 106 lib + 13 daemon + 24 fabric,
+  `chv-agent-core` startup replay 9), packaging/architecture contract tests
+  79/79, `cargo fmt`, clippy `-D warnings`, and shell syntax checks are green
+  in the rc.8 candidate tree. **No rc.8 real-KVM lane, post-publication
+  lane, or field day has run at tag time; none is claimed.** The rc.7 →
+  rc.8 upgrade (nwd then agent), clean install, documented start with a
+  guest DHCP lease and `login:` console, a policy change plus nwd restart
+  with the reservation surviving, and two consecutive `--wipe` installs are
+  required post-publication drills.
+- One-time gap: reservations written by rc.7 under `/run/chv/nwd` are not
+  migrated. The upgrade restart re-creates the topology but not the
+  per-NIC reservations; a DHCP guest keeps its current lease until renewal,
+  and a VM re-create (or a clean rc.8 install) repopulates the persistent
+  file. The field drill uses cloud-init static addressing for the upgrade
+  leg and exercises the reservation contract on the clean install.
+
 ## [0.4.0-rc.7] - 2026-11-06
+
+> **Disqualified and superseded by `v0.4.0-rc.8`; do not use it as the field
+> or stable base.** Its pre-window upgrade drill reproduced B8 (dnsmasq
+> cannot bind UDP/67 without `CAP_NET_BIND_SERVICE`) and B9 (an nwd restart
+> loses the topology table, so the next policy update fails `NOT_FOUND`).
+> The entry below is the historical rc.7 record; its tag and assets are not
+> rewritten.
 
 > **Final release candidate for `v0.4.0` and the base for the stable tag.**
 > Supersedes `v0.4.0-rc.6`, which is **disqualified**: a clean install from

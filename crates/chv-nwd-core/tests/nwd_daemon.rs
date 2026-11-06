@@ -11,13 +11,16 @@ use chv_nwd_core::executor::{
     DeleteOutcome, FabricOwnership, NetworkExecutor, OverlayStatusInfo, TopologyApplyResult,
 };
 use chv_nwd_core::fabric::{AppliedFabric, ApplyReport, FabricIdentity};
-use chv_nwd_core::{NetworkServer, TopologyState};
+use chv_nwd_core::handlers::NetworkServiceImpl;
+use chv_nwd_core::topology_store::TopologyStore;
+use chv_nwd_core::{NetworkServer, TopologyState, TopologyTable};
 use chv_observability::Metrics;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
+use tonic::Request as TonicRequest;
 use tower::service_fn;
 
 struct MockExecutor;
@@ -1241,5 +1244,234 @@ async fn delete_without_state_row_runs_derived_names_local_teardown() {
     assert!(
         !recorded.iter().any(|c| c == "derived_teardown:net-live"),
         "the state-row path must not double-run the derived-names fallback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rc.8 blocker B9: durable topology journal / restart recovery
+// ---------------------------------------------------------------------------
+
+fn bridge_only_spec(network_id: &str) -> TopologySpec {
+    TopologySpec {
+        network_id: network_id.to_string(),
+        tenant_id: "t1".to_string(),
+        bridge_name: chv_common::bridge_name_for_network(network_id),
+        namespace_name: format!("ns-{network_id}"),
+        subnet_cidr: "10.0.7.0/24".to_string(),
+        gateway_ip: "10.0.7.1".to_string(),
+        options: Default::default(),
+        vni: 0,
+        vtep_endpoints: vec![],
+        overlay_type: 0,
+        fabric: None,
+    }
+}
+
+/// The rc.7 field failure in one test: a topology is applied, nwd restarts
+/// (the in-memory table is empty), and the next policy update used to fail
+/// `not found: topology <id>`. The journal must rebuild the table and the
+/// update must apply.
+#[tokio::test]
+async fn topology_journal_recovers_after_restart_and_reopens_policy_updates() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let spec = bridge_only_spec("net-restart");
+
+    // First process lifetime: ensure the topology through the real handler.
+    let mut first = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    first.set_topology_store(Arc::new(store.clone()));
+    let ensured = first
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec.clone()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+    assert!(
+        store.path_for("net-restart").exists(),
+        "a successful ensure must journal the topology spec"
+    );
+
+    // Restart: a fresh in-memory table (exactly what a new nwd process has)
+    // and the same durable journal.
+    let table = Arc::new(TopologyTable::new());
+    let mut second = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        table.clone(),
+        Arc::new(Metrics::new()),
+    );
+    second.set_topology_store(Arc::new(store.clone()));
+    second
+        .recover_topologies()
+        .await
+        .expect("the journal must replay cleanly");
+    assert!(
+        table.get("net-restart").is_some(),
+        "recovery must rebuild the in-memory topology table"
+    );
+
+    // The exact failing RPC from the field drill.
+    let fw = second
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-restart".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        fw.status, "OK",
+        "a policy update after a restart must find the recovered topology: {}",
+        fw.human_summary
+    );
+}
+
+/// A topology delete must remove the journal entry, or the next restart would
+/// resurrect the network the operator just deleted.
+#[tokio::test]
+async fn topology_delete_removes_the_journal_entry() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+
+    let service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    let mut service = service;
+    service.set_topology_store(Arc::new(store.clone()));
+
+    service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-delete")),
+        }))
+        .await
+        .unwrap();
+    assert!(store.path_for("net-delete").exists());
+
+    let deleted = service
+        .delete_network_topology(TonicRequest::new(DeleteNetworkTopologyRequest {
+            meta: None,
+            network_id: "net-delete".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.status, "OK");
+    assert!(
+        !store.path_for("net-delete").exists(),
+        "a successful delete must remove the durable journal entry"
+    );
+
+    // A restart after the delete must not recover anything.
+    let table = Arc::new(TopologyTable::new());
+    let mut restarted = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        table.clone(),
+        Arc::new(Metrics::new()),
+    );
+    restarted.set_topology_store(Arc::new(store));
+    restarted.recover_topologies().await.unwrap();
+    assert!(table.get("net-delete").is_none());
+}
+
+/// The idempotent ensure path is what core-native reconciliation calls every
+/// tick. When the in-memory table still holds the topology but the journal
+/// entry is missing (an operator cleaned it, or a persist failed after the
+/// apply), the next ensure must repair the durable record instead of returning
+/// OK with no journal.
+#[tokio::test]
+async fn idempotent_ensure_repairs_a_deleted_journal_entry() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(store.clone()));
+
+    let spec = bridge_only_spec("net-repair");
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec.clone()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+    assert!(store.path_for("net-repair").exists());
+
+    // Simulate journal loss while the in-memory topology survives.
+    store.remove("net-repair").await.unwrap();
+    assert!(!store.path_for("net-repair").exists());
+
+    // The idempotent short-circuit must heal the journal.
+    let again = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.status, "OK");
+    assert!(
+        store.path_for("net-repair").exists(),
+        "the idempotent ensure path must repair a missing journal entry"
+    );
+}
+
+/// Fabric topologies are design-only and have a separate durable ownership
+/// surface; they must never leave a bridge-only journal entry behind that a
+/// restart would replay with the wrong shape.
+#[tokio::test]
+async fn fabric_topology_is_not_journaled_as_bridge_only() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(store.clone()));
+
+    let mut spec = bridge_only_spec("net-fabric");
+    spec.vni = 100;
+    spec.overlay_type = chv_nwd_api::chv_nwd_api::OverlayType::OverlayVxlan as i32;
+    spec.fabric = Some(FabricPlan::default());
+
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+    assert!(
+        !store.path_for("net-fabric").exists(),
+        "fabric specs are not journaled by the bridge-only journal"
     );
 }

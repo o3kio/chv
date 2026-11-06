@@ -258,6 +258,12 @@ delete_chv_network_state() {
                 nft delete table inet "$table" 2>/dev/null || true
             done || true
     fi
+
+    # Durable nwd network state (rc.8): the bridge-only topology journal and
+    # the DHCP hostsfile are derived from the network state torn down above.
+    # Package removal must drop them, or a later install would replay the
+    # removed networks from the journal.
+    rm -rf "${CHV_DATA_DIR:-/var/lib/chv}/nwd"
 }
 
 if [ "$ACTION" = "remove" ]; then

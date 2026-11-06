@@ -1,0 +1,36 @@
+=== rc.6 identifiable writes: operator + VM — 2026-11-06T17:02:02Z ===
+login_ok=yes
+=== create operator account
+create_user_http=200
+{'username': 'field-rc7-probe', 'role': 'operator', 'user_id': '32709be1f8f5c42aaa2ec5dedcf14e03'}
+=== users
+users= [('admin', 'admin'), ('field-rc7-probe', 'operator')]
+=== operator login (proves password hash + role survived the write)
+probe_login_http=200
+probe_login_ok= True role= None
+=== create VM on the default network
+create_vm_http=200
+{'vm_id': '8036de061349b9801b27010339931e78', 'display_name': None, 'summary': "Creating VM 'field-rc7-upgrade-vm'", 'accepted': True}
+vm_id=8036de061349b9801b27010339931e78
+=== wait for create to settle
+vm {'vm_id': None, 'display_name': None, 'power_state': None, 'health': None, 'node_id': None}
+nics []
+vols []
+=== vm dir on disk
+total 1827360
+-rw-r--r-- 1 chv chv 10737418240 Nov  6 17:02 84c1fefd8eb957eaba6b6a6ee424b65a.img
+-rw-rw-r-- 1 chv chv           6 Nov  6 17:02 ch.pid
+-rw-rw-r-- 1 chv chv           0 Nov  6 17:02 cloud-hypervisor.stderr.log
+-rw-rw-r-- 1 chv chv           0 Nov  6 17:02 console.log
+drwxrwxr-x 2 chv chv        4096 Nov  6 17:02 seed
+-rw-rw-r-- 1 chv chv      376832 Nov  6 17:02 seed.iso
+srwx------ 1 chv chv           0 Nov  6 17:02 serial.sock
+-rw-rw-r-- 1 chv chv         798 Nov  6 17:02 vm-config.json
+srwx------ 1 chv chv           0 Nov  6 17:02 vm.sock
+-rw------- 1 chv chv           0 Nov  6 17:02 vm.sock.lock
+=== taps/bridges after create
+chvbr0
+br-eac31935dc4f
+tap-9a5c9ad1
+tap-a2a1a4ed
+PRE_UPGRADE_WORKLOAD_DONE

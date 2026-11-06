@@ -1,0 +1,58 @@
+=== rc.7 blocker B9 reproduction (nwd restart -> policy update) — 2026-11-06T17:25:53Z ===
+host: rc.7 packages on field-host-1; authority_mode=core-managed
+login_http=200
+nwd_pid_before=133166 active=active
+
+=== step 1: policy update with the current nwd process (topology present) ===
+update1_body={"accepted":true,"network_id":"eac319350ba9fff7b0b957aedef20ba6","next_refresh_path":"/api/v1/tasks/fc68d8e5ce7c627d7c6ec1f05fd85c12","summary":"Firewall policy update accepted; applies on every node with an attached VM on this network","task_id":"fc68d8e5ce7c627d7c6ec1f05fd85c12"}
+update1_task=fc68d8e5ce7c627d7c6ec1f05fd85c12
+t=0s update1_status=Accepted
+t=5s update1_status=Succeeded
+terminal_task={"error_code": null, "error_message": null, "operation": "UpdateNetworkPolicy", "status": "Succeeded", "task_id": "fc68d8e5ce7c627d7c6ec1f05fd85c12"}
+dnsmasq_after_update1=2 (expected 0: B8)
+
+=== step 2: documented nwd restart (no agent restart, core-managed reconcile is observe-only) ===
+nft tables before restart:
+table inet chv-eac319350ba9fff7b0b957aedef20ba6
+nwd_pid_after=174335 active=active
+journal after restart (topology/journal/ensure lines):
+Nov 06 17:25:58 dev chv-nwd[174335]: 2026-11-06T17:25:58.641513Z  INFO chv_observability::metrics_server: metrics server listening bind=127.0.0.1:9102 daemon="chv-nwd"
+nft table still present after restart:
+table inet chv-eac319350ba9fff7b0b957aedef20ba6
+waiting 20s to show the table is not re-ensured in core-managed mode...
+
+=== step 3: policy update after the restart ===
+update2_body={"accepted":true,"network_id":"eac319350ba9fff7b0b957aedef20ba6","next_refresh_path":"/api/v1/tasks/ecdc0f0d0deb4eed927b22b1e59e475f","summary":"Firewall policy update accepted; applies on every node with an attached VM on this network","task_id":"ecdc0f0d0deb4eed927b22b1e59e475f"}
+update2_task=ecdc0f0d0deb4eed927b22b1e59e475f
+t=0s update2_status=Accepted
+t=5s update2_status=RetryPending
+t=10s update2_status=RetryPending
+t=15s update2_status=RetryPending
+t=20s update2_status=RetryPending
+t=25s update2_status=RetryPending
+t=30s update2_status=RetryPending
+t=35s update2_status=RetryPending
+t=40s update2_status=RetryPending
+t=45s update2_status=RetryPending
+t=50s update2_status=RetryPending
+t=55s update2_status=RetryPending
+t=60s update2_status=RetryPending
+t=65s update2_status=RetryPending
+t=70s update2_status=RetryPending
+t=75s update2_status=Failed
+terminal_task={"error_code": "DISPATCH_FAILED", "error_message": "permanently failed after 3 retries: internal error: network policy update for eac319350ba9fff7b0b957aedef20ba6 failed on 1 node(s): f22b8cc7-cd0d-435f-8d7e-22f81b4b04da: internal error: apply_network_policy failed: code: 'Internal error', message: \"network unavailable: nwd \u2014 set_firewall_policy failed: not found: topology eac319350ba9fff7b0b957aedef20ba6 (NOT_FOUND)\"", "operation": "UpdateNetworkPolicy", "status": "Failed", "task_id": "ecdc0f0d0deb4eed927b22b1e59e475f"}
+
+=== nwd log for the failed dispatch ===
+
+=== agent log for the failed dispatch ===
+B9_REPRO_DONE
+
+=== note on the dnsmasq count line ===
+The step-1 'dnsmasq_after_update1=2' used `pgrep -c dnsmasq`, which also
+matches the host's libvirt 'default' network dnsmasq. All dnsmasq
+processes on the host (pgrep -a dnsmasq):
+  2814357 /usr/sbin/dnsmasq --conf-file=/var/lib/libvirt/dnsmasq/default.conf --leasefile-ro --dhcp-script=/usr/lib/libvirt/libvirt_leaseshelper
+  2814358 /usr/sbin/dnsmasq --conf-file=/var/lib/libvirt/dnsmasq/default.conf --leasefile-ro --dhcp-script=/usr/lib/libvirt/libvirt_leaseshelper
+CHV-owned dnsmasq processes (comm=dnsmasq AND --conf-file under /run/chv/nwd):
+=> 0 CHV dnsmasq processes; B8 stands.
+B9_REPRO_COMPLETE

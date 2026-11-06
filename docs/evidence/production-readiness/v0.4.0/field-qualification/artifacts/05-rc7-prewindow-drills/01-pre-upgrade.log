@@ -1,0 +1,67 @@
+=== rc.6 pre-upgrade state — 2026-11-06T17:01:56Z ===
+install_kind=rc.6 tarball/install.sh (no dpkg packages)
+=== binary versions ===
+chv-controlplane: chv-controlplane 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chv-agent: chv-agent 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chv-stord: chv-stord 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chv-nwd: chv-nwd 0.4.0 (commit df86e53, build 2026-11-06, channel stable)
+chvctl: missing
+=== package versions ===
+(none installed)
+=== units (fragment path + DeviceAllow) ===
+FragmentPath=/etc/systemd/system/chv-controlplane.service
+FragmentPath=/etc/systemd/system/chv-agent.service
+FragmentPath=/etc/systemd/system/chv-stord.service
+FragmentPath=/etc/systemd/system/chv-nwd.service
+/etc/systemd/system/chv-agent.service:DeviceAllow=/dev/kvm rw
+=== /lib units present? ===
+zsh:16: no matches found: /lib/systemd/system/chv-*.service
+none
+=== node id + config identity hashes ===
+node_id = "f22b8cc7-cd0d-435f-8d7e-22f81b4b04da"
+6457a3e8def16899babea3869cbc9dfe4ccaed1cf84fbe9baa9c7374fcd37538  /etc/chv/encryption.env
+cc2c9c8d21939f8421dfdb189959042897b64ee742964aa6e567cb14251aa55b  /etc/chv/controlplane.toml
+984f014f599df519f0ca6a17ae2babab0e23b48b8a918759c9bd26ad8d09a0eb  /etc/chv/agent.toml
+1b6e3c72883df3a4518088db2d9584328d638391492b37d0301510e71b993ba8  /etc/chv/nwd.toml
+3c6ed3029d1345f315abcb7d511e606695f9adba67a40d7fc9802f363ba1c825  /etc/chv/stord.toml
+=== certificates ===
+total 28
+-rw-r--r-- 1 root chv  1517 Nov  6 14:54 agent-client.crt
+-rw-r----- 1 root chv  1704 Nov  6 14:54 agent-client.key
+-rw-r--r-- 1 root chv  1858 Nov  6 14:54 ca.crt
+-rw-r----- 1 root chv  3268 Nov  6 14:54 ca.key
+-rw-r--r-- 1 root root   41 Nov  6 14:54 ca.srl
+-rw-r--r-- 1 root chv  1566 Nov  6 14:54 server.crt
+-rw-r----- 1 root chv  1704 Nov  6 14:54 server.key
+084d673f04c011e8d7a0a3bd546c734373711ec9c83a484c548778ecddb91a88  /etc/chv/certs/ca.crt
+6d408f215b2fec642013225f254823a67660c94dac1d9b9a5f5845a5c05ee4c1  /etc/chv/certs/ca.key
+8acc3f00bb70720c74fb89e2ee32ce2e2ca278f16f0f7c76201f53e41ce871d7  /etc/chv/certs/agent-client.crt
+4fcfb0edfb4e5bbc86913c982680a090da383db06bb28183e4543eb2331a739f  /etc/chv/certs/agent-client.key
+=== databases ===
+-rw------- 1 chv chv 260K Nov  6 15:23 /var/lib/chv/agent/core.db
+-rw------- 1 chv chv  32K Nov  6 15:25 /var/lib/chv/agent/core.db-shm
+-rw------- 1 chv chv 186K Nov  6 15:25 /var/lib/chv/agent/core.db-wal
+-rw------- 1 chv chv 3.4M Nov  6 17:00 /var/lib/chv/controlplane.db
+-rw------- 1 chv chv  32K Nov  6 17:01 /var/lib/chv/controlplane.db-shm
+-rw------- 1 chv chv 4.0M Nov  6 17:01 /var/lib/chv/controlplane.db-wal
+=== network ownership before (10.200.0.1) ===
+br-eac31935dc4f 10.200.0.1/24
+chvbr0 10.200.0.1/24
+=== links ===
+chvbr0
+br-eac31935dc4f
+tap-9a5c9ad1
+=== forwarding / NAT ===
+1
+-A POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE
+=== services ===
+chv-controlplane active
+chv-agent active
+chv-stord active
+chv-nwd active
+=== cloud-hypervisor ===
+129721 /usr/bin/zsh -c set -u mkdir -p /root/chv-field/artifacts/rc7-drills cd /root/chv-field/artifacts/rc7-drills LOG=01-pre-upgrade.log exec > >(tee -a "$LOG") 2>&1 echo "=== rc.6 pre-upgrade state — $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" echo "install_kind=rc.6 tarball/install.sh (no dpkg packages)" echo "=== binary versions ===" for b in chv-controlplane chv-agent chv-stord chv-nwd chvctl; do printf '%s: ' "$b"; /usr/local/bin/$b --version 2>/dev/null || /usr/bin/$b --version 2>/dev/null || echo missing; done echo "=== package versions ===" dpkg-query -W -f='${Package} ${Version}\n' chv-controlplane chv-monitor-agent chv-node chvctl 2>/dev/null || echo "(none installed)" echo "=== units (fragment path + DeviceAllow) ===" systemctl show -p FragmentPath chv-controlplane chv-agent chv-stord chv-nwd | grep . grep -H '^DeviceAllow' /etc/systemd/system/chv-*.service 2>/dev/null || true echo "=== /lib units present? ===" ls /lib/systemd/system/chv-*.service 2>/dev/null || echo none echo "=== node id + config identity hashes ===" grep -E '^node_id' /etc/chv/agent.toml sha256sum /etc/chv/encryption.env /etc/chv/controlplane.toml /etc/chv/agent.toml /etc/chv/nwd.toml /etc/chv/stord.toml 2>/dev/null echo "=== certificates ===" ls -l /etc/chv/certs/ 2>/dev/null sha256sum /etc/chv/certs/ca.crt /etc/chv/certs/ca.key /etc/chv/certs/agent-client.crt /etc/chv/certs/agent-client.key 2>/dev/null echo "=== databases ===" ls -lh /var/lib/chv/controlplane.db* /var/lib/chv/agent/core.db* 2>/dev/null echo "=== network ownership before (10.200.0.1) ===" ip -o -4 addr show | awk -v gw="10.200.0.1/" 'index($4, gw) == 1 { print $2, $4 }' | sort echo "=== links ===" ip -o link show | awk -F': ' '{print $2}' | grep -E 'chvbr0|br-|tap-' || true echo "=== forwarding / NAT ===" sysctl -n net.ipv4.ip_forward iptables -t nat -S POSTROUTING 2>/dev/null | grep -E '10\.200\.0\.0/24' || echo "(no 10.200.0.0/24 MASQUERADE)" echo "=== services ===" for u in chv-controlplane chv-agent chv-stord chv-nwd; do printf '%s ' "$u"; systemctl is-active "$u"; done echo "=== cloud-hypervisor ===" pgrep -af cloud-hypervisor || echo none echo "=== image / network / vm inventory ===" ls -lh /var/lib/chv/images/ 2>/dev/null ls /var/lib/chv/agent/vms 2>/dev/null || echo "(no vms)" echo "PRE_UPGRADE_STATE_DONE"
+=== image / network / vm inventory ===
+total 1.8G
+-rw-r--r-- 1 chv chv 1.8G Nov  6 14:54 ubuntu-noble-amd64.img
+PRE_UPGRADE_STATE_DONE

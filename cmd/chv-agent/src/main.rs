@@ -1,3 +1,4 @@
+use chv_agent_core::network_replay::replay_network_topologies;
 use chv_agent_core::{
     agent_server::{AgentAuth, AgentServer},
     cache::{NodeCache, PendingControlPlaneMessage},
@@ -238,10 +239,11 @@ async fn start_core_managed(
     // Refuse to overwrite it and leave operator inspection possible.
     // (The decision itself is `NodeCache::unadopted_cache_vm_ids`, unit
     // tested in chv-agent-core.)
-    match activated.service().vms() {
+    let startup_vms = activated.service().vms();
+    match &startup_vms {
         Ok(rebuild_vms) => {
             let mut cache = cache.lock().await;
-            let unadopted = cache.unadopted_cache_vm_ids(&rebuild_vms);
+            let unadopted = cache.unadopted_cache_vm_ids(rebuild_vms.as_slice());
             if !unadopted.is_empty() {
                 warn!(
                     unadopted = ?unadopted,
@@ -250,7 +252,7 @@ async fn start_core_managed(
                      refusing to overwrite the on-disk cache — Core remains authoritative"
                 );
             } else {
-                cache.rebuild_from_core(&rebuild_vms);
+                cache.rebuild_from_core(rebuild_vms.as_slice());
                 if let Err(e) = cache.save(&cache_path).await {
                     warn!(error = %e, "core startup rebuild: failed to persist rebuilt NodeCache");
                 }
@@ -264,6 +266,27 @@ async fn start_core_managed(
         config.stord_socket.clone(),
         config.nwd_socket.clone(),
     ));
+    // B9 (rc.8): re-ensure every network the Core authority says a live VM
+    // uses. This seeds nwd's durable journal after a cold start/upgrade from
+    // a pre-journal RC, while a later nwd-only restart recovers the journal
+    // on its own. Best effort: a down nwd must not block agent startup.
+    match &startup_vms {
+        Ok(vms) => {
+            if let Err(e) = replay_network_topologies(resources.as_ref(), vms).await {
+                warn!(
+                    error = %e,
+                    "startup network topology replay did not complete; nwd will journal \
+                     each topology on its next ensure"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "startup network topology replay skipped: the Core VM list is unavailable"
+            );
+        }
+    }
     let runtime = Arc::new(
         chv_agent_runtime_ch::core_runtime::CloudHypervisorCoreRuntime::new(
             adapter,
@@ -347,6 +370,25 @@ async fn start_core_native(
         config.stord_socket.clone(),
         config.nwd_socket.clone(),
     ));
+    // B9 (rc.8): same replay as the core-managed path. core-native is not the
+    // qualified authority, but the nwd journal seeding contract is identical.
+    match activated.service().vms() {
+        Ok(vms) => {
+            if let Err(e) = replay_network_topologies(resources.as_ref(), &vms).await {
+                warn!(
+                    error = %e,
+                    "startup network topology replay did not complete; nwd will journal \
+                     each topology on its next ensure"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "startup network topology replay skipped: the Core VM list is unavailable"
+            );
+        }
+    }
     let runtime = Arc::new(
         chv_agent_runtime_ch::core_runtime::CloudHypervisorCoreRuntime::new(
             adapter,
