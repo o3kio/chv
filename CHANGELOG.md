@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.3] - 2026-11-06
+
+### Fixed
+- **Clean-install data loss (blocker; #722).** The installer wrote the
+  bootstrap admin row and the temporary `must_change_password` flag with the
+  `sqlite3` CLI while `chv-controlplane` was already running. When the CLI was
+  the last connection to close, it checkpointed and unlinked
+  `controlplane.db-wal`/`-shm`, while the running control plane kept those
+  inodes open. Every API write acknowledged afterwards — the documented
+  first-login password rotation, user creation, configuration and audit
+  writes — went into the unlinked WAL and was lost on the next restart or
+  upgrade. Reproduced on published `v0.3.0` and `v0.4.0-rc.2` clean installs:
+  the rotated password returned 200, then 401 after
+  `systemctl restart chv-controlplane`, and a created user was gone.
+  The installer now runs direct SQLite writes with the control plane stopped
+  (`chv_sqlite_offline`: stop → write as `chv` → restart → wait for
+  `/health`), so the service reopens the current database path. This applies
+  to the admin seed, the install-time flag clear, and the cleanup restore.
+  No schema, migration, or database-format change.
+- **A refused re-run no longer mutates the live deployment (#722).** The
+  `EXIT` trap always restored `must_change_password=1`, even when a re-run
+  correctly refused at the persistent-data guard. That revoked the operator's
+  current session (`403 PASSWORD_CHANGE_REQUIRED`). The installer now tracks
+  whether this run actually cleared the flag (`ADMIN_FLAG_MANAGED`) and only
+  restores it in that case.
+
+> **`v0.4.0-rc.2` has this clean-install data-loss defect and must not be
+> used for new installs.** It remains published and is not rewritten. Do not
+> promote it to stable. Any data written through the API during a process
+> lifetime of an rc.2 (or rc.1/v0.3.0) clean install may already have been
+> lost on a restart; verify operator accounts and configuration after
+> upgrading.
+
+### Qualification
+- **API-only fresh-host lane (#723).** The upgrade leg drives the product only
+  through its own API (`POST /v1/auth/change-password`,
+  `POST /v1/users/create`, `POST /v1/users`); the previous live-database
+  `sqlite3` fixture caused `database disk image is malformed` and could not
+  convict the product. The leg also restarts the previous release once before
+  its pre-upgrade writes, because `v0.3.0`/`rc.1`/`rc.2` installers have the
+  defect; the clean-install leg asserts the candidate itself does not need
+  that repair.
+- **Credential persistence gate (#723).** The clean-install and candidate
+  quick-install legs restart the control plane, re-authenticate with the
+  rotated password, and fail if any pooled connection still holds a
+  `controlplane.db-wal (deleted)` inode.
+- Offline harness invariants updated to guard the API rotation and
+  persistence checks and to reject a live-database `sqlite3` writer.
+
 ## [0.4.0-rc.2] - 2026-11-05
 
 ### Fixed
