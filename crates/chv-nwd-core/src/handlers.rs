@@ -449,6 +449,43 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
         }
     }
 
+    /// Marker-based fail-closed error for a network whose last firewall/NAT
+    /// save was rejected before it could be applied.
+    fn rejection_error(&self, network_id: &str) -> Option<ChvError> {
+        let rejected = self.rejected_policies.get(network_id)?;
+        if !rejected.firewall && !rejected.nat {
+            return None;
+        }
+        Some(ChvError::Internal {
+            reason: format!(
+                "network {network_id} has a rejected firewall/NAT policy (not applied); \
+                 re-save the policy before attaching a NIC or changing the overlay"
+            ),
+        })
+    }
+
+    /// Record a rejected firewall/NAT save as an in-memory marker.
+    ///
+    /// Serialized with the delete path (which removes the marker under the
+    /// same lock) and re-checks ownership: a marker set after a concurrent
+    /// delete would otherwise leak onto a re-created network with the same id
+    /// and refuse every attach until another delete.
+    async fn mark_policy_rejected(&self, network_id: &str, firewall: bool) {
+        let _guard = self.policy_persist.lock().await;
+        if self.topologies.get(network_id).is_none() {
+            return;
+        }
+        let mut rejected = self
+            .rejected_policies
+            .entry(network_id.to_string())
+            .or_default();
+        if firewall {
+            rejected.firewall = true;
+        } else {
+            rejected.nat = true;
+        }
+    }
+
     /// Re-assert the last applied firewall/NAT policy for a topology so its
     /// CHV-owned interface guard set includes any newly enslaved NIC. Fails
     /// closed (returns an error) so an attached NIC is never left outside the
@@ -458,16 +495,8 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
         // record (the last valid one, if any, stays intact). Refuse the attach
         // instead of leaving the new NIC outside the guard: the attach seam
         // drops nwd's semantic error, so returning Ok here would be fail-open.
-        if let Some(rejected) = self.rejected_policies.get(&state.network_id) {
-            if rejected.firewall || rejected.nat {
-                return Err(ChvError::Internal {
-                    reason: format!(
-                        "network {} has a rejected firewall/NAT policy (not applied); \
-                         re-save the policy before attaching a NIC",
-                        state.network_id
-                    ),
-                });
-            }
+        if let Some(e) = self.rejection_error(&state.network_id) {
+            return Err(e);
         }
         // Snapshot semantics: if no record exists for the network there is
         // nothing to re-scope. Re-read the latest desired JSON/version
@@ -1224,10 +1253,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             // with an unapplicable payload would erase the post-restart policy
             // (leaving a later attach unscoped). A marker makes
             // refresh_policy_scope refuse the attach until a valid save lands.
-            self.rejected_policies
-                .entry(req.network_id.clone())
-                .or_default()
-                .firewall = true;
+            self.mark_policy_rejected(&req.network_id, true).await;
             return Ok(Response::new(Self::err_result(&e)));
         }
 
@@ -1305,10 +1331,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             // Same marker semantics as the firewall path: keep `policy_state`
             // (and therefore the journal) on the last valid NAT entry, and
             // refuse an attach until a valid NAT save replaces the rejection.
-            self.rejected_policies
-                .entry(req.network_id.clone())
-                .or_default()
-                .nat = true;
+            self.mark_policy_rejected(&req.network_id, false).await;
             return Ok(Response::new(Self::err_result(&e)));
         }
 
@@ -1570,6 +1593,18 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         }
 
+        // Refuse before touching the datapath if the last policy save was
+        // rejected. The overlay apply grafts a consumer veth into the tenant
+        // bridge, and there is no desired policy to re-scope it with; applying
+        // first would leave it outside the guard set (the base hooks are
+        // `policy accept`). A concurrent rejection can still land after this
+        // check, so the refresh below rolls the overlay back on failure.
+        if let Some(e) = self.rejection_error(&req.network_id) {
+            return Ok(Response::new(proto::UpdateOverlayResponse {
+                result: Some(Self::err_result(&e)),
+            }));
+        }
+
         return match self
             .executor
             .apply_fabric_overlay(&req.network_id, req.vni, fabric_plan, &state.bridge_name)
@@ -1584,11 +1619,31 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                     binding_generation: Some(applied.binding_generation),
                     ..state.clone()
                 };
-                self.topologies.upsert(updated_state);
+                self.topologies.upsert(updated_state.clone());
                 // Re-assert the CHV firewall/NAT guard scope: the fabric
                 // consumer veth just joined the tenant bridge (same
-                // reasoning as NIC attach; fail closed).
-                if let Err(e) = self.refresh_policy_scope(&state).await {
+                // reasoning as NIC attach; fail closed). A rejected policy
+                // has no desired state to re-scope with, so on failure roll
+                // the overlay back: leaving the new veth grafted would put it
+                // outside the guard set.
+                if let Err(e) = self.refresh_policy_scope(&updated_state).await {
+                    if let Err(remove_err) =
+                        self.executor.remove_fabric_overlay(&req.network_id).await
+                    {
+                        error!(
+                            network_id = %req.network_id,
+                            error = %remove_err,
+                            "failed to roll back a fabric overlay after the policy guard \
+                             refresh failed; the consumer veth may remain outside the guard"
+                        );
+                    }
+                    self.topologies.upsert(TopologyState {
+                        vni: None,
+                        tenant_mtu: None,
+                        fabric_plan_generation: None,
+                        binding_generation: None,
+                        ..state.clone()
+                    });
                     return Ok(Response::new(proto::UpdateOverlayResponse {
                         result: Some(Self::err_result(&e)),
                     }));

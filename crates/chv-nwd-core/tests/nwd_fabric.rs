@@ -16,8 +16,9 @@ use async_trait::async_trait;
 use chv_errors::ChvError;
 use chv_nwd_api::chv_nwd_api::{
     network_service_client::NetworkServiceClient, AttachVmNicRequest, DeleteNetworkTopologyRequest,
-    EnsureNetworkTopologyRequest, FabricPeer, FabricPlan, GetFabricIdentityRequest,
-    GetOverlayStatusRequest, NicSpec, OverlayType, TopologySpec, UpdateOverlayRequest,
+    EnsureNetworkTopologyRequest, FabricPeer, FabricPlan, FirewallPolicy, GetFabricIdentityRequest,
+    GetOverlayStatusRequest, NatPolicy, NicSpec, OverlayType, SetFirewallPolicyRequest,
+    SetNatPolicyRequest, TopologySpec, UpdateOverlayRequest,
 };
 use chv_nwd_core::executor::{
     DeleteOutcome, FabricOwnership, NetworkExecutor, OverlayStatusInfo, TopologyApplyResult,
@@ -69,6 +70,9 @@ struct FabricExecutor {
     /// the handler must not proxy the fabric metric from the aggregate
     /// error).
     local_delete_fails: bool,
+    /// When set, firewall/NAT applies fail (used to drive the post-graft
+    /// guard-refresh rollback on the overlay path).
+    policy_apply_fails: bool,
 }
 
 impl FabricExecutor {
@@ -80,6 +84,14 @@ impl FabricExecutor {
             overlay_status_error: false,
             remove_fails: false,
             local_delete_fails: false,
+            policy_apply_fails: false,
+        }
+    }
+
+    fn with_failing_policy_apply() -> Self {
+        Self {
+            policy_apply_fails: true,
+            ..Self::enabled()
         }
     }
 
@@ -219,6 +231,11 @@ impl NetworkExecutor for FabricExecutor {
         _policy_json: &[u8],
         _bridge_name: &str,
     ) -> Result<(), ChvError> {
+        if self.policy_apply_fails {
+            return Err(ChvError::Internal {
+                reason: "policy apply deliberately failing".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -229,6 +246,11 @@ impl NetworkExecutor for FabricExecutor {
         _policy_json: &[u8],
         _bridge_name: &str,
     ) -> Result<(), ChvError> {
+        if self.policy_apply_fails {
+            return Err(ChvError::Internal {
+                reason: "policy apply deliberately failing".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -639,6 +661,167 @@ async fn update_overlay_fabric_path_fences_and_updates_state() {
         .into_inner();
     assert_eq!(fenced.status, "error");
     assert_eq!(fenced.error_code, "STALE_GENERATION");
+}
+
+#[tokio::test]
+async fn update_overlay_with_a_rejected_policy_does_not_graft_the_veth() {
+    let executor = FabricExecutor::enabled();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-ov-reject", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+    let applied_before = executor.count("apply_fabric:");
+
+    // A rejected NAT save leaves a marker and no desired state for NAT. The
+    // overlay update grafts a consumer veth, so it must refuse before touching
+    // the datapath rather than leave the veth outside the guard set.
+    let nat = client
+        .set_nat_policy(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-ov-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: br#"[{"source_cidr":"not-a-cidr"}]"#.to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(nat.status, "OK");
+
+    let refused = client
+        .update_overlay(UpdateOverlayRequest {
+            network_id: "net-ov-reject".to_string(),
+            vni: 100,
+            vtep_endpoints: vec![],
+            fdb_entries: vec![],
+            fabric: fabric_plan(3, 0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(refused.result.as_ref().unwrap().status, "error");
+    assert_eq!(
+        executor.count("apply_fabric:"),
+        applied_before,
+        "a rejected policy must not graft a veth that the guard set cannot cover"
+    );
+
+    // A valid save clears the marker and the same update then applies.
+    let valid = client
+        .set_nat_policy(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-ov-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v2".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.status, "OK");
+
+    let applied = client
+        .update_overlay(UpdateOverlayRequest {
+            network_id: "net-ov-reject".to_string(),
+            vni: 100,
+            vtep_endpoints: vec![],
+            fdb_entries: vec![],
+            fabric: fabric_plan(3, 0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.result.as_ref().unwrap().status, "OK");
+    assert!(executor
+        .calls()
+        .iter()
+        .any(|c| c == "apply_fabric:net-ov-reject:100:3:br-fab"));
+}
+
+/// If the guard refresh fails *after* the overlay grafted its consumer veth
+/// (e.g. the executor's policy apply errors), the handler must remove the
+/// overlay and clear the persisted fabric state. Leaving the veth attached
+/// with no re-scope would put it outside the guard set.
+#[tokio::test]
+async fn update_overlay_rolls_back_when_the_guard_refresh_fails() {
+    let executor = FabricExecutor::with_failing_policy_apply();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-ov-rollback", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+
+    // A valid save is recorded (desired state) even though the executor apply
+    // fails; the update's guard refresh will hit the same failure.
+    let fw = client
+        .set_firewall_policy(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-ov-rollback".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    let update = client
+        .update_overlay(UpdateOverlayRequest {
+            network_id: "net-ov-rollback".to_string(),
+            vni: 100,
+            vtep_endpoints: vec![],
+            fdb_entries: vec![],
+            fabric: fabric_plan(3, 0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(update.result.as_ref().unwrap().status, "error");
+    assert_eq!(
+        executor.count("remove_fabric:net-ov-rollback"),
+        1,
+        "a failed guard refresh must roll the overlay back"
+    );
+
+    // The rolled-back generation must not fence a later ensure with the older
+    // plan: the persisted state was cleared with the datapath.
+    let mut replay_spec = fabric_topology_spec("net-ov-rollback", 2);
+    replay_spec.fabric = fabric_plan(2, 0);
+    let replay = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(replay_spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        replay.status, "OK",
+        "the rolled-back generation must not leave a stale fence: {replay:?}"
+    );
 }
 
 #[tokio::test]
