@@ -45,12 +45,16 @@ fn canonical_cidr(cidr: &str) -> Option<String> {
 }
 
 /// Canonicalize a single port or ascending range for rendering, accepting the
-/// rc.7-storable forms (`+443`, `0443`, `8090-8080`).
+/// rc.7-storable forms (`+443`, `0443`, `0100-99`).
 ///
-/// Rust's parsers are decimal while nft's lexer is octal for a leading zero,
-/// so a literal round-trip can silently change the enforced port. Emit the
-/// decimal value instead. A reversed or non-numeric range returns `None`: rc.7
-/// could not apply it either (nft rejects it).
+/// Rust's parsers are decimal while nft's lexer is octal for a leading-zero
+/// token whose digits are all 0-7 (and decimal when it contains an 8 or 9), so
+/// a literal round-trip can silently change the enforced port. Prefer the
+/// decimal reading (what the operator wrote). If that reading is a reversed
+/// range, fall back to nft's own reading: rc.7 applied exactly that range, and
+/// rejecting it at attach time would silently drop the stored ruleset
+/// (fail-open). A range that is reversed under both readings returns `None`;
+/// nft rejects it too, so rc.7 never applied it.
 fn canonical_port_spec(spec: &str) -> Option<String> {
     fn endpoint(value: &str) -> Option<u16> {
         let value = value.strip_prefix('+').unwrap_or(value);
@@ -59,8 +63,25 @@ fn canonical_port_spec(spec: &str) -> Option<String> {
         }
         value.parse::<u16>().ok()
     }
+    /// nft's numeric lexer: a leading-zero token whose digits are all 0-7 is
+    /// octal; one containing 8 or 9 falls back to decimal.
+    fn nft_endpoint(value: &str) -> Option<u16> {
+        if value.len() > 1
+            && value.starts_with('0')
+            && value.bytes().all(|b| b.is_ascii_digit())
+            && value.bytes().skip(1).all(|b| (b'0'..=b'7').contains(&b))
+        {
+            return u16::from_str_radix(value, 8).ok();
+        }
+        value.parse::<u16>().ok()
+    }
     if let Some((lo, hi)) = spec.split_once('-') {
-        let (lo, hi) = (endpoint(lo)?, endpoint(hi)?);
+        if let (Some(lo), Some(hi)) = (endpoint(lo), endpoint(hi)) {
+            if lo <= hi {
+                return Some(format!("{lo}-{hi}"));
+            }
+        }
+        let (lo, hi) = (nft_endpoint(lo)?, nft_endpoint(hi)?);
         if lo > hi {
             return None;
         }
@@ -922,10 +943,10 @@ mod tests {
         )
         .is_ok());
         // Only an unrenderable port is rejected on tcp/udp. rc.7-storable
-        // forms (`+443`, `0443`, `600-0777`) are canonicalized and applied;
-        // a reversed range could never apply and is rejected before
-        // journaling.
-        for port in ["+443", "+8080-+8090", "0443", "0700", "600-0777"] {
+        // forms (`+443`, `0443`, `600-0777`, mixed-radix `0100-99`) are
+        // canonicalized and applied; a range reversed under both the decimal
+        // and nft readings could never apply and is rejected before journaling.
+        for port in ["+443", "+8080-+8090", "0443", "0700", "600-0777", "0100-99"] {
             let payload = format!(
                 r#"[{{"direction":"inbound","protocol":"tcp","action":"accept","dest_port":"{port}"}}]"#
             );
@@ -1016,6 +1037,11 @@ mod tests {
             canonical_port_spec("+8080-+8090").as_deref(),
             Some("8080-8090")
         );
+        // Decimal reading is reversed, but nft read 0100 as octal 64, so rc.7
+        // enforced 64-99; preserve that instead of failing the attach.
+        assert_eq!(canonical_port_spec("0100-99").as_deref(), Some("64-99"));
+        assert_eq!(canonical_port_spec("0200-150").as_deref(), Some("128-150"));
+        assert_eq!(canonical_port_spec("0500-400").as_deref(), Some("320-400"));
         assert_eq!(canonical_port_spec("8090-8080"), None);
         assert_eq!(canonical_port_spec("80-"), None);
         assert_eq!(canonical_port_spec("ssh"), None);
