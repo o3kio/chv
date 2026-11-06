@@ -1163,7 +1163,7 @@ chv_sqlite_offline() {
             while [ $attempt -le 30 ]; do
                 curl -sf "http://127.0.0.1:8080/health" &>/dev/null && break
                 sleep 1
-                ((attempt++))
+                attempt=$((attempt + 1))
             done
             if [ $attempt -gt 30 ]; then
                 warn "chv-controlplane did not become healthy after an offline database write."
@@ -1282,10 +1282,19 @@ seed_admin_user() {
     # stopped (chv_sqlite_offline), so SQLite never leaves root-owned WAL
     # sidecars (#669) and never unlinks the WAL the running service still has
     # open (#722).
-    if [ -f "${CHV_DB_PATH}" ] && \
-       [ "$(chv_sqlite_offline "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
-        info "Admin user already exists — skipping seed."
-        return 0
+    #
+    # Do not discard the helper's exit status. If the read cannot run, or the
+    # service does not come back afterwards, fail loudly instead of carrying
+    # on with the control plane down and reporting a successful install.
+    local admin_count=""
+    if [ -f "${CHV_DB_PATH}" ]; then
+        if ! admin_count="$(chv_sqlite_offline "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users WHERE username = 'admin';")"; then
+            fatal "Failed to read the admin row from ${CHV_DB_PATH} (control plane did not come back cleanly)."
+        fi
+        if [ "$admin_count" = "1" ]; then
+            info "Admin user already exists — skipping seed."
+            return 0
+        fi
     fi
 
     local plaintext_pw

@@ -342,6 +342,9 @@ grep -q 'chv_sqlite_offline "${CHV_DB_PATH}" <<SQL' "$quick_installer" \
 grep -qF '${copy}/controlplane.db' "$quick_installer" \
     && pass "quick installer checks enrollment against a database snapshot" \
     || fail "quick installer polls the live WAL for enrollment"
+grep -qF 'chv_sqlite_offline "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users' "$quick_installer" \
+    && pass "quick installer checks admin existence with the control plane stopped" \
+    || fail "quick installer reads the admin row from the live WAL"
 
 # Exercise the real version gate, not just its presence: source the installer
 # (its B1 guard makes that side-effect free) and assert the boundary plus a

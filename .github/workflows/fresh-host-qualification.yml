@@ -202,6 +202,11 @@ jobs:
           # release, assert the full candidate contract (including the
           # credential-persistence gate) rather than the weaker
           # previous-release path.
+          #
+          # Only dispatch this on a tag whose scripts/quick-install.sh carries
+          # the offline-write fix (rc.4+). On an older tag the persistence
+          # gate fails by design, because that quick installer loses the
+          # first-login rotation.
           candidate_release="${GITHUB_REF_NAME#v}"
           quick_is_candidate=0
           if [ -n "$quick_version" ] && [ "$quick_version" = "$candidate_release" ]; then
