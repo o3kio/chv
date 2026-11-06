@@ -805,7 +805,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                             match self.executor.remove_fabric_overlay(&spec.network_id).await {
                                 Ok(()) => {
                                     self.metrics.increment_nwd_fabric_remove("success");
-                                    if let Err(mtu_err) = self
+                                    match self
                                         .executor
                                         .reassert_tenant_mtu(
                                             &spec.network_id,
@@ -816,14 +816,18 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                                         )
                                         .await
                                     {
-                                        error!(
-                                            network_id = %spec.network_id,
-                                            error = %mtu_err,
-                                            "failed to reset the bridge MTU after rolling back a \
-                                             fabric overlay"
-                                        );
+                                        Ok(()) => "the fabric overlay was rolled back",
+                                        Err(mtu_err) => {
+                                            error!(
+                                                network_id = %spec.network_id,
+                                                error = %mtu_err,
+                                                "failed to reset the bridge MTU after rolling back \
+                                                 a fabric overlay"
+                                            );
+                                            "the fabric overlay was rolled back, but the bridge \
+                                             MTU reset failed and may remain at the fabric value"
+                                        }
                                     }
-                                    "the fabric overlay was rolled back"
                                 }
                                 Err(remove_err) => {
                                     self.metrics.increment_nwd_fabric_remove("failure");
@@ -1732,7 +1736,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                         match self.executor.remove_fabric_overlay(&req.network_id).await {
                             Ok(()) => {
                                 self.metrics.increment_nwd_fabric_remove("success");
-                                if let Err(mtu_err) = self
+                                match self
                                     .executor
                                     .reassert_tenant_mtu(
                                         &req.network_id,
@@ -1743,15 +1747,22 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                                     )
                                     .await
                                 {
-                                    error!(
-                                        network_id = %req.network_id,
-                                        error = %mtu_err,
-                                        "failed to reset the bridge MTU after rolling back a \
-                                         fabric overlay"
-                                    );
+                                    Ok(()) => {
+                                        "the fabric overlay was rolled back and the generation \
+                                         fence cleared; retry with the latest plan"
+                                    }
+                                    Err(mtu_err) => {
+                                        error!(
+                                            network_id = %req.network_id,
+                                            error = %mtu_err,
+                                            "failed to reset the bridge MTU after rolling back a \
+                                             fabric overlay"
+                                        );
+                                        "the fabric overlay was rolled back and the generation \
+                                         fence cleared, but the bridge MTU reset failed and may \
+                                         remain at the fabric value; retry with the latest plan"
+                                    }
                                 }
-                                "the fabric overlay was rolled back and the generation fence \
-                                 cleared; retry with the latest plan"
                             }
                             Err(remove_err) => {
                                 self.metrics.increment_nwd_fabric_remove("failure");

@@ -73,6 +73,13 @@ struct FabricExecutor {
     /// When set, firewall/NAT applies fail (used to drive the post-graft
     /// guard-refresh rollback on the overlay path).
     policy_apply_fails: bool,
+    /// When set, an MTU re-assert to an explicit value fails (m8 ordering).
+    mtu_reassert_fails: bool,
+    /// When set, the next fabric apply pauses after recording its call so a
+    /// test can queue a competing ensure behind the handler's fabric lock.
+    pause_apply: Arc<std::sync::atomic::AtomicBool>,
+    apply_entered: Arc<tokio::sync::Notify>,
+    apply_release: Arc<tokio::sync::Notify>,
 }
 
 impl FabricExecutor {
@@ -85,12 +92,31 @@ impl FabricExecutor {
             remove_fails: false,
             local_delete_fails: false,
             policy_apply_fails: false,
+            mtu_reassert_fails: false,
+            pause_apply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            apply_entered: Arc::new(tokio::sync::Notify::new()),
+            apply_release: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     fn with_failing_policy_apply() -> Self {
         Self {
             policy_apply_fails: true,
+            ..Self::enabled()
+        }
+    }
+
+    fn with_failing_policy_apply_and_removal() -> Self {
+        Self {
+            policy_apply_fails: true,
+            remove_fails: true,
+            ..Self::enabled()
+        }
+    }
+
+    fn with_failing_mtu_reassert() -> Self {
+        Self {
+            mtu_reassert_fails: true,
             ..Self::enabled()
         }
     }
@@ -226,11 +252,12 @@ impl NetworkExecutor for FabricExecutor {
 
     async fn set_firewall_policy(
         &self,
-        _network_id: &str,
-        _policy_version: &str,
+        network_id: &str,
+        policy_version: &str,
         _policy_json: &[u8],
         _bridge_name: &str,
     ) -> Result<(), ChvError> {
+        self.record(format!("set_firewall:{network_id}:{policy_version}"));
         if self.policy_apply_fails {
             return Err(ChvError::Internal {
                 reason: "policy apply deliberately failing".to_string(),
@@ -241,11 +268,12 @@ impl NetworkExecutor for FabricExecutor {
 
     async fn set_nat_policy(
         &self,
-        _network_id: &str,
-        _policy_version: &str,
+        network_id: &str,
+        policy_version: &str,
         _policy_json: &[u8],
         _bridge_name: &str,
     ) -> Result<(), ChvError> {
+        self.record(format!("set_nat:{network_id}:{policy_version}"));
         if self.policy_apply_fails {
             return Err(ChvError::Internal {
                 reason: "policy apply deliberately failing".to_string(),
@@ -321,6 +349,10 @@ impl NetworkExecutor for FabricExecutor {
             "apply_fabric:{network_id}:{vni}:{}:{bridge_name}",
             plan.plan_generation
         ));
+        if self.pause_apply.load(std::sync::atomic::Ordering::SeqCst) {
+            self.apply_entered.notify_one();
+            self.apply_release.notified().await;
+        }
         self.owned.lock().unwrap().insert(network_id.to_string());
         Ok(AppliedFabric {
             report: ApplyReport::default(),
@@ -411,6 +443,11 @@ impl NetworkExecutor for FabricExecutor {
             .map(|m| m.to_string())
             .unwrap_or_else(|| "none".to_string());
         self.record(format!("reassert_mtu:{network_id}:{mtu}"));
+        if self.mtu_reassert_fails && tenant_mtu.is_some() {
+            return Err(ChvError::Internal {
+                reason: "MTU re-assert deliberately failing".to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -996,6 +1033,245 @@ async fn ensure_with_fabric_rolls_back_when_the_guard_refresh_fails() {
     assert_ne!(
         replay.error_code, "STALE_GENERATION",
         "the rolled-back generation must not leave a stale fence: {replay:?}"
+    );
+    assert_ne!(
+        replay.status, "OK",
+        "the same-generation replay must not short-circuit to OK after the overlay \
+         was removed: {replay:?}"
+    );
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .any(|c| c == "apply_fabric:net-ensure-rollback:100:2:br-fab"),
+        "the older plan must be re-applied, not short-circuited: {:?}",
+        executor.calls()
+    );
+}
+
+/// When the rollback removal itself fails, the error must not claim the
+/// overlay was rolled back: the consumer veth may still be grafted and
+/// unguarded. Cover both the overlay-update and fabric-ensure paths.
+#[tokio::test]
+async fn failed_overlay_rollback_is_reported_truthfully() {
+    let executor = FabricExecutor::with_failing_policy_apply_and_removal();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-rollback-fail", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+
+    let fw = client
+        .set_firewall_policy(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-rollback-fail".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    let update = client
+        .update_overlay(UpdateOverlayRequest {
+            network_id: "net-rollback-fail".to_string(),
+            vni: 100,
+            vtep_endpoints: vec![],
+            fdb_entries: vec![],
+            fabric: fabric_plan(3, 0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let summary = &update.result.as_ref().unwrap().human_summary;
+    assert_eq!(update.result.as_ref().unwrap().status, "error");
+    assert!(
+        summary.contains("rollback FAILED") && summary.contains("unguarded"),
+        "the update error must disclose a failed rollback: {summary}"
+    );
+    assert!(
+        !summary.contains("was rolled back"),
+        "the update error must not claim a rollback that did not happen: {summary}"
+    );
+
+    // Same disclosure on the ensure path.
+    let mut newer = fabric_topology_spec("net-rollback-fail", 3);
+    newer.fabric = fabric_plan(3, 0);
+    let ensured = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(newer),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "error");
+    assert!(
+        ensured.human_summary.contains("rollback FAILED")
+            && ensured.human_summary.contains("unguarded"),
+        "the ensure error must disclose a failed rollback: {ensured:?}"
+    );
+    assert!(
+        !ensured.human_summary.contains("was rolled back"),
+        "the ensure error must not claim a rollback that did not happen: {ensured:?}"
+    );
+}
+
+/// The guard refresh must run before the m8 MTU re-assert: an MTU failure
+/// after a fabric apply must leave the overlay guarded (no rollback) rather
+/// than returning before the veth is re-scoped.
+#[tokio::test]
+async fn fabric_ensure_refreshes_the_guard_before_an_mtu_failure() {
+    let executor = FabricExecutor::with_failing_mtu_reassert();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-mtu-order", 2);
+    spec.fabric = fabric_plan(2, 1400);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+
+    let fw = client
+        .set_firewall_policy(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-mtu-order".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fw.status, "OK");
+    executor.calls.lock().unwrap().clear();
+
+    let mut newer = fabric_topology_spec("net-mtu-order", 3);
+    newer.fabric = fabric_plan(3, 1500);
+    let failed = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(newer),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(failed.status, "error");
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("set_firewall:net-mtu-order:")),
+        "the guard must be refreshed before the MTU re-assert: {:?}",
+        executor.calls()
+    );
+    assert!(
+        !executor
+            .calls()
+            .iter()
+            .any(|c| c == "remove_fabric:net-mtu-order"),
+        "an MTU failure after a successful refresh must not roll the overlay back: {:?}",
+        executor.calls()
+    );
+}
+
+/// A queued fabric ensure must re-read the topology after acquiring
+/// `fabric_ops`; otherwise it fences against a pre-lock generation and can
+/// apply an older plan over a newer one.
+#[tokio::test]
+async fn queued_fabric_ensure_rechecks_the_generation_under_the_lock() {
+    let executor = FabricExecutor::enabled();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-ensure-race", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+
+    // Pause the newer overlay update inside apply_fabric_overlay while it
+    // holds fabric_ops.
+    executor
+        .pause_apply
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut update_client = client.clone();
+    let update = tokio::spawn(async move {
+        update_client
+            .update_overlay(UpdateOverlayRequest {
+                network_id: "net-ensure-race".to_string(),
+                vni: 100,
+                vtep_endpoints: vec![],
+                fdb_entries: vec![],
+                fabric: fabric_plan(6, 0),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    executor.apply_entered.notified().await;
+
+    // Queue an older ensure: it snapshots gen 2 before blocking on the lock.
+    let mut ensure_client = client.clone();
+    let queued = tokio::spawn(async move {
+        let mut older = fabric_topology_spec("net-ensure-race", 5);
+        older.fabric = fabric_plan(5, 0);
+        ensure_client
+            .ensure_network_topology(EnsureNetworkTopologyRequest {
+                meta: None,
+                topology: Some(older),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    executor
+        .pause_apply
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    executor.apply_release.notify_one();
+    let update_result = update.await.unwrap();
+    assert_eq!(update_result.result.as_ref().unwrap().status, "OK");
+
+    let queued_result = queued.await.unwrap();
+    assert_eq!(
+        queued_result.error_code, "STALE_GENERATION",
+        "the queued ensure must fence against the generation applied while it waited: \
+         {queued_result:?}"
+    );
+    assert!(
+        !executor
+            .calls()
+            .iter()
+            .any(|c| c == "apply_fabric:net-ensure-race:100:5:br-fab"),
+        "the older plan must not be applied over the newer one: {:?}",
+        executor.calls()
     );
 }
 
