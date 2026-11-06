@@ -359,6 +359,46 @@ if awk '/^main\(\)/{m=1} m && /^        start_agent$/ && !a {a=NR} m && /seed_ad
 else
     fail "quick installer can start the agent before admin seeding (enrollment race)"
 fi
+# A re-run over a healthy install must preserve the enrolled identity: the
+# documented upgrade path is "re-run this script", and the one-time bootstrap
+# token is already consumed. Deleting the cache makes the agent re-enroll with
+# that dead token and never connect.
+grep -q '^agent_identity_usable()' "$quick_installer" \
+    && pass "quick installer can recognise a usable enrolled agent identity" \
+    || fail "quick installer cannot tell an enrolled identity from a stale cache"
+grep -qF 'elif agent_identity_usable; then' "$quick_installer" \
+    && grep -qF 'info "Existing install: enrolled agent identity preserved' "$quick_installer" \
+    && pass "quick installer preserves a healthy enrolled identity on re-run" \
+    || fail "quick installer deletes a healthy enrollment cache on re-run"
+# The agent unit's RuntimeDirectory=chv removes /run/chv on stop, so certs
+# staged before a restart are wiped. Stage them in start_agent, after the
+# stop, and never in start_services.
+start_services_body="$(awk '/^start_services\(\)/{f=1} f{print} f && /^}/{exit}' "$quick_installer")"
+start_agent_body="$(awk '/^start_agent\(\)/{f=1} f{print} f && /^}/{exit}' "$quick_installer")"
+if grep -qF 'cp "${CHV_CONFIG_DIR}/certs/agent-client.crt" /run/chv/agent/agent.crt' <<<"$start_services_body"; then
+    fail "quick installer stages the agent cert before the restart that wipes /run/chv"
+else
+    pass "quick installer no longer stages the agent cert before the restart"
+fi
+if grep -qF 'systemctl stop chv-agent' <<<"$start_agent_body" \
+    && grep -qF 'cp "${CHV_CONFIG_DIR}/certs/agent-client.crt" /run/chv/agent/agent.crt' <<<"$start_agent_body" \
+    && grep -qF 'systemctl start chv-agent' <<<"$start_agent_body"; then
+    pass "quick installer stages the agent cert after the stop and before the start"
+else
+    fail "quick installer restarts the agent after staging certs into a directory the stop removes"
+fi
+grep -q '^wait_for_daemon_sockets()' "$quick_installer" \
+    && grep -Eq '^[[:space:]]+wait_for_daemon_sockets$' "$quick_installer" \
+    && pass "quick installer waits for stord/nwd sockets before starting the agent" \
+    || fail "quick installer can start the agent before stord/nwd listen"
+# Stopping the agent removes RuntimeDirectory=chv, i.e. /run/chv/stord and
+# /run/chv/nwd too. On a re-run the stop must precede the stord/nwd restart,
+# otherwise the agent's supervisor finds no socket and spawns duplicates.
+if awk '/systemctl stop chv-agent/{s=NR} /systemctl restart chv-stord chv-nwd/{r=NR} END {exit !(s && r && s < r)}' <<<"$start_agent_body"; then
+    pass "quick installer stops the agent before restarting stord/nwd"
+else
+    fail "quick installer wipes the stord/nwd sockets before restarting them"
+fi
 
 # Exercise the real version gate, not just its presence: source the installer
 # (its B1 guard makes that side-effect free) and assert the boundary plus a

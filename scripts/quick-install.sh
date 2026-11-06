@@ -1371,6 +1371,45 @@ wait_for_controlplane_health() {
     fatal "Control plane did not become healthy within 60s. Check: journalctl -u chv-controlplane -n 50"
 }
 
+# Wait for the external stord/nwd sockets before starting the agent. The
+# agent's supervisor spawns its own stord/nwd when theirs is not listening
+# yet; those duplicates then fail to bind the metrics ports. On a fresh
+# install the admin seeding delay hides the gap. On a re-run the restart and
+# the agent start are adjacent, so the race is reachable. A timeout is a
+# warning, not a fatal: the units are up and the agent retries.
+wait_for_daemon_sockets() {
+    local attempt=1
+    while [ "$attempt" -le 30 ]; do
+        if [ -S /run/chv/stord/api.sock ] && [ -S /run/chv/nwd/api.sock ]; then
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    warn "stord/nwd sockets did not appear within 30s; starting the agent anyway."
+}
+
+# True when the agent cache records a completed enrollment and the durable
+# certificate, key, and CA it references are present. A non-fresh run must
+# preserve this identity: the documented upgrade path is "re-run this
+# script", and the one-time bootstrap token was consumed by the first
+# enrollment, so deleting the cache would leave the agent unable to
+# re-enroll (it then keeps the pre-enrollment CN=chv-agent certificate and
+# every publish is rejected). Only a missing/incomplete cache or missing
+# certs trigger a fresh token below.
+agent_identity_usable() {
+    local cache="${CHV_DATA_DIR}/cache/agent-cache.json"
+    local cert key ca
+    [ -s "$cache" ] || return 1
+    grep -Eq '"enrollment_complete"[[:space:]]*:[[:space:]]*true' "$cache" || return 1
+    cert=$(sed -n 's/.*"certificate_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cache")
+    key=$(sed -n 's/.*"private_key_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cache")
+    ca=$(sed -n 's/.*"ca_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cache")
+    [ -n "$cert" ] && [ -f "$cert" ] || return 1
+    [ -n "$key" ] && [ -f "$key" ] || return 1
+    [ -n "$ca" ] && [ -f "$ca" ] || return 1
+}
+
 start_services() {
     info "Enabling and starting CHV services..."
 
@@ -1389,21 +1428,23 @@ start_services() {
 
     if [ "$FRESH_INSTALL" = "1" ]; then
         seed_bootstrap_token
+        # A fresh install mints a new node_id, JWT secret, and bootstrap
+        # token. Drop any legacy cache so the agent cannot resume an
+        # identity that belongs to the replaced configuration.
+        rm -f "${CHV_DATA_DIR}/cache/agent-cache.json"
+    elif agent_identity_usable; then
+        info "Existing install: enrolled agent identity preserved (config and token unchanged)."
     else
-        info "Existing install: bootstrap token left as-is (config preserved)."
+        # The cached identity is absent, incomplete, or its durable certs are
+        # gone. Starting the agent with that cache would either make it exit
+        # on missing TLS credentials or re-enroll with the one-time token the
+        # first enrollment already consumed. Clear it and mint a fresh token
+        # so the documented "re-run this script" upgrade path re-enrolls.
+        info "Existing install: no usable enrolled agent identity; re-enrolling."
+        rm -f "${CHV_DATA_DIR}/cache/agent-cache.json"
+        create_bootstrap_token
+        seed_bootstrap_token
     fi
-
-    # Delete only the legacy enrollment cache; Core state is retained.
-    rm -f "${CHV_DATA_DIR}/cache/agent-cache.json"
-
-    # Pre-place the agent client cert so mTLS works immediately (idempotent:
-    # /run is tmpfs, so this also restores the certs after a reboot+rerun).
-    mkdir -p /run/chv/agent
-    cp "${CHV_CONFIG_DIR}/certs/agent-client.crt" /run/chv/agent/agent.crt
-    cp "${CHV_CONFIG_DIR}/certs/agent-client.key" /run/chv/agent/agent.key
-    cp "${CHV_CONFIG_DIR}/certs/ca.crt" /run/chv/agent/ca.crt
-    chown "$CHV_USER":"$CHV_USER" /run/chv/agent/agent.crt /run/chv/agent/agent.key /run/chv/agent/ca.crt
-    chmod 640 /run/chv/agent/agent.key
 
     # Storage ownership contract (matches the .deb postinst, #323):
     # storage dirs chv:chv-stord 0770.
@@ -1420,10 +1461,10 @@ start_services() {
     systemctl enable chv-stord chv-nwd chv-agent
     if [ "$FRESH_INSTALL" = "1" ]; then
         systemctl start chv-stord chv-nwd
-    else
-        systemctl restart chv-stord chv-nwd 2>/dev/null \
-            || systemctl start chv-stord chv-nwd
+        wait_for_daemon_sockets
     fi
+    # A re-run restarts the agent in start_agent; it must stop the agent
+    # before restarting stord/nwd (see the RuntimeDirectory note there).
 
     if [ ! -e /dev/kvm ]; then
         warn "/dev/kvm is not present (no KVM, or a container without device passthrough)."
@@ -1445,12 +1486,31 @@ start_services() {
 # the agent after the offline writes removes the race instead of narrowing
 # it.
 start_agent() {
-    info "Starting the local agent..."
     if [ "$FRESH_INSTALL" = "1" ]; then
-        systemctl start chv-agent
+        info "Starting the local agent..."
     else
-        systemctl restart chv-agent 2>/dev/null || systemctl start chv-agent
+        info "Restarting the local agent..."
+        # Stop first: the unit's RuntimeDirectory=chv is removed on stop,
+        # which deletes both the certs staged here and the stord/nwd sockets
+        # (they live under /run/chv). Restart stord/nwd afterwards so their
+        # sockets exist before the agent's supervisor looks for them;
+        # otherwise it spawns duplicates that collide on the metrics ports.
+        systemctl stop chv-agent 2>/dev/null || true
+        systemctl restart chv-stord chv-nwd 2>/dev/null \
+            || systemctl start chv-stord chv-nwd
+        wait_for_daemon_sockets
     fi
+
+    # Pre-place the agent client cert so mTLS works on the first attempt.
+    # /run is tmpfs, so this also restores the certs after a reboot.
+    mkdir -p /run/chv/agent
+    cp "${CHV_CONFIG_DIR}/certs/agent-client.crt" /run/chv/agent/agent.crt
+    cp "${CHV_CONFIG_DIR}/certs/agent-client.key" /run/chv/agent/agent.key
+    cp "${CHV_CONFIG_DIR}/certs/ca.crt" /run/chv/agent/ca.crt
+    chown "$CHV_USER":"$CHV_USER" /run/chv/agent/agent.crt /run/chv/agent/agent.key /run/chv/agent/ca.crt
+    chmod 640 /run/chv/agent/agent.key
+
+    systemctl start chv-agent
 }
 
 # Best-effort bounded wait for the local agent's enrollment. Read-only
