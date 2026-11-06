@@ -36,7 +36,7 @@ CHV is a Linux-first, cloud-image-first virtualization platform for sovereign pr
 
 ## Current Phase
 
-**Version:** `0.4.0` (release candidate `v0.4.0-rc.3`)  
+**Version:** `0.4.0` (release candidate `v0.4.0-rc.4`)  
 **Phase:** Early-to-MVP transitioning to stability  
 
 The project has a solid Phase 1 foundation (Rust control plane, SQLite store, certificate enrollment, gRPC services) and a functional SvelteKit Web UI. Active work is tracked in the [Phased Implementation Plan](./PHASED_IMPLEMENTATION_PLAN.md) covering stability hardening, feature completion, and production readiness.
@@ -118,8 +118,8 @@ The qualified deployment path is the all-in-one installer on a fresh Ubuntu amd6
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
 
 # Pin a release instead of resolving the latest stable (the current release
-# candidate is 0.4.0-rc.3; 0.3.0 remains the latest stable):
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.3 bash -s
+# candidate is 0.4.0-rc.4; 0.3.0 remains the latest stable):
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.4 bash -s
 ```
 
 The installer requires **bash** (it uses `set -o pipefail`); do not replace `bash -s` with `sh -`.

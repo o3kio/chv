@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.4] - 2026-11-06
+
+### Fixed
+- **Quick-install data loss (blocker; #725).** `scripts/quick-install.sh`
+  seeded the bootstrap admin (the idempotency `SELECT` and the `INSERT`) with
+  the `sqlite3` CLI after `start_services`, while `chv-controlplane` was
+  running. As in the #722 install defect, the CLI checkpointed and unlinked
+  `controlplane.db-wal`/`-shm` when it closed, while the live service kept
+  those inodes open. Every API write acknowledged afterwards — the documented
+  first-login password rotation, created users, configuration and audit
+  writes — went into the unlinked WAL and was lost on the next restart or
+  upgrade. Reproduced on the published `v0.4.0-rc.3` quick installer: four
+  `controlplane.db-wal (deleted)` and one `controlplane.db-shm (deleted)`
+  handles, `POST /v1/auth/change-password` returned 200 and the new password
+  logged in, then 401 after `systemctl restart chv-controlplane`; a created
+  user was gone.
+  The quick installer now uses `chv_sqlite_offline` (stop → write as `chv` →
+  start → wait for `/health`) for the admin check and insert, matching
+  `scripts/install.sh`, and reads enrollment from a snapshot copy of the
+  database instead of opening the live WAL. A failed read or restart is now
+  fatal, instead of a silent success with the control plane down. No schema,
+  migration, or runtime-binary change.
+> **`v0.4.0-rc.3`'s quick installer has this defect.** The rc.3 tarball and
+> package install path (`scripts/install.sh`) is fixed (#722), but the
+> quick-install script at the rc.3 tag is not. Do not use the rc.3 quick
+> installer for a new install; rc.3 remains published and is not rewritten.
+
+### Qualification
+- **Candidate-mode quick leg (#725).** `fresh-host.sh` gained
+  `--quick-install-candidate`; the workflow sets it when the dispatched tag
+  equals the quick-install version. A post-publication run that installs
+  `0.4.0-rc.4` (the binaries report the base `0.4.0`) now runs
+  `check_bringup` **and** `check_credential_persistence` instead of the
+  weaker previous-release assertions. The rc.3 quick leg did not run the
+  persistence gate, which is how the defect escaped that lane.
+- Offline invariants pin the quick installer's admin check, admin seed, and
+  enrollment snapshot to the offline/snapshot helpers; reverting only the
+  idempotency read now fails the suite.
+
 ## [0.4.0-rc.3] - 2026-11-06
 
 ### Fixed
