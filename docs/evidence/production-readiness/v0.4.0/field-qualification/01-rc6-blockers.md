@@ -374,11 +374,13 @@ the agent or CH, multi-host/Volvisor work, and any change to a published tag.
 
 No field-window day has run. No stable tag exists. This report is pre-window
 blocker evidence, not a field result. The rc.6 artifacts remain published and
-their digests are unchanged; the rc.6 tag is not rewritten. rc.7 is being cut
-as the successor and its release notes/support matrix mark rc.6 as disqualified
-and superseded; this profile is re-pinned to rc.7, but its artifact digests and
-clean-install re-run are pending publication. Nothing in this report claims
-that rc.7 fixes the defects on a published artifact until that run exists.
+their digests are unchanged; the rc.6 tag is not rewritten. rc.7 was published
+on 2026-11-06 as the successor and then disqualified by its own pre-window
+drill (B8/B9, Part 2); it is not rewritten and its clean-install re-run was
+never completed. rc.8 is the approved successor; its artifact identity is
+recorded in the profile after publication, and the rc.8 clean-install and
+upgrade drills run before the window opens. Nothing in this report claims that
+rc.7 fixes the defects on a published artifact.
 
 ## Evidence index
 
