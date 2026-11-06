@@ -233,10 +233,15 @@ def check(root: Path) -> list[str]:
                     continue
                 if not DESTRUCTIVE_CLEANUP.search(line):
                     continue
+                # dnsmasq keeps per-network DHCP leases under /run/chv/nwd and
+                # those are runtime files that cleanup must remove. They are
+                # not the Core runtime authority lease. Strip only dnsmasq
+                # tokens so a line that also targets Core state still fails.
+                checked = re.sub(r"\S*dnsmasq-\S*", "", line)
                 if (
-                    PERSISTENT_LEASE_TOKEN in line
-                    or LEASE_GLOB.search(line)
-                    or LEASE_PARENT_TARGET.search(line)
+                    PERSISTENT_LEASE_TOKEN in checked
+                    or LEASE_GLOB.search(checked)
+                    or LEASE_PARENT_TARGET.search(checked)
                 ):
                     errors.append(
                         f"{path.relative_to(root)}:{line_number}: package cleanup must preserve "

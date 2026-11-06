@@ -185,6 +185,35 @@ class ArchitectureGuardTests(unittest.TestCase):
                 any("persistent Core runtime authority lease" in error for error in GUARD.check(root))
             )
 
+    def test_dnsmasq_runtime_leases_may_be_cleaned_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copy_baseline(root)
+            path = root / "scripts/install.sh"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                'rm -f "${CHV_RUN_DIR}"/nwd/dnsmasq-*.leases\n',
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                any("persistent Core runtime authority lease" in error for error in GUARD.check(root))
+            )
+
+    def test_dnsmasq_exception_does_not_hide_a_core_lease_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copy_baseline(root)
+            path = root / "scripts/install.sh"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                'rm -f "${CHV_RUN_DIR}"/nwd/dnsmasq-*.leases '
+                '/var/lib/chv/agent/.core.db.cellhv-runtime-authority.lease\n',
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                any("persistent Core runtime authority lease" in error for error in GUARD.check(root))
+            )
+
     def test_undeclared_store_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
