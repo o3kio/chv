@@ -66,8 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped and before the identity is regenerated, `--wipe` now removes
   `core.db` plus its WAL/SHM/journal, the
   `.core.db.cellhv-runtime-authority.lease`, the `node-cache-v1.archive`,
-  and its authority lock. Other agent state (certificates) is untouched;
-  normal stop/restart never removes these paths.
+  and its authority lock. `--wipe` is otherwise a full teardown: it also
+  removes `/etc/chv` (including its certificates) and the legacy agent
+  certificate copies. The authority-state step is scoped to those seven
+  paths, and normal stop/restart never removes them.
 - **The install record named the wrong version (operational truth defect;
   B7).** In local release-directory/tarball mode the installer printed
   `Version: 0.3.0` and wrote that line into the rc.6 install transcript while

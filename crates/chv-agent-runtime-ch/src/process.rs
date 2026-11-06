@@ -1680,7 +1680,10 @@ impl ProcessCloudHypervisorAdapter {
         api_socket: &std::path::Path,
         boot: Option<(u16, &str)>,
     ) -> Result<(), ChvError> {
-        let expected = api_socket.parent().and_then(requested_nic_count);
+        let expected = match api_socket.parent() {
+            Some(vm_dir) => requested_nic_count(vm_dir).await,
+            None => None,
+        };
         let boot_failed = boot.is_some_and(|(status, _)| status != 200 && status != 204);
         let nic_check_required = expected.is_some_and(|count| count > 0);
         if !boot_failed && !nic_check_required {
@@ -3973,8 +3976,10 @@ fn start_vm_action(state: &str) -> StartVmAction {
 /// legacy state (a missing payload already degrades restart to a
 /// re-create-required error in `respawn_vmm`). A payload without a `net` key
 /// is a VM created with zero NICs.
-fn requested_nic_count(vm_dir: &std::path::Path) -> Option<usize> {
-    let body = std::fs::read_to_string(vm_config_file(vm_dir)).ok()?;
+async fn requested_nic_count(vm_dir: &std::path::Path) -> Option<usize> {
+    let body = tokio::fs::read_to_string(vm_config_file(vm_dir))
+        .await
+        .ok()?;
     let payload: serde_json::Value = serde_json::from_str(&body).ok()?;
     Some(
         payload

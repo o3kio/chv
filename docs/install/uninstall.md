@@ -109,7 +109,10 @@ state and the control-plane database, removes `/etc/chv` (so the node identity
 is regenerated), and — from rc.7 — removes the identity-bound Core authority
 state (`core.db`, its WAL/SHM/journal, `.core.db.cellhv-runtime-authority.lease`,
 `node-cache-v1.archive`, and its authority lock) after every Core writer is
-stopped. Other agent state such as certificates is untouched. It then installs
+stopped. That step is scoped to those files and never runs on a normal
+stop/restart, but `--wipe` is a full destructive teardown: it also removes
+`/etc/chv` (including its certificates) and the legacy agent certificate
+copies, so back up any PKI/enrollment material you must keep. It then installs
 fresh. Two consecutive `--wipe` installs must both reach `TenantReady`;
 retaining the old Core store while regenerating `agent.toml` made the second
 install crash-loop on `Identity(Conflict)` (rc.6 blocker B5).

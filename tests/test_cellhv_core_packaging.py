@@ -191,10 +191,28 @@ class CellHvCorePackagingTests(unittest.TestCase):
         owner = re.search(
             r"assert_single_gateway_owner\(\) \{(.*?)\n\}", installer, re.S
         ).group(1)
-        self.assertIn("$4 == gw", owner)
+        self.assertIn("index($4, gw) == 1", owner)
         self.assertIn("sort -u", owner)
         self.assertIn("-ne 1", owner)
         self.assertIn("fatal", owner)
+
+        # Exercise the match against real `ip -o -4 addr show` shape. `$4` is
+        # `addr/prefix`, so an equality test against `10.200.0.1/` never
+        # matches; the prefix guard must select only the exact gateway and
+        # reject the look-alike 10.200.0.10.
+        sample = (
+            "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
+            "2: chvbr0    inet 10.200.0.10/24 brd 10.200.0.255 scope global chvbr0\\       valid_lft forever\n"
+            "3: br-eac31935dc4f    inet 10.200.0.1/24 brd 10.200.0.255 scope global br-eac31935dc4f\\       valid_lft forever\n"
+        )
+        result = subprocess.run(
+            ["awk", "-v", "gw=10.200.0.1/", "index($4, gw) == 1 { print $2 }"],
+            input=sample,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.split(), ["br-eac31935dc4f"])
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required")
     def test_local_release_directory_reports_the_artifact_version(self):

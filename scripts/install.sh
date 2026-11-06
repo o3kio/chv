@@ -1458,7 +1458,7 @@ assert_single_gateway_owner() {
     owners=""
     for ((attempt = 1; attempt <= 60; attempt++)); do
         owners=$(ip -o -4 addr show 2>/dev/null \
-            | awk -v gw="${gateway_ip}/" '$4 == gw { print $2 }' \
+            | awk -v gw="${gateway_ip}/" 'index($4, gw) == 1 { print $2 }' \
             | sort -u)
         [ -n "$owners" ] && break
         sleep 1
