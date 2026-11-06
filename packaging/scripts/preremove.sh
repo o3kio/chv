@@ -110,7 +110,7 @@ chv_network_ids() {
                 | awk '{print $1}' \
                 | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p' || true
         fi
-    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u
+    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u || true
 }
 
 chv_network_cidr() {
@@ -126,7 +126,9 @@ chv_network_cidr() {
         # the service user exactly as chv_network_ids does (issue #669).
         chown chv:chv "$CHV_DB_PATH-wal" "$CHV_DB_PATH-shm" 2>/dev/null || true
     fi
-    printf '%s\n' "$net_cidr" | awk 'NF { print $1; exit }'
+    printf '%s\n' "$net_cidr" \
+        | awk 'NF { print $1; exit }' \
+        | grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' || true
 }
 
 # Remove one CHV bridge plus the host state that would recreate or outlive it:
@@ -164,12 +166,12 @@ remove_chv_bridge_and_nat() {
                 iptables -t nat -S POSTROUTING 2>/dev/null \
                     | awk -v b="! -o $1 " 'index($0, b) {
                         for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
-                    }'
+                    }' || true
             fi
             if [ -f "$rules_file" ]; then
                 awk -v b="! -o $1 " 'index($0, b) {
                     for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
-                }' "$rules_file"
+                }' "$rules_file" || true
             fi
             # Union, not a precedence chain: a stale `! -o` rule must not hide
             # the route or the database hint for the current `! -d` form.
@@ -179,7 +181,7 @@ remove_chv_bridge_and_nat() {
             if [ -n "$hint" ]; then
                 printf '%s\n' "$hint"
             fi
-        } | sort -u
+        } | sort -u || true
     )"
 
     for cidr in $cidrs; do

@@ -621,8 +621,10 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "    printf '%s\\n' 10.205.0.0/24 ;;\n"
                 "  *\"SELECT cidr FROM network_desired_state WHERE network_id = 'default'\"*)\n"
                 "    printf '%s\\n' 10.200.0.0/24 ;;\n"
+                "  *\"SELECT cidr FROM network_desired_state WHERE network_id = 'badcidr'\"*)\n"
+                "    printf '%s\\n' '10.211.0.0/24; touch /tmp/chv-pwned' ;;\n"
                 '  *"SELECT network_id FROM network_desired_state"*)\n'
-                "    printf '%s\\n' dbonly gonecur ;;\n"
+                "    printf '%s\\n' dbonly gonecur badcidr ;;\n"
                 "  *) : ;;\n"
                 "esac\n"
             )
@@ -706,6 +708,15 @@ class CellHvCorePackagingTests(unittest.TestCase):
             calls,
             relative,
         )
+        # A free-text database cidr is not trusted: the id is still torn
+        # down, but the invalid hint never reaches iptables.
+        self.assertIn("ip link del dev br-badcidr", calls, relative)
+        self.assertIn("nft delete table inet chv-badcidr", calls, relative)
+        self.assertNotIn("10.211.0.0/24", calls, relative)
+        self.assertFalse(
+            pathlib.Path("/tmp/chv-pwned").exists(),
+            "a cidr hint must never execute as shell",
+        )
         self.assertNotIn("10.205.0.0/24", persisted, relative)
         self.assertIn(
             "-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE", persisted, relative
@@ -719,11 +730,19 @@ class CellHvCorePackagingTests(unittest.TestCase):
             relative,
         )
         self.assertIn("netfilter-persistent save", calls, relative)
-        if relative == "packaging/scripts/preremove.sh":
-            # A root sqlite3 open can create root-owned WAL sidecars; the
-            # preremove path hands them back to the service user.
-            self.assertIn("chown chv:chv", calls, relative)
-            self.assertIn("controlplane.db-wal", calls, relative)
+        # A root sqlite3 open can create root-owned WAL sidecars. Both the
+        # id lookup and the new cidr lookup hand them back to the service
+        # user (the id lookup runs before any SELECT cidr). The bash copies
+        # derive the owner from $CHV_USER; preremove.sh hardcodes `chv`.
+        owner = (
+            "chv:chv"
+            if relative == "packaging/scripts/preremove.sh"
+            else "chv-no-such-user:chv-no-such-user"
+        )
+        self.assertGreaterEqual(calls.count(f"chown {owner}"), 2, relative)
+        before_cidr, after_cidr = calls.split("SELECT cidr", 1)
+        self.assertIn(f"chown {owner}", before_cidr, relative)
+        self.assertIn(f"chown {owner}", after_cidr, relative)
 
     def _assert_install_baseline_cidr_fallback(self):
         # install.sh writes the baseline NAT rule from INSTALL_CHV_BRIDGE_CIDR.
@@ -776,7 +795,15 @@ class CellHvCorePackagingTests(unittest.TestCase):
                         "  *) exit 0 ;;\n"
                         "esac\n"
                     )
-                    for tool in (ip, nft, iptables):
+                    # delete_chv_network_state ends with
+                    # `netfilter-persistent save`; never let a sandbox run
+                    # rewrite the host's persisted iptables rules.
+                    netfilter_persistent = bin_dir / "netfilter-persistent"
+                    netfilter_persistent.write_text(
+                        "#!/bin/bash\n"
+                        f"printf 'netfilter-persistent %s\\n' \"$*\" >> {log}\n"
+                    )
+                    for tool in (ip, nft, iptables, netfilter_persistent):
                         tool.chmod(0o755)
                     script = (
                         "set -euo pipefail\n"
@@ -802,6 +829,9 @@ class CellHvCorePackagingTests(unittest.TestCase):
                         text=True,
                     )
                     calls = log.read_text()
+                    # If the sandbox were missing the fake, the host's real
+                    # netfilter-persistent would run and leave no log entry.
+                    self.assertIn("netfilter-persistent save", calls)
                 self.assertIn(
                     f"iptables -t nat -C POSTROUTING -s {expected} "
                     f"! -d {expected} -j MASQUERADE",
@@ -843,7 +873,17 @@ class CellHvCorePackagingTests(unittest.TestCase):
                         "fi\n"
                     )
                     nft.chmod(0o755)
+                    # A failing sort must not discard the ids it already
+                    # received. Under pipefail it would otherwise abort
+                    # preremove's `chv_network_ids | while` teardown.
+                    sort_tool = bin_dir / "sort"
+                    sort_tool.write_text(
+                        "#!/bin/bash\n"
+                        "cat\n"
+                        "exit 1\n"
+                    )
                     ip.chmod(0o755)
+                    sort_tool.chmod(0o755)
                     script = (
                         "set -euo pipefail\n"
                         'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
@@ -866,6 +906,106 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 ids = result.stdout.split()
                 self.assertIn("deadbeef", ids, relative)
                 self.assertIn("default", ids, relative)
+
+    def test_network_sweep_survives_failing_nft(self):
+        # The final orphan-table sweep re-lists nft tables. If that listing
+        # prints a row and then exits non-zero, pipefail would abort the whole
+        # teardown before the table is deleted unless the pipeline is guarded.
+        for relative in (
+            "scripts/install.sh",
+            "scripts/quick-install.sh",
+            "packaging/scripts/preremove.sh",
+        ):
+            with self.subTest(script=relative):
+                source = (ROOT / relative).read_text()
+                functions = "\n".join(
+                    re.search(rf"^{name}\(\) \{{.*?\n\}}", source, re.S | re.M).group(0)
+                    for name in (
+                        "chv_bridge_name_for_network",
+                        "chv_network_ids",
+                        "chv_network_cidr",
+                        "remove_chv_bridge_and_nat",
+                        "delete_chv_network_state",
+                    )
+                )
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = pathlib.Path(tmp)
+                    bin_dir = tmp_path / "bin"
+                    bin_dir.mkdir()
+                    log = tmp_path / "calls.log"
+                    log.write_text("")
+                    count = tmp_path / "nft-list.count"
+                    etc = tmp_path / "etc"
+                    (etc / "sysctl.d").mkdir(parents=True)
+                    rules = tmp_path / "rules.v4"
+                    rules.write_text("*nat\nCOMMIT\n")
+
+                    nft = bin_dir / "nft"
+                    nft.write_text(
+                        "#!/bin/bash\n"
+                        "printf 'nft %s\\n' \"$*\" >> " + str(log) + "\n"
+                        'if [ "$1 $2" = "list tables" ]; then\n'
+                        "  n=$(cat " + str(count) + " 2>/dev/null || echo 0)\n"
+                        "  n=$((n + 1)); printf '%s\\n' \"$n\" > " + str(count) + "\n"
+                        # First listing (id discovery) is empty and succeeds;
+                        # the sweep listing prints a table and then fails.
+                        '  if [ "$n" -ge 2 ]; then\n'
+                        "    printf '%s\\n' 'table inet chv-orphan'\n"
+                        "    printf '%s\\n' 'table ip filter'\n"
+                        "    exit 1\n"
+                        "  fi\n"
+                        "fi\n"
+                        "exit 0\n"
+                    )
+                    ip = bin_dir / "ip"
+                    ip.write_text("#!/bin/bash\nexit 0\n")
+                    iptables = bin_dir / "iptables"
+                    iptables.write_text(
+                        "#!/bin/bash\n"
+                        "printf 'iptables %s\\n' \"$*\" >> " + str(log) + "\n"
+                        'if [ "$3" = "-C" ]; then exit 1; fi\n'
+                        "exit 0\n"
+                    )
+                    # The sweep runs the full teardown; never let it call
+                    # the host's real netfilter-persistent.
+                    netfilter_persistent = bin_dir / "netfilter-persistent"
+                    netfilter_persistent.write_text(
+                        "#!/bin/bash\n"
+                        f"printf 'netfilter-persistent %s\\n' \"$*\" >> {log}\n"
+                    )
+                    for tool in (nft, ip, iptables, netfilter_persistent):
+                        tool.chmod(0o755)
+
+                    script = (
+                        "set -euo pipefail\n"
+                        'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
+                        'have() { command -v "$1" >/dev/null 2>&1; }\n'
+                        "CHV_DB_PATH=/nonexistent.db\n"
+                        "CHV_USER=chv-no-such-user\n"
+                        "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
+                        "INSTALL_CHV_BRIDGE_CIDR=10.200.0.1/24\n"
+                        f"CHV_HOST_ETC='{etc}'\n"
+                        f"CHV_IPTABLES_RULES_V4='{rules}'\n"
+                        f"{functions}\n"
+                        "delete_chv_network_state\n"
+                    )
+                    subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
+                            os.environ,
+                            PATH=f"{bin_dir}:{os.environ['PATH']}",
+                        ),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    calls = log.read_text()
+                self.assertIn(
+                    "nft delete table inet chv-orphan", calls, relative
+                )
+                self.assertIn("netfilter-persistent save", calls, relative)
+                # A non-CHV table is never touched.
+                self.assertNotIn("nft delete table inet filter", calls, relative)
 
     def _assert_preremove_upgrade_is_a_noop(self):
         # dpkg/rpm call preremove.sh with `upgrade` (or `1`) on upgrade. The

@@ -336,6 +336,9 @@ chv_network_ids() {
                     "SELECT network_id FROM network_desired_state;" 2>/dev/null || true
                 sqlite3 "${CHV_DB_PATH}" \
                     "SELECT network_id FROM networks;" 2>/dev/null || true
+                # A root sqlite3 open can leave root-owned WAL sidecars.
+                chown "$CHV_USER:$CHV_USER" \
+                    "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" 2>/dev/null || true
             fi
         fi
         if cmd_exists nft; then
@@ -352,7 +355,7 @@ chv_network_ids() {
                 | awk '{print $1}' \
                 | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p' || true
         fi
-    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u
+    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u || true
 }
 
 chv_network_cidr() {
@@ -368,9 +371,13 @@ chv_network_cidr() {
         else
             net_cidr="$(sqlite3 "${CHV_DB_PATH}" \
                 "SELECT cidr FROM network_desired_state WHERE network_id = '$net_id';" 2>/dev/null || true)"
+            chown "$CHV_USER:$CHV_USER" \
+                "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" 2>/dev/null || true
         fi
     fi
-    printf '%s\n' "$net_cidr" | awk 'NF { print $1; exit }'
+    printf '%s\n' "$net_cidr" \
+        | awk 'NF { print $1; exit }' \
+        | grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' || true
 }
 
 # Remove one CHV bridge plus the host state that would recreate or outlive it:
