@@ -135,6 +135,22 @@ remove_chv_bridge_and_nat() {
         ip link del dev "$1" 2>/dev/null || true
     fi
 
+    # A bridge can already be gone (residue from a failed install/removal)
+    # while its NAT rules survive. Recover the CIDR from a rule that still
+    # names this bridge; otherwise the live rule is missed and the
+    # netfilter-persistent save below re-persists it.
+    if [ -z "$cidr" ] && have iptables; then
+        cidr="$(iptables -t nat -S POSTROUTING 2>/dev/null \
+            | awk -v b="! -o $1 " 'index($0, b) {
+                for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit }
+            }')"
+    fi
+    if [ -z "$cidr" ] && [ -f "$rules_file" ]; then
+        cidr="$(awk -v b="! -o $1 " 'index($0, b) {
+            for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit }
+        }' "$rules_file")"
+    fi
+
     if [ -n "$cidr" ] && have iptables; then
         while iptables -t nat -C POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null; do
             iptables -t nat -D POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null || break
@@ -142,14 +158,15 @@ remove_chv_bridge_and_nat() {
         while iptables -t nat -C POSTROUTING -s "$cidr" ! -o "$1" -j MASQUERADE 2>/dev/null; do
             iptables -t nat -D POSTROUTING -s "$cidr" ! -o "$1" -j MASQUERADE 2>/dev/null || break
         done
-        if [ -f "$rules_file" ]; then
-            awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
-                -v o="-A POSTROUTING -s $cidr ! -o $1 -j MASQUERADE" \
-                '$0 != d && $0 != o' "$rules_file" \
-                > "${rules_file}.chv-clean" \
-                && mv "${rules_file}.chv-clean" "$rules_file" \
-                || rm -f "${rules_file}.chv-clean"
-        fi
+    fi
+
+    if [ -n "$cidr" ] && [ -f "$rules_file" ]; then
+        awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
+            -v o="-A POSTROUTING -s $cidr ! -o $1 -j MASQUERADE" \
+            '$0 != d && $0 != o' "$rules_file" \
+            > "${rules_file}.chv-clean" \
+            && mv "${rules_file}.chv-clean" "$rules_file" \
+            || rm -f "${rules_file}.chv-clean"
     fi
 
     # Persistent bridge configuration: install.sh writes a networkd netdev/
@@ -222,6 +239,9 @@ if [ "$ACTION" = "remove" ]; then
     # so an unrelated cloud-hypervisor on the host is never signalled. The
     # path is the chv-config state-dir default (/var/lib/chv/agent/vms/); a
     # custom CHV_DATA_DIR would need this matcher updated in lockstep.
+    if ! have ps; then
+        echo "chv preremove: ps not found; running CHV VMMs cannot be discovered and will be left running" >&2
+    fi
     vmm_pids="$(ps -eo pid=,comm=,args= 2>/dev/null | awk '
         ($2 == "cloud-hyperviso" || $2 == "cloud-hypervisor") &&
         $0 ~ /\/var\/lib\/chv\/agent\/vms\// { print $1 }')"

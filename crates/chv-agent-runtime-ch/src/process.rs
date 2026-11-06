@@ -2944,7 +2944,7 @@ impl ProcessCloudHypervisorAdapter {
             // would burn the full `TimeoutStopSec` and systemd would
             // SIGKILL the agent (under the old `KillMode=mixed`, the
             // VMs with it) — the exact opposite of this hook's contract.
-            // SHUT_RD is description-level, so it also wakes
+            // shutdown(2) applies to the socket, so it also wakes
             // the readers' dups: their reads return EOF, the broadcaster
             // observes the draining latch, and the runtime can drop.
             // Buffered output was drained above, before the read side is

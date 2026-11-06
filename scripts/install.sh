@@ -362,11 +362,13 @@ chv_network_ids() {
 # exact.
 remove_chv_bridge_and_nat() {
     local bridge="$1" cidr tap f rules_file
+    rules_file="${CHV_IPTABLES_RULES_V4:-${CHV_HOST_ETC}/iptables/rules.v4}"
     if cmd_exists ip; then
         # The kernel route carries the network CIDR without re-deriving it
-        # from the address/prefix.
+        # from the address/prefix. `|| true`: ip exits 1 when the bridge is
+        # already gone, and these scripts run with pipefail.
         cidr="$(ip -o -4 route show dev "$bridge" proto kernel scope link 2>/dev/null \
-            | awk '{print $1; exit}')"
+            | awk '{print $1; exit}' || true)"
         for tap in $(ip -o link show master "$bridge" 2>/dev/null \
             | awk -F': ' '{print $2}' | cut -d@ -f1 \
             | grep '^tap-[0-9a-f]\{8\}$' || true); do
@@ -376,6 +378,22 @@ remove_chv_bridge_and_nat() {
         ip link del dev "$bridge" 2>/dev/null || true
     fi
 
+    # A bridge can already be gone (residue from a failed install/removal)
+    # while its NAT rules survive. Recover the CIDR from a rule that still
+    # names this bridge; otherwise the live rule is missed and the
+    # netfilter-persistent save below re-persists it.
+    if [ -z "${cidr:-}" ] && cmd_exists iptables; then
+        cidr="$(iptables -t nat -S POSTROUTING 2>/dev/null \
+            | awk -v b="! -o $bridge " 'index($0, b) {
+                for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit }
+            }' || true)"
+    fi
+    if [ -z "${cidr:-}" ] && [ -f "$rules_file" ]; then
+        cidr="$(awk -v b="! -o $bridge " 'index($0, b) {
+            for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); exit }
+        }' "$rules_file" || true)"
+    fi
+
     if [ -n "${cidr:-}" ] && cmd_exists iptables; then
         while iptables -t nat -C POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null; do
             iptables -t nat -D POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null || break
@@ -383,15 +401,15 @@ remove_chv_bridge_and_nat() {
         while iptables -t nat -C POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null; do
             iptables -t nat -D POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null || break
         done
-        rules_file="${CHV_IPTABLES_RULES_V4:-${CHV_HOST_ETC}/iptables/rules.v4}"
-        if [ -f "$rules_file" ]; then
-            awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
-                -v o="-A POSTROUTING -s $cidr ! -o $bridge -j MASQUERADE" \
-                '$0 != d && $0 != o' "$rules_file" \
-                > "${rules_file}.chv-clean" \
-                && mv "${rules_file}.chv-clean" "$rules_file" \
-                || rm -f "${rules_file}.chv-clean"
-        fi
+    fi
+
+    if [ -n "${cidr:-}" ] && [ -f "$rules_file" ]; then
+        awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
+            -v o="-A POSTROUTING -s $cidr ! -o $bridge -j MASQUERADE" \
+            '$0 != d && $0 != o' "$rules_file" \
+            > "${rules_file}.chv-clean" \
+            && mv "${rules_file}.chv-clean" "$rules_file" \
+            || rm -f "${rules_file}.chv-clean"
     fi
 
     # Persistent bridge configuration: install.sh writes a networkd netdev/
@@ -446,7 +464,7 @@ delete_chv_network_state() {
             | sed -n 's/^table inet \(chv-[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' \
             | while IFS= read -r table; do
                 nft delete table inet "$table" 2>/dev/null || true
-            done
+            done || true
     fi
 }
 

@@ -284,6 +284,10 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE\n"
                 "POSTROUTING -s 10.202.0.0/24 ! -d 10.202.0.0/24 -j MASQUERADE\n"
                 "POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE\n"
+                # `br-gone` is absent from the live links below, so only the
+                # NAT rules that still name it can identify the CIDR.
+                "POSTROUTING -s 10.204.0.0/24 ! -d 10.204.0.0/24 -j MASQUERADE\n"
+                "POSTROUTING -s 10.204.0.0/24 ! -o br-gone -j MASQUERADE\n"
             )
 
             # A persisted-rules file with CHV lines and one that belongs to
@@ -295,6 +299,8 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "-A POSTROUTING -s 10.200.0.0/24 ! -o chvbr0 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.204.0.0/24 ! -d 10.204.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.204.0.0/24 ! -o br-gone -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE\n"
                 "COMMIT\n"
             )
@@ -313,28 +319,45 @@ class CellHvCorePackagingTests(unittest.TestCase):
             sysctl.mkdir(parents=True)
             (sysctl / "99-chv-forward.conf").write_text("net.ipv4.ip_forward=1\n")
 
+            links = tmp_path / "links"
+            links.write_text(
+                "tap-1234abcd\ntap-deadbeef\ntap-cafebabe\n"
+                "br-63b276315a70\nbr-0b7f28f0\nbr-net1\nchvbr0\nens19\n"
+            )
             ip = bin_dir / "ip"
             ip.write_text(
                 "#!/bin/bash\n"
                 f"printf 'ip %s\\n' \"$*\" >> {log}\n"
-                'case "$*" in\n'
+                f"links={links}\n"
+                'args="$*"\n'
+                'case "$args" in\n'
                 '  "netns list") printf \'%s\\n\' ns-63b27631c9c92fda4a43351c5aeeba21 '
-                "ns-default ns-net1 ns-other ;;\n"
-                '  "-o -4 route show dev br-63b276315a70 proto kernel scope link") '
-                "printf '%s\\n' '10.201.0.0/24 proto kernel scope link src 10.201.0.1' ;;\n"
-                '  "-o -4 route show dev br-0b7f28f0 proto kernel scope link") '
-                "printf '%s\\n' '10.202.0.0/24 proto kernel scope link src 10.202.0.1' ;;\n"
-                '  "-o -4 route show dev br-net1 proto kernel scope link") '
-                "printf '%s\\n' '10.203.0.0/24 proto kernel scope link src 10.203.0.1' ;;\n"
-                '  "-o -4 route show dev chvbr0 proto kernel scope link") '
-                "printf '%s\\n' '10.200.0.0/24 proto kernel scope link src 10.200.0.1' ;;\n"
-                '  "-o link show master br-63b276315a70") '
-                "printf '%s\\n' '9: tap-1234abcd@if5: <BROADCAST> mtu 1500 master br-63b276315a70' "
+                "ns-default ns-net1 ns-gone ns-other ;;\n"
+                '  "-o -4 route show dev "*" proto kernel scope link")\n'
+                '    dev="${args#-o -4 route show dev }"\n'
+                '    dev="${dev% proto kernel scope link}"\n'
+                '    grep -Fxq "$dev" "$links" || exit 1\n'
+                '    case "$dev" in\n'
+                "      br-63b276315a70) printf '%s\\n' '10.201.0.0/24 proto kernel scope link src 10.201.0.1' ;;\n"
+                "      br-0b7f28f0) printf '%s\\n' '10.202.0.0/24 proto kernel scope link src 10.202.0.1' ;;\n"
+                "      br-net1) printf '%s\\n' '10.203.0.0/24 proto kernel scope link src 10.203.0.1' ;;\n"
+                "      chvbr0) printf '%s\\n' '10.200.0.0/24 proto kernel scope link src 10.200.0.1' ;;\n"
+                '      *) exit 1 ;;\n'
+                '    esac ;;\n'
+                '  "-o link show master "*)\n'
+                '    dev="${args#-o link show master }"\n'
+                '    grep -Fxq "$dev" "$links" || exit 1\n'
+                '    case "$dev" in\n'
+                "      br-63b276315a70) printf '%s\\n' '9: tap-1234abcd@if5: <BROADCAST> mtu 1500 master br-63b276315a70' "
                 "'10: ens19: <BROADCAST> mtu 1500 master br-63b276315a70' ;;\n"
-                '  "-o link show master br-0b7f28f0") '
-                "printf '%s\\n' '11: tap-deadbeef@if7: <BROADCAST> mtu 1500 master br-0b7f28f0' ;;\n"
-                '  "-o link show master br-net1") '
-                "printf '%s\\n' '12: tap-cafebabe@if9: <BROADCAST> mtu 1500 master br-net1' ;;\n"
+                "      br-0b7f28f0) printf '%s\\n' '11: tap-deadbeef@if7: <BROADCAST> mtu 1500 master br-0b7f28f0' ;;\n"
+                "      br-net1) printf '%s\\n' '12: tap-cafebabe@if9: <BROADCAST> mtu 1500 master br-net1' ;;\n"
+                '      *) : ;;\n'
+                '    esac ;;\n'
+                '  "link del dev "*)\n'
+                '    dev="${args#link del dev }"\n'
+                '    grep -Fxv "$dev" "$links" > "$links.tmp" || true\n'
+                '    mv "$links.tmp" "$links" ;;\n'
                 '  *) : ;;\n'
                 "esac\n"
             )
@@ -345,7 +368,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 'if [ "$1 $2" = "list tables" ]; then\n'
                 "  printf '%s\\n' 'table inet chv-63b27631c9c92fda4a43351c5aeeba21' "
                 "'table inet chv-0b7f28f0' 'table inet chv-default' 'table inet chv-net1' "
-                "'table inet chvhs-deadbeef' 'table ip filter'\n"
+                "'table inet chv-gone' 'table inet chvhs-deadbeef' 'table ip filter'\n"
                 "fi\n"
             )
             sqlite3 = bin_dir / "sqlite3"
@@ -367,6 +390,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 f'    grep -Fxv "$rule" {iptables_state} > {iptables_state}.tmp || true\n'
                 f'    mv {iptables_state}.tmp {iptables_state}\n'
                 "    ;;\n"
+                f"  -S) sed 's/^/-A /' {iptables_state} ;;\n"
                 "esac\n"
             )
             for tool in (ip, nft, sqlite3, iptables):
@@ -419,16 +443,22 @@ class CellHvCorePackagingTests(unittest.TestCase):
             "ip netns del ns-63b27631c9c92fda4a43351c5aeeba21",
             "ip netns del ns-default",
             "ip netns del ns-net1",
+            "ip netns del ns-gone",
             "nft delete table inet chv-63b27631c9c92fda4a43351c5aeeba21",
             "nft delete table inet chv-0b7f28f0",
             "nft delete table inet chv-default",
             "nft delete table inet chv-net1",
+            "nft delete table inet chv-gone",
             "ip link del dev chvbr0",
             # Live NAT rules are deleted in both historical forms.
             "iptables -t nat -D POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.200.0.0/24 ! -o chvbr0 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE",
+            # `br-gone` has no live route: the CIDR is recovered from the
+            # surviving rule that still names the bridge.
+            "iptables -t nat -D POSTROUTING -s 10.204.0.0/24 ! -d 10.204.0.0/24 -j MASQUERADE",
+            "iptables -t nat -D POSTROUTING -s 10.204.0.0/24 ! -o br-gone -j MASQUERADE",
             # The persisted rules are re-saved through the fake, never the
             # host's real netfilter-persistent.
             "netfilter-persistent save",
@@ -446,6 +476,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
         self.assertNotIn("10.200.0.0/24", persisted, relative)
         self.assertNotIn("10.201.0.0/24", persisted, relative)
         self.assertNotIn("10.203.0.0/24", persisted, relative)
+        self.assertNotIn("10.204.0.0/24", persisted, relative)
         self.assertIn("-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE", persisted, relative)
 
         # Bridging config that would recreate the CHV bridge is gone; another

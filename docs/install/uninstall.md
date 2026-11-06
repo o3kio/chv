@@ -34,9 +34,11 @@ After standard removal, the following remain on disk:
 ### What is removed
 
 Package removal stops the four services, so any running VMs are stopped
-(with their CHV-owned cloud-hypervisor processes terminated) before the
-software goes away. Persistent data is preserved and a reinstall resumes
-from it.
+with their CHV-owned cloud-hypervisor processes terminated before the
+software goes away. That is a VMM-level `SIGTERM` (then `SIGKILL` after
+10 s), not a guest-OS shutdown: if the guests must flush their own buffers,
+stop them through the API first. Persistent CHV data is preserved and a
+reinstall resumes from it.
 
 | Path | Contents | Removed? |
 |------|----------|----------|
@@ -44,7 +46,7 @@ from it.
 | `/lib/systemd/system/chv-*.service` | Systemd units | ✅ Yes |
 | `/usr/share/chv` | UI assets, migrations | ✅ Yes |
 | `/usr/lib/tmpfiles.d/chv-node.conf` | tmpfiles entry (`chv-node` package) | ✅ Yes |
-| `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Only via `scripts/install.sh` wipe/clean or `scripts/quick-install.sh --uninstall`; package remove/purge leaves them |
+| `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Only via `scripts/install.sh --wipe` or `scripts/quick-install.sh --uninstall`; package remove/purge and an `install.sh` re-run leave them |
 | Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (including the literal `default` network; plus the baseline `chvbr0` bridge), the live and persisted CHV `MASQUERADE` rules, `99-chv-forward.conf`, and the networkd/ifupdown bridge config | ✅ Yes (remove/purge, not upgrade) |
 
 ## Verify removal
@@ -160,7 +162,9 @@ ip -o link show type bridge | grep -E 'chvbr0|br-[A-Za-z0-9_.-]+' || echo "no CH
 
 The default network id is the literal `default` (namespace `ns-default`,
 nftables table `chv-default`, bridge `chvbr0`); operator-created network ids
-use the same `ns-<id>`/`chv-<id>`/`br-<id>` naming. On a host upgraded from an
+use the same `ns-<id>`/`chv-<id>`/`br-<id>` naming. Docker also creates
+`br-<12 hex>` bridges, so a `br-` match alone is not proof of CHV ownership:
+a CHV bridge carries `tap-[0-9a-f]{8}` slaves or is `chvbr0`. On a host upgraded from an
 older release, an orphaned table/bridge from that older layout may still be
 present. Remove it explicitly once: `nft delete table inet chv-<id>`,
 `ip netns del ns-<id>`, `ip link del dev br-<id>` (and

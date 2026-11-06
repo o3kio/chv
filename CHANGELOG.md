@@ -46,10 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the control-plane database plus the CHV-owned object names. They also
   remove the live and persisted `MASQUERADE` rules, the CHV sysctl file,
   and the networkd/ifupdown drop-ins, and every final path clears stale
-  failed unit state. `install.sh` wipe/clean and
+  failed unit state. `install.sh --wipe` and
   `quick-install.sh --uninstall` additionally remove the `install.sh` UI
-  tree, migrations, and nginx site; package removal does not own those
-  paths. A sandboxed test runs all three shipped copies
+  tree, migrations, and nginx site; package removal and an `install.sh`
+  re-run do not own those paths. A sandboxed test runs all three shipped copies
   (including `preremove.sh` under dash) against fake host tools and proves
   non-CHV objects survive. This closes the field-plan §6.9 "network residue
   that survives documented cleanup" blocker found during the rc.6
