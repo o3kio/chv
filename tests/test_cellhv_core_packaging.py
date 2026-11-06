@@ -670,8 +670,10 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 f"set -eu {pipefail}\n".replace("  ", " ")
                 + 'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
                 'have() { command -v "$1" >/dev/null 2>&1; }\n'
-                # The chv user does not exist in the sandbox, so both helper
-                # spellings take the plain-sqlite3 fallback.
+                # Passthroughs force the plain-sqlite3 path deterministically.
+                # The callers use a user that exists on no host, and
+                # preremove's real helper would otherwise take the runuser
+                # branch on hosts that have a chv user.
                 'chv_sqlite() { sqlite3 "$@"; }\n'
                 'chv_sqlite_read() { sqlite3 "$@"; }\n'
                 f"CHV_DB_PATH='{db}'\n"
