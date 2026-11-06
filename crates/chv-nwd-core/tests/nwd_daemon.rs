@@ -1616,6 +1616,79 @@ async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
     );
 }
 
+/// A rejected half is kept in memory for fail-closed attach but must never
+/// leak into the journal when the *other* half is updated: recovery replays the
+/// journal fail-closed, so a poison entry would crash-loop nwd at startup.
+#[tokio::test]
+async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(topologies));
+    service.set_policy_store(Arc::new(policies.clone()));
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-leak")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    // Rejected firewall half -> in-memory only.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-leak".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json:
+                    br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+                        .to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    // A valid NAT update snapshots the pair. The rejected firewall half must be
+    // filtered out of the durable snapshot.
+    let nat = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-leak".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(nat.status, "OK");
+
+    let raw = tokio::fs::read(policies.path_for("net-leak"))
+        .await
+        .expect("a valid NAT half must be journaled");
+    let stored: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(
+        stored["firewall"].is_null(),
+        "rejected firewall half leaked into the durable journal: {stored}"
+    );
+    // Policy JSON is stored as raw bytes: `[]` is [0x5b, 0x5d].
+    assert_eq!(stored["nat"], serde_json::json!([91, 93]));
+}
+
 /// If a journal entry can no longer be applied (corruption/tampering after the
 /// RPC began rejecting unapplicable payloads), recovery must fail closed with
 /// an error that names the exact file. An opaque crash loop is a documented

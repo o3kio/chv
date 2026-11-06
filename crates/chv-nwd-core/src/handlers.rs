@@ -24,6 +24,30 @@ struct AppliedPolicies {
     nat_version: Option<String>,
 }
 
+/// Build the durable snapshot from the in-memory desired state, dropping a half
+/// that is currently rejected.
+///
+/// A rejected payload is kept in memory only so the attach-time guard refresh
+/// fails closed. Persisting it — directly, or indirectly when the other half is
+/// updated and snapshots the pair — would make fail-closed startup recovery
+/// replay an unapplicable entry and crash-loop nwd, the exact B9 poison class.
+fn durable_snapshot(applied: &AppliedPolicies) -> StoredPolicies {
+    let firewall = applied
+        .firewall
+        .clone()
+        .filter(|json| crate::firewall::validate_firewall_policy(json).is_ok());
+    let nat = applied
+        .nat
+        .clone()
+        .filter(|json| crate::firewall::validate_nat_policy(json).is_ok());
+    StoredPolicies {
+        firewall_version: firewall.as_ref().and(applied.firewall_version.clone()),
+        firewall,
+        nat_version: nat.as_ref().and(applied.nat_version.clone()),
+        nat,
+    }
+}
+
 pub struct NetworkServiceImpl<E: NetworkExecutor> {
     executor: Arc<E>,
     topologies: Arc<TopologyTable>,
@@ -137,12 +161,7 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
             applied.firewall = Some(policy_json.to_vec());
             applied.firewall_version = Some(policy_version.to_string());
-            StoredPolicies {
-                firewall: applied.firewall.clone(),
-                firewall_version: applied.firewall_version.clone(),
-                nat: applied.nat.clone(),
-                nat_version: applied.nat_version.clone(),
-            }
+            durable_snapshot(&applied)
         };
         match self.policy_store.as_ref() {
             Some(store) => store.persist(network_id, &snapshot).await,
@@ -172,12 +191,7 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
             applied.nat = Some(policy_json.to_vec());
             applied.nat_version = Some(policy_version.to_string());
-            StoredPolicies {
-                firewall: applied.firewall.clone(),
-                firewall_version: applied.firewall_version.clone(),
-                nat: applied.nat.clone(),
-                nat_version: applied.nat_version.clone(),
-            }
+            durable_snapshot(&applied)
         };
         match self.policy_store.as_ref() {
             Some(store) => store.persist(network_id, &snapshot).await,
