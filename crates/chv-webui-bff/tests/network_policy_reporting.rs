@@ -665,6 +665,11 @@ async fn update_network_rejects_ui_dialect_and_malformed_rules() {
             "source_cidr",
         ),
         (
+            "leading-zero cidr prefix (nft reads octal)",
+            r#"{"direction":"inbound","action":"accept","protocol":"icmp","source_cidr":"10.99.0.0/030"}"#,
+            "source_cidr",
+        ),
+        (
             "reversed port range (nft rejects it)",
             r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"8090-8080"}"#,
             "dest_port",
@@ -672,6 +677,11 @@ async fn update_network_rejects_ui_dialect_and_malformed_rules() {
         (
             "plus-prefixed port (nft rejects it)",
             r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"+443"}"#,
+            "dest_port",
+        ),
+        (
+            "leading-zero port (nft reads octal)",
+            r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"0443"}"#,
             "dest_port",
         ),
         (

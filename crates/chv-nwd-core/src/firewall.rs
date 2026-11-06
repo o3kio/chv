@@ -59,19 +59,11 @@ fn validate_rule(rule: &FirewallRule) -> Result<(), ChvError> {
                 reason: format!("invalid port spec: '{}'", port),
             });
         }
-        // A port only renders for protocols that carry one. Silently ignoring
-        // it (the old behavior for icmp/all) broadens the rule the operator
-        // wrote, so reject the combination instead.
-        if !matches!(rule.protocol.as_str(), "tcp" | "udp" | "sctp") {
-            return Err(ChvError::InvalidArgument {
-                field: "dest_port".to_string(),
-                reason: format!(
-                    "dest_port is not valid for protocol '{}': only tcp, udp, and sctp \
-                     have ports",
-                    rule.protocol
-                ),
-            });
-        }
+        // Deliberately NOT rejected for icmp/all: rc.7's BFF accepted such a
+        // rule and nwd applied it with the port ignored, so rejecting it here
+        // would regress an upgrade (the stored ruleset would fail every
+        // dispatch). The BFF gate rejects it for new saves; the renderer logs
+        // a warning for legacy data instead of silently broadening it.
     }
     Ok(())
 }
@@ -328,6 +320,17 @@ pub async fn apply_firewall_rules(
                 args.push("dport");
                 port_owned = port.clone();
                 args.push(&port_owned);
+            } else {
+                // Legacy ruleset from before the save gate tightened: keep the
+                // old behavior (apply, ignore the port) instead of failing an
+                // upgrade, but say loudly that the constraint is not enforced.
+                tracing::warn!(
+                    network_table = %table,
+                    protocol = %rule.protocol,
+                    dest_port = %port,
+                    "dest_port is not valid for this protocol and is ignored; \
+                     re-save the rule to remove the field"
+                );
             }
         }
 
@@ -828,7 +831,22 @@ mod tests {
             ),
             Err(ChvError::InvalidArgument { .. })
         ));
-        for port in ["8090-8080", "+443", "+8080-+8090"] {
+        // nft reads a leading zero as octal; `/030` means /24, so a
+        // non-canonical prefix must not reach the journal.
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"10.0.0.0/030"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        for port in [
+            "8090-8080",
+            "+443",
+            "+8080-+8090",
+            "0443",
+            "0700",
+            "600-0777",
+        ] {
             let payload = format!(
                 r#"[{{"direction":"inbound","protocol":"tcp","action":"accept","dest_port":"{port}"}}]"#
             );
@@ -837,23 +855,20 @@ mod tests {
                     validate_firewall_policy(payload.as_bytes()),
                     Err(ChvError::InvalidArgument { .. })
                 ),
-                "port spec {port} would fail at nft and must be rejected"
+                "port spec {port} would be rejected or reinterpreted by nft and must not be accepted"
             );
         }
-        // A port on a protocol without ports used to be silently ignored,
-        // broadening the rule; reject the combination.
-        assert!(matches!(
-            validate_firewall_policy(
-                br#"[{"direction":"inbound","protocol":"icmp","action":"accept","dest_port":"443"}]"#
-            ),
-            Err(ChvError::InvalidArgument { .. })
-        ));
-        assert!(matches!(
-            validate_firewall_policy(
-                br#"[{"direction":"inbound","protocol":"all","action":"accept","dest_port":"443"}]"#
-            ),
-            Err(ChvError::InvalidArgument { .. })
-        ));
+        // Legacy rc.7 rulesets may carry a dest_port on icmp/all. nwd keeps
+        // applying them (the port is ignored, with a warning) so an upgrade
+        // does not regress; the BFF gate rejects the combination for new saves.
+        assert!(validate_firewall_policy(
+            br#"[{"direction":"inbound","protocol":"icmp","action":"accept","dest_port":"443"}]"#
+        )
+        .is_ok());
+        assert!(validate_firewall_policy(
+            br#"[{"direction":"inbound","protocol":"all","action":"accept","dest_port":"443"}]"#
+        )
+        .is_ok());
         // sctp does carry ports and the renderer emits `sctp dport`.
         assert!(validate_firewall_policy(
             br#"[{"direction":"inbound","protocol":"sctp","action":"accept","dest_port":"8080-8090"}]"#

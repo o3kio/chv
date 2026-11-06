@@ -40,6 +40,21 @@ pub const RULE_KEYS: &[&str] = &[
     "dest_port",
 ];
 
+/// Parse a canonical base-10 integer. nft's lexer reads a leading zero as
+/// octal (`0443` → 291, `/030` → /24) and a mixed-radix range like
+/// `600-0777` can even become a negative range. Rust's `parse` is always
+/// decimal, so accepting these forms would either broaden the enforced rule
+/// or fail at apply after the policy was journaled. Reject them at the gate.
+fn canonical_decimal(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
 /// Is `cidr` a syntactically valid **IPv4** CIDR block (nwd's engine
 /// semantics, shared with the BFF's save-time gate)?
 ///
@@ -53,16 +68,18 @@ pub fn is_valid_cidr(cidr: &str) -> bool {
     if parts.len() != 2 {
         return false;
     }
-    // nft rejects `+24` and other non-digit prefixes that Rust's integer
-    // parser would accept; require plain ASCII digits so the gate agrees with
-    // the renderer exactly.
-    if parts[1].is_empty() || !parts[1].bytes().all(|b| b.is_ascii_digit()) {
+    let Some(prefix) = canonical_decimal(parts[1]) else {
+        return false;
+    };
+    if prefix > 32 {
         return false;
     }
-    match parts[0].parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(_)) => parts[1].parse::<u8>().map(|p| p <= 32).unwrap_or(false),
-        _ => false,
-    }
+    // Rust rejects leading-zero IPv4 octets (`010.0.0.0`) itself, so the
+    // address side cannot be reinterpreted by nft.
+    matches!(
+        parts[0].parse::<std::net::IpAddr>(),
+        Ok(std::net::IpAddr::V4(_))
+    )
 }
 
 /// Is `port` a valid single port or ascending port range (`443`,
@@ -72,16 +89,16 @@ pub fn is_valid_cidr(cidr: &str) -> bool {
 /// rejects both. A payload that passes the save gate and is then journaled
 /// would crash-loop fail-closed recovery, so the gate mirrors the renderer.
 pub fn is_valid_port_spec(port: &str) -> bool {
-    fn digits(value: &str) -> Option<u16> {
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        value.parse::<u16>().ok()
+    fn parse_port(value: &str) -> Option<u16> {
+        canonical_decimal(value).and_then(|v| u16::try_from(v).ok())
     }
     if let Some((lo, hi)) = port.split_once('-') {
-        matches!((digits(lo), digits(hi)), (Some(lo), Some(hi)) if lo <= hi)
+        matches!(
+            (parse_port(lo), parse_port(hi)),
+            (Some(lo), Some(hi)) if lo <= hi
+        )
     } else {
-        digits(port).is_some()
+        parse_port(port).is_some()
     }
 }
 
@@ -150,8 +167,9 @@ mod tests {
         assert!(!is_valid_cidr("::1/128"));
         assert!(!is_valid_cidr("10.200.0.0")); // no prefix
         assert!(!is_valid_cidr("10.200.0.0/33")); // bad prefix
-                                                  // nft rejects a `+`-prefixed prefix; do not let it into the journal.
+                                                  // nft rejects a `+` prefix and reads a leading zero as octal.
         assert!(!is_valid_cidr("10.200.0.0/+24"));
+        assert!(!is_valid_cidr("10.200.0.0/030"));
         assert!(!is_valid_cidr("not-an-ip/24"));
     }
 
@@ -161,13 +179,18 @@ mod tests {
         assert!(is_valid_port_spec("8080-8090"));
         assert!(is_valid_port_spec("8080-8080")); // equal endpoints are valid in nft
         assert!(is_valid_port_spec("0-65535"));
+        assert!(is_valid_port_spec("0"));
         assert!(!is_valid_port_spec("80-")); // dangling range
         assert!(!is_valid_port_spec("ssh")); // no service names
         assert!(!is_valid_port_spec("0-99999")); // out of u16
-                                                 // nft rejects both of these; Rust's FromStr/parse would accept them.
+                                                 // nft rejects these; Rust's FromStr/parse would accept them.
         assert!(!is_valid_port_spec("8090-8080")); // reversed range
         assert!(!is_valid_port_spec("+443"));
         assert!(!is_valid_port_spec("+8080-+8090"));
+        // nft reads a leading zero as octal: 0443 is 291, 600-0777 is invalid.
+        assert!(!is_valid_port_spec("0443"));
+        assert!(!is_valid_port_spec("0700"));
+        assert!(!is_valid_port_spec("600-0777"));
     }
 
     #[test]
