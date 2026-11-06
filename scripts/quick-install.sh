@@ -1464,8 +1464,8 @@ start_services() {
         systemctl start chv-stord chv-nwd
         wait_for_daemon_sockets
     fi
-    # A re-run restarts the agent in start_agent. rc.6 nests the agent's
-    # RuntimeDirectory (=chv/agent), so that stop no longer removes
+    # A re-run restarts the agent in start_agent. Since rc.6, the agent's
+    # RuntimeDirectory is chv/agent, so that stop no longer removes
     # /run/chv; the ordering is kept so the new process reads the certs
     # staged below and the supervisor never races a missing socket.
 
@@ -1493,8 +1493,8 @@ start_agent() {
         info "Starting the local agent..."
     else
         info "Restarting the local agent..."
-        # Stop first so the new process reads the certs staged below. rc.6
-        # nests RuntimeDirectory to chv/agent, so this stop no longer
+        # Stop first so the new process reads the certs staged below. Since
+        # rc.6, RuntimeDirectory is chv/agent, so this stop no longer
         # removes /run/chv; the stord/nwd restart is kept so their sockets
         # exist before the agent's supervisor looks for them (and is
         # harmless when they already survive).

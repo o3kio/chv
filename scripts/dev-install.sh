@@ -229,6 +229,7 @@ elif [ "$NO_UNINSTALL" = "0" ]; then
     rm -f /run/chv/nwd/dnsmasq-*.conf
     rm -f /run/chv/nwd/dnsmasq-*.hosts
     rm -f /run/chv/nwd/dnsmasq-*.pid
+    rm -f /run/chv/nwd/dnsmasq-*.leases
 
     # Remove database (clean state for new install)
     rm -f /var/lib/chv/controlplane.db*

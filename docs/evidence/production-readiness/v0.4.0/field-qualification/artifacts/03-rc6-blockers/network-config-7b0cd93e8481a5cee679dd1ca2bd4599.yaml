@@ -1,0 +1,11 @@
+version: 2
+ethernets:
+  id0:
+    match:
+      macaddress: "02:72:3f:37:9d:bf"
+    dhcp4: false
+    addresses:
+      - 10.200.0.18/24
+    routes:
+      - to: default
+        via: 10.200.0.1

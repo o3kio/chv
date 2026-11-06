@@ -650,6 +650,24 @@ print_github_install_alternatives() {
     warn "See docs/install/from-github-release.md for details."
 }
 
+# Extract the tag version from a release directory or tarball name.
+#
+# Release artifacts are named `chv-<version>-linux-amd64` (directory) or
+# `chv-<version>-linux-amd64.tar.gz` (tarball), so the name carries the RC
+# suffix that the base `VERSION` file and the binaries' version banner do not.
+# Returns nothing for any other shape.
+version_from_release_dir() {
+    local name
+    name="$(basename "$1")"
+    name="${name%.tar.gz}"
+    case "$name" in
+        chv-*-linux-amd64)
+            name="${name#chv-}"
+            printf '%s' "${name%-linux-amd64}"
+            ;;
+    esac
+}
+
 resolve_version() {
     # Offline/air-gapped fallback pin: used ONLY when the GitHub API cannot be
     # reached or queried (never silently — every use is logged as a warning
@@ -662,12 +680,19 @@ resolve_version() {
     # A local tarball/directory needs no GitHub API lookup — and the 404
     # fail-fast below must not abort the documented local-tarball install
     # path while no stable release is published yet (#440, #454 review).
-    # Preserve main's semantics when no explicit version is given: the same
-    # default the failed-'latest' fallback uses, which only names the
-    # extracted top-level directory (EXTRACT_DIR) in download_release().
     if [ -n "$INSTALL_CHV_TARBALL_PATH" ] && [ "$INSTALL_CHV_VERSION" = "latest" ]; then
-        INSTALL_CHV_VERSION="$fallback_version"
-        info "Local tarball mode with no explicit version — using ${INSTALL_CHV_VERSION} for the extracted directory name."
+        local local_dir_version
+        local_dir_version="$(version_from_release_dir "$INSTALL_CHV_TARBALL_PATH")"
+        if [ -n "$local_dir_version" ]; then
+            # The release directory is chv-<version>-linux-amd64. Reporting the
+            # fallback pin here was wrong: run 3 of the rc.6 field clean
+            # install printed "Version: 0.3.0" while installing 0.4.0-rc.6.
+            INSTALL_CHV_VERSION="$local_dir_version"
+            info "Local tarball mode: using ${INSTALL_CHV_VERSION} from the release directory name."
+        else
+            INSTALL_CHV_VERSION="$fallback_version"
+            info "Local tarball mode with no explicit version — using ${INSTALL_CHV_VERSION} for the extracted directory name."
+        fi
     fi
     if [ "$INSTALL_CHV_VERSION" = "latest" ]; then
         if cmd_exists curl; then
@@ -1425,6 +1450,33 @@ import_base_image() {
     fi
 }
 
+# rc.6 blocker B3: exactly one interface may own the default gateway. Two
+# owners (the legacy chvbr0 and nwd's bridge) make the kernel route guest
+# traffic to the dead device, so this is a hard install failure, not a warn.
+assert_single_gateway_owner() {
+    local gateway_ip="$1" attempt owners count
+    owners=""
+    for ((attempt = 1; attempt <= 60; attempt++)); do
+        owners=$(ip -o -4 addr show 2>/dev/null \
+            | awk -v gw="${gateway_ip}/" '$4 == gw { print $2 }' \
+            | sort -u)
+        [ -n "$owners" ] && break
+        sleep 1
+    done
+    count=$(printf '%s\n' "$owners" | sed '/^$/d' | wc -l)
+    if [ "$count" -ne 1 ]; then
+        fatal "Expected exactly one interface to own the default gateway ${gateway_ip}, found ${count} (${owners:-none}).
+The seeded default network must be materialized by chv-nwd and the legacy
+${INSTALL_CHV_BRIDGE_NAME} bridge must not also carry that address.
+Inspect: ip -o -4 addr show; journalctl -u chv-nwd -n 50
+On a host installed by rc.6 or earlier, remove the legacy bridge once
+(ip link del ${INSTALL_CHV_BRIDGE_NAME}) and its persisted networkd/ifupdown
+config, then re-run this installer (a plain re-run refuses while persistent
+data exists; use --wipe only if the deployment is expendable)."
+    fi
+    info "Verified exactly one owner of the default gateway ${gateway_ip} (${owners})."
+}
+
 # -----------------------------------------------------------------------------
 # Seed Dev Resources (default network + test VM)
 # -----------------------------------------------------------------------------
@@ -1511,6 +1563,9 @@ seed_dev_resources() {
         # Try to find existing default network ID for VM creation
         net_id="default"
     fi
+
+    # rc.6 B3: fail the install if the gateway is owned twice (or never).
+    assert_single_gateway_owner "${gateway_ip}"
 
     # --- Create test VM via API ---
     if [ ! -f "$BASE_IMAGE_PATH" ]; then
@@ -1621,6 +1676,31 @@ generate_certs() {
 # -----------------------------------------------------------------------------
 # Bridge and NAT network setup
 # -----------------------------------------------------------------------------
+# Guest egress needs forwarding and source NAT regardless of which device owns
+# the default gateway. Extracted so the legacy bridge path and the
+# chv-nwd-managed default network share one implementation.
+enable_guest_forwarding() {
+    local bridge_net="$1"
+
+    # Enable IP forwarding
+    sysctl -qw net.ipv4.ip_forward=1
+    mkdir -p "${CHV_HOST_ETC}/sysctl.d"
+    echo "net.ipv4.ip_forward=1" > "${CHV_HOST_ETC}/sysctl.d/99-chv-forward.conf"
+
+    # NAT outbound traffic from the guest subnet
+    if ! iptables -t nat -C POSTROUTING -s "${bridge_net}" ! -d "${bridge_net}" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s "${bridge_net}" ! -d "${bridge_net}" -j MASQUERADE
+    fi
+
+    # Persist iptables rules (iptables-persistent / netfilter-persistent)
+    if cmd_exists netfilter-persistent; then
+        netfilter-persistent save 2>/dev/null || true
+    elif cmd_exists iptables-save; then
+        mkdir -p "${CHV_HOST_ETC}/iptables"
+        iptables-save > "${CHV_HOST_ETC}/iptables/rules.v4"
+    fi
+}
+
 setup_network() {
     # The legacy dev bootstrap: pre-create chvbr0 + NAT so the seeded default
     # network has external connectivity. Qualified networks are created via
@@ -1631,6 +1711,27 @@ setup_network() {
         warn "Skipping legacy bridge/NAT bootstrap (INSTALL_CHV_NO_BRIDGE=1)."
         return 0
     fi
+
+    local bridge_ip="${INSTALL_CHV_BRIDGE_CIDR%/*}"
+    local bridge_prefix="${INSTALL_CHV_BRIDGE_CIDR#*/}"
+    local bridge_net="${bridge_ip%.*}.0/${bridge_prefix}"
+
+    # rc.6 blocker B3: the seeded default network is materialized by chv-nwd
+    # on its own bridge with this exact gateway address. Creating the legacy
+    # bridge here as well gives the host two owners of the /24 and routes
+    # guest traffic to the dead one. Keep forwarding + NAT (nwd's bridge has
+    # no uplink port of its own) and let chv-nwd own the gateway.
+    if [ "${INSTALL_CHV_NO_SEED:-0}" != "1" ]; then
+        info "Default network is seeded via the API: chv-nwd will own ${bridge_ip}; skipping the legacy ${INSTALL_CHV_BRIDGE_NAME} bridge/IP."
+        # A re-run, or a host installed by rc.6 or earlier, may still carry the
+        # legacy bridge, its persisted networkd/ifupdown config, and its NAT
+        # rules. Remove all of it so the bridge does not return at the next
+        # boot; forwarding + NAT are re-added below for nwd's bridge.
+        remove_chv_bridge_and_nat "${INSTALL_CHV_BRIDGE_NAME}" "${bridge_net}"
+        enable_guest_forwarding "${bridge_net}"
+        return 0
+    fi
+
     info "Setting up bridge network ${INSTALL_CHV_BRIDGE_NAME} (${INSTALL_CHV_BRIDGE_CIDR}) on ${INSTALL_CHV_BRIDGE_IFACE}..."
 
     # Create bridge if absent
@@ -1640,8 +1741,6 @@ setup_network() {
     ip link set "${INSTALL_CHV_BRIDGE_NAME}" up
 
     # Assign gateway IP to the bridge (idempotent)
-    local bridge_ip="${INSTALL_CHV_BRIDGE_CIDR%/*}"
-    local bridge_prefix="${INSTALL_CHV_BRIDGE_CIDR#*/}"
     if ! ip addr show "${INSTALL_CHV_BRIDGE_NAME}" | grep -q "${bridge_ip}"; then
         ip addr add "${INSTALL_CHV_BRIDGE_CIDR}" dev "${INSTALL_CHV_BRIDGE_NAME}"
     fi
@@ -1659,23 +1758,8 @@ setup_network() {
         warn "Set INSTALL_CHV_BRIDGE_IFACE to an existing interface if you need external connectivity."
     fi
 
-    # Enable IP forwarding
-    sysctl -qw net.ipv4.ip_forward=1
-    echo "net.ipv4.ip_forward=1" > "${CHV_HOST_ETC}/sysctl.d/99-chv-forward.conf"
-
-    # NAT outbound traffic from bridge subnet
-    local bridge_net="${bridge_ip%.*}.0/${bridge_prefix}"
-    if ! iptables -t nat -C POSTROUTING -s "${bridge_net}" ! -d "${bridge_net}" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s "${bridge_net}" ! -d "${bridge_net}" -j MASQUERADE
-    fi
-
-    # Persist iptables rules (iptables-persistent / netfilter-persistent)
-    if cmd_exists netfilter-persistent; then
-        netfilter-persistent save 2>/dev/null || true
-    elif cmd_exists iptables-save; then
-        mkdir -p "${CHV_HOST_ETC}/iptables"
-        iptables-save > "${CHV_HOST_ETC}/iptables/rules.v4"
-    fi
+    # Forwarding and NAT are shared with the seeded-network path above.
+    enable_guest_forwarding "${bridge_net}"
 
     # Persist bridge via systemd-networkd or a simple netplan/ifupdown snippet
     # We use a drop-in under ${CHV_HOST_ETC}/network/interfaces.d (ifupdown) if available,
@@ -2268,8 +2352,25 @@ BANNER
 }
 
 # -----------------------------------------------------------------------------
-# Wipe Deployment (--wipe flag: teardown while preserving agent authority state)
+# Wipe Deployment (--wipe flag: full teardown, including authority state)
 # -----------------------------------------------------------------------------
+# rc.6 blocker B5: `--wipe` deletes /etc/chv/agent.toml and install_configs
+# mints a fresh node_id, but the Core store is keyed to the node_id it was
+# created with. Retaining core.db made the new agent crash-loop on
+# Identity(Conflict). Remove the whole identity-bound authority namespace
+# after every process is stopped so a wiped deployment starts coherent.
+# (Normal stop/restart paths must never call this while Core is live.)
+remove_agent_authority_state() {
+    local agent_dir="${CHV_DATA_DIR}/agent"
+    rm -f "${agent_dir}/core.db" \
+          "${agent_dir}/core.db-wal" \
+          "${agent_dir}/core.db-shm" \
+          "${agent_dir}/core.db-journal" \
+          "${agent_dir}/.core.db.cellhv-runtime-authority.lease" \
+          "${agent_dir}/node-cache-v1.archive" \
+          "${agent_dir}/.node-cache-v1.archive.cellhv-authority.lock"
+}
+
 wipe_deployment() {
     info "Wiping previous CHV deployment (--wipe)..."
     # Stop the control plane and the agent first so nothing reconciles the VMs
@@ -2288,14 +2389,18 @@ wipe_deployment() {
     done
     remove_running_chv_processes
     delete_chv_network_state
+    # Every Core writer is stopped now; the node identity is about to be
+    # regenerated, so the old authority namespace must go with it (B5).
+    remove_agent_authority_state
     # Remove systemd units
     rm -f /etc/systemd/system/chv-*.service
     systemctl daemon-reload
     systemctl reset-failed chv-controlplane chv-agent chv-stord chv-nwd \
         2>/dev/null || true
-    # Remove replaceable deployment state. Agent authority state is persistent:
-    # deleting its database or runtime lease could orphan VM identity or create
-    # two independent lock namespaces on a concurrent-start failure.
+    # Remove replaceable deployment state. This includes the identity-bound
+    # Core authority state (see remove_agent_authority_state): --wipe
+    # deliberately discards the node identity, so retaining the old database
+    # would conflict with the regenerated one (B5).
     rm -rf "${CHV_CONFIG_DIR}"
     rm -rf "${CHV_DATA_DIR}/cache" "${CHV_DATA_DIR}/storage"
     rm -f "${CHV_DATA_DIR}/agent/agent.crt" "${CHV_DATA_DIR}/agent/agent.key" "${CHV_DATA_DIR}/agent/ca.crt"
@@ -2318,7 +2423,7 @@ wipe_deployment() {
     local bridge_subnet
     bridge_subnet=$(echo "${INSTALL_CHV_BRIDGE_CIDR}" | sed 's|/[0-9]*$||' | sed 's|\.[0-9]*$|.0/24|')
     iptables -t nat -D POSTROUTING -s "${bridge_subnet}" ! -o "${INSTALL_CHV_BRIDGE_NAME}" -j MASQUERADE 2>/dev/null || true
-    info "Wipe complete; persistent agent authority state was retained. Starting fresh install."
+    info "Wipe complete; agent authority state was removed so the fresh node identity starts coherent."
 }
 
 # -----------------------------------------------------------------------------
@@ -2439,7 +2544,7 @@ database, rerun with INSTALL_CHV_WIPE=1 (or --wipe/--fresh)."
         2>/dev/null || true
     delete_chv_network_state
     rm -f "${CHV_RUN_DIR}/agent/api.sock" "${CHV_RUN_DIR}/stord/api.sock" "${CHV_RUN_DIR}/nwd/api.sock"
-    rm -f "${CHV_RUN_DIR}"/nwd/dnsmasq-*.conf "${CHV_RUN_DIR}"/nwd/dnsmasq-*.hosts "${CHV_RUN_DIR}"/nwd/dnsmasq-*.pid
+    rm -f "${CHV_RUN_DIR}"/nwd/dnsmasq-*.conf "${CHV_RUN_DIR}"/nwd/dnsmasq-*.hosts "${CHV_RUN_DIR}"/nwd/dnsmasq-*.pid "${CHV_RUN_DIR}"/nwd/dnsmasq-*.leases
     # Remove old configs (will be regenerated)
     rm -f "${CHV_CONFIG_DIR}/agent.toml" "${CHV_CONFIG_DIR}/controlplane.toml" \
           "${CHV_CONFIG_DIR}/stord.toml" "${CHV_CONFIG_DIR}/nwd.toml" \
@@ -2453,6 +2558,10 @@ database, rerun with INSTALL_CHV_WIPE=1 (or --wipe/--fresh)."
     if [ "$INSTALL_CHV_WIPE" = "1" ]; then
         rm -rf "${CHV_DATA_DIR}/agent/vms" "${CHV_DATA_DIR}/agent/"*.img
         rm -f "${CHV_DB_PATH}" "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" "${CHV_DB_PATH}-journal"
+        # Same identity-bound Core state as wipe_deployment (B5); calling it
+        # twice is harmless, but keeping it here makes the wipe contract hold
+        # even if the caller skips wipe_deployment.
+        remove_agent_authority_state
     fi
     # Remove old cache
     rm -f "${CHV_DATA_DIR}/cache/agent-cache.json"
@@ -2517,6 +2626,11 @@ EOF
         cat <<EOF2
 Bridge:         skipped (INSTALL_CHV_NO_BRIDGE=1; networks are created via
                 the API and managed by chv-nwd)
+EOF2
+    elif [ "${INSTALL_CHV_NO_SEED:-0}" != "1" ]; then
+        cat <<EOF2
+Network:        default (${INSTALL_CHV_BRIDGE_CIDR}) on a chv-nwd br-<id>
+Upstream iface: ${INSTALL_CHV_BRIDGE_IFACE} (NAT enabled; legacy ${INSTALL_CHV_BRIDGE_NAME} skipped)
 EOF2
     else
         cat <<EOF2

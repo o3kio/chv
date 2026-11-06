@@ -1,0 +1,124 @@
+CHV v0.4.0 field qualification — host pre-flight snapshot
+captured_at_utc: 2026-11-06T10:33:26Z
+host_label: field-host-1 (internal hostname withheld)
+
+=== uname ===
+Linux field-host-1 6.8.0-142-generic #142-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep  2 14:24:27 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+
+=== os-release ===
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+VERSION_ID="24.04"
+ID=ubuntu
+
+=== virtualization ===
+kvm
+
+=== dmi ===
+sys_vendor: QEMU
+product_name: Standard PC (i440FX + PIIX, 1996)
+product_version: pc-i440fx-11.0
+bios_vendor: SeaBIOS
+bios_version: rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org
+board_vendor: unknown
+
+=== cpu ===
+16
+model name	: AMD EPYC 9554P 64-Core Processor
+aes
+avx2
+avx512f
+svm
+
+=== kvm ===
+crw-rw---- 1 root kvm 10, 232 Nov  5 15:56 /dev/kvm
+1
+
+=== memory ===
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi       7.0Gi       2.8Gi       334Mi        22Gi        24Gi
+Swap:             0B          0B          0B
+
+=== block devices ===
+NAME        SIZE TYPE FSTYPE  MOUNTPOINT
+sda       528.5G disk         
+├─sda1    527.5G part ext4    /
+├─sda14       4M part         
+├─sda15     106M part vfat    
+└─sda16     913M part ext4    
+sdb         100G disk ext4    /var/lib/libvirt/images
+sdc         100G disk         
+sr0           4M rom  iso9660 
+nbd0        3.5G disk         
+├─nbd0p1    2.5G part ext4    /tmp/opencode/g5/imgroot
+├─nbd0p14     4M part         
+├─nbd0p15   106M part vfat    /boot/efi
+└─nbd0p16   913M part ext4    
+nbd1          0B disk         
+nbd2          0B disk         
+nbd3          0B disk         
+nbd4          0B disk         
+nbd5          0B disk         
+nbd6          0B disk         
+nbd7          0B disk         
+nbd8          0B disk         
+nbd9          0B disk         
+nbd10         0B disk         
+nbd11         0B disk         
+nbd12         0B disk         
+nbd13         0B disk         
+nbd14         0B disk         
+nbd15         0B disk         
+
+=== filesystems ===
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sda1      ext4  511G  354G  158G  70% /
+/dev/sda1      ext4  511G  354G  158G  70% /
+/dev/sdb       ext4   98G   32G   62G  34% /var/lib/libvirt/images
+
+=== network ===
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0             UP             <redacted-ip>/24 <redacted-ll>/64 
+ens19            DOWN           
+cni-podman0      DOWN           10.88.0.1/16 <redacted-ll>/64 
+virbr0           DOWN           192.168.122.1/24 
+--- routes
+default via <redacted-gw> dev eth0 proto static 
+<redacted-subnet> dev eth0 proto kernel scope link src <redacted-ip> 
+10.88.0.0/16 dev cni-podman0 proto kernel scope link src 10.88.0.1 linkdown 
+192.168.122.0/24 dev virbr0 proto kernel scope link src 192.168.122.1 linkdown 
+--- bridges
+cni-podman0      DOWN           <redacted-mac> <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+virbr0           DOWN           <redacted-mac> <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+
+=== baseline CHV ===
+no chv packages
+inactive
+inactive
+inactive
+inactive
+--- /etc/chv
+total 24
+drwxr-xr-x   2 root root  4096 Nov  2 20:51 .
+drwxr-xr-x 129 root root 12288 Nov  5 06:47 ..
+-rw-r--r--   1 root root  3431 Sep 30 21:10 chv.yaml
+-rw-------   1 root root    64 Sep 30 23:18 jwt_secret
+--- /var/lib/chv
+4.0K	/var/lib/chv/agent
+48K	/var/lib/chv/backups
+4.0K	/var/lib/chv/cache
+136K	/var/lib/chv/hypervisor-fw
+144K	/var/lib/chv/monitoring
+6.3G	/var/lib/chv/qual
+12K	/var/lib/chv/storage
+
+=== baseline processes ===
+none (no chv-* or cloud-hypervisor daemons running; unit check above)
+
+=== nftables ===
+table ip nat
+table ip filter
+table ip mangle
+table ip6 mangle
+table ip6 nat
+table ip6 filter
+table ip raw

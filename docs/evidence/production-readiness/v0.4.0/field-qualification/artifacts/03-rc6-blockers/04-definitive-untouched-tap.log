@@ -1,0 +1,30 @@
+# Definitive NIC test: documented create + documented start, tap left exactly as nwd made it
+# Agent device policy currently (diagnostic runtime fix):
+DeviceAllow=/dev/kvm rwm
+DeviceAllow=/dev/net/tun rwm
+
+== create vm7 ==
+{"accepted":true,"next_refresh_path":"/api/v1/tasks/a213c588b2dde6a3b61b3e950ba07fbf","summary":"Creating VM 'dev-vm-7'","task_id":"a213c588b2dde6a3b61b3e950ba07fbf","vm_id":"daf9d7f943cf1ce96e7198aa0022e283"}
+VM7=daf9d7f943cf1ce96e7198aa0022e283
+TAP=tap-ae0ea772
+tap as created by nwd: {'ifname': 'tap-ae0ea772', 'flags': ['tap', 'persist']}
+guest_ip=10.200.0.175
+state_before=Created
+
+== documented start ==
+start_http=200
+{"accepted":true,"summary":"start vm accepted","task_id":"StartVm-6657aa23d07cdfb114e9ad433f6f8ec2","vm_id":"daf9d7f943cf1ce96e7198aa0022e283"}
+t=2s state=Running carrier=1 console=2556
+t=4s state=Running carrier=1 console=11141
+t=6s state=Running carrier=1 console=11141
+t=8s state=Running carrier=1 console=39739
+t=10s state=Running carrier=1 console=53003
+
+== CH tun fds ==
+lrwx------ 1 chv chv 64 Nov  6 15:18 132 -> /dev/net/tun
+lrwx------ 1 chv chv 64 Nov  6 15:18 133 -> /dev/net/tun
+lrwx------ 1 chv chv 64 Nov  6 15:18 137 -> /dev/net/tun
+lrwx------ 1 chv chv 64 Nov  6 15:18 140 -> /dev/net/tun
+lrwx------ 1 chv chv 64 Nov  6 15:18 75 -> /dev/net/tun
+== agent warn vm.boot? ==
+== console evidence ==

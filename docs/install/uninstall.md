@@ -47,7 +47,7 @@ reinstall resumes from it.
 | `/usr/share/chv` | UI assets, migrations | ✅ Yes |
 | `/usr/lib/tmpfiles.d/chv-node.conf` | tmpfiles entry (`chv-node` package) | ✅ Yes |
 | `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Only via `scripts/install.sh --wipe` or `scripts/quick-install.sh --uninstall`; package remove/purge and an `install.sh` re-run leave them |
-| Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (including the literal `default` network; plus the baseline `chvbr0` bridge), the live and persisted CHV `MASQUERADE` rules, `99-chv-forward.conf`, and the networkd/ifupdown bridge config | ✅ Yes (remove/purge, not upgrade) |
+| Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (including the seeded default network, whose generated id yields `br-<id>`; plus the legacy baseline `chvbr0` bridge when one exists), the live and persisted CHV `MASQUERADE` rules, `99-chv-forward.conf`, and the networkd/ifupdown bridge config | ✅ Yes (remove/purge, not upgrade) |
 
 ## Verify removal
 
@@ -100,6 +100,23 @@ restore the uplink configuration. For a supported removal, remove
 ## Complete removal (destructive)
 
 > **⚠️ WARNING:** This procedure permanently destroys all CHV data. Back up anything you need before proceeding.
+
+### Using `scripts/install.sh --wipe`
+
+`--wipe` is the installer's destructive reset, not a package operation. It
+stops all four services, terminates surviving CHV VMMs, deletes host network
+state and the control-plane database, removes `/etc/chv` (so the node identity
+is regenerated), and — from rc.7 — removes the identity-bound Core authority
+state (`core.db`, its WAL/SHM/journal, `.core.db.cellhv-runtime-authority.lease`,
+`node-cache-v1.archive`, and its authority lock) after every Core writer is
+stopped. Other agent state such as certificates is untouched. It then installs
+fresh. Two consecutive `--wipe` installs must both reach `TenantReady`;
+retaining the old Core store while regenerating `agent.toml` made the second
+install crash-loop on `Identity(Conflict)` (rc.6 blocker B5).
+
+This path is **destructive**: back up first if the deployment must be
+recoverable. A plain re-run without `--wipe` still refuses to proceed when
+persistent data is present.
 
 ### 1. Stop services
 
@@ -160,11 +177,16 @@ sudo ip netns list | grep -E '^ns-([0-9a-f]+|default)( |$)' || echo "no CHV name
 ip -o link show type bridge | grep -E 'chvbr0|br-[A-Za-z0-9_.-]+' || echo "no CHV bridges"
 ```
 
-The default network id is the literal `default` (namespace `ns-default`,
-nftables table `chv-default`, bridge `chvbr0`); operator-created network ids
-use the same `ns-<id>`/`chv-<id>`/`br-<id>` naming. Docker also creates
+The default network created by `scripts/install.sh` has a generated id, so its
+namespace is `ns-<id>`, its nftables table is `chv-<id>`, and its bridge is
+`br-<id>` (a 15-character-hashed name past that length). A network row whose
+id is literally `default` maps to `chvbr0`; `chvbr0` is also the legacy
+baseline bridge created when the installer seeds no default network
+(`INSTALL_CHV_NO_SEED=1`) or on an older deployment. Operator-created network
+ids use the same `ns-<id>`/`chv-<id>`/`br-<id>` naming. Docker also creates
 `br-<12 hex>` bridges, so a `br-` match alone is not proof of CHV ownership:
-a CHV bridge carries `tap-[0-9a-f]{8}` slaves or is `chvbr0`. On a host upgraded from an
+a CHV bridge carries `tap-[0-9a-f]{8}` slaves or is the CHV-owned `chvbr0`.
+On a host upgraded from an
 older release, an orphaned table/bridge from that older layout may still be
 present. Remove it explicitly once: `nft delete table inet chv-<id>`,
 `ip netns del ns-<id>`, `ip link del dev br-<id>` (and
@@ -195,6 +217,25 @@ Critical files to back up:
 - `/etc/chv/bootstrap.token` — enrollment token (if still needed)
 
 ## Troubleshooting
+
+### A VM reports `Running` but has no network / 0-byte console
+This was rc.6 blocker B6: after a failed first boot, a retried `start_vm`
+could report `Running` with an empty `config.net`, and stop/start did not heal
+it. rc.7 fails such a start visibly and names the recovery. Delete the VM and
+recreate it; do not reuse a volume whose guest never wrote successfully. Check
+the agent log for `vm.boot failed` or `without all requested NICs`, and verify
+the packaged unit allows `/dev/net/tun` (see
+[DEPLOYMENT.md](../DEPLOYMENT.md#cloud-hypervisor-fails-to-open-devnettun)).
+
+### `chv-agent` crash-loops on `Identity(Conflict)` after `--wipe`
+This was rc.6 blocker B5: `--wipe` regenerated `agent.toml`'s node identity but
+retained the old Core store. On rc.6, stop the services, remove
+`/var/lib/chv/agent/core.db*`, `.core.db.cellhv-runtime-authority.lease`,
+`node-cache-v1.archive`, and `.node-cache-v1.archive.cellhv-authority.lock`,
+then re-run `install.sh --wipe` (the failed deployment's data has already been
+discarded). A plain re-run refuses while persistent data exists. rc.7 removes
+this state automatically after every Core writer is stopped, so a fresh
+`--wipe` install does not need the manual step.
 
 ### `userdel: user chv is currently used by process ...`
 

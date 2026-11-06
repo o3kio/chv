@@ -753,6 +753,7 @@ impl LinuxExecutor {
         let conf_path = runtime_dir.join(format!("dnsmasq-{}.conf", network_id));
         let hosts_path = runtime_dir.join(format!("dnsmasq-{}.hosts", network_id));
         let pid_path = runtime_dir.join(format!("dnsmasq-{}.pid", network_id));
+        let lease_path = runtime_dir.join(format!("dnsmasq-{}.leases", network_id));
 
         if Self::is_dnsmasq_running(&pid_path).await {
             return Ok(());
@@ -788,7 +789,7 @@ impl LinuxExecutor {
                 source: e,
             })?;
 
-        let dnsmasq_args = Self::dnsmasq_args(&conf_path, &pid_path);
+        let dnsmasq_args = Self::dnsmasq_args(&conf_path, &pid_path, &lease_path);
         let out = Command::new("dnsmasq")
             .args(dnsmasq_args)
             .output()
@@ -809,10 +810,19 @@ impl LinuxExecutor {
         Ok(())
     }
 
-    fn dnsmasq_args(conf_path: &std::path::Path, pid_path: &std::path::Path) -> [String; 2] {
+    fn dnsmasq_args(
+        conf_path: &std::path::Path,
+        pid_path: &std::path::Path,
+        lease_path: &std::path::Path,
+    ) -> [String; 3] {
         [
             format!("--conf-file={}", conf_path.display()),
             format!("--pid-file={}", pid_path.display()),
+            // dnsmasq's default lease path (/var/lib/misc) is outside the
+            // nwd sandbox's writable roots; without this the daemon exits
+            // with "cannot open or create lease file: Permission denied"
+            // and DHCP is dead (rc.6 blocker B4).
+            format!("--dhcp-leasefile={}", lease_path.display()),
         ]
     }
 
@@ -831,6 +841,7 @@ impl LinuxExecutor {
         let pid_path = runtime_dir.join(format!("dnsmasq-{}.pid", network_id));
         let conf_path = runtime_dir.join(format!("dnsmasq-{}.conf", network_id));
         let hosts_path = runtime_dir.join(format!("dnsmasq-{}.hosts", network_id));
+        let lease_path = runtime_dir.join(format!("dnsmasq-{}.leases", network_id));
 
         // SIGTERM, then a bounded wait for the process to actually exit
         // before the pid file is removed (m8 race): dnsmasq uses
@@ -872,6 +883,7 @@ impl LinuxExecutor {
         let _ = tokio::fs::remove_file(&pid_path).await;
         let _ = tokio::fs::remove_file(&conf_path).await;
         let _ = tokio::fs::remove_file(&hosts_path).await;
+        let _ = tokio::fs::remove_file(&lease_path).await;
     }
 
     async fn add_dhcp_host(network_id: &str, mac_address: &str, ip_address: &str) {
@@ -1695,6 +1707,23 @@ mod tests {
     }
 
     #[test]
+    fn dnsmasq_argv_uses_a_writable_lease_file() {
+        // rc.6 B4: dnsmasq's default lease file (/var/lib/misc) is outside
+        // the nwd sandbox's writable roots, so the daemon exited with
+        // "Permission denied" and DHCP never served a lease.
+        let conf = std::path::Path::new("/run/chv/nwd/dnsmasq-net1.conf");
+        let pid = std::path::Path::new("/run/chv/nwd/dnsmasq-net1.pid");
+        let lease = std::path::Path::new("/run/chv/nwd/dnsmasq-net1.leases");
+        let args = LinuxExecutor::dnsmasq_args(conf, pid, lease);
+        assert_eq!(args[0], "--conf-file=/run/chv/nwd/dnsmasq-net1.conf");
+        assert_eq!(args[1], "--pid-file=/run/chv/nwd/dnsmasq-net1.pid");
+        assert_eq!(
+            args[2], "--dhcp-leasefile=/run/chv/nwd/dnsmasq-net1.leases",
+            "the lease file must live under the nwd ReadWritePaths root"
+        );
+    }
+
+    #[test]
     fn fabric_attach_commands_enslave_and_set_mtu() {
         let commands = LinuxExecutor::fabric_attach_commands("chv-c-0123abcd", "br-net-1", 1380);
         assert_eq!(
@@ -2072,6 +2101,7 @@ mod tests {
         let args = LinuxExecutor::dnsmasq_args(
             std::path::Path::new("/run/chv/nwd/dnsmasq-net.conf"),
             std::path::Path::new("/run/chv/nwd/dnsmasq-net.pid"),
+            std::path::Path::new("/run/chv/nwd/dnsmasq-net.leases"),
         );
 
         assert_eq!(
@@ -2079,6 +2109,7 @@ mod tests {
             [
                 "--conf-file=/run/chv/nwd/dnsmasq-net.conf".to_string(),
                 "--pid-file=/run/chv/nwd/dnsmasq-net.pid".to_string(),
+                "--dhcp-leasefile=/run/chv/nwd/dnsmasq-net.leases".to_string(),
             ]
         );
     }

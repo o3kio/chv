@@ -1,0 +1,26 @@
+# Probe: can a process in the agent's device cgroup open /dev/net/tun?
+# /dev/net/tun is crw-rw-rw- root:root 666
+
+== shipped policy: DevicePolicy=auto implied by DeviceAllow=/dev/kvm rw (closed) ==
+2026-11-06T15:12:22Z
+Running as unit: devprobe-closed-23784.service; invocation ID: db62db1ebac14c638dce1acc8bae3df9
+FAILED /dev/net/tun [Errno 1] Operation not permitted: '/dev/net/tun'
+opened /dev/kvm 3
+Finished with result: success
+Main processes terminated with: code=exited/status=0
+Service runtime: 16ms
+CPU time consumed: 15ms
+Memory peak: 256.0K
+Memory swap peak: 0B
+
+== with /dev/net/tun allowed ==
+2026-11-06T15:12:22Z
+Running as unit: devprobe-tun-21189.service; invocation ID: 9d08f9fdbbc949b78ea3cc68bb84bf04
+opened /dev/net/tun 3
+opened /dev/kvm 3
+Finished with result: success
+Main processes terminated with: code=exited/status=0
+Service runtime: 17ms
+CPU time consumed: 16ms
+Memory peak: 256.0K
+Memory swap peak: 0B

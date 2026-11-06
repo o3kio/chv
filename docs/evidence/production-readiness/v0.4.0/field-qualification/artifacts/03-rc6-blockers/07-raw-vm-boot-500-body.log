@@ -1,0 +1,22 @@
+token_len=300
+# Raw Cloud Hypervisor response to PUT /api/v1/vm.boot from a VM created through
+# the documented BFF path, with the shipped agent device policy (no /dev/net/tun).
+# This is the body the agent logged only as status=500.
+2026-11-06T15:25:50Z
+agent_device_policy: DevicePolicy=auto DeviceAllow=/dev/kvm rw 
+
+== create dev-vm-8 via BFF ==
+create_http=200
+{"accepted":true,"next_refresh_path":"/api/v1/tasks/a13f55f031b7ecb89a10c451344b93a6","summary":"Creating VM 'dev-vm-8'","task_id":"a13f55f031b7ecb89a10c451344b93a6","vm_id":"53b69fbdff5c4d64b3dab84668e5d9f5"}
+VM8=53b69fbdff5c4d64b3dab84668e5d9f5
+vm_dir_exists=yes
+state_before=Created
+
+== direct PUT /api/v1/vm.boot (raw CH) ==
+boot_http=500
+["Error from API","The VM could not boot","Error from device manager","Cannot create virtio-net device","Failed to open taps","Open tap device failed","Couldn't open /dev/net/tun","Operation not permitted (os error 1)"]
+state_after=Created
+console_bytes=0
+
+== cleanup: kill VMM, remove its dir ==
+vm_dirs=0

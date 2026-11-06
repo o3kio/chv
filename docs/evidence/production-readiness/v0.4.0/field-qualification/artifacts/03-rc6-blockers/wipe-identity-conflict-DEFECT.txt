@@ -1,0 +1,4 @@
+run2: install.sh --wipe then clean install
+defect: --wipe retains /var/lib/chv/agent/core.db (host_identity be476a16-135c-410c-a439-51a3f3c15730) but generates a new node_id (d0d70212-03e1-4688-9ebf-45c30d642a8f); agent exits Identity(Conflict) and crash-loops; installer skips VM seeding after 60s.
+classification pending; field path uses docs/install/uninstall.md complete removal instead.
+archived: 2026-11-06T14:53:57Z

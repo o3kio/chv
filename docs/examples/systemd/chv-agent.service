@@ -41,8 +41,14 @@ StateDirectory=chv/agent
 StateDirectoryMode=0700
 LogsDirectory=chv
 
-# Device access for KVM
+# Device access for KVM and the VM NIC. Any DeviceAllow entry switches the
+# unit to a closed device cgroup, so every device Cloud Hypervisor opens as a
+# child must be listed: /dev/kvm for the guest CPU and /dev/net/tun for each
+# virtio-net device. Without the tun entry every vm.boot fails with
+# "Couldn't open /dev/net/tun: Operation not permitted" and the VM runs with no
+# NIC (rc.6 blocker B1).
 DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
 SupplementaryGroups=kvm
 
 # Security hardening

@@ -75,11 +75,27 @@ class CellHvCorePackagingTests(unittest.TestCase):
             "RuntimeDirectoryMode=0775",
             "StateDirectory=chv/agent",
             "StateDirectoryMode=0700",
+            "DeviceAllow=/dev/kvm rw",
+            "DeviceAllow=/dev/net/tun rw",
         ):
             self.assertIn(directive, packaged)
             self.assertIn(directive, standalone)
         self.assertIn("ExecStartPre=+/usr/bin/install -d -m 0700", standalone)
         self.assertNotIn("ExecStartPost=", standalone)
+
+    def test_agent_unit_allows_the_vm_nic_device(self):
+        # Field blocker B1: any DeviceAllow switches the unit to a closed
+        # device cgroup, and cloud-hypervisor runs as a child of this unit.
+        # /dev/net/tun is world-writable but the device cgroup still returns
+        # EPERM on open() unless the device is allow-listed, so every
+        # virtio-net attach failed and the VM booted without a NIC.
+        for relative in (
+            "packaging/systemd/chv-agent.service",
+            "docs/examples/systemd/chv-agent.service",
+        ):
+            unit = (ROOT / relative).read_text()
+            self.assertIn("DeviceAllow=/dev/kvm rw", unit)
+            self.assertIn("DeviceAllow=/dev/net/tun rw", unit)
 
     def test_install_surfaces_provision_exact_private_parents(self):
         postinstall = (ROOT / "packaging/scripts/postinstall.sh").read_text()
@@ -89,10 +105,23 @@ class CellHvCorePackagingTests(unittest.TestCase):
             self.assertRegex(tmpfiles, rf"d {re.escape(path)} 0700 chv chv -")
         self.assertRegex(tmpfiles, r"d /run/chv/agent 0775 chv chv -")
 
-    def test_no_packaging_surface_removes_core_socket_or_runtime_lease(self):
-        surfaces = list((ROOT / "packaging").rglob("*")) + [ROOT / "scripts/install.sh"]
+    def test_core_socket_and_runtime_lease_are_only_removed_by_explicit_wipe(self):
+        # A normal stop/restart must never unlink Core's socket or its runtime
+        # authority lease: doing so under a live Core splits authority. The one
+        # explicit destructive path is install.sh --wipe, which regenerates the
+        # node identity and therefore must remove the identity-bound Core
+        # state (field blocker B5).
         forbidden = ("/run/chv/core/core-v1.sock", ".cellhv-runtime-authority.lease")
-        for path in surfaces:
+        installer = (ROOT / "scripts/install.sh").read_text()
+
+        helper = re.search(
+            r"remove_agent_authority_state\(\) \{(.*?)\n\}", installer, re.S
+        )
+        self.assertIsNotNone(helper, "the --wipe authority helper is missing")
+        helper_body = helper.group(1)
+        outside_helper = installer.replace(helper_body, "")
+
+        for path in (ROOT / "packaging").rglob("*"):
             if not path.is_file():
                 continue
             text = path.read_text(errors="ignore")
@@ -100,6 +129,144 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 for line in text.splitlines():
                     if token in line and re.search(r"\b(?:rm|remove|unlink)\b", line):
                         self.fail(f"{path}: destructive Core path line: {line}")
+        for token in forbidden:
+            for line in outside_helper.splitlines():
+                if token in line and re.search(r"\b(?:rm|remove|unlink)\b", line):
+                    self.fail(
+                        "scripts/install.sh: destructive Core path line outside "
+                        f"the --wipe helper: {line}"
+                    )
+
+        wipe_body = re.search(r"wipe_deployment\(\) \{(.*?)\n\}", installer, re.S).group(1)
+        self.assertIn("remove_agent_authority_state", wipe_body)
+        # Every Core writer must be stopped before its database/lease vanish.
+        self.assertLess(
+            wipe_body.index("remove_running_chv_processes"),
+            wipe_body.index("remove_agent_authority_state"),
+        )
+        # The identity is regenerated only because /etc/chv is removed.
+        self.assertLess(
+            wipe_body.index("remove_agent_authority_state"),
+            wipe_body.index("${CHV_CONFIG_DIR}"),
+        )
+        for expected in (
+            "core.db",
+            ".core.db.cellhv-runtime-authority.lease",
+            "node-cache-v1.archive",
+        ):
+            self.assertIn(expected, helper_body)
+
+    def test_default_seed_owns_the_gateway_once(self):
+        # Field blocker B3: the legacy chvbr0 and nwd's bridge both carried the
+        # seeded gateway, so the host routed guest traffic to chvbr0. When the
+        # default network is seeded, the installer must leave the address to
+        # chv-nwd and still provide forwarding/NAT, then verify single
+        # ownership.
+        installer = (ROOT / "scripts/install.sh").read_text()
+        setup = re.search(r"setup_network\(\) \{(.*?)\n\}", installer, re.S).group(1)
+        self.assertIn("enable_guest_forwarding", setup)
+        # The seeded-network branch removes the legacy bridge (and its
+        # persisted config/NAT) and returns before the legacy bridge is made.
+        self.assertIn(
+            'remove_chv_bridge_and_nat "${INSTALL_CHV_BRIDGE_NAME}"', setup
+        )
+        self.assertLess(
+            setup.index('INSTALL_CHV_NO_SEED:-0'), setup.index("ip link add name")
+        )
+        self.assertLess(
+            setup.index('INSTALL_CHV_NO_SEED:-0'),
+            setup.index('ip addr add "${INSTALL_CHV_BRIDGE_CIDR}"'),
+        )
+        forwarding = re.search(
+            r"enable_guest_forwarding\(\) \{(.*?)\n\}", installer, re.S
+        ).group(1)
+        self.assertIn("net.ipv4.ip_forward=1", forwarding)
+        self.assertIn("MASQUERADE", forwarding)
+
+        seed = re.search(r"seed_dev_resources\(\) \{(.*?)\n\}", installer, re.S).group(1)
+        self.assertLess(
+            seed.index("/v1/networks/create"),
+            seed.index('assert_single_gateway_owner "${gateway_ip}"'),
+        )
+        owner = re.search(
+            r"assert_single_gateway_owner\(\) \{(.*?)\n\}", installer, re.S
+        ).group(1)
+        self.assertIn("$4 == gw", owner)
+        self.assertIn("sort -u", owner)
+        self.assertIn("-ne 1", owner)
+        self.assertIn("fatal", owner)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required")
+    def test_local_release_directory_reports_the_artifact_version(self):
+        # Field evidence B7: the rc.6 clean-install transcript printed
+        # "Version: 0.3.0" while installing 0.4.0-rc.6, because local
+        # release-directory mode used the offline fallback pin. The completion
+        # banner and the install record must name the artifact's own tag.
+        source = (ROOT / "scripts/install.sh").read_text()
+        helper = re.search(
+            r"version_from_release_dir\(\) \{(.*?)\n\}", source, re.S
+        ).group(0)
+        self.assertIn("chv-*-linux-amd64", helper)
+        self.assertIn('INSTALL_CHV_VERSION="$local_dir_version"', source)
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {
+                "chv-0.4.0-rc.7-linux-amd64": "0.4.0-rc.7",
+                "chv-0.4.0-rc.6-linux-amd64": "0.4.0-rc.6",
+                "chv-0.3.0-linux-amd64": "0.3.0",
+                "chv-0.4.0-rc.7-linux-amd64.tar.gz": "0.4.0-rc.7",
+                "not-a-release": "",
+                "chv-0.4.0-linux-amd64.bak": "",
+            }
+            script = "set -euo pipefail\n" + helper + "\n"
+            for name in cases:
+                path = pathlib.Path(tmp) / name
+                if name.endswith(".tar.gz"):
+                    path.write_text("")
+                else:
+                    path.mkdir()
+                script += (
+                    f"printf '%s\\n' \"$(version_from_release_dir '{path}')\"\n"
+                )
+            out = subprocess.run(
+                ["bash", "-c", script], check=True, capture_output=True, text=True
+            ).stdout.splitlines()
+        self.assertEqual(out, list(cases.values()))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required")
+    def test_wipe_removes_identity_bound_core_state_but_keeps_other_agent_state(self):
+        # Exercise the helper itself: only the identity-bound authority files
+        # may disappear; certificates and anything else in the agent dir stay.
+        source = (ROOT / "scripts/install.sh").read_text()
+        helper = re.search(
+            r"remove_agent_authority_state\(\) \{(.*?)\n\}", source, re.S
+        ).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            data = pathlib.Path(tmp) / "chv"
+            agent = data / "agent"
+            agent.mkdir(parents=True)
+            for name in (
+                "core.db",
+                "core.db-wal",
+                "core.db-shm",
+                "core.db-journal",
+                ".core.db.cellhv-runtime-authority.lease",
+                "node-cache-v1.archive",
+                ".node-cache-v1.archive.cellhv-authority.lock",
+            ):
+                (agent / name).write_text("state")
+            keep = agent / "agent.crt"
+            keep.write_text("keep")
+            script = (
+                "set -euo pipefail\n"
+                f"CHV_DATA_DIR='{data}'\n"
+                f"{helper}\n"
+                "remove_agent_authority_state\n"
+            )
+            subprocess.run(
+                ["bash", "-c", script], check=True, capture_output=True, text=True
+            )
+            remaining = sorted(p.name for p in agent.iterdir())
+        self.assertEqual(remaining, ["agent.crt"])
 
     def test_removal_paths_terminate_vms_left_running_by_the_agent(self):
         # `KillMode=process` lets VMMs outlive chv-agent by design, so every

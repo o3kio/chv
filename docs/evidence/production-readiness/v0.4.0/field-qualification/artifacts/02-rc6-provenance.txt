@@ -1,0 +1,34 @@
+rc.6 asset provenance verification — 2026-11-06T14:16:00Z
+repository: o3kio/chv
+tag: v0.4.0-rc.6
+head commit: df86e53935b8d2ccacc1908ffa5e4b9c472911b7
+
+method: GitHub attestation REST API (repos/{repo}/attestations/sha256:<digest>),
+decoding the Sigstore DSSE in-toto statement. The local installed gh
+does not provide `gh attestation`; the release workflow still generated
+the build provenance with actions/attest-build-provenance.
+
+attestations returned: 1
+predicate type: https://slsa.dev/provenance/v1
+workflow: .github/workflows/release.yml @ refs/tags/v0.4.0-rc.6
+resolved commit: df86e53935b8d2ccacc1908ffa5e4b9c472911b7
+run invocation: https://github.com/o3kio/chv/actions/runs/42228721214/attempts/1
+
+=== subject digest verification (local file vs attested subject) ===
+OK   fa999d64d43e0cfb018b9c9b41edbf35888ce5181680584f201bb9fd403e4906  chv-0.4.0-rc.6-linux-amd64.tar.gz
+OK   dd17c27ab2cac8f16296e4d4dfb9bb1191cf4b71a4d3cb3c41c19481b6572cfe  chv-0.4.0-rc.6-linux-amd64.tar.gz.sha256
+OK   854caf395f1f405c288de5bdc40464da20d8d033ed68cf6aad5388131099db7f  chv-controlplane_0.4.0.rc.6_amd64.deb
+OK   bc3818b283dd94008a51130d2f9e45c8e42a884d362678d7ec1ea0cb69f8216b  chv-monitor-agent_0.4.0.rc.6_amd64.deb
+OK   c676460080a51ffa3e46dbad3a8c47a306410e1ef08986a447df8d0aaf7e349a  chv-node_0.4.0.rc.6_amd64.deb
+OK   0ff97a53fbcc01a81cd32640edc1cbcf5079faf6b02e636e6deaaa739f99435c  chvctl_0.4.0.rc.6_amd64.deb
+OK   3e4379c15c9a0fbde48a6aa5c66fd85343f1c36e96d9b5b8d5e9ea3fbe91f65a  chv-controlplane-0.4.0.rc.6-1.x86_64.rpm
+OK   3616b6931e741b9243f145b6b36a78f4bd5d0fe3b5a7e6bc0c3365db7e80c677  chv-monitor-agent-0.4.0.rc.6-1.x86_64.rpm
+OK   14ca55a4bcf5ac697f5ac608f7287a72f4048c2836dad0ffaa59f5450a69b425  chv-node-0.4.0.rc.6-1.x86_64.rpm
+OK   e25ffed37e04910c916e3ccead0ab9458ea0a542e61a87eff0495679dc93f3c0  chvctl-0.4.0.rc.6-1.x86_64.rpm
+
+subject digest mismatches: 0
+assets without an attested subject: none
+workflow ref == refs/tags/v0.4.0-rc.6: True
+resolved commit == df86e53935b8d2ccacc1908ffa5e4b9c472911b7: True
+
+result: PROVENANCE VERIFIED

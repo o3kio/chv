@@ -1,0 +1,27 @@
+# CORRECTION: tap ownership is NOT a defect.
+#
+# Earlier hypothesis: nwd creates taps without `user chv`, so CH as uid 999
+# cannot TUNSETIFF. That hypothesis is wrong. `ip tuntap add ... mode tap`
+# executed by a process holding CAP_NET_ADMIN (nwd's context) creates the
+# device with no TUNSETOWNER, i.e. kernel owner == -1, which is attachable by
+# any uid. The observed EPERM was at open(/dev/net/tun) from the agent unit's
+# device cgroup, not at TUNSETIFF.
+
+== tap created in nwd's exact context (uid chv + ambient CAP_NET_ADMIN, no user=) ==
+Running as unit: nwdproof-6661.service; invocation ID: aaed57bacdba47ad885844017a86efca
+Finished with result: success
+Main processes terminated with: code=exited/status=0
+Service runtime: 2ms
+CPU time consumed: 2ms
+Memory peak: 256.0K
+Memory swap peak: 0B
+{'ifname': 'tap-nwdproof', 'flags': ['tap', 'persist']}
+
+== CH as chv, CapEff=0, against that root-owned/ownerless tap ==
+serial_bytes=64017
+[INFO] Booting with PVH Boot Protocol^M
+5531bda5a80cea45770addaba999ba3c login: 
+
+== conclusion ==
+CH attached the nwd-created (ownerless) tap with CapEff=0 and booted to login.
+Tap ownership is not a blocker; only the agent device cgroup denies the open.
