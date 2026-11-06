@@ -208,11 +208,12 @@ class CellHvCorePackagingTests(unittest.TestCase):
         self.assertIn("\n    delete_chv_network_state\n", remove_branch)
 
     @unittest.skipUnless(shutil.which("bash") and shutil.which("sh"), "shells required")
-    def test_bridge_name_derivation_matches_the_rust_helper(self):
+    def test_bridge_name_derivation_shell_vectors(self):
         # The shells reimplement chv_common::bridge_name_for_network (the
         # kernel caps device names at 15 chars; long ids keep an 8-char prefix
-        # plus a 4-hex FNV-1a suffix). A drift here deletes nothing or the
-        # wrong device.
+        # plus a 4-hex FNV-1a suffix). The Rust side owns the same vectors in
+        # crates/chv-common/src/lib.rs; these assertions pin the sh copies.
+        # A drift here deletes nothing or the wrong device.
         vectors = {
             "default": "chvbr0",
             "0b7f28f0": "br-0b7f28f0",
@@ -238,12 +239,28 @@ class CellHvCorePackagingTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required to exercise the cleanup")
     def test_network_cleanup_deletes_only_chv_owned_state(self):
-        # Exercise the shipped functions against fake ip/nft/sqlite3/iptables
-        # and a redirected CHV_HOST_ETC, so the test can never touch the real
-        # host's bridges, namespaces, firewall, or networkd config.
-        installer = (ROOT / "scripts/install.sh").read_text()
+        # Exercise every shipped copy of the removal teardown. install.sh and
+        # quick-install.sh are bash; preremove.sh must also run under dash,
+        # which is what dpkg invokes. Each case gets a fresh sandbox so the
+        # fakes cannot leak state between runs.
+        cases = [
+            ("scripts/install.sh", shutil.which("bash")),
+            ("scripts/quick-install.sh", shutil.which("bash")),
+        ]
+        posix_shell = shutil.which("dash") or shutil.which("sh")
+        if posix_shell:
+            cases.append(("packaging/scripts/preremove.sh", posix_shell))
+        for relative, shell in cases:
+            with self.subTest(script=relative):
+                self._exercise_network_cleanup(relative, shell)
+
+    def _exercise_network_cleanup(self, relative, shell):
+        # Run the shipped functions against fake ip/nft/sqlite3/iptables and a
+        # redirected CHV_HOST_ETC, so the test can never touch the real host's
+        # bridges, namespaces, firewall, or networkd config.
+        source = (ROOT / relative).read_text()
         functions = "\n".join(
-            re.search(rf"^{name}\(\) \{{.*?\n\}}", installer, re.S | re.M).group(0)
+            re.search(rf"^{name}\(\) \{{.*?\n\}}", source, re.S | re.M).group(0)
             for name in (
                 "chv_bridge_name_for_network",
                 "chv_network_ids",
@@ -260,15 +277,16 @@ class CellHvCorePackagingTests(unittest.TestCase):
             log.write_text("")
             iptables_state = tmp_path / "iptables.state"
             # Both CHV NAT forms, live in the kernel table, for the baseline
-            # bridge plus the two per-network rules.
+            # bridge, the two hex-id networks, and an operator-chosen id.
             iptables_state.write_text(
                 "POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE\n"
                 "POSTROUTING -s 10.200.0.0/24 ! -o chvbr0 -j MASQUERADE\n"
                 "POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE\n"
                 "POSTROUTING -s 10.202.0.0/24 ! -d 10.202.0.0/24 -j MASQUERADE\n"
+                "POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE\n"
             )
 
-            # A persisted-rules file with two CHV lines and one that belongs to
+            # A persisted-rules file with CHV lines and one that belongs to
             # something else: only the former may be removed.
             rules = tmp_path / "rules.v4"
             rules.write_text(
@@ -276,6 +294,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "-A POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.200.0.0/24 ! -o chvbr0 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE\n"
                 "COMMIT\n"
             )
@@ -299,11 +318,14 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "#!/bin/bash\n"
                 f"printf 'ip %s\\n' \"$*\" >> {log}\n"
                 'case "$*" in\n'
-                '  "netns list") printf \'%s\\n\' ns-63b27631c9c92fda4a43351c5aeeba21 ns-other ;;\n'
+                '  "netns list") printf \'%s\\n\' ns-63b27631c9c92fda4a43351c5aeeba21 '
+                "ns-default ns-net1 ns-other ;;\n"
                 '  "-o -4 route show dev br-63b276315a70 proto kernel scope link") '
                 "printf '%s\\n' '10.201.0.0/24 proto kernel scope link src 10.201.0.1' ;;\n"
                 '  "-o -4 route show dev br-0b7f28f0 proto kernel scope link") '
                 "printf '%s\\n' '10.202.0.0/24 proto kernel scope link src 10.202.0.1' ;;\n"
+                '  "-o -4 route show dev br-net1 proto kernel scope link") '
+                "printf '%s\\n' '10.203.0.0/24 proto kernel scope link src 10.203.0.1' ;;\n"
                 '  "-o -4 route show dev chvbr0 proto kernel scope link") '
                 "printf '%s\\n' '10.200.0.0/24 proto kernel scope link src 10.200.0.1' ;;\n"
                 '  "-o link show master br-63b276315a70") '
@@ -311,6 +333,8 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "'10: ens19: <BROADCAST> mtu 1500 master br-63b276315a70' ;;\n"
                 '  "-o link show master br-0b7f28f0") '
                 "printf '%s\\n' '11: tap-deadbeef@if7: <BROADCAST> mtu 1500 master br-0b7f28f0' ;;\n"
+                '  "-o link show master br-net1") '
+                "printf '%s\\n' '12: tap-cafebabe@if9: <BROADCAST> mtu 1500 master br-net1' ;;\n"
                 '  *) : ;;\n'
                 "esac\n"
             )
@@ -320,7 +344,8 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 f"printf 'nft %s\\n' \"$*\" >> {log}\n"
                 'if [ "$1 $2" = "list tables" ]; then\n'
                 "  printf '%s\\n' 'table inet chv-63b27631c9c92fda4a43351c5aeeba21' "
-                "'table inet chv-0b7f28f0' 'table inet chvhs-deadbeef' 'table ip filter'\n"
+                "'table inet chv-0b7f28f0' 'table inet chv-default' 'table inet chv-net1' "
+                "'table inet chvhs-deadbeef' 'table ip filter'\n"
                 "fi\n"
             )
             sqlite3 = bin_dir / "sqlite3"
@@ -347,9 +372,13 @@ class CellHvCorePackagingTests(unittest.TestCase):
             for tool in (ip, nft, sqlite3, iptables):
                 tool.chmod(0o755)
 
+            pipefail = "-o pipefail" if "bash" in (shell or "") else ""
             script = (
-                'cmd_exists() { command -v "$1" &>/dev/null; }\n'
+                f"set -eu {pipefail}\n".replace("  ", " ")
+                + 'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
+                'have() { command -v "$1" >/dev/null 2>&1; }\n'
                 "CHV_DB_PATH=/nonexistent.db\n"
+                "CHV_USER=chv-no-such-user\n"
                 "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
                 f"CHV_HOST_ETC='{etc}'\n"
                 f"CHV_IPTABLES_RULES_V4='{rules}'\n"
@@ -358,7 +387,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
             )
             env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
             subprocess.run(
-                [shutil.which("bash"), "-c", script],
+                [shell, "-c", script],
                 env=env,
                 check=True,
                 capture_output=True,
@@ -373,36 +402,44 @@ class CellHvCorePackagingTests(unittest.TestCase):
         for expected in (
             "ip link del dev tap-1234abcd",
             "ip link del dev tap-deadbeef",
+            "ip link del dev tap-cafebabe",
             "ip link del dev br-63b276315a70",
             "ip link del dev br-0b7f28f0",
+            "ip link del dev br-net1",
             "ip netns del ns-63b27631c9c92fda4a43351c5aeeba21",
+            "ip netns del ns-default",
+            "ip netns del ns-net1",
             "nft delete table inet chv-63b27631c9c92fda4a43351c5aeeba21",
             "nft delete table inet chv-0b7f28f0",
+            "nft delete table inet chv-default",
+            "nft delete table inet chv-net1",
             "ip link del dev chvbr0",
             # Live NAT rules are deleted in both historical forms.
             "iptables -t nat -D POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.200.0.0/24 ! -o chvbr0 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE",
+            "iptables -t nat -D POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE",
         ):
-            self.assertIn(expected, calls)
+            self.assertIn(expected, calls, relative)
         for forbidden in (
             "ip link del dev ens19",
             "ns-other",
             "chvhs-deadbeef",
             "iptables -t nat -D POSTROUTING -s 10.9.9.0/24",
         ):
-            self.assertNotIn(forbidden, calls)
+            self.assertNotIn(forbidden, calls, relative)
 
         # Only the CHV rules disappear from the persisted file.
-        self.assertNotIn("10.200.0.0/24", persisted)
-        self.assertNotIn("10.201.0.0/24", persisted)
-        self.assertIn("-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE", persisted)
+        self.assertNotIn("10.200.0.0/24", persisted, relative)
+        self.assertNotIn("10.201.0.0/24", persisted, relative)
+        self.assertNotIn("10.203.0.0/24", persisted, relative)
+        self.assertIn("-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE", persisted, relative)
 
         # Bridging config that would recreate the CHV bridge is gone; another
         # bridge's drop-in and the uplink's non-CHV config are untouched.
-        self.assertEqual(remaining, ["12-eth9.network"])
-        self.assertEqual(ifupdown_remaining, [])
-        self.assertEqual(sysctl_remaining, [])
+        self.assertEqual(remaining, ["12-eth9.network"], relative)
+        self.assertEqual(ifupdown_remaining, [], relative)
+        self.assertEqual(sysctl_remaining, [], relative)
 
     @unittest.skipUnless(shutil.which("awk"), "awk is required to exercise the matcher")
     def test_vmm_process_matchers_only_select_chv_owned_vmms(self):

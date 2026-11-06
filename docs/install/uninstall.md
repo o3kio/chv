@@ -45,7 +45,7 @@ from it.
 | `/usr/share/chv` | UI assets, migrations | ✅ Yes |
 | `/usr/lib/tmpfiles.d/chv-node.conf` | tmpfiles entry (`chv-node` package) | ✅ Yes |
 | `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Yes |
-| Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (plus the baseline `chvbr0` bridge) | ✅ Yes (remove/purge, not upgrade) |
+| Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (including the literal `default` network; plus the baseline `chvbr0` bridge), the live and persisted CHV `MASQUERADE` rules, `99-chv-forward.conf`, and the networkd/ifupdown bridge config | ✅ Yes (remove/purge, not upgrade) |
 
 ## Verify removal
 
@@ -140,14 +140,24 @@ left (other host bridges/namespaces are not CHV's):
 
 ```bash
 sudo nft list tables | grep 'inet chv-' || echo "no CHV nftables tables"
-sudo ip netns list | grep -E '^ns-[0-9a-f]+' || echo "no CHV namespaces"
-ip -o link show type bridge | grep -E 'chvbr0|br-[0-9a-f]{8}' || echo "no CHV bridges"
+sudo ip netns list | grep -E '^ns-([0-9a-f]+|default)( |$)' || echo "no CHV namespaces"
+ip -o link show type bridge | grep -E 'chvbr0|br-[A-Za-z0-9_.-]+' || echo "no CHV bridges"
 ```
 
-On a host upgraded from an older release, an orphaned table/bridge from that
-older layout may still be present. Remove it explicitly once:
-`nft delete table inet chv-<id>`, `ip netns del ns-<id>`,
-`ip link del dev br-<id>` (and `ip link del dev chvbr0`).
+The default network id is the literal `default` (namespace `ns-default`,
+nftables table `chv-default`, bridge `chvbr0`); operator-created network ids
+use the same `ns-<id>`/`chv-<id>`/`br-<id>` naming. On a host upgraded from an
+older release, an orphaned table/bridge from that older layout may still be
+present. Remove it explicitly once: `nft delete table inet chv-<id>`,
+`ip netns del ns-<id>`, `ip link del dev br-<id>` (and
+`ip link del dev chvbr0`).
+
+Removal also deletes any networkd `12-*.network` drop-in that enslaved the
+uplink to a CHV bridge, because leaving it would recreate the bridge at the
+next boot. That drop-in is also what configured the uplink. Before rebooting,
+restore or verify the uplink's own network configuration (for example
+`networkctl status <uplink>` plus a `10-<uplink>.network`/DHCP stanza) so the
+host does not come back with an unconfigured NIC.
 
 ## What to back up before removal
 

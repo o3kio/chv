@@ -27,6 +27,10 @@ stop_service() {
     if have systemctl; then
         systemctl stop "$1.service" 2>/dev/null || true
     fi
+    # Without systemd (container/chroot package removal) the daemons are not
+    # stopped here; the VMM teardown below still matches by process listing,
+    # but stord/nwd may keep running until the container exits. Documented
+    # limitation, unchanged by this script.
 }
 
 chv_sqlite_read() {
@@ -86,17 +90,27 @@ chv_network_ids() {
                 "SELECT network_id FROM network_desired_state;" 2>/dev/null || true
             chv_sqlite_read "$CHV_DB_PATH" \
                 "SELECT network_id FROM networks;" 2>/dev/null || true
+            # The root fallback in chv_sqlite_read can create -wal/-shm
+            # sidecars owned by root. The preserved database restarts as the
+            # chv user, so hand any sidecars back to it (issue #669).
+            chown chv:chv "$CHV_DB_PATH-wal" "$CHV_DB_PATH-shm" \
+                2>/dev/null || true
         fi
         if have nft; then
             nft list tables 2>/dev/null \
-                | sed -n 's/^table inet chv-\([0-9a-f][0-9a-f]*\)$/\1/p'
+                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p'
         fi
         if have ip; then
+            # A netns name alone is weaker evidence than a CHV nft table or
+            # database row, so only the literal `default` network and legacy
+            # hex ids are treated as ours from this source; custom ids come
+            # from the two sources above. This keeps an unrelated `ns-<name>`
+            # from being deleted.
             ip netns list 2>/dev/null \
                 | awk '{print $1}' \
-                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\)$/\1/p'
+                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p'
         fi
-    } | sort -u
+    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u
 }
 
 # Remove one CHV bridge plus the host state that would recreate or outlive it:
@@ -158,7 +172,7 @@ delete_chv_network_state() {
     chv_network_ids | while IFS= read -r id; do
         [ -n "$id" ] || continue
         case "$id" in
-            *[!0-9a-f]*) continue ;;
+            ''|*[!A-Za-z0-9_.-]*) continue ;;
         esac
         bridge="$(chv_bridge_name_for_network "$id")"
         remove_chv_bridge_and_nat "$bridge"
@@ -186,7 +200,7 @@ delete_chv_network_state() {
     # Sweep any CHV-owned table whose id could not be derived above.
     if have nft; then
         nft list tables 2>/dev/null \
-            | sed -n 's/^table inet \(chv-[0-9a-f][0-9a-f]*\)$/\1/p' \
+            | sed -n 's/^table inet \(chv-[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' \
             | while IFS= read -r table; do
                 nft delete table inet "$table" 2>/dev/null || true
             done
@@ -205,7 +219,9 @@ if [ "$ACTION" = "remove" ]; then
     # Package removal is final: stop any CHV-owned cloud-hypervisor too, or
     # removal leaves orphaned guests (and their taps/nftables state) behind.
     # Match the truncated comm (TASK_COMM_LEN) plus the CHV VM api-socket path
-    # so an unrelated cloud-hypervisor on the host is never signalled.
+    # so an unrelated cloud-hypervisor on the host is never signalled. The
+    # path is the chv-config state-dir default (/var/lib/chv/agent/vms/); a
+    # custom CHV_DATA_DIR would need this matcher updated in lockstep.
     vmm_pids="$(ps -eo pid=,comm=,args= 2>/dev/null | awk '
         ($2 == "cloud-hyperviso" || $2 == "cloud-hypervisor") &&
         $0 ~ /\/var\/lib\/chv\/agent\/vms\// { print $1 }')"

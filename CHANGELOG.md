@@ -21,23 +21,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicates that died on the already-bound metrics ports, leaving the node
   `Failed` and `CreateVm` refused. A plain stop/start reproduced (c) without
   any crash. The unit now uses `KillMode=process` (VMs outlive the agent and
-  are adopted on restart) and `RuntimeDirectory=chv/agent`, and the drain now
-  `shutdown(SHUT_RD)`s each console socket after draining so the readers see
-  EOF and the serial drain no longer holds the process open until
-  `TimeoutStopSec`. Regression tests cover the live-reader unblock and pin
-  the unit contract.
+  are adopted on restart) and `RuntimeDirectory=chv/agent`. The shutdown
+  drain now waits until each console socket's receive queue has stayed empty
+  for consecutive probes — evidence that the serial manager observed
+  `SHUT_WR` and stopped writing — before issuing `shutdown(SHUT_RD)`, so the
+  blocking readers see EOF without EPIPE-ing a still-writing peer.
+  Pty-transport consoles (no `shutdown(2)`) now poll the draining latch
+  instead of staying parked. Regression tests cover the late-write window,
+  the live-reader unblock, the Pty reader, and the unit contract.
 - **Removal left running VMs and host network state behind (blocker).**
   `KillMode=process` deliberately lets VMMs outlive `chv-agent`, but the
-  removal paths did not stop them: package remove/purge, `install.sh --wipe`,
-  and `quick-install.sh --uninstall` now terminate CHV-owned
-  cloud-hypervisor processes before the binaries and data go away. Those
-  paths — and `preremove.sh` on remove/purge, never on upgrade — also tear
-  down the host state nwd materializes outside `/var/lib/chv`: per-network
-  bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables,
-  derived from the control-plane database plus the CHV-owned object names.
-  Previously a documented complete removal left all of it running. This
-  closes the field-plan §6.9 "network residue that survives documented
-  cleanup" blocker found during the rc.6 pre-window drills.
+  removal paths did not stop them: package remove/purge, `install.sh --wipe`
+  and re-run cleanup, and `quick-install.sh --uninstall` now terminate
+  CHV-owned cloud-hypervisor processes before the binaries and data go away.
+  Those paths — and `preremove.sh` on remove/purge, never on upgrade — also
+  tear down the host state nwd materializes outside `/var/lib/chv`:
+  per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables
+  tables for both hex and operator-chosen ids (including the literal
+  `default` network: `ns-default`, `chv-default`, `chvbr0`), derived from
+  the control-plane database plus the CHV-owned object names. They also
+  remove the live and persisted `MASQUERADE` rules, the CHV sysctl file,
+  networkd/ifupdown drop-ins, the `install.sh` UI/migrations/nginx tree, and
+  stale failed unit state. A sandboxed test runs all three shipped copies
+  (including `preremove.sh` under dash) against fake host tools and proves
+  non-CHV objects survive. This closes the field-plan §6.9 "network residue
+  that survives documented cleanup" blocker found during the rc.6
+  pre-window drills.
 
 ## [0.4.0-rc.5] - 2026-11-06
 

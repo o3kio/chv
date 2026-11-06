@@ -210,7 +210,9 @@ list_chv_dnsmasq_processes() {
 # surviving CHV-owned cloud-hypervisor must be stopped too, or the removal
 # leaves orphaned guests, tap interfaces and nftables state behind. Match
 # the truncated comm (TASK_COMM_LEN) plus the CHV VM api-socket path so an
-# unrelated cloud-hypervisor on the host is never signalled.
+# unrelated cloud-hypervisor on the host is never signalled. The path is the
+# chv-config state-dir default (/var/lib/chv/agent/vms/); a custom
+# CHV_DATA_DIR would need this matcher updated in lockstep.
 list_chv_vmm_processes() {
     ps -eo pid=,comm=,args= | awk '
         ($2 == "cloud-hyperviso" || $2 == "cloud-hypervisor") &&
@@ -338,14 +340,19 @@ chv_network_ids() {
         fi
         if cmd_exists nft; then
             nft list tables 2>/dev/null \
-                | sed -n 's/^table inet chv-\([0-9a-f][0-9a-f]*\)$/\1/p'
+                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p'
         fi
         if cmd_exists ip; then
+            # A netns name alone is weaker evidence than a CHV nft table or
+            # database row, so only the literal `default` network and legacy
+            # hex ids are treated as ours from this source; custom ids come
+            # from the two sources above. This keeps an unrelated `ns-<name>`
+            # from being deleted.
             ip netns list 2>/dev/null \
                 | awk '{print $1}' \
-                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\)$/\1/p'
+                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p'
         fi
-    } | sort -u
+    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u
 }
 
 # Remove one CHV bridge plus the host state that would recreate or outlive it:
@@ -408,7 +415,7 @@ delete_chv_network_state() {
     while IFS= read -r id; do
         [ -n "$id" ] || continue
         case "$id" in
-            *[!0-9a-f]*) continue ;;
+            ''|*[!A-Za-z0-9_.-]*) continue ;;
         esac
         bridge="$(chv_bridge_name_for_network "$id")"
         remove_chv_bridge_and_nat "$bridge"
@@ -436,7 +443,7 @@ delete_chv_network_state() {
     # Sweep any CHV-owned table whose id could not be derived above.
     if cmd_exists nft; then
         nft list tables 2>/dev/null \
-            | sed -n 's/^table inet \(chv-[0-9a-f][0-9a-f]*\)$/\1/p' \
+            | sed -n 's/^table inet \(chv-[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' \
             | while IFS= read -r table; do
                 nft delete table inet "$table" 2>/dev/null || true
             done
