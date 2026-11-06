@@ -1550,18 +1550,20 @@ async fn invalid_policy_is_rejected_without_being_journaled() {
     );
 }
 
-/// A rejected policy must still be recorded in memory (never in the journal)
-/// so the attach-time guard refresh fails closed. The attach seam drops nwd's
-/// semantic error; without the record, a stored rc.7 ruleset that cannot be
-/// rendered would leave the tap outside the policy chains (fail-open).
+/// A rejected policy must leave a fail-closed marker in memory (never in the
+/// journal) so the attach-time guard refresh refuses the NIC, and a later valid
+/// save must clear it. The attach seam drops nwd's semantic error; without the
+/// marker, a stored rc.7 ruleset that cannot be rendered would leave the tap
+/// outside the policy chains (fail-open).
 #[tokio::test]
-async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
+async fn rejected_policy_blocks_attach_until_a_valid_save_clears_it() {
     use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
 
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let service = NetworkServiceImpl::new(
         Arc::new(RecordingExecutor {
-            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
-            reject_firewall: true,
+            calls: calls.clone(),
+            reject_firewall: false,
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
@@ -1577,7 +1579,7 @@ async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
     assert_eq!(ensured.status, "OK");
 
     // IPv6 can never be rendered by the IPv4 engine, so this payload is
-    // rejected before journaling. It must still be recorded in memory.
+    // rejected before journaling. It must still set the in-memory marker.
     let fw = service
         .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
             meta: None,
@@ -1594,8 +1596,8 @@ async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
         .into_inner();
     assert_ne!(fw.status, "OK");
 
-    let attach = service
-        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+    let attach_request = || {
+        TonicRequest::new(AttachVmNicRequest {
             meta: None,
             nic: Some(NicSpec {
                 nic_id: "nic-reject".to_string(),
@@ -1605,6 +1607,105 @@ async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
                 tap_name: "tap-reject".to_string(),
                 ip_address: "10.0.9.10".to_string(),
             }),
+        })
+    };
+    let attach = service
+        .attach_vm_nic(attach_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a rejected policy must refuse the attach, not proceed unguarded"
+    );
+
+    // A valid save clears the marker; the attach must now succeed and re-scope
+    // the guard set to the new policy.
+    let valid = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-reject".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v2".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.status, "OK");
+
+    calls.lock().unwrap().clear();
+    let attach = service
+        .attach_vm_nic(attach_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a valid save must clear the marker and allow the attach"
+    );
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("fw:net-reject:")),
+        "the attach must re-scope the guard set with the new policy"
+    );
+}
+
+/// A rejected NAT half must also refuse the attach; NAT is not the isolation
+/// boundary, but silently skipping its re-scope would hide the rejection.
+#[tokio::test]
+async fn rejected_nat_policy_blocks_attach_until_a_valid_save_clears_it() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reject_firewall: false,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-nat-reject")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    let nat = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-nat-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: br#"[{"source_cidr":"not-a-cidr"}]"#.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(nat.status, "OK");
+
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-nat-reject".to_string(),
+                vm_id: "vm-nat-reject".to_string(),
+                network_id: "net-nat-reject".to_string(),
+                mac_address: "02:00:00:00:00:0c".to_string(),
+                tap_name: "tap-nat-reject".to_string(),
+                ip_address: "10.0.9.11".to_string(),
+            }),
         }))
         .await
         .unwrap()
@@ -1612,7 +1713,42 @@ async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
     assert_ne!(
         attach.result.as_ref().unwrap().status,
         "OK",
-        "a recorded unapplicable policy must refuse the attach, not proceed unguarded"
+        "a rejected NAT policy must refuse the attach until a valid save lands"
+    );
+
+    let valid = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-nat-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v2".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.status, "OK");
+
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-nat-reject-2".to_string(),
+                vm_id: "vm-nat-reject".to_string(),
+                network_id: "net-nat-reject".to_string(),
+                mac_address: "02:00:00:00:00:0d".to_string(),
+                tap_name: "tap-nat-reject-2".to_string(),
+                ip_address: "10.0.9.12".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a valid NAT save must clear the marker and allow the attach"
     );
 }
 
@@ -1817,6 +1953,25 @@ async fn topology_delete_removes_the_journal_entry() {
         .unwrap();
     assert!(policies.path_for("net-delete").exists());
 
+    // A rejected save leaves an in-memory marker. Deleting the topology must
+    // clear it, or a re-created network with the same id would refuse attaches
+    // forever (a fail-closed availability failure).
+    let rejected = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-delete".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v2".to_string(),
+                policy_json:
+                    br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+                        .to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(rejected.status, "OK");
+
     let deleted = service
         .delete_network_topology(TonicRequest::new(DeleteNetworkTopologyRequest {
             meta: None,
@@ -1842,10 +1997,40 @@ async fn topology_delete_removes_the_journal_entry() {
         table.clone(),
         Arc::new(Metrics::new()),
     );
-    restarted.set_topology_store(Arc::new(store));
-    restarted.set_policy_store(Arc::new(policies));
+    restarted.set_topology_store(Arc::new(store.clone()));
+    restarted.set_policy_store(Arc::new(policies.clone()));
     restarted.recover_topologies().await.unwrap();
     assert!(table.get("net-delete").is_none());
+
+    // Re-ensure the same network id: the deleted rejection marker must not
+    // refuse an attach on the fresh topology.
+    service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-delete")),
+        }))
+        .await
+        .unwrap();
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-delete".to_string(),
+                vm_id: "vm-delete".to_string(),
+                network_id: "net-delete".to_string(),
+                mac_address: "02:00:00:00:00:0e".to_string(),
+                tap_name: "tap-delete".to_string(),
+                ip_address: "10.0.9.13".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "deleting the topology must clear a rejection marker"
+    );
 }
 
 /// The idempotent ensure path is what core-native reconciliation calls every

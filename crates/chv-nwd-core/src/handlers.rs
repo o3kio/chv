@@ -179,6 +179,12 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
             applied.firewall = Some(policy_json.to_vec());
             applied.firewall_version = Some(policy_version.to_string());
+            // Clear the rejection marker only after the desired state is
+            // committed. Clearing it first would open a window where an attach
+            // finds neither a marker nor a policy and proceeds unguarded.
+            if let Some(mut rejected) = self.rejected_policies.get_mut(network_id) {
+                rejected.firewall = false;
+            }
             durable_snapshot(&applied)
         };
         match self.policy_store.as_ref() {
@@ -209,6 +215,10 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
             applied.nat = Some(policy_json.to_vec());
             applied.nat_version = Some(policy_version.to_string());
+            // Same commit-then-clear ordering as record_firewall_policy.
+            if let Some(mut rejected) = self.rejected_policies.get_mut(network_id) {
+                rejected.nat = false;
+            }
             durable_snapshot(&applied)
         };
         match self.policy_store.as_ref() {
@@ -1220,9 +1230,6 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 .firewall = true;
             return Ok(Response::new(Self::err_result(&e)));
         }
-        if let Some(mut rejected) = self.rejected_policies.get_mut(&req.network_id) {
-            rejected.firewall = false;
-        }
 
         // Record the DESIRED policy state regardless of apply outcome (the
         // topology is ensured at this point). A failed or partial apply must not
@@ -1303,9 +1310,6 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 .or_default()
                 .nat = true;
             return Ok(Response::new(Self::err_result(&e)));
-        }
-        if let Some(mut rejected) = self.rejected_policies.get_mut(&req.network_id) {
-            rejected.nat = false;
         }
 
         // Record the DESIRED NAT policy state regardless of apply outcome for
