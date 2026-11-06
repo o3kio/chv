@@ -333,6 +333,18 @@ grep -q 'usermod -aG chv-stord "\$CHV_USER"' "$quick_installer" \
 grep -q 'systemd-tmpfiles --create "\$tmpfiles"' "$quick_installer" \
     && pass "quick installer applies the tmpfiles entry that creates /run/netns" \
     || fail "quick installer relies on a reboot before chv-nwd can start"
+grep -q '^chv_sqlite_offline()' "$quick_installer" \
+    && pass "quick installer has an offline SQLite write helper" \
+    || fail "quick installer can unlink the WAL of a live control plane (#722)"
+grep -q 'chv_sqlite_offline "${CHV_DB_PATH}" <<SQL' "$quick_installer" \
+    && pass "quick installer seeds the admin with the control plane stopped" \
+    || fail "quick installer seeds the admin against the live WAL"
+grep -qF '${copy}/controlplane.db' "$quick_installer" \
+    && pass "quick installer checks enrollment against a database snapshot" \
+    || fail "quick installer polls the live WAL for enrollment"
+grep -qF 'chv_sqlite_offline "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users' "$quick_installer" \
+    && pass "quick installer checks admin existence with the control plane stopped" \
+    || fail "quick installer reads the admin row from the live WAL"
 
 # Exercise the real version gate, not just its presence: source the installer
 # (its B1 guard makes that side-effect free) and assert the boundary plus a
@@ -495,6 +507,15 @@ grep -q 'CHV_ENCRYPTION_KEY is unset or empty' "$install_sh_leg" \
 grep -q 'QUICK_VERSION" = "$CANDIDATE_VERSION' "$fresh" \
     && pass "fresh-host quick leg uses candidate-mode checks when installing the candidate" \
     || fail "fresh-host quick leg weakens candidate checks unconditionally"
+grep -q -- '--quick-install-candidate' "$fresh" \
+    && pass "fresh-host can force candidate-mode checks for a released RC" \
+    || fail "fresh-host treats the candidate RC as an older release"
+grep -q 'QUICK_INSTALL_CANDIDATE:-0' "$fresh" \
+    && pass "fresh-host gates the persistence check on the candidate-release flag" \
+    || fail "fresh-host drops the candidate-release persistence check"
+grep -q 'quick_is_candidate=1' "$fresh_workflow" \
+    && pass "fresh-host workflow marks the published RC quick leg as the candidate" \
+    || fail "fresh-host workflow weakens the published RC quick leg"
 
 # ---------------------------------------------------------------------------
 # Release packaging: every nfpm package's binary must reach the Package job.

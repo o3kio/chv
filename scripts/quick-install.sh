@@ -1129,6 +1129,52 @@ chv_sqlite() {
     fi
 }
 
+# Run sqlite3 against the control-plane database with chv-controlplane
+# stopped, then bring the service back up.
+#
+# The sqlite3 CLI checkpoints and unlinks controlplane.db-wal/-shm when it is
+# the last connection to close. When the control plane is already running, its
+# pooled connections keep the now-unlinked WAL inode: every write the API
+# acknowledges after that point is lost when the process exits. That is the
+# clean-install defect in v0.3.0/v0.4.0-rc.1/rc.2 (#722), and the quick
+# installer kept the same shape through v0.4.0-rc.3 because it seeds the admin
+# after start_services.
+#
+# A second writer is only safe while the service is not running. Restarting
+# afterwards reopens the database on the current path, so subsequent API
+# writes land in a live WAL again.
+chv_sqlite_offline() {
+    local was_active=0 rc=0 attempt=1
+    if systemctl is-active --quiet chv-controlplane 2>/dev/null; then
+        was_active=1
+        if ! systemctl stop chv-controlplane >/dev/null 2>&1; then
+            warn "Failed to stop chv-controlplane before an offline database write."
+            return 1
+        fi
+    fi
+
+    chv_sqlite "$@" || rc=$?
+
+    if [ "$was_active" -eq 1 ]; then
+        if ! systemctl start chv-controlplane >/dev/null 2>&1; then
+            warn "Failed to restart chv-controlplane after an offline database write."
+            rc=1
+        elif cmd_exists curl; then
+            while [ $attempt -le 30 ]; do
+                curl -sf "http://127.0.0.1:8080/health" &>/dev/null && break
+                sleep 1
+                attempt=$((attempt + 1))
+            done
+            if [ $attempt -gt 30 ]; then
+                warn "chv-controlplane did not become healthy after an offline database write."
+                rc=1
+            fi
+        fi
+    fi
+
+    return "$rc"
+}
+
 # Verify (and if necessary repair) ownership of the control-plane database and
 # its WAL/SHM sidecars. Root-owned sidecars make the service fail; never leave
 # them behind (#669).
@@ -1232,12 +1278,23 @@ seed_admin_user() {
     fi
 
     # Idempotency guard: if the admin user already exists, do nothing. Both
-    # the read and the write run as the service user so SQLite never leaves
-    # root-owned WAL sidecars (#669).
-    if [ -f "${CHV_DB_PATH}" ] && \
-       [ "$(chv_sqlite "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users WHERE username = 'admin';" 2>/dev/null)" = "1" ]; then
-        info "Admin user already exists — skipping seed."
-        return 0
+    # the read and the write run as the service user with the control plane
+    # stopped (chv_sqlite_offline), so SQLite never leaves root-owned WAL
+    # sidecars (#669) and never unlinks the WAL the running service still has
+    # open (#722).
+    #
+    # Do not discard the helper's exit status. If the read cannot run, or the
+    # service does not come back afterwards, fail loudly instead of carrying
+    # on with the control plane down and reporting a successful install.
+    local admin_count=""
+    if [ -f "${CHV_DB_PATH}" ]; then
+        if ! admin_count="$(chv_sqlite_offline "${CHV_DB_PATH}" "SELECT COUNT(*) FROM users WHERE username = 'admin';")"; then
+            fatal "Failed to read the admin row from ${CHV_DB_PATH} (control plane did not come back cleanly)."
+        fi
+        if [ "$admin_count" = "1" ]; then
+            info "Admin user already exists — skipping seed."
+            return 0
+        fi
     fi
 
     local plaintext_pw
@@ -1266,7 +1323,7 @@ print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode("utf-8"))
 
     local admin_user_id="00000000-0000-0000-0000-000000000001"
 
-    if ! chv_sqlite "${CHV_DB_PATH}" <<SQL
+    if ! chv_sqlite_offline "${CHV_DB_PATH}" <<SQL
 INSERT INTO users (user_id, username, password_hash, role, display_name, must_change_password, created_at, updated_at)
 VALUES ('${admin_user_id}', 'admin', '${hashed_pw}', 'admin', 'Administrator', 1,
         strftime('%Y-%m-%dT%H:%M:%SZ','now'),
@@ -1378,16 +1435,29 @@ start_services() {
 # sqlite polling avoids the admin-auth/must_change_password dance install.sh
 # needs for its API-based TenantReady wait. A timeout is a LOUD warning, not
 # a fatal: the install itself is complete and the state is observable.
+#
+# Query a snapshot copy, never the live database: a second sqlite3 process
+# opening the live WAL while the control plane serves can checkpoint/unlink
+# it (#722). The copy is best-effort and may occasionally be torn; a failed
+# read just counts as "not enrolled yet" and is retried.
 wait_for_enrollment() {
     if ! cmd_exists sqlite3 || [ ! -f "${CHV_DB_PATH}" ]; then
         info "Enrollment check skipped (sqlite3 or database not available)."
         return 0
     fi
     info "Waiting for the local agent to enroll (up to 90s)..."
-    local attempt=1 enrolled
+    local attempt=1 enrolled copy
     while [ $attempt -le 90 ]; do
-        enrolled=$(chv_sqlite "${CHV_DB_PATH}" \
-            "SELECT COUNT(*) FROM nodes WHERE enrolled_at IS NOT NULL;" 2>/dev/null || echo "0")
+        copy="$(mktemp -d /tmp/chv-quick-db.XXXXXX 2>/dev/null || true)"
+        enrolled=0
+        if [ -n "${copy:-}" ]; then
+            cp -a "${CHV_DB_PATH}" "${copy}/controlplane.db" 2>/dev/null || true
+            cp -a "${CHV_DB_PATH}-wal" "${copy}/controlplane.db-wal" 2>/dev/null || true
+            cp -a "${CHV_DB_PATH}-shm" "${copy}/controlplane.db-shm" 2>/dev/null || true
+            enrolled=$(sqlite3 -cmd '.timeout 5000' "${copy}/controlplane.db" \
+                "SELECT COUNT(*) FROM nodes WHERE enrolled_at IS NOT NULL;" 2>/dev/null || echo "0")
+            rm -rf "$copy"
+        fi
         if [ "${enrolled}" -ge 1 ] 2>/dev/null; then
             info "Local agent enrolled."
             return 0

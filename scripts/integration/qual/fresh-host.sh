@@ -63,6 +63,9 @@
 #                               (enables the #556 leg; branch names are refused)
 #   --quick-install-version VER release version the quick installer installs
 #                               (default: the previous version)
+#   --quick-install-candidate   the quick-install version is the candidate
+#                               release (assert the full candidate contract,
+#                               including the credential-persistence gate)
 #   --evidence-dir DIR          results/summary/log destination
 #                               (default: CHV_QUAL_ROOT/fresh-host-evidence-TS)
 #   --keep                      keep container roots after a passing leg too
@@ -96,6 +99,7 @@ PREVIOUS_VERSION="${PREVIOUS_VERSION:-}"
 PACKAGES_DIR="${PACKAGES_DIR:-}"
 QUICK_REF="${QUICK_REF:-}"
 QUICK_VERSION="${QUICK_VERSION:-}"
+QUICK_INSTALL_CANDIDATE=false
 EVIDENCE_DIR="${EVIDENCE_DIR:-}"
 KEEP=false
 SKIP_UPGRADE=false
@@ -124,6 +128,7 @@ while [ $# -gt 0 ]; do
         --quick-install=*) QUICK_REF="${1#*=}"; shift ;;
         --quick-install-version) QUICK_VERSION="${2:?--quick-install-version requires a version}"; shift 2 ;;
         --quick-install-version=*) QUICK_VERSION="${1#*=}"; shift ;;
+        --quick-install-candidate) QUICK_INSTALL_CANDIDATE=true; shift ;;
         --evidence-dir) EVIDENCE_DIR="${2:?--evidence-dir requires a directory}"; shift 2 ;;
         --evidence-dir=*) EVIDENCE_DIR="${1#*=}"; shift ;;
         --keep) KEEP=true; shift ;;
@@ -486,6 +491,7 @@ prepare_root() {
         printf 'PACKAGES_DIR=/root/fresh-host/packages\n'
         printf 'QUICK_REF=%q\n' "$QUICK_REF"
         printf 'QUICK_VERSION=%q\n' "$QUICK_VERSION"
+        printf 'QUICK_INSTALL_CANDIDATE=%q\n' "$( [ "$QUICK_INSTALL_CANDIDATE" = true ] && echo 1 || echo 0 )"
         printf 'QUICK_INSTALL_SCRIPT=/root/fresh-host/quick-install.sh\n'
         printf 'QUICK_INSTALL_LOCAL=/root/fresh-host/quick-install-local.sh\n'
         printf 'export GITHUB_REPO=%q\n' "$GITHUB_REPO"
@@ -737,12 +743,13 @@ rotate_admin_password() {
 }
 
 # A clean install must preserve the documented first-login credential across a
-# control-plane restart. v0.3.0 and v0.4.0-rc.2 seeded the admin with a second
+# control-plane restart. Older installers seeded the admin with a second
 # sqlite3 writer while the service was live; that writer unlinked the WAL the
 # service had open, so the rotation was acknowledged and then silently lost on
-# the next restart. rc.3 writes with the service stopped
-# (scripts/install.sh chv_sqlite_offline). Assert both the durable result and
-# the direct cause: no pooled connection may hold a "(deleted)" WAL.
+# the next restart. The defect was fixed in scripts/install.sh for rc.3 and in
+# scripts/quick-install.sh for rc.4 (both use chv_sqlite_offline). Assert both
+# the durable result and the direct cause: no pooled connection may hold a
+# "(deleted)" WAL.
 check_credential_persistence() {
     local before_pid after_pid
     section "credential persistence across control-plane restart"
@@ -1449,9 +1456,14 @@ else
     tail -n 30 /var/fresh-host-quick.log >>"$OUT"
     finish
 fi
-if [ "$QUICK_VERSION" = "$CANDIDATE_VERSION" ]; then
-    # A manual run may point the quick leg at the candidate itself; only a
-    # strictly older release may use the weaker previous-mode assertion.
+if [ "$QUICK_VERSION" = "$CANDIDATE_VERSION" ] \
+    || [ "${QUICK_INSTALL_CANDIDATE:-0}" = "1" ]; then
+    # A manual run may point the quick leg at the candidate itself, and a
+    # post-publication run installs the candidate *release* whose version
+    # carries an -rc.N suffix while the binaries report the base version.
+    # Only a strictly older release may use the weaker previous-mode
+    # assertion; the workflow sets --quick-install-candidate for the exact
+    # tag it is qualifying.
     check_bringup
     check_credential_persistence
 elif [ "$(printf '%s\n%s\n' "$QUICK_VERSION" "$CANDIDATE_VERSION" | sort -V | head -1)" = "$QUICK_VERSION" ]; then

@@ -196,6 +196,22 @@ jobs:
           previous_version="${PREVIOUS_RELEASE#v}"
           quick_version="${QUICK_INSTALL_VERSION:-$previous_version}"
           quick_version="${quick_version#v}"
+          # The candidate binaries report the base VERSION (0.4.0) while a
+          # released RC is installed as 0.4.0-rc.N. When the lane is
+          # dispatched on the tag and points the quick installer at that same
+          # release, assert the full candidate contract (including the
+          # credential-persistence gate) rather than the weaker
+          # previous-release path.
+          #
+          # Only dispatch this on a tag whose scripts/quick-install.sh carries
+          # the offline-write fix (rc.4+). On an older tag the persistence
+          # gate fails by design, because that quick installer loses the
+          # first-login rotation.
+          candidate_release="${GITHUB_REF_NAME#v}"
+          quick_is_candidate=0
+          if [ -n "$quick_version" ] && [ "$quick_version" = "$candidate_release" ]; then
+            quick_is_candidate=1
+          fi
           args=(
             --candidate-tarball "dist/chv-$(cat VERSION)-linux-amd64.tar.gz"
             --candidate-version "$(cat VERSION)"
@@ -207,6 +223,9 @@ jobs:
             --quick-install-version "$quick_version"
             --evidence-dir "$EVIDENCE_DIR"
           )
+          if [ "$quick_is_candidate" = "1" ]; then
+            args+=(--quick-install-candidate)
+          fi
           if [ "${PREVIOUS_TARBALL:-}" != "" ]; then
             args+=(--previous-tarball "$PREVIOUS_TARBALL")
           fi
