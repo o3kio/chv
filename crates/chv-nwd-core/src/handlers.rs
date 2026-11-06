@@ -1161,6 +1161,18 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // so an unapplicable entry would turn the next documented restart
         // into a crash loop that only manual file surgery could clear.
         if let Err(e) = crate::firewall::validate_firewall_policy(&policy.policy_json) {
+            // Still record the DESIRED (unapplicable) payload in memory, but
+            // never in the journal. The attach seam deliberately drops nwd's
+            // semantic error, so returning without a record would let the next
+            // NIC attach find nothing to re-scope and proceed unguarded
+            // (fail-open). With the record, refresh_policy_scope re-attempts
+            // the invalid apply and refuses the attach — rc.7's fail-closed
+            // outcome — while a restart cannot replay the poison entry.
+            {
+                let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
+                applied.firewall = Some(policy.policy_json.clone());
+                applied.firewall_version = Some(policy.policy_version.clone());
+            }
             return Ok(Response::new(Self::err_result(&e)));
         }
 
@@ -1235,6 +1247,14 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // set_firewall_policy): the journal is replayed fail-closed at
         // startup, so a permanently unapplicable entry would crash-loop nwd.
         if let Err(e) = crate::firewall::validate_nat_policy(&policy.policy_json) {
+            // Same in-memory fail-closed record as the firewall path: NAT is
+            // not the isolation boundary, but an attach-time refresh failure
+            // must still be visible rather than silently skipped.
+            {
+                let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
+                applied.nat = Some(policy.policy_json.clone());
+                applied.nat_version = Some(policy.policy_version.clone());
+            }
             return Ok(Response::new(Self::err_result(&e)));
         }
 

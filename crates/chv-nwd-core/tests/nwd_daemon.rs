@@ -1550,6 +1550,72 @@ async fn invalid_policy_is_rejected_without_being_journaled() {
     );
 }
 
+/// A rejected policy must still be recorded in memory (never in the journal)
+/// so the attach-time guard refresh fails closed. The attach seam drops nwd's
+/// semantic error; without the record, a stored rc.7 ruleset that cannot be
+/// rendered would leave the tap outside the policy chains (fail-open).
+#[tokio::test]
+async fn rejected_policy_is_recorded_in_memory_so_attach_fails_closed() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reject_firewall: true,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-reject")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    // IPv6 can never be rendered by the IPv4 engine, so this payload is
+    // rejected before journaling. It must still be recorded in memory.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-reject".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json:
+                    br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+                        .to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-reject".to_string(),
+                vm_id: "vm-reject".to_string(),
+                network_id: "net-reject".to_string(),
+                mac_address: "02:00:00:00:00:0b".to_string(),
+                tap_name: "tap-reject".to_string(),
+                ip_address: "10.0.9.10".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a recorded unapplicable policy must refuse the attach, not proceed unguarded"
+    );
+}
+
 /// If a journal entry can no longer be applied (corruption/tampering after the
 /// RPC began rejecting unapplicable payloads), recovery must fail closed with
 /// an error that names the exact file. An opaque crash loop is a documented
