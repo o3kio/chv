@@ -3,14 +3,17 @@
 **Campaign:** `v0.4.0` field qualification (Prompt 06)
 **Host label:** `field-host-1` (internal hostname and management addresses withheld)
 **Recorded:** 2026-11-06 (UTC)
-**Status:** pre-flight, **blocked**. A clean `v0.4.0-rc.6` install reproduced
-blocker-class defects on 2026-11-06. rc.6 is disqualified as the field/stable
-base, and `v0.4.0-rc.7` is the approved successor and is being cut. See
+**Status:** pre-flight, **blocked pending pre-window drills**. A clean
+`v0.4.0-rc.6` install reproduced blocker-class defects on 2026-11-06. rc.6 is
+disqualified as the field/stable base, and `v0.4.0-rc.7` is the approved
+successor. rc.7 is published (tag `v0.4.0-rc.7`, 2026-11-06) with verified
+tarball/sidecar/SLSA provenance. See
 [`01-rc6-blockers.md`](01-rc6-blockers.md). The field window has not started.
-This profile is re-pinned to rc.7 below, but the artifact digests and the
-clean-install re-run are pending publication; keep this status blocked until
-the rc.7 pre-window drills pass. No field-window evidence is claimed before
-that point.
+This profile is re-pinned to the published rc.7 artifacts below; keep this
+status blocked until the upgrade/purge drill, the clean rc.7 install, the
+documented start with a guest DHCP lease and `login:` console, a policy
+change plus nwd restart, and two consecutive `--wipe` installs pass. No
+field-window evidence is claimed before that point.
 
 ## Approved profile
 
@@ -24,7 +27,7 @@ This run uses the narrow profile in
 | Topology | one host running control plane, agent, stord, nwd, and nginx |
 | Host | Ubuntu 24.04.5 LTS, amd64, **virtualized KVM guest** (QEMU/SeaBIOS). Not bare metal. |
 | VMM | Cloud Hypervisor v53.0, installed and digest-verified by the published installer |
-| Artifacts | **approved target:** published `v0.4.0-rc.7` `.deb` set and tarball; the clean install uses the published tarball's `scripts/install.sh` (release-directory mode). The pinned quick installer is a container-verified path and is not used for this window. Digests **pending publication** and must be recorded here before the window |
+| Artifacts | **target:** published `v0.4.0-rc.7` `.deb` set and tarball; the clean install uses the published tarball's `install.sh` (release-directory mode). The pinned quick installer is a container-verified path and is not used for this window. Digests are recorded below |
 | Storage | local directory + LVM on the dedicated blank `/dev/sdc` (100 GiB) |
 | Network | default single-host bridge only; no VLAN, no fabric/VXLAN |
 | Lifecycle | Core-managed authority; stop-first |
@@ -72,17 +75,45 @@ residue purge transcript is in
 
 ## Artifact identity
 
-### Target: rc.7 (pending publication)
+### Target: rc.7 (published 2026-11-06)
 
 | Artifact | Digest / identity |
 |---|---|
-| rc.7 tag | **pending** — record the annotated tag object and commit after publication |
-| rc.7 tarball + sidecar | **pending** |
-| rc.7 `SHA256SUMS` and package set | **pending** |
-| rc.7 provenance | **pending** — verify the SLSA attestation and record the run link |
+| rc.7 tag | annotated tag object `e0da45d70e58f64f8d0e60b0ac76298974edffe8`, commit `1b8f68f17378d135cb0bbd72f46932e4e7240199` |
+| rc.7 tarball | `chv-0.4.0-rc.7-linux-amd64.tar.gz` = `604e05396bbed7d76f79f360e00716b1781d3b22204db8fddc050a5556aef8be` |
+| rc.7 tarball sidecar | `chv-0.4.0-rc.7-linux-amd64.tar.gz.sha256` = `a4068218ef282471c1ff72c779225e2dfbf1e7cbe64855beaa16dd45f75c258b` |
+| rc.7 `SHA256SUMS` | `f376e8556128e5a565644f5416e1588cc676ec9f5e9e02a733ba8931fee78650` (8 package lines) |
+| rc.7 control plane deb | `ef06066b75ed238e025111f4619556d170107e3a8aa409e785b7d7b097e4d76b` |
+| rc.7 monitor-agent deb | `5cc4d3d1f09c3a36836c57364882f0ad8b4590564990b734a213a7293bf31fa4` |
+| rc.7 node deb | `ae2b3ff8e4ea5fbafcb5738345d36c90e03d4cb799eea4e57a344bad149c5a01` |
+| rc.7 chvctl deb | `b7eed655ede08f0d5de545ed1c99c28dd28996a3eb171b5ef0d97805318966c5` |
+| rc.7 control plane rpm | `53ea487374dde4ffa166308a4acd44cdcff0ea138f731f4244d82166a30cc633` |
+| rc.7 monitor-agent rpm | `558921c9d22ea4412c14466720318f4f261b8fcd0ab6e5cc87098b626b52facf` |
+| rc.7 node rpm | `62a202d8f9f32a8ecb3a04788b9d5dbe9a311837ea8303f108256209321abd18` |
+| rc.7 chvctl rpm | `0e3271f4324a6a63f2aeb02027c013ccf920b5e65d2258df04899528c35e0ab3` |
+| v0.3.0 tarball (upgrade start) | `chv-0.3.0-linux-amd64.tar.gz` = `45990c38f9ba0a1ca573e0c7549479464ff6a0eb763da6ecec4bf1eb376eea0d` |
 
-Do not fill these values from a local build. The field window uses the
-published artifacts only.
+Published release: <https://github.com/o3kio/chv/releases/tag/v0.4.0-rc.7>.
+The tarball was downloaded from the published release, its sidecar verified
+(`sha256sum -c` OK), and the extracted binaries report
+`0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)`. The package
+version is `0.4.0~rc.7` and the published asset version is `0.4.0.rc.7`.
+The node row reports the base `0.4.0`, so rc.7 is discriminated by the
+package version and the commit banner, not by the node row.
+
+### Build provenance (rc.7)
+
+The release workflow
+([42253715143](https://github.com/o3kio/chv/actions/runs/42253715143))
+generated a SLSA v1 build-provenance attestation with
+`actions/attest-build-provenance`. It was verified through the GitHub
+attestation REST API (the installed `gh` has no `attestation` subcommand):
+one attestation covers all ten uploaded subjects, the DSSE statement names
+`.github/workflows/release.yml @ refs/tags/v0.4.0-rc.7`, the resolved
+dependency is commit `1b8f68f17378d135cb0bbd72f46932e4e7240199`, and every
+local asset digest matches its attested subject digest. Raw verification is
+recorded in
+[`artifacts/04-rc7-provenance.txt`](artifacts/04-rc7-provenance.txt).
 
 ### Prior artifact: rc.6 (disqualified, historical)
 
