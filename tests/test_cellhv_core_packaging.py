@@ -372,6 +372,16 @@ class CellHvCorePackagingTests(unittest.TestCase):
             for tool in (ip, nft, sqlite3, iptables):
                 tool.chmod(0o755)
 
+            # Never let the teardown call the host's real
+            # netfilter-persistent, which would rewrite the host's persisted
+            # iptables rules.
+            netfilter_persistent = bin_dir / "netfilter-persistent"
+            netfilter_persistent.write_text(
+                "#!/bin/bash\n"
+                f"printf 'netfilter-persistent %s\\n' \"$*\" >> {log}\n"
+            )
+            netfilter_persistent.chmod(0o755)
+
             pipefail = "-o pipefail" if "bash" in (shell or "") else ""
             script = (
                 f"set -eu {pipefail}\n".replace("  ", " ")
@@ -419,6 +429,9 @@ class CellHvCorePackagingTests(unittest.TestCase):
             "iptables -t nat -D POSTROUTING -s 10.200.0.0/24 ! -o chvbr0 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.201.0.0/24 ! -d 10.201.0.0/24 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE",
+            # The persisted rules are re-saved through the fake, never the
+            # host's real netfilter-persistent.
+            "netfilter-persistent save",
         ):
             self.assertIn(expected, calls, relative)
         for forbidden in (
@@ -440,6 +453,138 @@ class CellHvCorePackagingTests(unittest.TestCase):
         self.assertEqual(remaining, ["12-eth9.network"], relative)
         self.assertEqual(ifupdown_remaining, [], relative)
         self.assertEqual(sysctl_remaining, [], relative)
+
+    @unittest.skipUnless(
+        shutil.which("bash") and shutil.which("sh"), "shells required"
+    )
+    def test_network_cleanup_uses_database_ids_and_upgrade_is_a_noop(self):
+        # The database is the only source that knows about a network whose
+        # nft table and namespace are already gone. Exercise it for every
+        # shipped copy, then prove the package upgrade path touches nothing.
+        cases = [
+            ("scripts/install.sh", shutil.which("bash")),
+            ("scripts/quick-install.sh", shutil.which("bash")),
+        ]
+        posix_shell = shutil.which("dash") or shutil.which("sh")
+        if posix_shell:
+            cases.append(("packaging/scripts/preremove.sh", posix_shell))
+        for relative, shell in cases:
+            with self.subTest(script=relative):
+                self._exercise_database_id_source(relative, shell)
+        self._assert_preremove_upgrade_is_a_noop()
+
+    def _exercise_database_id_source(self, relative, shell):
+        source = (ROOT / relative).read_text()
+        functions = "\n".join(
+            re.search(rf"^{name}\(\) \{{.*?\n\}}", source, re.S | re.M).group(0)
+            for name in (
+                "chv_bridge_name_for_network",
+                "chv_network_ids",
+                "remove_chv_bridge_and_nat",
+                "delete_chv_network_state",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            log = tmp_path / "calls.log"
+            log.write_text("")
+            db = tmp_path / "controlplane.db"
+            db.write_text("")  # existence is what chv_network_ids checks
+            rules = tmp_path / "rules.v4"
+            rules.write_text("")
+            etc = tmp_path / "etc"
+            etc.mkdir()
+
+            # No nft tables and no namespaces are reported, so the only way
+            # `dbonly` can be removed is the database row.
+            ip = bin_dir / "ip"
+            ip.write_text(
+                "#!/bin/bash\n" f"printf 'ip %s\\n' \"$*\" >> {log}\n"
+            )
+            nft = bin_dir / "nft"
+            nft.write_text(
+                "#!/bin/bash\n" f"printf 'nft %s\\n' \"$*\" >> {log}\n"
+            )
+            sqlite3 = bin_dir / "sqlite3"
+            sqlite3.write_text(
+                "#!/bin/bash\n"
+                f"printf 'sqlite3 %s\\n' \"$*\" >> {log}\n"
+                "printf 'dbonly\\n'\n"
+            )
+            chown = bin_dir / "chown"
+            chown.write_text(
+                "#!/bin/bash\n" f"printf 'chown %s\\n' \"$*\" >> {log}\n"
+            )
+            for tool in (ip, nft, sqlite3, chown):
+                tool.chmod(0o755)
+
+            pipefail = "-o pipefail" if "bash" in (shell or "") else ""
+            script = (
+                f"set -eu {pipefail}\n".replace("  ", " ")
+                + 'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
+                'have() { command -v "$1" >/dev/null 2>&1; }\n'
+                # The chv user does not exist in the sandbox, so both helper
+                # spellings take the plain-sqlite3 fallback.
+                'chv_sqlite() { sqlite3 "$@"; }\n'
+                'chv_sqlite_read() { sqlite3 "$@"; }\n'
+                f"CHV_DB_PATH='{db}'\n"
+                "CHV_USER=chv-no-such-user\n"
+                "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
+                f"CHV_HOST_ETC='{etc}'\n"
+                f"CHV_IPTABLES_RULES_V4='{rules}'\n"
+                f"{functions}\n"
+                "delete_chv_network_state\n"
+            )
+            subprocess.run(
+                [shell, "-c", script],
+                env=dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}"),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            calls = log.read_text()
+
+        self.assertIn("sqlite3", calls, relative)
+        self.assertIn("ip netns del ns-dbonly", calls, relative)
+        self.assertIn("nft delete table inet chv-dbonly", calls, relative)
+        self.assertIn("ip link del dev br-dbonly", calls, relative)
+        if relative == "packaging/scripts/preremove.sh":
+            # A root sqlite3 open can create root-owned WAL sidecars; the
+            # preremove path hands them back to the service user.
+            self.assertIn("chown chv:chv", calls, relative)
+            self.assertIn("controlplane.db-wal", calls, relative)
+
+    def _assert_preremove_upgrade_is_a_noop(self):
+        # dpkg/rpm call preremove.sh with `upgrade` (or `1`) on upgrade. The
+        # restarted agent adopts live VMs, so no service stop or host teardown
+        # may run.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            log = tmp_path / "calls.log"
+            log.write_text("")
+            for name in ("ip", "nft", "systemctl", "kill", "ps"):
+                tool = bin_dir / name
+                tool.write_text(
+                    "#!/bin/bash\n" f"printf '{name} %s\\n' \"$*\" >> {log}\n"
+                )
+                tool.chmod(0o755)
+            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+            for action in ("upgrade", "1"):
+                subprocess.run(
+                    ["sh", str(ROOT / "packaging/scripts/preremove.sh"), action],
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            self.assertEqual(
+                log.read_text(), "", "upgrade must not touch services or host state"
+            )
 
     @unittest.skipUnless(shutil.which("awk"), "awk is required to exercise the matcher")
     def test_vmm_process_matchers_only_select_chv_owned_vmms(self):

@@ -44,7 +44,7 @@ from it.
 | `/lib/systemd/system/chv-*.service` | Systemd units | ✅ Yes |
 | `/usr/share/chv` | UI assets, migrations | ✅ Yes |
 | `/usr/lib/tmpfiles.d/chv-node.conf` | tmpfiles entry (`chv-node` package) | ✅ Yes |
-| `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Yes |
+| `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Only via `scripts/install.sh` wipe/clean or `scripts/quick-install.sh --uninstall`; package remove/purge leaves them |
 | Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (including the literal `default` network; plus the baseline `chvbr0` bridge), the live and persisted CHV `MASQUERADE` rules, `99-chv-forward.conf`, and the networkd/ifupdown bridge config | ✅ Yes (remove/purge, not upgrade) |
 
 ## Verify removal
@@ -80,6 +80,20 @@ sudo systemctl enable --now chv-controlplane chv-agent chv-stord chv-nwd
 ```
 
 Your previous database, caches, and configs will be intact.
+
+### Partial package removal
+
+`preremove.sh` ships with both `chv-node` and `chv-controlplane`, and it
+performs the full node teardown for either package's removal: it stops all
+four services and the VMMs the agent owns, then deletes the CHV bridges,
+namespaces, taps, nftables/iptables state, sysctl file, and the uplink
+`12-*.network` (or ifupdown) drop-in that enslaved the uplink to `chvbr0`.
+That drop-in also carried the uplink's own configuration; it is written by
+`scripts/install.sh`, and reinstalling a package does not recreate it. If you
+remove only one CHV package but intend to keep the rest running, the host
+networking stays down until you re-run the installer's network setup or
+restore the uplink configuration. For a supported removal, remove
+`chv-node`, `chv-controlplane`, and `chvctl` together.
 
 ## Complete removal (destructive)
 

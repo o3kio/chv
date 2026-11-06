@@ -2631,13 +2631,22 @@ impl ProcessCloudHypervisorAdapter {
     ///
     /// `SHUT_WR` alone does not prove the peer stopped writing: the serial
     /// manager observes the EOF asynchronously, and bytes already in flight
-    /// can land after the first empty probe. Shutting the read side while
-    /// the peer still writes makes those writes fail EPIPE, the v43
-    /// skipped-THRE freeze trigger documented on
-    /// [`Self::abandon_serial_connection`]. Consecutive empty probes are the
-    /// evidence that the peer is quiescent; the deadline bounds the wait if
-    /// it never is. `settle_start` is shared across all sockets so the floor
-    /// and the deadline cover the whole shutdown, not each VM separately.
+    /// can land after the first empty probe. The poll interval and the
+    /// [`Self::SERIAL_DRAIN_MIN_SETTLE`] floor bound how long those in-flight
+    /// bytes have to arrive; the
+    /// [`Self::SERIAL_DRAIN_SETTLE_DEADLINE`] bounds the whole wait.
+    ///
+    /// The empty-probe streak is a fast-path signal, not proof of
+    /// quiescence: the broadcaster's concurrent reader shares this socket's
+    /// receive queue, so it can consume a late write between probes. If the
+    /// deadline is reached while the peer is still writing — or a write
+    /// lands after the last probe — the subsequent `SHUT_RD` makes that
+    /// write fail EPIPE, the v43 skipped-THRE freeze trigger documented on
+    /// [`Self::abandon_serial_connection`]. That residual window degrades to
+    /// the pre-fix behavior and is recoverable with `vm.reboot`; the wait
+    /// exists to make it small, not to eliminate it. `settle_start` is
+    /// shared across all sockets so the floor and the deadline cover the
+    /// whole shutdown, not each VM separately.
     async fn drain_serial_until_stable(
         fd: &OwnedFd,
         fanout: &ConsoleFanout,
@@ -2795,12 +2804,15 @@ impl ProcessCloudHypervisorAdapter {
     /// the connection is still open, which is itself a freeze trigger on
     /// v43 (the skipped-THRE path above). The sole exception is
     /// [`Self::drain_and_close_consoles`], where the agent is exiting:
-    /// there the read side is shut only after the receive queue has been
-    /// observed empty for consecutive probes — evidence the peer has
-    /// already stopped writing — so Tokio's runtime drop can finish without
-    /// waiting for the VMM to close its side. A residual microsecond-scale
-    /// write-after-shut window remains and degrades to the pre-fix behavior
-    /// (recoverable with `vm.reboot`).
+    /// there the read side is shut only after a bounded settle — a
+    /// [`Self::SERIAL_DRAIN_MIN_SETTLE`] floor, consecutive empty probes on
+    /// the fast path, and a shared [`Self::SERIAL_DRAIN_SETTLE_DEADLINE`] —
+    /// so Tokio's runtime drop can finish without waiting for the VMM to
+    /// close its side. The empty-probe streak is not proof the peer stopped
+    /// writing (the concurrent reader shares the queue, and the deadline can
+    /// fire right after a data-returning probe), so a write-after-shut
+    /// window remains. It degrades to the pre-fix behavior and is
+    /// recoverable with `vm.reboot`.
     async fn abandon_serial_connection(vm_id: &str, fd: OwnedFd, fanout: Option<ConsoleFanout>) {
         if let Err(e) =
             nix::sys::socket::shutdown(fd.as_raw_fd(), nix::sys::socket::Shutdown::Write)
@@ -2846,11 +2858,12 @@ impl ProcessCloudHypervisorAdapter {
     ///    serial manager observes the clean EOF it handles correctly and
     ///    detaches, which also stops it writing guest output into the
     ///    connection;
-    /// 3. drain each receive queue until it has stayed empty for
-    ///    consecutive probes, forwarding the buffered guest output into the
-    ///    console fan-out (scrollback + console.log) so the descriptors'
-    ///    close at process exit is a FIN, not an RST, and so `SHUT_RD` is
-    ///    only issued once the peer has demonstrably stopped writing;
+    /// 3. drain each receive queue with a bounded settle (a floor, a
+    ///    consecutive-empty-probe fast path, and a shared deadline),
+    ///    forwarding the buffered guest output into the console fan-out
+    ///    (scrollback + console.log) so the descriptors' close at process
+    ///    exit is a FIN, not an RST. The streak is a signal, not proof of
+    ///    quiescence; the wait only bounds the write-after-shut window;
     /// 4. shut down each Socket connection's read side — the live VMM
     ///    keeps its own write side open, so the dedicated blocking readers
     ///    would otherwise stay parked in `read()` and Tokio's runtime drop

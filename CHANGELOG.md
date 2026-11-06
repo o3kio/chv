@@ -22,10 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Failed` and `CreateVm` refused. A plain stop/start reproduced (c) without
   any crash. The unit now uses `KillMode=process` (VMs outlive the agent and
   are adopted on restart) and `RuntimeDirectory=chv/agent`. The shutdown
-  drain now waits until each console socket's receive queue has stayed empty
-  for consecutive probes — evidence that the serial manager observed
-  `SHUT_WR` and stopped writing — before issuing `shutdown(SHUT_RD)`, so the
-  blocking readers see EOF without EPIPE-ing a still-writing peer.
+  drain now waits for a bounded settle — a 200 ms floor, consecutive empty
+  receive-queue probes on the fast path, and a shared 1 s deadline — before
+  issuing `shutdown(SHUT_RD)`, so the blocking readers see EOF instead of
+  holding the process until `TimeoutStopSec`. The empty-probe streak is a
+  signal, not proof the peer stopped writing (the concurrent reader shares
+  the queue, and the deadline can fire right after a data-returning probe);
+  a write-after-shut window remains and degrades to the pre-fix,
+  `vm.reboot`-recoverable behavior.
   Pty-transport consoles (no `shutdown(2)`) now poll the draining latch
   instead of staying parked. Regression tests cover the late-write window,
   the live-reader unblock, the Pty reader, and the unit contract.
@@ -41,8 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `default` network: `ns-default`, `chv-default`, `chvbr0`), derived from
   the control-plane database plus the CHV-owned object names. They also
   remove the live and persisted `MASQUERADE` rules, the CHV sysctl file,
-  networkd/ifupdown drop-ins, the `install.sh` UI/migrations/nginx tree, and
-  stale failed unit state. A sandboxed test runs all three shipped copies
+  and the networkd/ifupdown drop-ins, and every final path clears stale
+  failed unit state. `install.sh` wipe/clean and
+  `quick-install.sh --uninstall` additionally remove the `install.sh` UI
+  tree, migrations, and nginx site; package removal does not own those
+  paths. A sandboxed test runs all three shipped copies
   (including `preremove.sh` under dash) against fake host tools and proves
   non-CHV objects survive. This closes the field-plan §6.9 "network residue
   that survives documented cleanup" blocker found during the rc.6
