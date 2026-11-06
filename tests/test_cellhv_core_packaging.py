@@ -192,6 +192,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
             r"assert_single_gateway_owner\(\) \{(.*?)\n\}", installer, re.S
         ).group(1)
         self.assertIn("index($4, gw) == 1", owner)
+        self.assertIn('gw="${gateway_ip}/"', owner)
         self.assertIn("sort -u", owner)
         self.assertIn("-ne 1", owner)
         self.assertIn("fatal", owner)
