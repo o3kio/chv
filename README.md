@@ -122,6 +122,14 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh |
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.5 bash -s
 ```
 
+`v0.4.0-rc.5` is the final release candidate. Its post-publication fresh-host
+lane ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210))
+passed all four legs — tarball, packages, upgrade, and the published quick
+installer — in a clean container; see the
+[evidence report](./docs/evidence/production-readiness/v0.4.0-rc5/fresh-host-qualification.md).
+This is container-verified, not bare-metal evidence, and `v0.3.0` remains the
+latest stable release.
+
 The installer requires **bash** (it uses `set -o pipefail`); do not replace `bash -s` with `sh -`.
 
 CHV is also distributed as `.deb` and `.rpm` packages. Choose the guide for your distribution:
