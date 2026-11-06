@@ -1227,6 +1227,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "metrics",
+ "prost",
  "serde",
  "serde_json",
  "tempfile",

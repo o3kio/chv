@@ -1,0 +1,72 @@
+=== rc.7 network policy change on the upgraded host — 2026-11-06T17:06:11Z ===
+=== before: dnsmasq for this network ===
+none
+=== before: guest ICMP ===
+2 packets transmitted, 0 received, 100% packet loss, time 1012ms
+
+=== apply inbound/outbound ICMP allow (live policy change) ===
+update_http=200
+{"accepted":true,"network_id":"eac319350ba9fff7b0b957aedef20ba6","next_refresh_path":"/api/v1/tasks/c61753c6ed9de588c83f4d9a03a66a12","summary":"Firewall policy update accepted; applies on every node with an attached VM on this network","task_id":"c61753c6ed9de588c83f4d9a03a66a12"}
+=== wait for policy apply + dnsmasq ===
+t=2s dnsmasq=down
+t=4s dnsmasq=down
+t=6s dnsmasq=down
+t=8s dnsmasq=down
+t=10s dnsmasq=down
+t=12s dnsmasq=down
+t=14s dnsmasq=down
+t=16s dnsmasq=down
+t=18s dnsmasq=down
+t=20s dnsmasq=down
+t=22s dnsmasq=down
+t=24s dnsmasq=down
+t=26s dnsmasq=down
+t=28s dnsmasq=down
+t=30s dnsmasq=down
+t=32s dnsmasq=down
+t=34s dnsmasq=down
+t=36s dnsmasq=down
+t=38s dnsmasq=down
+t=40s dnsmasq=down
+=== dnsmasq process + explicit lease file ===
+none
+total 0
+srw------- 1 chv chv 0 Nov  6 17:05 api.sock
+=== nwd policy/dnsmasq log ===
+=== nft policy after change ===
+table inet chv-eac319350ba9fff7b0b957aedef20ba6 {
+	chain chv-policy-in {
+		ct state established,related accept
+		udp dport 67-68 accept
+		udp dport 53 accept
+		tcp dport 53 accept
+		counter packets 6 bytes 336 drop
+	}
+
+	chain chv-policy-fwd {
+		ct state established,related accept
+		udp dport 67-68 accept
+		udp dport 67-68 accept
+		udp dport 53 accept
+		tcp dport 53 accept
+		counter packets 0 bytes 0 drop
+	}
+
+	chain chv-policy-out {
+		ct state established,related accept
+		udp dport 67-68 accept
+		counter packets 17 bytes 1592 drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname { "tap-9a5c9ad1", "tap-a2a1a4ed", "br-eac31935dc4f" } jump chv-policy-in
+	}
+
+	chain forward {
+=== after: guest ICMP ===
+
+--- 10.200.0.65 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2046ms
+
+POLICY_CHANGE_B4_DONE

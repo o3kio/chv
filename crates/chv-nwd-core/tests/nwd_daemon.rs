@@ -11,13 +11,17 @@ use chv_nwd_core::executor::{
     DeleteOutcome, FabricOwnership, NetworkExecutor, OverlayStatusInfo, TopologyApplyResult,
 };
 use chv_nwd_core::fabric::{AppliedFabric, ApplyReport, FabricIdentity};
-use chv_nwd_core::{NetworkServer, TopologyState};
+use chv_nwd_core::handlers::NetworkServiceImpl;
+use chv_nwd_core::policy_store::{PolicyStore, StoredPolicies};
+use chv_nwd_core::topology_store::TopologyStore;
+use chv_nwd_core::{NetworkServer, TopologyState, TopologyTable};
 use chv_observability::Metrics;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
+use tonic::Request as TonicRequest;
 use tower::service_fn;
 
 struct MockExecutor;
@@ -203,6 +207,9 @@ impl NetworkExecutor for MockExecutor {
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Simulate an executor that cannot apply a valid-looking firewall
+    /// payload (used to exercise the actionable recovery error).
+    reject_firewall: bool,
 }
 
 #[async_trait]
@@ -323,6 +330,12 @@ impl NetworkExecutor for RecordingExecutor {
             .lock()
             .unwrap()
             .push(format!("fw:{network_id}:{bridge_name}"));
+        if self.reject_firewall {
+            return Err(ChvError::InvalidArgument {
+                field: "policy_json".to_string(),
+                reason: "simulated executor rejection".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -706,7 +719,7 @@ async fn all_network_handlers_smoke() {
             network_id: "net-1".to_string(),
             policy: Some(FirewallPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -721,7 +734,7 @@ async fn all_network_handlers_smoke() {
             network_id: "net-1".to_string(),
             policy: Some(NatPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -881,7 +894,7 @@ async fn firewall_nat_and_exposure_smoke() {
             network_id: "net-fw".to_string(),
             policy: Some(FirewallPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -895,7 +908,7 @@ async fn firewall_nat_and_exposure_smoke() {
             network_id: "net-fw".to_string(),
             policy: Some(NatPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -940,6 +953,7 @@ async fn attach_refreshes_policy_guard_scope() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let rec = RecordingExecutor {
         calls: calls.clone(),
+        reject_firewall: false,
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1041,6 +1055,7 @@ async fn concurrent_fw_nat_applies_persist_both_halves() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let rec = RecordingExecutor {
         calls: calls.clone(),
+        reject_firewall: false,
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1172,6 +1187,7 @@ async fn delete_without_state_row_runs_derived_names_local_teardown() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let rec = RecordingExecutor {
         calls: calls.clone(),
+        reject_firewall: false,
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1241,5 +1257,864 @@ async fn delete_without_state_row_runs_derived_names_local_teardown() {
     assert!(
         !recorded.iter().any(|c| c == "derived_teardown:net-live"),
         "the state-row path must not double-run the derived-names fallback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rc.8 blocker B9: durable topology journal / restart recovery
+// ---------------------------------------------------------------------------
+
+fn bridge_only_spec(network_id: &str) -> TopologySpec {
+    TopologySpec {
+        network_id: network_id.to_string(),
+        tenant_id: "t1".to_string(),
+        bridge_name: chv_common::bridge_name_for_network(network_id),
+        namespace_name: format!("ns-{network_id}"),
+        subnet_cidr: "10.0.7.0/24".to_string(),
+        gateway_ip: "10.0.7.1".to_string(),
+        options: Default::default(),
+        vni: 0,
+        vtep_endpoints: vec![],
+        overlay_type: 0,
+        fabric: None,
+    }
+}
+
+/// The rc.7 field failure in one test: a topology is applied, nwd restarts
+/// (the in-memory table is empty), and the next policy update used to fail
+/// `not found: topology <id>`. The journal must rebuild the table and the
+/// update must apply.
+#[tokio::test]
+async fn topology_journal_recovers_after_restart_and_reopens_policy_updates() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let spec = bridge_only_spec("net-restart");
+
+    // First process lifetime: ensure the topology through the real handler.
+    let mut first = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    first.set_topology_store(Arc::new(store.clone()));
+    let ensured = first
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec.clone()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+    assert!(
+        store.path_for("net-restart").exists(),
+        "a successful ensure must journal the topology spec"
+    );
+
+    // Restart: a fresh in-memory table (exactly what a new nwd process has)
+    // and the same durable journal.
+    let table = Arc::new(TopologyTable::new());
+    let mut second = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        table.clone(),
+        Arc::new(Metrics::new()),
+    );
+    second.set_topology_store(Arc::new(store.clone()));
+    second
+        .recover_topologies()
+        .await
+        .expect("the journal must replay cleanly");
+    assert!(
+        table.get("net-restart").is_some(),
+        "recovery must rebuild the in-memory topology table"
+    );
+
+    // The exact failing RPC from the field drill.
+    let fw = second
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-restart".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        fw.status, "OK",
+        "a policy update after a restart must find the recovered topology: {}",
+        fw.human_summary
+    );
+}
+
+/// §6.4 requires policy AND bridge to re-materialize after an nwd restart or
+/// network disruption. The topology journal alone restores ownership; the
+/// policy journal must restore the guard set, or a NIC attached after the
+/// restart would sit outside CHV default-deny (the base hooks are
+/// `policy accept`; only the guard dispatches into the policy chains).
+#[tokio::test]
+async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // First process lifetime: ensure the topology and apply a policy.
+    let mut first = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+            reject_firewall: false,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    first.set_topology_store(Arc::new(topologies.clone()));
+    first.set_policy_store(Arc::new(policies.clone()));
+    first
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-policy")),
+        }))
+        .await
+        .unwrap();
+    let applied = first
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-policy".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "policy-9".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.status, "OK");
+    assert!(
+        policies.path_for("net-policy").exists(),
+        "a firewall policy must be journaled for restart recovery"
+    );
+
+    // Restart: fresh in-memory state, same durable journals.
+    calls.lock().unwrap().clear();
+    let table = Arc::new(TopologyTable::new());
+    let mut second = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+            reject_firewall: false,
+        }),
+        table.clone(),
+        Arc::new(Metrics::new()),
+    );
+    second.set_topology_store(Arc::new(topologies));
+    second.set_policy_store(Arc::new(policies));
+    second
+        .recover_topologies()
+        .await
+        .expect("the journals must replay cleanly");
+    assert!(table.get("net-policy").is_some());
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "fw:net-policy:br-net-policy"),
+        "recovery must re-apply the journaled firewall policy: {:?}",
+        calls.lock().unwrap()
+    );
+
+    // A NIC attach after the restart must re-scope the guard from the
+    // recovered policy, not silently skip because policy_state was lost.
+    calls.lock().unwrap().clear();
+    let attached = second
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                network_id: "net-policy".to_string(),
+                nic_id: "nic-1".to_string(),
+                vm_id: "vm-1".to_string(),
+                mac_address: "52:54:00:00:00:01".to_string(),
+                tap_name: "tap-nic-1".to_string(),
+                ip_address: "10.0.7.10".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(attached.result.unwrap().status, "OK");
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "fw:net-policy:br-net-policy"),
+        "attach after recovery must re-apply the recovered policy guard: {:?}",
+        calls.lock().unwrap()
+    );
+}
+
+/// The RPC boundary must reject a payload the engine can never apply BEFORE
+/// journaling it as desired state. The journal is replayed fail-closed at
+/// startup, so a persisted unapplicable entry would turn the next documented
+/// restart into a permanent crash loop.
+#[tokio::test]
+async fn invalid_policy_is_rejected_without_being_journaled() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(topologies.clone()));
+    service.set_policy_store(Arc::new(policies.clone()));
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-bad")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    // Malformed firewall JSON: the handler rejects it and nothing is journaled.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-bad".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"{".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        fw.status, "OK",
+        "an unapplicable firewall payload must fail"
+    );
+    assert!(
+        !policies.path_for("net-bad").exists(),
+        "an unapplicable firewall payload must not be journaled"
+    );
+
+    // Invalid CIDR in the NAT payload: BFF stores nat_rules verbatim, so the
+    // nwd handler is the only validation on that path.
+    let nat = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-bad".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: br#"[{"source_cidr":"10.0.0.1"}]"#.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(nat.status, "OK", "an unapplicable NAT payload must fail");
+    assert!(
+        !policies.path_for("net-bad").exists(),
+        "an unapplicable NAT payload must not be journaled"
+    );
+
+    // A valid empty policy still applies and is journaled.
+    let ok = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-bad".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ok.status, "OK");
+    assert!(
+        policies.path_for("net-bad").exists(),
+        "a valid policy must still be journaled for restart recovery"
+    );
+}
+
+/// A rejected policy must leave a fail-closed marker in memory (never in the
+/// journal) so the attach-time guard refresh refuses the NIC, and a later valid
+/// save must clear it. The attach seam drops nwd's semantic error; without the
+/// marker, a stored rc.7 ruleset that cannot be rendered would leave the tap
+/// outside the policy chains (fail-open).
+#[tokio::test]
+async fn rejected_policy_blocks_attach_until_a_valid_save_clears_it() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+            reject_firewall: false,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-reject")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    // IPv6 can never be rendered by the IPv4 engine, so this payload is
+    // rejected before journaling. It must still set the in-memory marker.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-reject".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json:
+                    br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+                        .to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    let attach_request = || {
+        TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-reject".to_string(),
+                vm_id: "vm-reject".to_string(),
+                network_id: "net-reject".to_string(),
+                mac_address: "02:00:00:00:00:0b".to_string(),
+                tap_name: "tap-reject".to_string(),
+                ip_address: "10.0.9.10".to_string(),
+            }),
+        })
+    };
+    let attach = service
+        .attach_vm_nic(attach_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a rejected policy must refuse the attach, not proceed unguarded"
+    );
+
+    // A valid save clears the marker; the attach must now succeed and re-scope
+    // the guard set to the new policy.
+    let valid = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-reject".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v2".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.status, "OK");
+
+    calls.lock().unwrap().clear();
+    let attach = service
+        .attach_vm_nic(attach_request())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a valid save must clear the marker and allow the attach"
+    );
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("fw:net-reject:")),
+        "the attach must re-scope the guard set with the new policy"
+    );
+}
+
+/// A rejected NAT half must also refuse the attach; NAT is not the isolation
+/// boundary, but silently skipping its re-scope would hide the rejection.
+#[tokio::test]
+async fn rejected_nat_policy_blocks_attach_until_a_valid_save_clears_it() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reject_firewall: false,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-nat-reject")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    let nat = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-nat-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: br#"[{"source_cidr":"not-a-cidr"}]"#.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(nat.status, "OK");
+
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-nat-reject".to_string(),
+                vm_id: "vm-nat-reject".to_string(),
+                network_id: "net-nat-reject".to_string(),
+                mac_address: "02:00:00:00:00:0c".to_string(),
+                tap_name: "tap-nat-reject".to_string(),
+                ip_address: "10.0.9.11".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a rejected NAT policy must refuse the attach until a valid save lands"
+    );
+
+    let valid = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-nat-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v2".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.status, "OK");
+
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-nat-reject-2".to_string(),
+                vm_id: "vm-nat-reject".to_string(),
+                network_id: "net-nat-reject".to_string(),
+                mac_address: "02:00:00:00:00:0d".to_string(),
+                tap_name: "tap-nat-reject-2".to_string(),
+                ip_address: "10.0.9.12".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "a valid NAT save must clear the marker and allow the attach"
+    );
+}
+
+/// A rejected half is kept in memory for fail-closed attach but must never
+/// leak into the journal when the *other* half is updated: recovery replays the
+/// journal fail-closed, so a poison entry would crash-loop nwd at startup.
+#[tokio::test]
+async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(topologies.clone()));
+    service.set_policy_store(Arc::new(policies.clone()));
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-leak")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    // A valid firewall policy is journaled first.
+    let p1 = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-leak".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(p1.status, "OK");
+
+    // A rejected firewall update must not overwrite the last valid entry.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-leak".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v2".to_string(),
+                policy_json:
+                    br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+                        .to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    // A valid NAT update snapshots the pair. The rejected firewall half must be
+    // filtered out of the durable snapshot, and the last valid P1 must survive
+    // so post-restart attaches are still re-scoped.
+    let nat = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-leak".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(nat.status, "OK");
+
+    let raw = tokio::fs::read(policies.path_for("net-leak"))
+        .await
+        .expect("a valid NAT half must be journaled");
+    let stored: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    // Policy JSON is stored as raw bytes: `[]` is [0x5b, 0x5d].
+    assert_eq!(
+        stored["firewall"],
+        serde_json::json!([91, 93]),
+        "the last valid firewall policy must survive a rejected update: {stored}"
+    );
+    assert_eq!(stored["firewall_version"], "v1");
+    assert_eq!(stored["nat"], serde_json::json!([91, 93]));
+
+    // A restart must recover P1 and re-apply it, so a later attach is scoped.
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut restarted = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+            reject_firewall: false,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    restarted.set_topology_store(Arc::new(topologies));
+    restarted.set_policy_store(Arc::new(policies));
+    restarted.recover_topologies().await.unwrap();
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("fw:net-leak:")),
+        "recovery must re-apply the surviving validated firewall policy"
+    );
+}
+
+/// If a journal entry can no longer be applied (corruption/tampering after the
+/// RPC began rejecting unapplicable payloads), recovery must fail closed with
+/// an error that names the exact file. An opaque crash loop is a documented
+/// recovery failure (plan §6.9).
+#[tokio::test]
+async fn recovery_names_the_journal_file_when_a_policy_cannot_be_reapplied() {
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    topologies
+        .persist(&bridge_only_spec("net-poison"))
+        .await
+        .unwrap();
+    policies
+        .persist(
+            "net-poison",
+            &StoredPolicies {
+                firewall: Some(b"[]".to_vec()),
+                firewall_version: Some("v1".to_string()),
+                nat: None,
+                nat_version: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reject_firewall: true,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(topologies));
+    service.set_policy_store(Arc::new(policies.clone()));
+
+    let expected = policies.path_for("net-poison").display().to_string();
+    match service.recover_topologies().await {
+        Err(ChvError::Internal { reason }) => assert!(
+            reason.contains(&expected),
+            "the recovery error must name {expected}: {reason}"
+        ),
+        other => panic!("recovery must fail closed, got {other:?}"),
+    }
+}
+
+/// A topology delete must remove the journal entry, or the next restart would
+/// resurrect the network the operator just deleted.
+#[tokio::test]
+async fn topology_delete_removes_the_journal_entry() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    let service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    let mut service = service;
+    service.set_topology_store(Arc::new(store.clone()));
+    service.set_policy_store(Arc::new(policies.clone()));
+
+    service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-delete")),
+        }))
+        .await
+        .unwrap();
+    assert!(store.path_for("net-delete").exists());
+    service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-delete".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap();
+    assert!(policies.path_for("net-delete").exists());
+
+    // A rejected save leaves an in-memory marker. Deleting the topology must
+    // clear it, or a re-created network with the same id would refuse attaches
+    // forever (a fail-closed availability failure).
+    let rejected = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-delete".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v2".to_string(),
+                policy_json:
+                    br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+                        .to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(rejected.status, "OK");
+
+    let deleted = service
+        .delete_network_topology(TonicRequest::new(DeleteNetworkTopologyRequest {
+            meta: None,
+            network_id: "net-delete".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.status, "OK");
+    assert!(
+        !store.path_for("net-delete").exists(),
+        "a successful delete must remove the durable journal entry"
+    );
+    assert!(
+        !policies.path_for("net-delete").exists(),
+        "a successful delete must remove the durable policy entry"
+    );
+
+    // A restart after the delete must not recover anything.
+    let table = Arc::new(TopologyTable::new());
+    let mut restarted = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        table.clone(),
+        Arc::new(Metrics::new()),
+    );
+    restarted.set_topology_store(Arc::new(store.clone()));
+    restarted.set_policy_store(Arc::new(policies.clone()));
+    restarted.recover_topologies().await.unwrap();
+    assert!(table.get("net-delete").is_none());
+
+    // Re-ensure the same network id: the deleted rejection marker must not
+    // refuse an attach on the fresh topology.
+    service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-delete")),
+        }))
+        .await
+        .unwrap();
+    let attach = service
+        .attach_vm_nic(TonicRequest::new(AttachVmNicRequest {
+            meta: None,
+            nic: Some(NicSpec {
+                nic_id: "nic-delete".to_string(),
+                vm_id: "vm-delete".to_string(),
+                network_id: "net-delete".to_string(),
+                mac_address: "02:00:00:00:00:0e".to_string(),
+                tap_name: "tap-delete".to_string(),
+                ip_address: "10.0.9.13".to_string(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        attach.result.as_ref().unwrap().status,
+        "OK",
+        "deleting the topology must clear a rejection marker"
+    );
+}
+
+/// The idempotent ensure path is what core-native reconciliation calls every
+/// tick. When the in-memory table still holds the topology but the journal
+/// entry is missing (an operator cleaned it, or a persist failed after the
+/// apply), the next ensure must repair the durable record instead of returning
+/// OK with no journal.
+#[tokio::test]
+async fn idempotent_ensure_repairs_a_deleted_journal_entry() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(store.clone()));
+
+    let spec = bridge_only_spec("net-repair");
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec.clone()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+    assert!(store.path_for("net-repair").exists());
+
+    // Simulate journal loss while the in-memory topology survives.
+    store.remove("net-repair").await.unwrap();
+    assert!(!store.path_for("net-repair").exists());
+
+    // The idempotent short-circuit must heal the journal.
+    let again = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.status, "OK");
+    assert!(
+        store.path_for("net-repair").exists(),
+        "the idempotent ensure path must repair a missing journal entry"
+    );
+}
+
+/// Fabric topologies are design-only and have a separate durable ownership
+/// surface; they must never leave a bridge-only journal entry behind that a
+/// restart would replay with the wrong shape.
+#[tokio::test]
+async fn fabric_topology_is_not_journaled_as_bridge_only() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TopologyStore::new(dir.path().join("topologies"));
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(store.clone()));
+
+    let mut spec = bridge_only_spec("net-fabric");
+    spec.vni = 100;
+    spec.overlay_type = chv_nwd_api::chv_nwd_api::OverlayType::OverlayVxlan as i32;
+    spec.fabric = Some(FabricPlan::default());
+
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+    assert!(
+        !store.path_for("net-fabric").exists(),
+        "fabric specs are not journaled by the bridge-only journal"
     );
 }

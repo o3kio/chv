@@ -230,6 +230,9 @@ elif [ "$NO_UNINSTALL" = "0" ]; then
     rm -f /run/chv/nwd/dnsmasq-*.hosts
     rm -f /run/chv/nwd/dnsmasq-*.pid
     rm -f /run/chv/nwd/dnsmasq-*.leases
+    # Durable nwd state (topology journal + DHCP reservations) is derived
+    # from the deployment being replaced.
+    rm -rf /var/lib/chv/nwd
 
     # Remove database (clean state for new install)
     rm -f /var/lib/chv/controlplane.db*

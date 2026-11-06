@@ -1,0 +1,83 @@
+=== post-upgrade verification — 2026-11-06T17:05:17Z ===
+=== config/cert hashes (compare to 01-pre-upgrade.log) ===
+6457a3e8def16899babea3869cbc9dfe4ccaed1cf84fbe9baa9c7374fcd37538  /etc/chv/encryption.env
+cc2c9c8d21939f8421dfdb189959042897b64ee742964aa6e567cb14251aa55b  /etc/chv/controlplane.toml
+984f014f599df519f0ca6a17ae2babab0e23b48b8a918759c9bd26ad8d09a0eb  /etc/chv/agent.toml
+1b6e3c72883df3a4518088db2d9584328d638391492b37d0301510e71b993ba8  /etc/chv/nwd.toml
+3c6ed3029d1345f315abcb7d511e606695f9adba67a40d7fc9802f363ba1c825  /etc/chv/stord.toml
+084d673f04c011e8d7a0a3bd546c734373711ec9c83a484c548778ecddb91a88  /etc/chv/certs/ca.crt
+6d408f215b2fec642013225f254823a67660c94dac1d9b9a5f5845a5c05ee4c1  /etc/chv/certs/ca.key
+8acc3f00bb70720c74fb89e2ee32ce2e2ca278f16f0f7c76201f53e41ce871d7  /etc/chv/certs/agent-client.crt
+4fcfb0edfb4e5bbc86913c982680a090da383db06bb28183e4543eb2331a739f  /etc/chv/certs/agent-client.key
+=== node identity ===
+node_id = "f22b8cc7-cd0d-435f-8d7e-22f81b4b04da"
+=== DB row counts and schema ===
+users 2
+networks 1
+vms 9
+images 1
+volumes 9
+max_migration n/a
+=== admin + operator login ===
+admin_token_len=300
+probe_login_http=200
+probe_login_ok= True
+=== users ===
+users= [('admin', 'admin'), ('field-rc7-probe', 'operator')]
+=== node row ===
+[{'node_id': 'f22b8cc7-cd0d-435f-8d7e-22f81b4b04da', 'name': 'dev', 'state': 'TenantReady', 'health': 'Healthy', 'version': '0.4.0'}]
+=== drill VM summary (row must survive; VMM still Running) ===
+  File "<stdin>", line 1
+    {"summary":{"attached_nics":[{"addressing_mode":"internal","ip_address":"10.200.0.65","mac_address":"02:6a:b0:6d:35:6f","network_id":"eac319350ba9fff7b0b957aedef20ba6","network_name":"default","nic_id":"8036de061349b9801b27010339931e78-eac319350ba9fff7b0b957aedef20ba6","nic_model":"virtio"}],"attached_volumes":[{"device_name":"vda","health":"unknown","name":"field-rc7-upgrade-vm-disk","read_only":false,"size":"10.0 GiB","volume_id":"84c1fefd8eb957eaba6b6a6ee424b65a"}],"cpu":"1","health":"Unknown","last_error":"","memory":"512.0 MiB","name":"field-rc7-upgrade-vm","node_id":"f22b8cc7-cd0d-435f-8d7e-22f81b4b04da","power_state":"Running","recent_tasks":[{"error_code":null,"error_message":null,"started_unix_ms":1793984682000,"status":"Succeeded","summary":"StartVm","task_id":"StartVm-d71b646e670b37cf3b8a2361b04974f2"},{"error_code":null,"error_message":null,"started_unix_ms":1793984522000,"status":"Succeeded","summary":"CreateVm","task_id":"0e91ad155af2e16b77ee60112ba4be0a"}],"snapshot_count":0,"vm_id":"8036de061349b9801b27010339931e78"}}import sys,json
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             ^^^^^^
+SyntaxError: invalid syntax
+=== VMM direct state + NIC count ===
+state= Running net_count= 1
+=== console tail: guest reached DHCP/login? ===
+ice[0m - Disk Manager.
+[[0;32m  OK  [0m] Finished [0;1;39msetvtrgb.service[0m - Set console scheme.
+[[0;32m  OK  [0m] Created slice [0;1;39msystem-getty.slice[0m - Slice /system/getty.
+[[0;32m  OK  [0m] Started [0;1;39mgetty@tty1.service[0m - Getty on tty1.
+[[0;32m  OK  [0m] Reached target [0;1;39mgetty.target[0m - Login Prompts.
+[[0;32m  OK  [0m] Finished [0;1;39mpollinate.service[0m - Polli…the pseudo random number generator.
+[[0;32m  OK  [0m] Finished [0;1;39mgrub-initrd-fallback.service[0m - GRUB failed boot detection.
+[[0;32m  OK  [0m] Started [0;1;39mModemManager.service[0m - Modem Manager.
+[[0;32m  OK  [0m] Started [0;1;39msnapd.service[0m - Snap Daemon.
+         Starting [0;1;39msystemd-timedated.service[0m - Time & Date Service...
+[[0;32m  OK  [0m] Started [0;1;39msystemd-timedated.service[0m - Time & Date Service.
+[[0;32m  OK  [0m] Finished [0;1;39mcloud-config.service[0m - Cloud-init: Config Stage.
+
+Ubuntu 24.04.5 LTS 8036de061349b9801b27010339931e78 ttyS0
+
+8036de061349b9801b27010339931e78 login: 
+Ubuntu 24.04.5 LTS 8036de061349b9801b27010339931e78 ttyS0
+
+8036de061349b9801b27010339931e78 login: 
+=== services + versions ===
+chv-controlplane active
+chv-agent active
+chv-stord active
+chv-nwd active
+Nov 06 17:03:26 dev chv-agent[131054]: 2026-11-06T17:03:26.105321Z  INFO chv_agent: chv-agent starting (version 0.4.0, commit df86e53, channel stable)
+Nov 06 17:03:26 dev chv-agent[131054]: 2026-11-06T17:03:26.106502Z  INFO chv_agent_runtime_ch::process: adopted running vm after agent restart; console capture resumed vm_id=8036de061349b9801b27010339931e78 pid=130075
+Nov 06 17:05:12 dev chv-agent[133209]: 2026-11-06T17:05:12.569882Z  INFO chv_agent: chv-agent starting (version 0.4.0, commit 1b8f68f, channel stable)
+Nov 06 17:05:12 dev chv-agent[133209]: 2026-11-06T17:05:12.570753Z  INFO chv_agent_runtime_ch::process: adopted running vm after agent restart; console capture resumed vm_id=8036de061349b9801b27010339931e78 pid=130075
+=== cgroup device policy for the VMM ===
+vmm_pid=130075
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/kvm rw
+POST_UPGRADE_VERIFICATION_DONE
+=== drill VM summary (corrected capture) ===
+{'vm_id': '8036de061349b9801b27010339931e78', 'name': 'field-rc7-upgrade-vm', 'power_state': 'Running', 'health': 'Unknown', 'node_id': 'f22b8cc7-cd0d-435f-8d7e-22f81b4b04da'}
+nics [('10.200.0.65', 'default')]
+vols [('field-rc7-upgrade-vm-disk', '10.0 GiB', 'vda')]
+=== persisted bridge config present before removal ===
+-rw-r--r-- 1 root root 33 Nov  6 14:54 /etc/systemd/network/10-chvbr0.netdev
+-rw-r--r-- 1 root root 67 Nov  6 14:54 /etc/systemd/network/11-chvbr0.network
+(none of the three)
+/etc/systemd/network/12-ens19.network
+=== chvbr0 slaves ===
+3: ens19: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel master chvbr0 state UP mode DEFAULT group default qlen 1000\    link/ether bc:24:11:d7:c4:73 brd ff:ff:ff:ff:ff:ff\    altname enp0s19
+=== which bridge carries the guest tap ===
+tap-9a5c9ad1
+tap-a2a1a4ed

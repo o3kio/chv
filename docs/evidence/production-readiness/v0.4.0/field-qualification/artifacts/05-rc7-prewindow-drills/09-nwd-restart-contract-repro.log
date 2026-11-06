@@ -1,0 +1,19 @@
+=== rc.7 nwd-restart contract reproduction (pre-clean-install) — 2026-11-06T17:09:03Z ===
+host: rc.7 package upgrade over rc.6 tarball install; authority_mode=core-managed
+login_ok=yes
+=== materialize topology with a VM create (core-managed ensure path) ===
+create_vm_http=200
+{"accepted":true,"next_refresh_path":"/api/v1/tasks/a3498b4672d4985c0c4f8c80dcc6e4ba","summary":"Creating VM 'field-rc7-nwd-drill-vm'","task_id":"a3498b4672d4985c0c4f8c80dcc6e4ba","vm_id":"b358dad15709dfc7ef706f96bd0a47a8"}
+vm2=b358dad15709dfc7ef706f96bd0a47a8 task2=a3498b4672d4985c0c4f8c80dcc6e4ba
+=== wait for the create operation ===
+t=3s task_status=Accepted
+t=6s task_status=Succeeded
+task {'operation': 'CreateVm', 'status': 'Succeeded', 'error_code': None, 'error_message': None}
+=== nwd topology table after ensure (via list_namespace_state if exposed) ===
+=== dnsmasq for the network ===
+none
+=== runtime dir ===
+total 0
+srw------- 1 chv chv 0 Nov  6 17:05 api.sock
+=== dnsmasq lease file per B4 ===
+zsh:44: no matches found: /run/chv/nwd/dnsmasq-*.leases

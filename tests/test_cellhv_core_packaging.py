@@ -97,6 +97,77 @@ class CellHvCorePackagingTests(unittest.TestCase):
             self.assertIn("DeviceAllow=/dev/kvm rw", unit)
             self.assertIn("DeviceAllow=/dev/net/tun rw", unit)
 
+    def test_nwd_unit_can_bind_the_dhcp_server_port(self):
+        # Field blocker B8: dnsmasq runs as a child of the non-root chv-nwd
+        # unit and binds UDP/67. With the default
+        # net.ipv4.ip_unprivileged_port_start=1024 and only NET_ADMIN/NET_RAW/
+        # SYS_ADMIN, every spawn failed with "failed to bind DHCP server
+        # socket: Permission denied". The exact cap set is pinned: losing
+        # NET_BIND_SERVICE silently kills the documented DHCP path again.
+        expected = "CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_BIND_SERVICE"
+        for relative in (
+            "packaging/systemd/chv-nwd.service",
+            "docs/examples/systemd/chv-nwd.service",
+        ):
+            unit = (ROOT / relative).read_text()
+            self.assertIn(f"AmbientCapabilities={expected}", unit)
+            self.assertIn(f"CapabilityBoundingSet={expected}", unit)
+
+    def test_nwd_unit_prepares_the_topology_journal_directory(self):
+        # Field blocker B9: nwd journals applied bridge-only topologies under
+        # /var/lib/chv/nwd/topologies (and the last requested policy under
+        # /var/lib/chv/nwd/policies) and replays both before serving. The
+        # unit must create those directories before ExecStart (StateDirectory
+        # only creates /var/lib/chv), with the daemon's identity so the
+        # non-root process can write them under ProtectSystem=strict.
+        for relative in (
+            "packaging/systemd/chv-nwd.service",
+            "docs/examples/systemd/chv-nwd.service",
+        ):
+            unit = (ROOT / relative).read_text()
+            self.assertIn(
+                "ExecStartPre=+/usr/bin/install -d -m 0700 -o chv -g chv "
+                "/var/lib/chv/nwd/topologies /var/lib/chv/nwd/policies "
+                "/var/lib/chv/nwd/dhcp",
+                unit,
+            )
+
+    def test_nwd_daemon_wires_the_durable_topology_journal(self):
+        main = (ROOT / "cmd/chv-nwd/src/main.rs").read_text()
+        self.assertIn(".with_topology_store(", main)
+        self.assertIn(".with_policy_store(", main)
+        self.assertIn("TopologyStore::default_dir()", main)
+        self.assertIn("PolicyStore::default_dir()", main)
+        server = (ROOT / "crates/chv-nwd-core/src/server.rs").read_text()
+        self.assertIn("recover_topologies().await", server)
+        handlers = (ROOT / "crates/chv-nwd-core/src/handlers.rs").read_text()
+        # Recovery must restore the guard set, not just the topology row.
+        self.assertIn("recover_policies(&spec.network_id, &state)", handlers)
+        self.assertIn(".set_firewall_policy(network_id, &version, &json", handlers)
+
+    def test_nwd_durable_network_state_is_removed_by_wipe_and_package_removal(self):
+        # rc.8 B9: nwd now replays a durable bridge-only topology journal at
+        # startup. A --wipe reinstall (and package removal) tears the networks
+        # down, so it must also drop the journal, or the fresh install would
+        # resurrect the previous run's bridges from it.
+        expected = 'rm -rf "${CHV_DATA_DIR:-/var/lib/chv}/nwd"'
+        installer = (ROOT / "scripts/install.sh").read_text()
+        cleanup = re.search(
+            r"delete_chv_network_state\(\) \{(.*?)\n\}", installer, re.S
+        ).group(1)
+        self.assertIn(expected, cleanup)
+
+        # Package removal is deliberately surgical: the persistent root is
+        # preserved, so the journal contents are deleted with find/rmdir
+        # instead of a blanket `rm -rf` (which check-safety.sh rejects).
+        preremove = (ROOT / "packaging/scripts/preremove.sh").read_text()
+        cleanup = re.search(
+            r"delete_chv_network_state\(\) \{(.*?)\n\}", preremove, re.S
+        ).group(1)
+        self.assertIn('nwd_state="${CHV_DATA_DIR:-/var/lib/chv}/nwd"', cleanup)
+        self.assertIn('find "$nwd_state" -mindepth 1 -delete', cleanup)
+        self.assertNotIn("rm -rf", cleanup)
+
     def test_install_surfaces_provision_exact_private_parents(self):
         postinstall = (ROOT / "packaging/scripts/postinstall.sh").read_text()
         tmpfiles = (ROOT / "packaging/tmpfiles/chv-node.conf").read_text()

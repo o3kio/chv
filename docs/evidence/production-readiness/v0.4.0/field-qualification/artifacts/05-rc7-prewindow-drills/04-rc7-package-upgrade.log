@@ -1,0 +1,86 @@
+=== rc.7 package upgrade over rc.6 tarball install — 2026-11-06T17:05:04Z ===
+pre_upgrade_vmm_pid=130075
+pre_upgrade_vmm_state=Running
+pre_upgrade_console_bytes=72586
+pre_upgrade_db_counts:
+users 2
+networks 1
+vms 9
+images 1
+
+=== dpkg -i published rc.7 debs (noninteractive, force-confold) ===
+Selecting previously unselected package chv-controlplane.
+(Reading database ... 145122 files and directories currently installed.)
+Preparing to unpack .../chv-controlplane_0.4.0.rc.7_amd64.deb ...
+Unpacking chv-controlplane (0.4.0~rc.7) ...
+Selecting previously unselected package chv-monitor-agent.
+Preparing to unpack .../chv-monitor-agent_0.4.0.rc.7_amd64.deb ...
+Unpacking chv-monitor-agent (0.4.0~rc.7) ...
+Selecting previously unselected package chv-node.
+Preparing to unpack .../chv-node_0.4.0.rc.7_amd64.deb ...
+Unpacking chv-node (0.4.0~rc.7) ...
+Selecting previously unselected package chvctl.
+Preparing to unpack .../chvctl_0.4.0.rc.7_amd64.deb ...
+Unpacking chvctl (0.4.0~rc.7) ...
+Setting up chv-controlplane (0.4.0~rc.7) ...
+
+Configuration file '/etc/chv/controlplane.toml'
+ ==> File on system created by you or by a script.
+ ==> File also in package provided by package maintainer.
+ ==> Using current old file as you requested.
+Setting up chv-monitor-agent (0.4.0~rc.7) ...
+chv-monitor-agent: installed (disabled by default).
+chv-monitor-agent: set server_url and manager_ca_path in /etc/chv-monitor/agent.toml,
+chv-monitor-agent: place a one-time claim at /var/lib/chv-monitor/claim (owner chv-monitor, 0600), then:
+chv-monitor-agent:   systemctl enable --now chv-monitor-agent
+Setting up chv-node (0.4.0~rc.7) ...
+
+Configuration file '/etc/chv/agent.toml'
+ ==> File on system created by you or by a script.
+ ==> File also in package provided by package maintainer.
+ ==> Using current old file as you requested.
+
+Configuration file '/etc/chv/nwd.toml'
+ ==> File on system created by you or by a script.
+ ==> File also in package provided by package maintainer.
+ ==> Using current old file as you requested.
+
+Configuration file '/etc/chv/stord.toml'
+ ==> File on system created by you or by a script.
+ ==> File also in package provided by package maintainer.
+ ==> Using current old file as you requested.
+Setting up chvctl (0.4.0~rc.7) ...
+DPKG_RC=0
+=== dpkg --configure -a ===
+CONFIGURE_RC=0
+=== package versions ===
+chv-controlplane 0.4.0~rc.7 install ok installed
+chv-monitor-agent 0.4.0~rc.7 install ok installed
+chv-node 0.4.0~rc.7 install ok installed
+chvctl 0.4.0~rc.7 install ok installed
+=== on-disk binary versions (new inodes) ===
+chv-controlplane: chv-controlplane 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+chv-agent: chv-agent 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+chv-stord: chv-stord 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+chv-nwd: chv-nwd 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+chvctl: chvctl 0.4.0
+=== services still old processes ===
+chv-controlplane active
+chv-agent active
+chv-stord active
+chv-nwd active
+=== fragment paths after dpkg (expect /etc shadow) ===
+FragmentPath=/etc/systemd/system/chv-controlplane.service
+FragmentPath=/etc/systemd/system/chv-agent.service
+FragmentPath=/etc/systemd/system/chv-stord.service
+FragmentPath=/etc/systemd/system/chv-nwd.service
+=== /lib units now present ===
+-rw-r--r-- 1 root root 2905 Nov  6 16:55 /lib/systemd/system/chv-agent.service
+-rw-r--r-- 1 root root  679 Nov  6 16:55 /lib/systemd/system/chv-controlplane.service
+-rw-r--r-- 1 root root 1767 Nov  6 16:55 /lib/systemd/system/chv-monitor-agent.service
+-rw-r--r-- 1 root root 1746 Nov  6 16:55 /lib/systemd/system/chv-nwd.service
+-rw-r--r-- 1 root root  887 Nov  6 16:55 /lib/systemd/system/chv-stord.service
+=== VM process after dpkg (must still be 130075) ===
+130075 /usr/bin/cloud-hypervisor --no-shutdown --api-socket /var/lib/chv/agent/vms/8036de061349b9801b27010339931e78/vm.sock
+132276 /usr/bin/zsh -c set -u cd /root/chv-field/artifacts/rc7-drills LOG=04-rc7-package-upgrade.log exec > >(tee -a "$LOG") 2>&1 echo "=== rc.7 package upgrade over rc.6 tarball install — $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" VM="$(cat /root/chv-field/state/rc7_drill_vmid)" PRE_VMM_PID="$(cat /var/lib/chv/agent/vms/$VM/ch.pid)" echo "pre_upgrade_vmm_pid=$PRE_VMM_PID" echo "pre_upgrade_vmm_state=$(/usr/local/bin/ch-remote --api-socket /var/lib/chv/agent/vms/$VM/vm.sock info 2>/dev/null | /usr/bin/python3 -c 'import sys,json;print(json.load(sys.stdin).get("state"))')" echo "pre_upgrade_console_bytes=$(wc -c < /var/lib/chv/agent/vms/$VM/console.log)" echo "pre_upgrade_db_counts:" /usr/bin/python3 - <<'PY' import sqlite3 c=sqlite3.connect('file:/var/lib/chv/controlplane.db?mode=ro', uri=True) for t in ('users','networks','vms','images'):     print(t, c.execute(f'select count(*) from {t}').fetchone()[0]) PY echo echo "=== dpkg -i published rc.7 debs (noninteractive, force-confold) ===" DEBIAN_FRONTEND=noninteractive dpkg --force-confold -i \   /root/chv-field/artifacts/rc7/chv-controlplane_0.4.0.rc.7_amd64.deb \   /root/chv-field/artifacts/rc7/chv-monitor-agent_0.4.0.rc.7_amd64.deb \   /root/chv-field/artifacts/rc7/chv-node_0.4.0.rc.7_amd64.deb \   /root/chv-field/artifacts/rc7/chvctl_0.4.0.rc.7_amd64.deb 2>&1 DPKG_RC=$? echo "DPKG_RC=$DPKG_RC" echo "=== dpkg --configure -a ===" DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a 2>&1 echo "CONFIGURE_RC=$?" echo "=== package versions ===" dpkg-query -W -f='${Package} ${Version} ${Status}\n' chv-controlplane chv-monitor-agent chv-node chvctl echo "=== on-disk binary versions (new inodes) ===" for b in chv-controlplane chv-agent chv-stord chv-nwd chvctl; do printf '%s: ' "$b"; /usr/bin/$b --version 2>/dev/null || echo missing; done echo "=== services still old processes ===" for u in chv-controlplane chv-agent chv-stord chv-nwd; do printf '%s ' "$u"; systemctl is-active "$u"; done echo "=== fragment paths after dpkg (expect /etc shadow) ===" systemctl show -p FragmentPath chv-controlplane chv-agent chv-stord chv-nwd | grep . echo "=== /lib units now present ===" ls -l /lib/systemd/system/chv-*.service echo "=== VM process after dpkg (must still be $PRE_VMM_PID) ===" pgrep -af cloud-hypervisor || true echo "UPGRADE_DPKG_DONE"
+UPGRADE_DPKG_DONE

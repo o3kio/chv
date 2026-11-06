@@ -1,14 +1,17 @@
 use crate::ebpf::{self, EbpfManager};
 use crate::executor::{FabricOwnership, NetworkExecutor, OverlayStatusInfo, TopologyApplyResult};
+use crate::policy_store::{PolicyStore, StoredPolicies};
 use crate::state::{TopologyState, TopologyTable};
+use crate::topology_store::TopologyStore;
 use chv_errors::ChvError;
 use chv_nwd_api::chv_nwd_api as proto;
 use chv_observability::{operation_span, Metrics};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Last successfully applied CHV firewall/NAT policy for a network, used to
 /// re-scope the CHV-owned interface guard set when a VM NIC attaches so the
@@ -21,6 +24,46 @@ struct AppliedPolicies {
     nat_version: Option<String>,
 }
 
+/// In-memory rejection markers for policies that failed pre-journal validation.
+///
+/// The rejected payload is deliberately NOT stored in `policy_state`: that map
+/// is the desired state the durable journal snapshots, and a rejected half must
+/// never overwrite the last valid entry (otherwise a post-restart attach would
+/// find nothing to re-scope). Instead the marker makes `refresh_policy_scope`
+/// refuse a NIC attach until a valid policy replaces it — fail-closed while the
+/// last valid policy stays durable and recoverable.
+#[derive(Clone, Default)]
+struct RejectedPolicies {
+    firewall: bool,
+    nat: bool,
+}
+
+/// Build the durable snapshot from the in-memory desired state, dropping a half
+/// that does not validate.
+///
+/// Defense in depth: the rejection path only sets [`RejectedPolicies`] and never
+/// writes `policy_state`, so this should be a no-op today. It stays because a
+/// future writer (or a restored/regressed desired state) must not leak an
+/// unapplicable half into the journal through an update of the other half:
+/// fail-closed recovery would replay it and crash-loop nwd (the B9 poison
+/// class).
+fn durable_snapshot(applied: &AppliedPolicies) -> StoredPolicies {
+    let firewall = applied
+        .firewall
+        .clone()
+        .filter(|json| crate::firewall::validate_firewall_policy(json).is_ok());
+    let nat = applied
+        .nat
+        .clone()
+        .filter(|json| crate::firewall::validate_nat_policy(json).is_ok());
+    StoredPolicies {
+        firewall_version: firewall.as_ref().and(applied.firewall_version.clone()),
+        firewall,
+        nat_version: nat.as_ref().and(applied.nat_version.clone()),
+        nat,
+    }
+}
+
 pub struct NetworkServiceImpl<E: NetworkExecutor> {
     executor: Arc<E>,
     topologies: Arc<TopologyTable>,
@@ -28,9 +71,25 @@ pub struct NetworkServiceImpl<E: NetworkExecutor> {
     security_policies: Arc<DashMap<String, proto::SecurityPolicy>>,
     rate_limit_policies: Arc<DashMap<String, proto::RateLimitPolicy>>,
     policy_state: Arc<DashMap<String, AppliedPolicies>>,
+    rejected_policies: Arc<DashMap<String, RejectedPolicies>>,
     ebpf: Arc<dyn EbpfManager>,
     /// Counter tracking eBPF program load failures.
     ebpf_load_failures: Arc<AtomicU32>,
+    /// Durable bridge-only topology journal (rc.8 blocker B9). `None` in unit
+    /// tests and in any composition that has not opted in; the production
+    /// daemon always wires it (see `cmd/chv-nwd/src/main.rs`).
+    topology_store: Option<Arc<TopologyStore>>,
+    /// Durable firewall/NAT policy journal (rc.8 B9 follow-up). Re-applied on
+    /// recovery so a restart or reboot restores the interface guard set
+    /// instead of leaving attached guests outside default-deny.
+    policy_store: Option<Arc<PolicyStore>>,
+    /// Serializes policy-journal updates with the in-memory `policy_state`
+    /// mutation so concurrent firewall/NAT RPCs cannot persist a half pair.
+    policy_persist: AsyncMutex<()>,
+    /// Serializes fabric datapath mutations (overlay apply/rollback and the
+    /// ensure path's fabric apply) so one operation's guard-refresh rollback
+    /// cannot tear down a concurrent operation's overlay.
+    fabric_ops: AsyncMutex<()>,
 }
 
 impl<E: NetworkExecutor> NetworkServiceImpl<E> {
@@ -42,8 +101,393 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             security_policies: Arc::new(DashMap::new()),
             rate_limit_policies: Arc::new(DashMap::new()),
             policy_state: Arc::new(DashMap::new()),
+            rejected_policies: Arc::new(DashMap::new()),
             ebpf: Arc::new(ebpf::NoopEbpfManager),
             ebpf_load_failures: Arc::new(AtomicU32::new(0)),
+            topology_store: None,
+            policy_store: None,
+            policy_persist: AsyncMutex::new(()),
+            fabric_ops: AsyncMutex::new(()),
+        }
+    }
+
+    /// Opt into the durable bridge-only topology journal. Production wiring
+    /// calls this once before serving; tests that do not care leave it unset.
+    pub fn set_topology_store(&mut self, store: Arc<TopologyStore>) {
+        self.topology_store = Some(store);
+    }
+
+    /// Opt into the durable policy journal (rc.8 B9 follow-up). Production
+    /// wiring calls this alongside [`Self::set_topology_store`].
+    pub fn set_policy_store(&mut self, store: Arc<PolicyStore>) {
+        self.policy_store = Some(store);
+    }
+
+    /// Persist the applied bridge-only spec, or drop a stale bridge-only entry
+    /// when the topology is now fabric-backed. Fabric plans are deliberately
+    /// not journaled: the stretched-L2 provider owns its durable surface and
+    /// claiming recovery here would be false.
+    async fn journal_topology(&self, spec: &proto::TopologySpec) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        if spec.fabric.is_some() {
+            store.remove(&spec.network_id).await
+        } else {
+            store.persist(spec).await
+        }
+    }
+
+    async fn forget_topology(&self, network_id: &str) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        store.remove(network_id).await
+    }
+
+    /// Drop the durable policy for a network. A failure fails the delete
+    /// closed: a stale policy re-applied after a restart against a re-created
+    /// network with the same id would be the #227 S5 residue class.
+    async fn forget_policies(&self, network_id: &str) -> Result<(), ChvError> {
+        let Some(store) = self.policy_store.as_ref() else {
+            return Ok(());
+        };
+        store.remove(network_id).await
+    }
+
+    /// Record the requested firewall half durably before the executor apply.
+    /// Mutating the in-memory pair and taking the persistence snapshot under
+    /// one lock keeps a concurrent NAT RPC from persisting a half pair. The
+    /// in-memory record is kept even when the journal write fails, so a later
+    /// NIC attach still re-scopes; the RPC itself reports the write failure.
+    async fn record_firewall_policy(
+        &self,
+        network_id: &str,
+        policy_json: &[u8],
+        policy_version: &str,
+    ) -> Result<(), ChvError> {
+        // Hold the lock across the persist: releasing it before the write
+        // would let a concurrent NAT snapshot land first and then be
+        // overwritten by this older firewall-only snapshot.
+        let _guard = self.policy_persist.lock().await;
+        // Re-verify ownership under the lock: a concurrent delete may have
+        // removed the topology between the handler's check and this call.
+        // Persisting now would leave a durable policy for a deleted network,
+        // which a later re-create could inherit after a restart (#227 S5).
+        if self.topologies.get(network_id).is_none() {
+            return Err(ChvError::NotFound {
+                resource: "topology".to_string(),
+                id: network_id.to_string(),
+            });
+        }
+        let snapshot = {
+            let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
+            applied.firewall = Some(policy_json.to_vec());
+            applied.firewall_version = Some(policy_version.to_string());
+            // Clear the rejection marker only after the desired state is
+            // committed. Clearing it first would open a window where an attach
+            // finds neither a marker nor a policy and proceeds unguarded.
+            if let Some(mut rejected) = self.rejected_policies.get_mut(network_id) {
+                rejected.firewall = false;
+            }
+            durable_snapshot(&applied)
+        };
+        match self.policy_store.as_ref() {
+            Some(store) => store.persist(network_id, &snapshot).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Record the requested NAT half durably (see `record_firewall_policy`).
+    async fn record_nat_policy(
+        &self,
+        network_id: &str,
+        policy_json: &[u8],
+        policy_version: &str,
+    ) -> Result<(), ChvError> {
+        let _guard = self.policy_persist.lock().await;
+        // Re-verify ownership under the lock: a concurrent delete may have
+        // removed the topology between the handler's check and this call.
+        // Persisting now would leave a durable policy for a deleted network,
+        // which a later re-create could inherit after a restart (#227 S5).
+        if self.topologies.get(network_id).is_none() {
+            return Err(ChvError::NotFound {
+                resource: "topology".to_string(),
+                id: network_id.to_string(),
+            });
+        }
+        let snapshot = {
+            let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
+            applied.nat = Some(policy_json.to_vec());
+            applied.nat_version = Some(policy_version.to_string());
+            // Same commit-then-clear ordering as record_firewall_policy.
+            if let Some(mut rejected) = self.rejected_policies.get_mut(network_id) {
+                rejected.nat = false;
+            }
+            durable_snapshot(&applied)
+        };
+        match self.policy_store.as_ref() {
+            Some(store) => store.persist(network_id, &snapshot).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Heal the durable entry on the idempotent ensure path. Persist only when
+    /// the journal is missing or differs from the applied spec: core-native
+    /// re-ensures every network on each reconciliation tick, and an
+    /// unconditional rewrite would fsync the journal every ~10 s per network.
+    async fn repair_topology(&self, spec: &proto::TopologySpec) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        if spec.fabric.is_some() {
+            return store.remove(&spec.network_id).await;
+        }
+        match store.load(&spec.network_id).await {
+            Ok(Some(journaled)) if &journaled == spec => Ok(()),
+            Ok(_) => store.persist(spec).await,
+            Err(e) => {
+                // A corrupt entry is healed by the authoritative applied
+                // spec; an I/O failure resurfaces on the persist below.
+                warn!(
+                    network_id = %spec.network_id,
+                    error = %e,
+                    "topology journal entry unreadable on the idempotent ensure path; rewriting it"
+                );
+                store.persist(spec).await
+            }
+        }
+    }
+
+    /// Re-apply every journaled bridge-only topology before the server starts
+    /// accepting RPCs (rc.8 blocker B9). The in-memory [`TopologyTable`] is
+    /// rebuilt from the journal, so a later `SetFirewallPolicy` finds the
+    /// topology instead of failing `NOT_FOUND`.
+    ///
+    /// Every entry is attempted even when one fails; the first failure still
+    /// aborts startup, because serving with a partial table is exactly the
+    /// silent-degradation failure this journal exists to eliminate.
+    pub async fn recover_topologies(&self) -> Result<(), ChvError> {
+        let Some(store) = self.topology_store.as_ref() else {
+            return Ok(());
+        };
+        let specs = store.load_all().await?;
+        if specs.is_empty() {
+            return Ok(());
+        }
+        info!(
+            count = specs.len(),
+            dir = %store.dir().display(),
+            "recovering journaled network topologies"
+        );
+
+        let mut failures = Vec::new();
+        for spec in specs {
+            if spec.fabric.is_some() {
+                warn!(
+                    network_id = %spec.network_id,
+                    "journaled fabric topology is not recovered; the stretched-L2 \
+                     provider owns that durable surface"
+                );
+                continue;
+            }
+            match self.executor.ensure_topology(&spec).await {
+                Ok(applied) => {
+                    let state = Self::state_from_apply(&spec, &applied);
+                    self.topologies.upsert(state.clone());
+                    info!(
+                        network_id = %spec.network_id,
+                        bridge = %spec.bridge_name,
+                        "recovered journaled network topology"
+                    );
+                    // Policy must re-materialize too (§6.4): nftables survives
+                    // a process restart but not a reboot, and the in-memory
+                    // record is what re-scopes the guard set on the next NIC
+                    // attach. Re-applying here is fail-closed: a policy that
+                    // cannot be restored aborts startup rather than serving an
+                    // unguarded tenant network.
+                    if let Err(e) = self.recover_policies(&spec.network_id, &state).await {
+                        error!(
+                            network_id = %spec.network_id,
+                            error = %e,
+                            "failed to recover journaled network policy"
+                        );
+                        failures.push(format!("{} policy: {e}", spec.network_id));
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        network_id = %spec.network_id,
+                        error = %e,
+                        "failed to recover journaled network topology"
+                    );
+                    failures.push(format!("{}: {e}", spec.network_id));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ChvError::Internal {
+                reason: format!(
+                    "failed to recover {} journaled network topology(ies): {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+            })
+        }
+    }
+
+    /// Restore and re-apply the last requested firewall/NAT policy for one
+    /// recovered topology. A half pair in the journal is treated as corruption
+    /// rather than silently dropped: a firewall payload without its version
+    /// (or vice versa) would otherwise leave the network unguarded.
+    async fn recover_policies(
+        &self,
+        network_id: &str,
+        state: &TopologyState,
+    ) -> Result<(), ChvError> {
+        let Some(store) = self.policy_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(policies) = store.load(network_id).await? else {
+            return Ok(());
+        };
+        if policies.is_empty() {
+            return Ok(());
+        }
+
+        let firewall = match (policies.firewall.clone(), policies.firewall_version.clone()) {
+            (Some(json), Some(version)) => Some((json, version)),
+            (None, None) => None,
+            _ => {
+                return Err(ChvError::Internal {
+                    reason: format!(
+                    "policy journal entry for {network_id} has a firewall payload/version mismatch"
+                ),
+                })
+            }
+        };
+        let nat = match (policies.nat.clone(), policies.nat_version.clone()) {
+            (Some(json), Some(version)) => Some((json, version)),
+            (None, None) => None,
+            _ => {
+                return Err(ChvError::Internal {
+                    reason: format!(
+                        "policy journal entry for {network_id} has a NAT payload/version mismatch"
+                    ),
+                })
+            }
+        };
+
+        {
+            let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
+            applied.firewall = policies.firewall;
+            applied.firewall_version = policies.firewall_version;
+            applied.nat = policies.nat;
+            applied.nat_version = policies.nat_version;
+        }
+
+        if let Some((json, version)) = firewall {
+            self.executor
+                .set_firewall_policy(network_id, &version, &json, &state.bridge_name)
+                .await
+                .map_err(|e| {
+                    // Name the exact file. A payload-level rejection here
+                    // means a persisted entry diverged (corruption,
+                    // tampering, or a writer that predates RPC validation);
+                    // an environmental nft failure is also possible, so the
+                    // message must not imply the entry is always the culprit.
+                    // Recovery stays fail-closed: removing the entry without
+                    // re-applying leaves the base hooks at `policy accept`.
+                    ChvError::Internal {
+                        reason: format!(
+                            "cannot re-apply journaled firewall policy for {network_id} \
+                             from {}: {e}; recovery stays fail-closed. Re-apply the \
+                             network policy once nwd is serving, or replace that entry's \
+                             payload with [] (default-deny) before restarting chv-nwd; \
+                             deleting the entry leaves the network unguarded",
+                            store.path_for(network_id).display()
+                        ),
+                    }
+                })?;
+        }
+        if let Some((json, version)) = nat {
+            self.executor
+                .set_nat_policy(network_id, &version, &json, &state.bridge_name)
+                .await
+                .map_err(|e| ChvError::Internal {
+                    reason: format!(
+                        "cannot re-apply journaled NAT policy for {network_id} from {}: \
+                         {e}; recovery stays fail-closed. Re-apply the network policy \
+                         once nwd is serving, or replace that entry's payload with [] \
+                         before restarting chv-nwd",
+                        store.path_for(network_id).display()
+                    ),
+                })?;
+        }
+        info!(
+            network_id = %network_id,
+            "recovered journaled network policy"
+        );
+        Ok(())
+    }
+
+    fn state_from_apply(
+        spec: &proto::TopologySpec,
+        applied: &TopologyApplyResult,
+    ) -> TopologyState {
+        let vni = if spec.vni > 0 { Some(spec.vni) } else { None };
+        TopologyState {
+            network_id: spec.network_id.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            bridge_name: spec.bridge_name.clone(),
+            namespace_name: spec.namespace_name.clone(),
+            subnet_cidr: spec.subnet_cidr.clone(),
+            gateway_ip: spec.gateway_ip.clone(),
+            runtime_status: "ensured".to_string(),
+            vni,
+            tenant_mtu: applied.tenant_mtu,
+            fabric_plan_generation: applied.fabric_plan_generation,
+            binding_generation: applied.binding_generation,
+        }
+    }
+
+    /// Marker-based fail-closed error for a network whose last firewall/NAT
+    /// save was rejected before it could be applied.
+    fn rejection_error(&self, network_id: &str) -> Option<ChvError> {
+        let rejected = self.rejected_policies.get(network_id)?;
+        if !rejected.firewall && !rejected.nat {
+            return None;
+        }
+        Some(ChvError::Internal {
+            reason: format!(
+                "network {network_id} has a rejected firewall/NAT policy (not applied); \
+                 re-save the policy before attaching a NIC or changing the overlay"
+            ),
+        })
+    }
+
+    /// Record a rejected firewall/NAT save as an in-memory marker.
+    ///
+    /// Serialized with the delete path (which removes the marker under the
+    /// same lock) and re-checks ownership: a marker set after a concurrent
+    /// delete would otherwise leak onto a re-created network with the same id
+    /// and refuse every attach until another delete.
+    async fn mark_policy_rejected(&self, network_id: &str, firewall: bool) {
+        let _guard = self.policy_persist.lock().await;
+        if self.topologies.get(network_id).is_none() {
+            return;
+        }
+        let mut rejected = self
+            .rejected_policies
+            .entry(network_id.to_string())
+            .or_default();
+        if firewall {
+            rejected.firewall = true;
+        } else {
+            rejected.nat = true;
         }
     }
 
@@ -52,6 +496,13 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
     /// closed (returns an error) so an attached NIC is never left outside the
     /// default-deny boundary.
     async fn refresh_policy_scope(&self, state: &TopologyState) -> Result<(), ChvError> {
+        // A policy that failed pre-journal validation has no desired-state
+        // record (the last valid one, if any, stays intact). Refuse the attach
+        // instead of leaving the new NIC outside the guard: the attach seam
+        // drops nwd's semantic error, so returning Ok here would be fail-open.
+        if let Some(e) = self.rejection_error(&state.network_id) {
+            return Err(e);
+        }
         // Snapshot semantics: if no record exists for the network there is
         // nothing to re-scope. Re-read the latest desired JSON/version
         // immediately before each apply so a concurrent policy RPC that landed
@@ -130,6 +581,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             Err(e) => return Ok(Response::new(Self::err_result(&e))),
         };
 
+        // The id becomes a journal file name (and already appears in nwd's
+        // runtime file names); reject traversal/injection before any host
+        // command runs.
+        if let Err(e) = crate::topology_store::validate_network_id(&spec.network_id) {
+            return Ok(Response::new(Self::err_result(&e)));
+        }
+
         // IFNAMSIZ limit: Linux interface names must be <= 15 bytes
         if spec.bridge_name.len() > 15 {
             let e = ChvError::InvalidArgument {
@@ -184,7 +642,25 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // untouched — without these fields the replay would short-circuit
         // and the datapath would keep the OLD VNI, silently cross-bleeding
         // two networks.
-        let existing = self.topologies.get(&spec.network_id);
+        let mut existing = self.topologies.get(&spec.network_id);
+        // Serialize fabric datapath mutations across ensure/update so a
+        // rollback in one handler cannot remove the overlay a concurrent
+        // handler just applied.
+        let _fabric_guard = if spec.fabric.is_some()
+            || existing
+                .as_ref()
+                .is_some_and(|s| s.fabric_plan_generation.is_some())
+        {
+            Some(self.fabric_ops.lock().await)
+        } else {
+            None
+        };
+        // The lock may have waited behind a concurrent apply: re-read the
+        // state under it, or a queued ensure would fence and short-circuit
+        // against the snapshot taken before the other operation landed.
+        if _fabric_guard.is_some() {
+            existing = self.topologies.get(&spec.network_id);
+        }
         if let Some(existing) = existing.as_ref() {
             let new_fabric_generation = spec.fabric.as_ref().map(|f| f.plan_generation);
             if let (Some(applied_gen), Some(new_gen)) =
@@ -221,6 +697,14 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 && existing.binding_generation == new_binding_generation
                 && !explicit_mtu_changed
             {
+                // B9: the table can already hold the topology while the
+                // journal is missing (a persist that failed after the apply,
+                // or an operator-cleaned journal). Repair it on the
+                // idempotent path instead of returning OK with no durable
+                // record.
+                if let Err(e) = self.repair_topology(&spec).await {
+                    return Ok(Response::new(Self::err_result(&e)));
+                }
                 return Ok(Response::new(Self::ok_result()));
             }
 
@@ -291,27 +775,97 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         }
 
+        // A rejected policy has no desired state to re-scope a newly grafted
+        // consumer veth with. Refuse a fabric apply before touching the
+        // datapath (the base hooks are `policy accept`; only the guard set
+        // dispatches guest traffic). Bridge-only re-ensures above are allowed:
+        // they remove fabric members instead of adding one.
+        if spec.fabric.is_some() {
+            if let Some(e) = self.rejection_error(&spec.network_id) {
+                return Ok(Response::new(Self::err_result(&e)));
+            }
+        }
+
         let fabric_intent = spec.fabric.is_some();
         let result = self.executor.ensure_topology(&spec).await;
         match result {
-            Ok(TopologyApplyResult {
-                namespace_handle: _,
-                bridge_handle: _,
-                tenant_mtu,
-                fabric_plan_generation,
-                binding_generation,
-            }) => {
-                if fabric_plan_generation.is_some() {
+            Ok(applied) => {
+                if applied.fabric_plan_generation.is_some() {
                     self.metrics.increment_nwd_fabric_apply("success");
+                }
+                // Guard the newly grafted consumer veth BEFORE persisting the
+                // topology (and before the MTU re-assert): if a concurrent
+                // rejected policy makes the refresh fail, roll the overlay
+                // back instead of leaving the veth outside the policy chains
+                // (base hooks are `policy accept`).
+                let state = Self::state_from_apply(&spec, &applied);
+                if applied.fabric_plan_generation.is_some() {
+                    if let Err(e) = self.refresh_policy_scope(&state).await {
+                        let rollback_note =
+                            match self.executor.remove_fabric_overlay(&spec.network_id).await {
+                                Ok(()) => {
+                                    self.metrics.increment_nwd_fabric_remove("success");
+                                    match self
+                                        .executor
+                                        .reassert_tenant_mtu(
+                                            &spec.network_id,
+                                            &spec.bridge_name,
+                                            &spec.subnet_cidr,
+                                            &spec.gateway_ip,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => "the fabric overlay was rolled back",
+                                        Err(mtu_err) => {
+                                            error!(
+                                                network_id = %spec.network_id,
+                                                error = %mtu_err,
+                                                "failed to reset the bridge MTU after rolling back \
+                                                 a fabric overlay"
+                                            );
+                                            "the fabric overlay was rolled back, but the bridge \
+                                             MTU reset failed and may remain at the fabric value"
+                                        }
+                                    }
+                                }
+                                Err(remove_err) => {
+                                    self.metrics.increment_nwd_fabric_remove("failure");
+                                    error!(
+                                        network_id = %spec.network_id,
+                                        error = %remove_err,
+                                        "failed to roll back a fabric overlay after the policy \
+                                         guard refresh failed; the consumer veth may remain \
+                                         outside the guard"
+                                    );
+                                    "the fabric overlay rollback FAILED; the consumer veth may \
+                                     remain grafted and unguarded"
+                                }
+                            };
+                        if let Some(existing) = existing.as_ref() {
+                            self.topologies.upsert(TopologyState {
+                                vni: None,
+                                tenant_mtu: None,
+                                fabric_plan_generation: None,
+                                binding_generation: None,
+                                ..existing.clone()
+                            });
+                        }
+                        let e = ChvError::Internal {
+                            reason: format!("{e}; {rollback_note}"),
+                        };
+                        return Ok(Response::new(Self::err_result(&e)));
+                    }
                 }
                 // Tenant MTU change (m8): the running dnsmasq still
                 // advertises the old DHCP option 26 and the existing bridge
                 // ports (TAPs, fabric consumer veth) still carry the old
                 // MTU. Re-assert both before persisting the new state.
                 // Bounded: only when a previously applied MTU changed.
-                if let (Some(old_mtu), Some(new_mtu)) =
-                    (existing.as_ref().and_then(|s| s.tenant_mtu), tenant_mtu)
-                {
+                if let (Some(old_mtu), Some(new_mtu)) = (
+                    existing.as_ref().and_then(|s| s.tenant_mtu),
+                    applied.tenant_mtu,
+                ) {
                     if old_mtu != new_mtu {
                         if let Err(e) = self
                             .executor
@@ -324,24 +878,20 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                             )
                             .await
                         {
+                            // The overlay is already guarded by the refresh
+                            // above, so an MTU failure leaves no unguarded
+                            // member; returning before the journal/upsert
+                            // keeps the retry path intact.
                             return Ok(Response::new(Self::err_result(&e)));
                         }
                     }
                 }
-                let vni = if spec.vni > 0 { Some(spec.vni) } else { None };
-                let state = TopologyState {
-                    network_id: spec.network_id.clone(),
-                    tenant_id: spec.tenant_id.clone(),
-                    bridge_name: spec.bridge_name.clone(),
-                    namespace_name: spec.namespace_name.clone(),
-                    subnet_cidr: spec.subnet_cidr.clone(),
-                    gateway_ip: spec.gateway_ip.clone(),
-                    runtime_status: "ensured".to_string(),
-                    vni,
-                    tenant_mtu,
-                    fabric_plan_generation,
-                    binding_generation,
-                };
+                // Journal BEFORE the in-memory upsert: if the write fails,
+                // the retry cannot short-circuit on a topology whose durable
+                // record is missing.
+                if let Err(e) = self.journal_topology(&spec).await {
+                    return Ok(Response::new(Self::err_result(&e)));
+                }
                 self.topologies.upsert(state);
                 Ok(Response::new(Self::ok_result()))
             }
@@ -491,9 +1041,27 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 .delete_local_topology_by_derived_names(&req.network_id)
                 .await;
         }
-        // Drop any remembered policy so a stale firewall policy is not re-asserted
-        // if a new topology with the same network_id is created later (#227 S5).
-        self.policy_state.remove(&req.network_id);
+        // B9: remove the journal entry once the host topology is gone (or was
+        // already gone). A failure here leaves a durable record that would
+        // resurrect the topology on the next restart, so the delete fails
+        // closed and the idempotent retry clears it.
+        if let Err(e) = self.forget_topology(&req.network_id).await {
+            return Ok(Response::new(Self::err_result(&e)));
+        }
+        // Drop the durable policy for the same reason: a stale policy
+        // re-applied after a restart against a re-created network with the
+        // same id would be the #227 S5 residue class. This also drops the
+        // in-memory record, which is only meaningful with a topology. Take
+        // the persistence lock so a policy RPC that already passed its
+        // topology check cannot re-persist an entry after this removal.
+        {
+            let _guard = self.policy_persist.lock().await;
+            if let Err(e) = self.forget_policies(&req.network_id).await {
+                return Ok(Response::new(Self::err_result(&e)));
+            }
+            self.policy_state.remove(&req.network_id);
+            self.rejected_policies.remove(&req.network_id);
+        }
 
         Ok(Response::new(Self::ok_result()))
     }
@@ -776,6 +1344,20 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         };
 
+        // Reject a payload the engine can never apply BEFORE journaling it as
+        // desired state. The journal is replayed fail-closed before serving,
+        // so an unapplicable entry would turn the next documented restart
+        // into a crash loop that only manual file surgery could clear.
+        if let Err(e) = crate::firewall::validate_firewall_policy(&policy.policy_json) {
+            // Do not touch `policy_state`: it holds the desired state the
+            // durable journal snapshots, and overwriting the last valid entry
+            // with an unapplicable payload would erase the post-restart policy
+            // (leaving a later attach unscoped). A marker makes
+            // refresh_policy_scope refuse the attach until a valid save lands.
+            self.mark_policy_rejected(&req.network_id, true).await;
+            return Ok(Response::new(Self::err_result(&e)));
+        }
+
         // Record the DESIRED policy state regardless of apply outcome (the
         // topology is ensured at this point). A failed or partial apply must not
         // leave policy_state empty, otherwise a later NIC attach would find
@@ -783,15 +1365,16 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // boundary (fail-open, #227 S3). refresh_policy_scope re-applies the
         // desired policy, so the boundary converges on the next attach.
         //
-        // The entry is mutated in place under the DashMap shard lock: a
-        // read-clone-modify-insert here could LOSE the concurrent NAT half of
-        // the pair (the two RPCs may overlap), leaving a newly attached NIC
-        // outside the firewall boundary. Mutating the shared value directly
-        // makes the fw+nat pair merge atomically.
+        // The same record is written to the durable policy journal, so an nwd
+        // restart (or host reboot) restores the guard set instead of serving a
+        // recovered topology with no policy. The in-memory pair and the
+        // persisted snapshot are mutated under one lock, so a concurrent NAT
+        // RPC cannot lose the firewall half (and vice versa).
+        if let Err(e) = self
+            .record_firewall_policy(&req.network_id, &policy.policy_json, &policy.policy_version)
+            .await
         {
-            let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
-            applied.firewall = Some(policy.policy_json.clone());
-            applied.firewall_version = Some(policy.policy_version.clone());
+            return Ok(Response::new(Self::err_result(&e)));
         }
 
         match self
@@ -842,15 +1425,29 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         };
 
+        // Reject an unapplicable NAT payload before journaling it (see
+        // set_firewall_policy): the journal is replayed fail-closed at
+        // startup, so a permanently unapplicable entry would crash-loop nwd.
+        if let Err(e) = crate::firewall::validate_nat_policy(&policy.policy_json) {
+            // Same marker semantics as the firewall path: keep `policy_state`
+            // (and therefore the journal) on the last valid NAT entry, and
+            // refuse an attach until a valid NAT save replaces the rejection.
+            self.mark_policy_rejected(&req.network_id, false).await;
+            return Ok(Response::new(Self::err_result(&e)));
+        }
+
         // Record the DESIRED NAT policy state regardless of apply outcome for
         // the same reason as set_firewall_policy (re-scope convergence, #227
-        // S3). A failed or partial NAT apply must not leave policy_state empty.
-        // Mutated in place under the shard lock (see set_firewall_policy) so a
-        // concurrent firewall RPC cannot lose either half of the pair.
+        // S3), and persist it to the durable policy journal so restart/reboot
+        // recovery restores the NAT guard as well. The in-memory pair and the
+        // persisted snapshot are mutated under one lock (see
+        // set_firewall_policy) so a concurrent firewall RPC cannot lose either
+        // half of the pair.
+        if let Err(e) = self
+            .record_nat_policy(&req.network_id, &policy.policy_json, &policy.policy_version)
+            .await
         {
-            let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
-            applied.nat = Some(policy.policy_json.clone());
-            applied.nat_version = Some(policy.policy_version.clone());
+            return Ok(Response::new(Self::err_result(&e)));
         }
 
         match self
@@ -1007,6 +1604,10 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         request: Request<proto::UpdateOverlayRequest>,
     ) -> Result<Response<proto::UpdateOverlayResponse>, Status> {
         self.metrics.increment_counter("nwd_update_overlay_total");
+        // Serialize with the ensure path's fabric apply/rollback so this
+        // update's rollback cannot remove an overlay a concurrent operation
+        // just applied (and vice versa).
+        let _fabric_guard = self.fabric_ops.lock().await;
         let req = request.into_inner();
 
         let state = match self.topologies.get(&req.network_id) {
@@ -1097,6 +1698,18 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         }
 
+        // Refuse before touching the datapath if the last policy save was
+        // rejected. The overlay apply grafts a consumer veth into the tenant
+        // bridge, and there is no desired policy to re-scope it with; applying
+        // first would leave it outside the guard set (the base hooks are
+        // `policy accept`). A concurrent rejection can still land after this
+        // check, so the refresh below rolls the overlay back on failure.
+        if let Some(e) = self.rejection_error(&req.network_id) {
+            return Ok(Response::new(proto::UpdateOverlayResponse {
+                result: Some(Self::err_result(&e)),
+            }));
+        }
+
         return match self
             .executor
             .apply_fabric_overlay(&req.network_id, req.vni, fabric_plan, &state.bridge_name)
@@ -1111,11 +1724,69 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                     binding_generation: Some(applied.binding_generation),
                     ..state.clone()
                 };
-                self.topologies.upsert(updated_state);
+                self.topologies.upsert(updated_state.clone());
                 // Re-assert the CHV firewall/NAT guard scope: the fabric
                 // consumer veth just joined the tenant bridge (same
-                // reasoning as NIC attach; fail closed).
-                if let Err(e) = self.refresh_policy_scope(&state).await {
+                // reasoning as NIC attach; fail closed). A rejected policy
+                // has no desired state to re-scope with, so on failure roll
+                // the overlay back: leaving the new veth grafted would put it
+                // outside the guard set.
+                if let Err(e) = self.refresh_policy_scope(&updated_state).await {
+                    let rollback_note =
+                        match self.executor.remove_fabric_overlay(&req.network_id).await {
+                            Ok(()) => {
+                                self.metrics.increment_nwd_fabric_remove("success");
+                                match self
+                                    .executor
+                                    .reassert_tenant_mtu(
+                                        &req.network_id,
+                                        &updated_state.bridge_name,
+                                        &updated_state.subnet_cidr,
+                                        &updated_state.gateway_ip,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        "the fabric overlay was rolled back and the generation \
+                                         fence cleared; retry with the latest plan"
+                                    }
+                                    Err(mtu_err) => {
+                                        error!(
+                                            network_id = %req.network_id,
+                                            error = %mtu_err,
+                                            "failed to reset the bridge MTU after rolling back a \
+                                             fabric overlay"
+                                        );
+                                        "the fabric overlay was rolled back and the generation \
+                                         fence cleared, but the bridge MTU reset failed and may \
+                                         remain at the fabric value; retry with the latest plan"
+                                    }
+                                }
+                            }
+                            Err(remove_err) => {
+                                self.metrics.increment_nwd_fabric_remove("failure");
+                                error!(
+                                    network_id = %req.network_id,
+                                    error = %remove_err,
+                                    "failed to roll back a fabric overlay after the policy guard \
+                                     refresh failed; the consumer veth may remain outside the \
+                                     guard"
+                                );
+                                "the fabric overlay rollback FAILED and the generation fence was \
+                                 cleared; the consumer veth may remain grafted and unguarded"
+                            }
+                        };
+                    self.topologies.upsert(TopologyState {
+                        vni: None,
+                        tenant_mtu: None,
+                        fabric_plan_generation: None,
+                        binding_generation: None,
+                        ..state.clone()
+                    });
+                    let e = ChvError::Internal {
+                        reason: format!("{e}; {rollback_note}"),
+                    };
                     return Ok(Response::new(proto::UpdateOverlayResponse {
                         result: Some(Self::err_result(&e)),
                     }));

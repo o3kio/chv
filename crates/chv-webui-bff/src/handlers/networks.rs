@@ -927,6 +927,22 @@ fn validate_firewall_ruleset(rules: &[serde_json::Value]) -> Result<(), BffError
             obj.get("dest_port"),
             vocab::is_valid_port_spec,
         )?;
+        // A port only renders for protocols that carry one. New saves must not
+        // carry the combination (silently ignoring it would broaden the rule);
+        // nwd still tolerates it for rc.7-stored rulesets (port ignored, a
+        // warning logged) so an upgrade does not fail closed at attach time.
+        if obj.get("dest_port").is_some_and(|v| !v.is_null()) {
+            let protocol = obj
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !matches!(protocol, "tcp" | "udp" | "sctp") {
+                return Err(BffError::BadRequest(format!(
+                    "firewall_rules[{index}]: 'dest_port' is not valid for protocol \
+                     '{protocol}' — only tcp, udp, and sctp carry a port"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -956,7 +972,7 @@ fn check_optional_rule_field(
     if !is_valid(text) {
         return Err(BffError::BadRequest(format!(
             "firewall_rules[{index}]: invalid {name} '{text}' \
-             (expected a.b.c.d/p IPv4 or IPv6 CIDR, or a port like 443 / range like 8080-8090)"
+             (expected an IPv4 CIDR like 10.0.0.0/24, or a port like 443 / range like 8080-8090)"
         )));
     }
     Ok(())

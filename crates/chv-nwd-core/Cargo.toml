@@ -23,6 +23,7 @@ dashmap = { workspace = true }
 tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+prost = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

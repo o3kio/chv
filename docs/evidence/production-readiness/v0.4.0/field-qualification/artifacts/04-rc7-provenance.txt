@@ -1,0 +1,38 @@
+# v0.4.0-rc.7 publication and provenance verification
+# Recorded: 2026-11-06T17:00:17Z
+
+tag=v0.4.0-rc.7
+tag_object=e0da45d70e58f64f8d0e60b0ac76298974edffe8
+commit=1b8f68f17378d135cb0bbd72f46932e4e7240199
+release_url=https://github.com/o3kio/chv/releases/tag/v0.4.0-rc.7
+release_workflow_run=42253715143
+
+## downloaded assets (published release, not a local build)
+tarball=chv-0.4.0-rc.7-linux-amd64.tar.gz
+tarball_sha256=604e05396bbed7d76f79f360e00716b1781d3b22204db8fddc050a5556aef8be
+sidecar_sha256=a4068218ef282471c1ff72c779225e2dfbf1e7cbe64855beaa16dd45f75c258b
+sha256sums_sha256=f376e8556128e5a565644f5416e1588cc676ec9f5e9e02a733ba8931fee78650
+sidecar_check=OK
+
+## extracted binary banner
+chv-controlplane 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+chv-agent 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+chv-nwd 0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)
+
+## SLSA attestation (GitHub REST API, predicate_type=slsa)
+attestation_count=1
+subject_count=10
+subject=chv-0.4.0-rc.7-linux-amd64.tar.gz sha256:604e05396bbed7d76f79f360e00716b1781d3b22204db8fddc050a5556aef8be
+subject=chv-0.4.0-rc.7-linux-amd64.tar.gz.sha256 sha256:a4068218ef282471c1ff72c779225e2dfbf1e7cbe64855beaa16dd45f75c258b
+subject=chv-controlplane-0.4.0.rc.7-1.x86_64.rpm sha256:53ea487374dde4ffa166308a4acd44cdcff0ea138f731f4244d82166a30cc633
+subject=chv-controlplane_0.4.0.rc.7_amd64.deb sha256:ef06066b75ed238e025111f4619556d170107e3a8aa409e785b7d7b097e4d76b
+subject=chv-monitor-agent-0.4.0.rc.7-1.x86_64.rpm sha256:558921c9d22ea4412c14466720318f4f261b8fcd0ab6e5cc87098b626b52facf
+subject=chv-monitor-agent_0.4.0.rc.7_amd64.deb sha256:5cc4d3d1f09c3a36836c57364882f0ad8b4590564990b734a213a7293bf31fa4
+subject=chv-node-0.4.0.rc.7-1.x86_64.rpm sha256:62a202d8f9f32a8ecb3a04788b9d5dbe9a311837ea8303f108256209321abd18
+subject=chv-node_0.4.0.rc.7_amd64.deb sha256:ae2b3ff8e4ea5fbafcb5738345d36c90e03d4cb799eea4e57a344bad149c5a01
+subject=chvctl-0.4.0.rc.7-1.x86_64.rpm sha256:0e3271f4324a6a63f2aeb02027c013ccf920b5e65d2258df04899528c35e0ab3
+subject=chvctl_0.4.0.rc.7_amd64.deb sha256:b7eed655ede08f0d5de545ed1c99c28dd28996a3eb171b5ef0d97805318966c5
+workflow_ref=refs/tags/v0.4.0-rc.7
+workflow_path=.github/workflows/release.yml
+resolved_commit=1b8f68f17378d135cb0bbd72f46932e4e7240199
+invocation=https://github.com/o3kio/chv/actions/runs/42253715143/attempts/1

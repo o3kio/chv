@@ -14,6 +14,7 @@ pub mod legacy_core_adapter;
 pub mod metrics_server;
 pub mod migration;
 pub mod migration_registry;
+pub mod network_replay;
 pub mod network_usage;
 pub mod projection;
 pub mod reconcile;

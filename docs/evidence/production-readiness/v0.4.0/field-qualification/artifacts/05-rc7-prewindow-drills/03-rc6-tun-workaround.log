@@ -1,0 +1,73 @@
+=== rc.6 tun workaround — 2026-11-06T17:03:25Z ===
+pre_boot_vmm_state=Created
+pre_boot_bff_power_state=Running
+note: cloud-hypervisor runs in chv-agent.service's device cgroup; the rc.6 unit allows only /dev/kvm.
+active
+=== agent device policy after restart ===
+DevicePolicy=auto
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/kvm rw
+=== start the VM via the documented API ===
+start_http=404
+{"error":{"code":"NOT_IMPLEMENTED","hint":"Use the BFF-backed /v1 routes for supported UI workflows.","message":"This endpoint is not implemented in the current control plane build.","retryable":false},"request_id":"85c9c07fcea93bfaa2c600d14d06b583"}
+t=3s vmm=Created
+t=6s vmm=Created
+t=9s vmm=Created
+t=12s vmm=Created
+t=15s vmm=Created
+t=18s vmm=Created
+t=21s vmm=Created
+t=24s vmm=Created
+t=27s vmm=Created
+t=30s vmm=Created
+t=33s vmm=Created
+t=36s vmm=Created
+t=39s vmm=Created
+t=42s vmm=Created
+t=45s vmm=Created
+t=48s vmm=Created
+t=51s vmm=Created
+t=54s vmm=Created
+t=57s vmm=Created
+t=60s vmm=Created
+=== console bytes ===
+0 /var/lib/chv/agent/vms/8036de061349b9801b27010339931e78/console.log
+=== console head ===
+
+=== stderr ===
+=== tap ===
+1968: tap-a2a1a4ed: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel master br-eac31935dc4f state DOWN mode DEFAULT group default qlen 1000\    link/ether 06:c1:39:38:5e:03 brd ff:ff:ff:ff:ff:ff
+RC6_WORKAROUND_DONE
+=== retry start via documented /v1/vms/mutate — 2026-11-06T17:04:41Z ===
+mutate_http=200
+{"accepted":true,"summary":"start vm accepted","task_id":"StartVm-d71b646e670b37cf3b8a2361b04974f2","vm_id":"8036de061349b9801b27010339931e78"}
+t=3s vmm=Created
+t=6s vmm=Running
+=== console bytes ===
+11141 /var/lib/chv/agent/vms/8036de061349b9801b27010339931e78/console.log
+=== console head ===
+[INFO] Setting up 4 GiB identity mapping
+[INFO] Page tables setup
+[INFO] Booting with PVH Boot Protocol
+[INFO] Found PCI device vendor=8086 device=d57 in slot=0
+[INFO] Found PCI device vendor=1af4 device=1042 in slot=1
+[INFO] Found PCI device vendor=1af4 device=1042 in slot=2
+[INFO] Found PCI device vendor=1af4 device=1041 in slot=3
+[INFO] Found PCI device vendor=1af4 device=1044 in slot=4
+[INFO] PCI Device: 0:1.0 1af4:1042
+[INFO] Bar: type=MemorySpace32 address=0xe7f80000 size=0x80000
+[INFO] Bar: type=MemorySpace32 address=0x0 size=0x0
+[INFO] Bar: type=MemorySpace32 address=0x0 size=0x0
+[INFO] Bar: type=MemorySpace32 address=0x0 size=0x0
+[INFO] Bar: type=MemorySpace32 address=0x0 size=0x0
+[INFO] Bar: type=MemorySpace32 address=0x0 size=0x0
+[INFO] Updated BARs: type=MemorySpace32 address=e7f80000 size=80000
+[INFO] Updated BARs: type=MemorySpace32 address=0 size=0
+[INFO] Updated BARs: type=MemorySpace32 address=0 size=0
+[INFO] Updated BARs: type=MemorySpace32 address=0
+=== stderr ===
+cloud-hypervisor: 153.179520s: <vmm> WARN:virtio-devices/src/block.rs:859 -- sparse=on requested but backend does not support sparse operations
+cloud-hypervisor: 153.179749s: <vmm> WARN:net_util/src/open_tap.rs:84 -- Tap tap-a2a1a4ed already exists. IP configuration will not be overwritten.
+=== BFF power_state ===
+Running
+RC6_WORKAROUND_RETRY_DONE

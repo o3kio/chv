@@ -97,6 +97,7 @@ AGENT_PID="$QUAL_AGENT_PID"
 VMS_DIR="${QUAL_AGENT_DIR}/vms"
 GUEST_IMAGE_PATH="${QUAL_GUEST_IMAGE_PATH:-/var/lib/chv/qual/images/noble-qual-patched.img}"
 NWD_RUNTIME_DIR="/run/chv/nwd"       # hardcoded in the candidate (chv-nwd-core dhcp.rs/dns.rs)
+NWD_STATE_DIR="/var/lib/chv/nwd"     # durable topology journal + DHCP reservations
 DEFAULT_NET="default"              # network REFERENCE for vm create (Legs A–D)
 SECOND_NET="m44x"                  # network REFERENCE for Leg F's second network
 FALLBACK_CIDR="10.200.0.0/24"      # the implicit-create fallback (N1)
@@ -448,7 +449,7 @@ fi
 nwd_dnsmasq_running "$VM1_NET" \
     && qual_pass "nwd dnsmasq running for '${VM1_NET}'" \
     || qual_error "FORBIDDEN: no dnsmasq for '${VM1_NET}'"
-grep -q "^${VM1_MAC},${VM1_IP}$" "${NWD_RUNTIME_DIR}/dnsmasq-${VM1_NET}.hosts" 2>/dev/null \
+grep -q "^${VM1_MAC},${VM1_IP}$" "${NWD_STATE_DIR}/dhcp/dnsmasq-${VM1_NET}.hosts" 2>/dev/null \
     && qual_pass "dhcp reservation ${VM1_MAC} → ${VM1_IP} in place" \
     || qual_error "dhcp reservation for ${VM1_IP} missing"
 nft list table inet "$VM1_NFT_TABLE" >/dev/null 2>&1 \

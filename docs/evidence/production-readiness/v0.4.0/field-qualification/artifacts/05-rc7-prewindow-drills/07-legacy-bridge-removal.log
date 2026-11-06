@@ -1,0 +1,32 @@
+=== legacy chvbr0 removal (documented rc.7 upgrade step) — 2026-11-06T17:05:28Z ===
+=== before: owners of 10.200.0.1 ===
+br-eac31935dc4f 10.200.0.1/24
+chvbr0 10.200.0.1/24
+=== before: guest reachability ===
+--- 10.200.0.65 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 1024ms
+
+10.200.0.65 dev chvbr0 INCOMPLETE 
+=== remove the legacy bridge and its persisted config (exact release-notes commands) ===
+removed /etc/systemd/network/12-ens19.network
+=== after: owners of 10.200.0.1 (must be exactly one) ===
+br-eac31935dc4f
+1
+=== after: links ===
+ens19
+br-eac31935dc4f
+tap-9a5c9ad1
+tap-a2a1a4ed
+=== after: ens19 address state (released from bridge) ===
+=== after: guest reachability ===
+
+--- 10.200.0.65 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2054ms
+
+=== after: forwarding + NAT intact ===
+1
+# Warning: iptables-legacy tables present, use iptables-legacy to see them
+-A POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE
+=== after: guest still Running ===
+state= Running net_count= 1
+LEGACY_BRIDGE_REMOVAL_DONE

@@ -5,7 +5,155 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0-rc.8] - 2026-11-06
+
+> **Final release candidate for `v0.4.0` and the base for the stable tag.**
+> Supersedes `v0.4.0-rc.7`, which is **disqualified**: the rc.7 pre-window
+> upgrade drill on `field-host-1` reproduced two blocker-class defects.
+> dnsmasq could not bind the DHCP server port because the non-root nwd unit
+> lacked `CAP_NET_BIND_SERVICE` (B8), and an nwd restart discarded the
+> in-memory topology table so the next policy update failed
+> `not found: topology <id>` (B9, a failed documented recovery under plan
+> §6.4/§6.9). rc.7 remains published and is not rewritten. Details and
+> evidence are in
+> [`01-rc6-blockers.md`](docs/evidence/production-readiness/v0.4.0/field-qualification/01-rc6-blockers.md).
+>
+> **Upgrade order:** rc.7 → rc.8 requires `chv-nwd` to be restarted before
+> (or with) `chv-agent`, so the agent's startup replay reaches rc.8 nwd and
+> seeds the journal. `chv-agent.service` already orders after
+> `chv-nwd.service`; a combined `systemctl restart chv-nwd chv-agent` is
+> correct.
+
+### Fixed
+- **DHCP could not bind its server socket (blocker; B8).** `chv-nwd` runs as
+  non-root `chv` with only `CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN`;
+  `net.ipv4.ip_unprivileged_port_start` is 1024, so every dnsmasq spawn
+  exited `failed to bind DHCP server socket: Permission denied`. The unit's
+  ambient and bounding sets now include `CAP_NET_BIND_SERVICE`, which the
+  dnsmasq child inherits and which grants nothing beyond binding privileged
+  ports. dnsmasq start remains a hard failure in `ensure_topology`: a
+  topology that reports success with no DHCP server is the silent-success
+  class behind B4/B8.
+- **An nwd restart lost every topology and broke policy updates (blocker;
+  B9).** `TopologyTable` was in-memory only, so after any documented nwd
+  restart the next `SetFirewallPolicy` failed
+  `set_firewall_policy failed: not found: topology <id> (NOT_FOUND)` and the
+  operation ended `DISPATCH_FAILED`. nwd now journals the exact bridge-only
+  `TopologySpec` protobuf atomically under
+  `/var/lib/chv/nwd/topologies/<network_id>.pb` after a successful apply,
+  removes it on delete, and replays the journal before binding its socket.
+  A corrupt or ambiguous entry fails startup loudly rather than serving a
+  partial table. Fabric topologies are deliberately not journaled: the
+  stretched-L2 fabric is design-only and its provider owns its durable
+  surface. The unit creates the journal directory (`0700 chv:chv`).
+- **A restart also forgot the firewall/NAT guard (B9 follow-up).** Recovering
+  the topology alone does not satisfy plan §6.4 ("policy and bridge
+  re-materialize"): nftables state survives a process restart but not a host
+  reboot, and the in-memory policy record is what re-scopes the interface
+  guard on a NIC attach. The last requested firewall/NAT policy and version
+  are now journaled under `/var/lib/chv/nwd/policies/<network_id>.json`,
+  restored and re-applied fail-closed before serving, and removed on
+  topology delete. Without it, a restart followed by an attach could leave
+  the new tap outside CHV default-deny (the base hooks are `policy accept`;
+  only the guard dispatches guest traffic into the policy chains). An
+  unapplicable payload (malformed JSON, bad action/protocol/CIDR) is now
+  rejected at the RPC boundary before it is journaled: replay is fail-closed,
+  so a poison entry would crash-loop the daemon. IPv6 rule CIDRs are rejected
+  too (the engine renders `ip saddr`/`ip daddr` only). A persisted entry that
+  still cannot be re-applied fails with an error naming the exact journal
+  file.
+- **Firewall-rule validation now matches what the renderer can produce.**
+  The BFF save gate requires canonical IPv4 CIDRs and decimal ports/ranges
+  (it rejects IPv6, leading-zero forms nft may read as octal, `+` prefixes,
+  reversed ranges, and a `dest_port` on a protocol without ports). nwd
+  rejects the forms nft can never apply before journaling, and canonicalizes
+  the rc.7-storable numeric forms (leading-zero or `+`-prefixed ports,
+  mixed-radix ranges nft accepted under its octal reading, non-canonical CIDR
+  prefixes) before rendering, so a stored rc.7 ruleset still renders instead
+  of failing dispatch at the attach seam. Where rc.7 accepted a non-canonical
+  form, rc.8 enforces the decimal value the operator wrote (`0443` → 443,
+  `0100-0200` → 100-200); a decimal-reversed mixed-radix range keeps nft's
+  values (`0100-99` → `64-99`) because rc.7 applied exactly that range, and a
+  form rc.7 could not apply (`+443`, `600-0777`) is now applied at its decimal
+  meaning. A payload that still cannot render leaves a rejection marker in
+  memory (never in the journal, and the last valid journaled policy survives)
+  so the attach is refused rather than left unguarded. `sctp` destination
+  ports render when canonical (rc.7 ignored them); a legacy `dest_port` on
+  `icmp`/`all`/unrenderable `sctp` is still applied with the port ignored and
+  a warning, preserving rc.7 behavior.
+- **Fabric overlay changes cannot add an unguarded interface.** A fabric
+  apply grafts a consumer veth into the tenant bridge, and the guard set is
+  what dispatches guest traffic into the policy chains (the base hooks are
+  `policy accept`). If the network's last firewall/NAT save was rejected, both
+  the overlay update and a fabric-carrying ensure now refuse before touching
+  the datapath. If a rejection races a post-graft guard refresh, the handler
+  removes the overlay, resets the bridge MTU, clears the persisted fabric
+  generation, and reports that the overlay was rolled back; retry with the
+  latest plan. If the removal itself fails, the error says the veth may
+  remain grafted and unguarded. If the removal succeeds but the bridge-MTU
+  reset fails, the error says the overlay was rolled back while the MTU may
+  remain at the fabric value. The rollback is operator-visible: it tears down
+  the network's fabric overlay rather than leaving a new veth outside the
+  guard set.
+- **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
+  asks nwd which topologies it already owns and replays only the distinct
+  bridge-only networks referenced by a live Core VM that nwd does **not**
+  own, with bounded retries, before serving. Skipping an already-owned
+  network matters: nwd recovers its journal before serving, and a VM
+  definition is a create-time snapshot, so replaying it could roll a later
+  CIDR/gateway change back. This seeds the journal for later nwd-only
+  restarts, so the first policy update after the upgrade no longer fails
+  `NOT_FOUND`. A failed ownership query falls back to replaying every
+  network; the replay is best-effort and cannot block agent startup.
+- **DHCP MAC→IP reservations died on nwd restart (B9 follow-up).** The
+  `dhcp-hostsfile` lived under `/run/chv/nwd`, which systemd's
+  `RuntimeDirectory=` wipes on every stop/restart; the restarted dnsmasq
+  then no longer reserved the Core-assigned address. Reservations now live
+  under `/var/lib/chv/nwd/dhcp/`, are created only when absent, and are
+  removed only by topology teardown. A failed reservation unlink fails the
+  delete closed (the idempotent retry clears it) rather than leaving a
+  MAC→IP map a re-created network would inherit. Lease files stay under
+  `/run` by design (B4).
+- **Durable nwd state survived `--wipe` and package removal (B9
+  follow-up).** A journal or reservation set from a deleted deployment would
+  resurrect its bridges on a clean install. `install.sh --wipe`/re-run
+  cleanup, the packaged `preremove.sh` (remove/purge only, never upgrade),
+  and `dev-install.sh` now remove `${CHV_DATA_DIR:-/var/lib/chv}/nwd`.
+  `scripts/integration/qual/m4.4-network.sh` asserts the persistent hosts
+  path.
+
+### Qualification
+- Targeted Rust tests (`chv-nwd-core` 115 lib + 16 daemon + 24 fabric,
+  `chv-agent-core` startup replay 9), packaging/architecture contract tests
+  79/79, `cargo fmt`, clippy `-D warnings`, and shell syntax checks are green
+  in the rc.8 candidate tree. **No rc.8 real-KVM lane, post-publication
+  lane, or field day has run at tag time; none is claimed.** The rc.7 →
+  rc.8 upgrade (nwd then agent), clean install, documented start with a
+  guest DHCP lease and `login:` console, a policy change plus nwd restart
+  with the reservation surviving, and two consecutive `--wipe` installs are
+  required post-publication drills.
+- One-time gap: reservations written by rc.7 under `/run/chv/nwd` are not
+  migrated. The upgrade restart re-creates the topology but not the
+  per-NIC reservations; a DHCP guest keeps its current lease until renewal,
+  and a VM re-create (or a clean rc.8 install) repopulates the persistent
+  file. The field drill uses cloud-init static addressing for the upgrade
+  leg and exercises the reservation contract on the clean install.
+- One-time gap: the rc.7 → rc.8 upgrade starts with an empty policy journal.
+  The rc.7 nft guard persists in the kernel, so running guests stay filtered;
+  the journal is seeded by the first attach-time policy application (the core
+  runtime applies the NIC snapshot or the DP4 baseline before attach) or the
+  operator's first policy update. The upgrade drill performs that update
+  immediately and verifies the guard re-scopes. A clean rc.8 install has no
+  such gap.
+
 ## [0.4.0-rc.7] - 2026-11-06
+
+> **Disqualified and superseded by `v0.4.0-rc.8`; do not use it as the field
+> or stable base.** Its pre-window upgrade drill reproduced B8 (dnsmasq
+> cannot bind UDP/67 without `CAP_NET_BIND_SERVICE`) and B9 (an nwd restart
+> loses the topology table, so the next policy update fails `NOT_FOUND`).
+> The entry below is the historical rc.7 record; its tag and assets are not
+> rewritten.
 
 > **Final release candidate for `v0.4.0` and the base for the stable tag.**
 > Supersedes `v0.4.0-rc.6`, which is **disqualified**: a clean install from

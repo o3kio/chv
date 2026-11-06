@@ -3,14 +3,19 @@
 **Campaign:** `v0.4.0` field qualification (Prompt 06)
 **Host label:** `field-host-1` (internal hostname and management addresses withheld)
 **Recorded:** 2026-11-06 (UTC)
-**Status:** pre-flight, **blocked**. A clean `v0.4.0-rc.6` install reproduced
-blocker-class defects on 2026-11-06. rc.6 is disqualified as the field/stable
-base, and `v0.4.0-rc.7` is the approved successor and is being cut. See
-[`01-rc6-blockers.md`](01-rc6-blockers.md). The field window has not started.
-This profile is re-pinned to rc.7 below, but the artifact digests and the
-clean-install re-run are pending publication; keep this status blocked until
-the rc.7 pre-window drills pass. No field-window evidence is claimed before
-that point.
+**Status:** pre-flight, **blocked pending pre-window drills**. A clean
+`v0.4.0-rc.6` install reproduced blocker-class defects on 2026-11-06, and the
+published `v0.4.0-rc.7` pre-window upgrade/restart drill then reproduced B8
+(dnsmasq cannot bind UDP/67 without `CAP_NET_BIND_SERVICE`) and B9 (an nwd
+restart loses the topology table, so the next policy update fails
+`NOT_FOUND` / `DISPATCH_FAILED`). rc.6 and rc.7 are disqualified as the
+field/stable base; `v0.4.0-rc.8` is the approved successor and final release
+candidate. See [`01-rc6-blockers.md`](01-rc6-blockers.md). The field window
+has not started. This profile is re-pinned to rc.8; keep this status blocked
+until the rc.8 upgrade/purge drill, the clean rc.8 install, the documented
+start with a guest DHCP lease and `login:` console, a policy change plus nwd
+restart with the reservation surviving, and two consecutive `--wipe` installs
+pass. No field-window evidence is claimed before that point.
 
 ## Approved profile
 
@@ -24,12 +29,12 @@ This run uses the narrow profile in
 | Topology | one host running control plane, agent, stord, nwd, and nginx |
 | Host | Ubuntu 24.04.5 LTS, amd64, **virtualized KVM guest** (QEMU/SeaBIOS). Not bare metal. |
 | VMM | Cloud Hypervisor v53.0, installed and digest-verified by the published installer |
-| Artifacts | **approved target:** published `v0.4.0-rc.7` `.deb` set and tarball; the clean install uses the published tarball's `scripts/install.sh` (release-directory mode). The pinned quick installer is a container-verified path and is not used for this window. Digests **pending publication** and must be recorded here before the window |
+| Artifacts | **target:** published `v0.4.0-rc.8` `.deb` set and tarball; the clean install uses the published tarball's `install.sh` (release-directory mode). The pinned quick installer is a container-verified path and is not used for this window. Digests are recorded below |
 | Storage | local directory + LVM on the dedicated blank `/dev/sdc` (100 GiB) |
 | Network | default single-host bridge only; no VLAN, no fabric/VXLAN |
 | Lifecycle | Core-managed authority; stop-first |
 | Workload | 3–5 VMs; repeated create/delete; start/stop/reboot; console; one policy change; LVM attach/use |
-| Upgrade | `v0.3.0` → `v0.4.0-rc.7` (or `v0.4.0-rc.6` → `v0.4.0-rc.7`) before the window; an rc.6/older source host needs the one-time legacy `chvbr0` removal documented in the rc.7 release notes §4; the window starts from a clean rc.7 install |
+| Upgrade | `v0.3.0` → `v0.4.0-rc.8` (or `v0.4.0-rc.7` → `v0.4.0-rc.8`) before the window, restarting `chv-nwd` before/with `chv-agent`; an rc.6/older source host needs the one-time legacy `chvbr0` removal documented in the rc.7 release notes §4; the window starts from a clean rc.8 install |
 | Data | disposable qualification data only; no backup means no data-protection claim |
 | Duration | 21 days minimum, 30 preferred |
 
@@ -42,7 +47,7 @@ minimums, S3/object storage, or Volvisor.
 `vm delete` removes the authority-side state, but the BFF/CP rows, the VM
 directory, the volume row, and the backing file persist after the delete
 returns success. The truthful delete signal is the task/operation result.
-This is a **pre-existing disclosed residual**, not part of the rc.6/rc.7
+This is a **pre-existing disclosed residual**, not part of the rc.6/rc.7/rc.8
 fixes, and it is acceptable for this campaign only because it is documented
 with that workaround (field plan §6.9). It does not involve isolation, data
 corruption, authority split, or recovery, so it is not blocker-class.
@@ -72,17 +77,70 @@ residue purge transcript is in
 
 ## Artifact identity
 
-### Target: rc.7 (pending publication)
+### Target: rc.8 (publication in progress)
+
+The rc.8 tag is not yet published at the time this profile is re-pinned. Its
+tag object, commit, tarball, sidecar, `SHA256SUMS`, eight package digests, and
+SLSA build provenance must be recorded here from the published release before
+the window opens. **No rc.8 artifact digest or provenance is claimed until it
+appears in this table.**
 
 | Artifact | Digest / identity |
 |---|---|
-| rc.7 tag | **pending** — record the annotated tag object and commit after publication |
-| rc.7 tarball + sidecar | **pending** |
-| rc.7 `SHA256SUMS` and package set | **pending** |
-| rc.7 provenance | **pending** — verify the SLSA attestation and record the run link |
+| rc.8 tag | pending publication |
+| rc.8 commit | pending publication |
+| rc.8 tarball | pending publication |
+| rc.8 tarball sidecar | pending publication |
+| rc.8 `SHA256SUMS` | pending publication |
+| rc.8 control plane deb/rpm | pending publication |
+| rc.8 monitor-agent deb/rpm | pending publication |
+| rc.8 node deb/rpm | pending publication |
+| rc.8 chvctl deb/rpm | pending publication |
+| v0.3.0 tarball (upgrade start) | `chv-0.3.0-linux-amd64.tar.gz` = `45990c38f9ba0a1ca573e0c7549479464ff6a0eb763da6ecec4bf1eb376eea0d` |
 
-Do not fill these values from a local build. The field window uses the
-published artifacts only.
+### Prior artifact: rc.7 (disqualified, historical)
+
+> rc.7 was published on 2026-11-06 and verified, then disqualified by its own
+> pre-window drill (B8/B9). Its tag and assets are not rewritten; the identity
+> below is retained as history, not as the target.
+
+| Artifact | Digest / identity |
+|---|---|
+| rc.7 tag | annotated tag object `e0da45d70e58f64f8d0e60b0ac76298974edffe8`, commit `1b8f68f17378d135cb0bbd72f46932e4e7240199` |
+| rc.7 tarball | `chv-0.4.0-rc.7-linux-amd64.tar.gz` = `604e05396bbed7d76f79f360e00716b1781d3b22204db8fddc050a5556aef8be` |
+| rc.7 tarball sidecar | `chv-0.4.0-rc.7-linux-amd64.tar.gz.sha256` = `a4068218ef282471c1ff72c779225e2dfbf1e7cbe64855beaa16dd45f75c258b` |
+| rc.7 `SHA256SUMS` | `f376e8556128e5a565644f5416e1588cc676ec9f5e9e02a733ba8931fee78650` (8 package lines) |
+| rc.7 control plane deb | `ef06066b75ed238e025111f4619556d170107e3a8aa409e785b7d7b097e4d76b` |
+| rc.7 monitor-agent deb | `5cc4d3d1f09c3a36836c57364882f0ad8b4590564990b734a213a7293bf31fa4` |
+| rc.7 node deb | `ae2b3ff8e4ea5fbafcb5738345d36c90e03d4cb799eea4e57a344bad149c5a01` |
+| rc.7 chvctl deb | `b7eed655ede08f0d5de545ed1c99c28dd28996a3eb171b5ef0d97805318966c5` |
+| rc.7 control plane rpm | `53ea487374dde4ffa166308a4acd44cdcff0ea138f731f4244d82166a30cc633` |
+| rc.7 monitor-agent rpm | `558921c9d22ea4412c14466720318f4f261b8fcd0ab6e5cc87098b626b52facf` |
+| rc.7 node rpm | `62a202d8f9f32a8ecb3a04788b9d5dbe9a311837ea8303f108256209321abd18` |
+| rc.7 chvctl rpm | `0e3271f4324a6a63f2aeb02027c013ccf920b5e65d2258df04899528c35e0ab3` |
+| v0.3.0 tarball (upgrade start) | `chv-0.3.0-linux-amd64.tar.gz` = `45990c38f9ba0a1ca573e0c7549479464ff6a0eb763da6ecec4bf1eb376eea0d` |
+
+Published release: <https://github.com/o3kio/chv/releases/tag/v0.4.0-rc.7>.
+The tarball was downloaded from the published release, its sidecar verified
+(`sha256sum -c` OK), and the extracted binaries report
+`0.4.0 (commit 1b8f68f, build 2026-11-06, channel stable)`. The package
+version is `0.4.0~rc.7` and the published asset version is `0.4.0.rc.7`.
+The node row reports the base `0.4.0`, so rc.7 is discriminated by the
+package version and the commit banner, not by the node row.
+
+### Build provenance (rc.7, historical)
+
+The release workflow
+([42253715143](https://github.com/o3kio/chv/actions/runs/42253715143))
+generated a SLSA v1 build-provenance attestation with
+`actions/attest-build-provenance`. It was verified through the GitHub
+attestation REST API (the installed `gh` has no `attestation` subcommand):
+one attestation covers all ten uploaded subjects, the DSSE statement names
+`.github/workflows/release.yml @ refs/tags/v0.4.0-rc.7`, the resolved
+dependency is commit `1b8f68f17378d135cb0bbd72f46932e4e7240199`, and every
+local asset digest matches its attested subject digest. Raw verification is
+recorded in
+[`artifacts/04-rc7-provenance.txt`](artifacts/04-rc7-provenance.txt).
 
 ### Prior artifact: rc.6 (disqualified, historical)
 
@@ -128,16 +186,18 @@ local asset digest matches its attested subject digest. The transcript is in
 - The upgrade drill starts from the published `v0.3.0` tarball. The old
   installer carries the WAL-unlink defect, so the old control plane is
   restarted once **before** any identifiable-state writes.
-- The **published rc.7** artifacts are the approved target for the clean
+- The **published rc.8** artifacts are the approved target for the clean
   install and the window. No source builds, local patches, or unreleased
   artifacts are used. The digests in the target table must be filled from the
   published release before the window.
-- The field window starts only after publication, the `v0.3.0` → rc.7 (or
-  `rc.6` → rc.7) drill, the uninstall/purge drill, the clean rc.7 install,
-  a documented start with a guest DHCP lease and `login:` console, a policy
-  change plus nwd restart, and **two consecutive `--wipe` installs reaching
-  `TenantReady`** succeed.
-- The rc.6 clean install (published artifact) is historical pre-window
-  evidence for the blocker investigation only. It cannot qualify rc.7.
+- The field window starts only after publication, the `v0.3.0` → rc.8 (or
+  `rc.7` → rc.8) drill restarting `chv-nwd` before/with `chv-agent`, the
+  uninstall/purge drill, the clean rc.8 install, a documented start with a
+  guest DHCP lease and `login:` console, a policy change plus nwd restart
+  with the reservation surviving, and **two consecutive `--wipe` installs
+  reaching `TenantReady`** succeed.
+- The rc.6 clean install and the rc.7 pre-window upgrade/restart drill are
+  historical pre-window evidence for the blocker investigations only. They
+  cannot qualify rc.8.
 - The M2.5 delete-retention residual is disclosed above and in field plan
-  §4 and §6.9; it is not a blocker and not a new rc.6/rc.7 finding.
+  §4 and §6.9; it is not a blocker and not a new rc.6/rc.7/rc.8 finding.

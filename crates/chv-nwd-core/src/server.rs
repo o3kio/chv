@@ -1,7 +1,9 @@
 use crate::executor::NetworkExecutor;
 use crate::handlers::NetworkServiceImpl;
 use crate::link_monitor::{link_health_loop, LinkHealthSnapshot};
+use crate::policy_store::PolicyStore;
 use crate::state::TopologyTable;
+use crate::topology_store::TopologyStore;
 use chv_errors::ChvError;
 use chv_nwd_api::chv_nwd_api::network_service_server::NetworkServiceServer;
 use chv_observability::Metrics;
@@ -36,7 +38,30 @@ impl<E: NetworkExecutor> NetworkServer<E> {
         self
     }
 
+    /// Opt into the durable bridge-only topology journal (rc.8 blocker B9).
+    /// The production daemon wires `TopologyStore::default_dir()`; tests that
+    /// do not exercise restart recovery leave it unset.
+    pub fn with_topology_store(mut self, store: TopologyStore) -> Self {
+        self.inner.set_topology_store(Arc::new(store));
+        self
+    }
+
+    /// Opt into the durable firewall/NAT policy journal (rc.8 B9 follow-up).
+    /// Recovery re-applies the last requested policy so a restart or reboot
+    /// restores the interface guard set instead of serving an unguarded
+    /// recovered topology.
+    pub fn with_policy_store(mut self, store: PolicyStore) -> Self {
+        self.inner.set_policy_store(Arc::new(store));
+        self
+    }
+
     pub async fn serve(self, socket_path: &Path) -> Result<(), ChvError> {
+        // B9: replay the journaled topologies BEFORE binding the socket, so
+        // the first RPC a client sends (including a policy update after a
+        // restart) always observes the recovered table. A recovery failure
+        // aborts startup loudly instead of serving a partial table.
+        self.inner.recover_topologies().await?;
+
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
