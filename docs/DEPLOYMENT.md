@@ -2,9 +2,9 @@
 
 This guide deploys CHV on a single Linux host. The host runs the **control plane** (orchestration, API, Web UI) and Cloud Hypervisor (the VMM) as the VM runtime.
 
-> **Version:** 0.4.0 (release candidate `v0.4.0-rc.5`; `VERSION` holds the base
-> `0.4.0` and the tag carries the `-rc.5` suffix)  
-> **Target:** Ubuntu 22.04/24.04 LTS or equivalent Linux with KVM support  
+> **Version:** 0.4.0 (release candidate `v0.4.0-rc.6`; `VERSION` holds the base
+> `0.4.0` and the tag carries the `-rc.6` suffix)<br>
+> **Target:** Ubuntu 22.04/24.04 LTS or equivalent Linux with KVM support<br>
 > **Database:** SQLite (no external database service required)
 
 ---
@@ -29,11 +29,11 @@ Run the qualified all-in-one installer on a fresh Ubuntu server with root access
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
 ```
 
-Or install a specific version (the current release candidate is `0.4.0-rc.5`;
+Or install a specific version (the current release candidate is `0.4.0-rc.6`;
 `0.3.0` remains the latest stable):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.5 bash -s
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.6 bash -s
 ```
 
 The installer script requires **bash**: it uses `set -o pipefail`, which `sh`
@@ -143,8 +143,8 @@ GPG signature check in the installer.
 > tarball with a `.sha256` sidecar alongside the `.deb`/`.rpm` packages), so
 > this resolution leg is live — tagged releases are the artifact source, and
 > the rolling `nightly` pre-release is never selected. The current release
-> candidate `v0.4.0-rc.5` is a GitHub pre-release, so the stable resolver
-> correctly skips it; install it by pinning `0.4.0-rc.5` explicitly. The
+> candidate `v0.4.0-rc.6` is a GitHub pre-release, so the stable resolver
+> correctly skips it; install it by pinning `0.4.0-rc.6` explicitly. The
 > `get.cellhv.com` hosting surface is **not stood up** (the name does not
 > resolve); see
 > [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
@@ -185,9 +185,12 @@ in the install output. You will be required to change it on first login.
 > persisted across a control-plane restart, WAL retained). See the
 > [rc.1 evidence report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md)
 > and the [rc.5 evidence report](evidence/production-readiness/v0.4.0-rc5/fresh-host-qualification.md).
-> The container shares the host kernel/network namespace and has no `/dev/kvm`,
-> so this is not bare-metal evidence. `scripts/install.sh` remains the
-> qualified (KVM-verified) deployment path.
+> The rc.5 lane is evidence for the #727 installer fixes only: rc.5 was
+> superseded by rc.6 for the agent-restart defect, and **no rc.6
+> post-publication lane has run at tag time**. The container shares the host
+> kernel/network namespace and has no `/dev/kvm`, so this is not bare-metal
+> evidence. `scripts/install.sh` remains the qualified (KVM-verified)
+> deployment path.
 >
 > **Do not install `v0.4.0-rc.2`, or use the `v0.4.0-rc.3` or `v0.4.0-rc.4`
 > quick installers.** rc.2 and the rc.3 quick installer have a
@@ -199,9 +202,15 @@ in the install output. You will be required to change it on first login.
 > `v0.4.0-rc.4` fixed that quick-installer defect (#725), but rc.4's quick
 > installer has two more: it can complete with no enrolled node, and a
 > documented re-run destroys the enrolled agent identity. Both are fixed in
-> `v0.4.0-rc.5` (#727). The rc.4 tarball/package and upgrade path is
-> unaffected and passed its lane. See the
-> [rc.5 release notes](release/v0.4.0-rc.5-release-notes.md) §2. The rc.5
+> `v0.4.0-rc.5` (#727) and retained in rc.6. The rc.4 tarball/package and
+> upgrade path is unaffected and passed its lane. See the
+> [rc.5 release notes](release/v0.4.0-rc.5-release-notes.md) §2.
+>
+> **Do not use `v0.4.0-rc.5` as the stable base.** On rc.5,
+> `systemctl restart chv-agent` with a running VM killed the VMM after
+> `TimeoutStopSec`, and a plain stop/start could remove `/run/chv` and wedge
+> the node. **rc.6 fixes the restart, drain, and removal paths (#732)**; the
+> rc.6 release notes state the evidence boundary. The rc.5
 > post-publication lane
 > ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210))
 > passed all four legs; see the
@@ -220,7 +229,7 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-instal
 Or pinned to a tagged release, with a dry run available:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0-rc.5
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0-rc.6
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --dry-run
 ```
 
@@ -243,7 +252,7 @@ package-serving shape where the control plane serves the WebUI itself
 that shape, so the script refuses them (`--version 0.3.0` fails closed)
 rather than install a host with a 404 UI. While v0.3.0 remains the latest
 stable during the v0.4.0-rc.N window, pin the pre-release explicitly:
-`--version 0.4.0-rc.5`.
+`--version 0.4.0-rc.6`.
 
 After it completes, open `http://<host-ip>:8080/` and log in as
 **admin** with the password from `/etc/chv/initial_admin_password`
@@ -302,7 +311,9 @@ four `/metrics` listeners (run
 `v0.4.0-rc.1`). The label remains [CONTAINER-VERIFIED] after the rc.5 re-run
 ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210), tag
 `v0.4.0-rc.5`), which passed all four legs after the rc.4 quick-install defect
-was fixed. This is the same gate shape as the container package-smoke leg
+was fixed. That run is installer evidence only: rc.5 was superseded by rc.6
+for the agent-restart defect, and **no rc.6 post-publication lane has run at
+tag time**. This is the same gate shape as the container package-smoke leg
 that ran in #549 (2026-10-08). The scope is the container contract — not
 bare-metal behavior and not guest execution.
 
