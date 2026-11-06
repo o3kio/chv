@@ -11,7 +11,7 @@ tighter umask.
 |---|---|---|
 | `chv-agent` service user | `User=chv`, `Group=chv`, `SupplementaryGroups=kvm` | `packaging/systemd/chv-agent.service` |
 | `chv-agent` umask | `UMask=002` | same unit |
-| `chv-agent` runtime dir | `RuntimeDirectory=chv`, `RuntimeDirectoryMode=0775` | same unit |
+| `chv-agent` runtime dir | `RuntimeDirectory=chv/agent`, `RuntimeDirectoryMode=0775` | same unit |
 | `chv-agent` state dir | `StateDirectory=chv/agent`, `StateDirectoryMode=0700` | same unit |
 | Agent-created Core/state dirs | `/run/chv/core`, `/var/lib/chv/agent`, `/var/lib/chv/cache` created `0700 chv:chv` by `ExecStartPre` | same unit; `packaging/tmpfiles/chv-node.conf` |
 | `chv-stord` service user | `User=chv`, `Group=chv` — **not** `chv-stord` | `packaging/systemd/chv-stord.service` |

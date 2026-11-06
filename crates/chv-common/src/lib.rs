@@ -211,6 +211,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bridge_name_matches_the_shell_removal_helper_vectors() {
+        // The removal scripts reimplement this function in POSIX sh; these
+        // vectors are the shared contract (see
+        // tests/test_cellhv_core_packaging.py).
+        assert_eq!(bridge_name_for_network("default"), "chvbr0");
+        assert_eq!(bridge_name_for_network("net1"), "br-net1");
+        assert_eq!(
+            bridge_name_for_network("63b27631c9c92fda4a43351c5aeeba21"),
+            "br-63b276315a70"
+        );
+        // IFNAMSIZ guard: even a long id stays within 15 chars and keeps
+        // the 8-char prefix + 4-hex FNV-1a suffix.
+        let long = "a".repeat(64);
+        let name = bridge_name_for_network(&long);
+        assert_eq!(name.len(), 15);
+        assert!(name.starts_with("br-aaaaaaaa"));
+    }
+
+    #[test]
     fn firewall_ruleset_is_empty_matches_blank_and_empty_arrays() {
         // #355: blank strings and empty JSON arrays are semantically
         // empty — they must never engage default-deny-with-no-allows.

@@ -104,6 +104,7 @@ CHV_MIGRATIONS_DIR="${CHV_MIGRATIONS_DIR:-/usr/share/chv/migrations}"
 # leg copies its monitoring-migrations/ tree to the same location (#668).
 CHV_MONITORING_MIGRATIONS_DIR="${CHV_MONITORING_MIGRATIONS_DIR:-/usr/share/chv/monitoring-migrations}"
 CHV_DB_PATH="${CHV_DB_PATH:-${CHV_DATA_DIR}/controlplane.db}"
+CHV_HOST_ETC="${CHV_HOST_ETC:-/etc}"
 
 # CLI flags (parsed in main)
 ARG_VERSION=""
@@ -1463,8 +1464,10 @@ start_services() {
         systemctl start chv-stord chv-nwd
         wait_for_daemon_sockets
     fi
-    # A re-run restarts the agent in start_agent; it must stop the agent
-    # before restarting stord/nwd (see the RuntimeDirectory note there).
+    # A re-run restarts the agent in start_agent. rc.6 nests the agent's
+    # RuntimeDirectory (=chv/agent), so that stop no longer removes
+    # /run/chv; the ordering is kept so the new process reads the certs
+    # staged below and the supervisor never races a missing socket.
 
     if [ ! -e /dev/kvm ]; then
         warn "/dev/kvm is not present (no KVM, or a container without device passthrough)."
@@ -1490,11 +1493,11 @@ start_agent() {
         info "Starting the local agent..."
     else
         info "Restarting the local agent..."
-        # Stop first: the unit's RuntimeDirectory=chv is removed on stop,
-        # which deletes both the certs staged here and the stord/nwd sockets
-        # (they live under /run/chv). Restart stord/nwd afterwards so their
-        # sockets exist before the agent's supervisor looks for them;
-        # otherwise it spawns duplicates that collide on the metrics ports.
+        # Stop first so the new process reads the certs staged below. rc.6
+        # nests RuntimeDirectory to chv/agent, so this stop no longer
+        # removes /run/chv; the stord/nwd restart is kept so their sockets
+        # exist before the agent's supervisor looks for them (and is
+        # harmless when they already survive).
         systemctl stop chv-agent 2>/dev/null || true
         systemctl restart chv-stord chv-nwd 2>/dev/null \
             || systemctl start chv-stord chv-nwd
@@ -1608,13 +1611,281 @@ EOF
 # Uninstall (software removed, data preserved by default — mirrors
 # docs/install/uninstall.md; --purge also removes data and config)
 # -----------------------------------------------------------------------------
+# VMMs are children of chv-agent but outlive it by design (the unit uses
+# KillMode=process so a restart adopts them). Uninstall is final: stop any
+# CHV-owned cloud-hypervisor too, or removal leaves orphaned guests, tap
+# interfaces and nftables state behind. Match the truncated comm
+# (TASK_COMM_LEN) plus the CHV VM api-socket path so an unrelated
+# cloud-hypervisor on the host is never signalled. The path is the
+# chv-config state-dir default (/var/lib/chv/agent/vms/); a custom
+# CHV_DATA_DIR would need this matcher updated in lockstep.
+terminate_chv_vmms() {
+    local pids remaining attempt
+    mapfile -t pids < <(ps -eo pid=,comm=,args= | awk '
+        ($2 == "cloud-hyperviso" || $2 == "cloud-hypervisor") &&
+        $0 ~ /\/var\/lib\/chv\/agent\/vms\// { print $1 }' | sort -u)
+    if [ "${#pids[@]}" -eq 0 ]; then
+        return 0
+    fi
+    warn "Terminating ${#pids[@]} running VM process(es) before removal: ${pids[*]}"
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    for attempt in {1..10}; do
+        # `|| true`: ps/awk can fail transiently and this script runs with
+        # `set -euo pipefail`; a failed probe must mean "nothing listed",
+        # not abort the uninstall before the force-kill fallback.
+        remaining=$(ps -eo pid=,comm=,args= 2>/dev/null | awk '
+            ($2 == "cloud-hyperviso" || $2 == "cloud-hypervisor") &&
+            $0 ~ /\/var\/lib\/chv\/agent\/vms\// { print $1 }' || true)
+        if [ -z "$remaining" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    # Word-split on purpose: the list is PIDs only.
+    warn "Forcing VM processes to exit: ${remaining//$'\n'/ }"
+    kill -KILL $remaining 2>/dev/null || true
+}
+
+# CHV-owned host network state does not live under /var/lib/chv: nwd
+# materializes a bridge, a netns and an nft table per network (plus tap
+# slaves). Uninstall never asks nwd to tear those down, so without this they
+# outlive even `--uninstall --purge` (field-plan section 6.9: network residue
+# that survives documented cleanup is blocker-class). Derive ids from the
+# deployment database when readable AND from CHV-owned nft tables / netns
+# names, so a network whose row is gone is still cleaned. Best-effort.
+chv_bridge_name_for_network() {
+    local id="$1"
+    if [ "$id" = "default" ]; then
+        printf 'chvbr0'
+        return 0
+    fi
+    local candidate="br-${id}"
+    if [ "${#candidate}" -le 15 ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+    # Same FNV-1a name as chv_common::bridge_name_for_network: the kernel
+    # device name is capped at 15 chars, so long ids keep an 8-char prefix and
+    # a 4-hex hash.
+    local h=$((0x811c9dc5)) prefix="${id:0:8}" i=0 b
+    while [ "$i" -lt "${#id}" ]; do
+        b=$(printf '%d' "'${id:$i:1}")
+        h=$(( ((h * 0x01000193) & 0xffffffff) ^ b ))
+        i=$((i + 1))
+    done
+    printf 'br-%s%04x' "$prefix" "$((h & 0xffff))"
+}
+
+chv_network_ids() {
+    {
+        if cmd_exists sqlite3 && [ -f "${CHV_DB_PATH}" ]; then
+            # Read as the service user: a root sqlite3 open can leave
+            # root-owned -wal/-shm sidecars that the chv user then cannot use
+            # (issue #669). Fall back to plain sqlite3 only when the user or
+            # sudo/runuser is gone (nothing will restart as chv then).
+            if id -u "$CHV_USER" >/dev/null 2>&1 \
+                && { cmd_exists runuser || cmd_exists sudo; }; then
+                chv_sqlite "${CHV_DB_PATH}" \
+                    "SELECT network_id FROM network_desired_state;" 2>/dev/null || true
+                chv_sqlite "${CHV_DB_PATH}" \
+                    "SELECT network_id FROM networks;" 2>/dev/null || true
+            else
+                sqlite3 "${CHV_DB_PATH}" \
+                    "SELECT network_id FROM network_desired_state;" 2>/dev/null || true
+                sqlite3 "${CHV_DB_PATH}" \
+                    "SELECT network_id FROM networks;" 2>/dev/null || true
+                # A root sqlite3 open can leave root-owned WAL sidecars.
+                chown "$CHV_USER:$CHV_USER" \
+                    "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" 2>/dev/null || true
+            fi
+        fi
+        if cmd_exists nft; then
+            nft list tables 2>/dev/null \
+                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' || true
+        fi
+        if cmd_exists ip; then
+            # A netns name alone is weaker evidence than a CHV nft table or
+            # database row, so only the literal `default` network and legacy
+            # hex ids are treated as ours from this source; custom ids come
+            # from the two sources above. This keeps an unrelated `ns-<name>`
+            # from being deleted.
+            ip netns list 2>/dev/null \
+                | awk '{print $1}' \
+                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p' || true
+        fi
+    } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u || true
+}
+
+chv_network_cidr() {
+    # Best-effort recovery of a network's CIDR from the control-plane
+    # database. It lets removal delete the current `! -d <cidr>` NAT form
+    # when the bridge is already gone and no surviving rule names it.
+    local net_id="$1" net_cidr=""
+    if cmd_exists sqlite3 && [ -f "${CHV_DB_PATH}" ]; then
+        if id -u "$CHV_USER" >/dev/null 2>&1 \
+            && { cmd_exists runuser || cmd_exists sudo; }; then
+            net_cidr="$(chv_sqlite "${CHV_DB_PATH}" \
+                "SELECT cidr FROM network_desired_state WHERE network_id = '$net_id';" 2>/dev/null || true)"
+        else
+            net_cidr="$(sqlite3 "${CHV_DB_PATH}" \
+                "SELECT cidr FROM network_desired_state WHERE network_id = '$net_id';" 2>/dev/null || true)"
+            chown "$CHV_USER:$CHV_USER" \
+                "${CHV_DB_PATH}-wal" "${CHV_DB_PATH}-shm" 2>/dev/null || true
+        fi
+    fi
+    printf '%s\n' "$net_cidr" \
+        | awk 'NF { print $1; exit }' \
+        | grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' || true
+}
+
+# Remove one CHV bridge plus the host state that would recreate or outlive it:
+# its CHV tap slaves, the exact CHV MASQUERADE rules (live and persisted), and
+# the networkd/ifupdown drop-in. Never touches other slaves or other bridges:
+# the uplink enslaved to chvbr0 must survive, and the persisted-rule match is
+# exact.
+remove_chv_bridge_and_nat() {
+    local bridge="$1" hint="${2:-}" cidr cidrs tap f rules_file
+    rules_file="${CHV_IPTABLES_RULES_V4:-${CHV_HOST_ETC}/iptables/rules.v4}"
+    if cmd_exists ip; then
+        # The kernel route carries the network CIDR without re-deriving it
+        # from the address/prefix. `|| true`: ip exits 1 when the bridge is
+        # already gone, and these scripts run with pipefail.
+        cidr="$(ip -o -4 route show dev "$bridge" proto kernel scope link 2>/dev/null \
+            | awk '{print $1; exit}' || true)"
+        for tap in $(ip -o link show master "$bridge" 2>/dev/null \
+            | awk -F': ' '{print $2}' | cut -d@ -f1 \
+            | grep '^tap-[0-9a-f]\{8\}$' || true); do
+            ip link del dev "$tap" 2>/dev/null || true
+        done
+        ip link set dev "$bridge" down 2>/dev/null || true
+        ip link del dev "$bridge" 2>/dev/null || true
+    fi
+
+    # The bridge may already be gone (residue from a failed install/removal)
+    # while its NAT rules survive. Collect every CIDR from a rule that still
+    # names this bridge: knowing one CIDR also exposes the historical
+    # `! -d <cidr>` form. A database hint covers a host whose only surviving
+    # rule is the current `! -d` form, which does not name the bridge.
+    cidrs="$(
+        {
+            if cmd_exists iptables; then
+                iptables -t nat -S POSTROUTING 2>/dev/null \
+                    | awk -v b="! -o $bridge " 'index($0, b) {
+                        for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
+                    }' || true
+            fi
+            if [ -f "$rules_file" ]; then
+                awk -v b="! -o $bridge " 'index($0, b) {
+                    for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
+                }' "$rules_file" || true
+            fi
+            # Union, not a precedence chain: a stale `! -o` rule must not hide
+            # the route or the database hint for the current `! -d` form.
+            if [ -n "${cidr:-}" ]; then
+                printf '%s\n' "$cidr"
+            fi
+            if [ -n "$hint" ]; then
+                printf '%s\n' "$hint"
+            fi
+        } | sort -u || true
+    )"
+
+    for cidr in $cidrs; do
+        if cmd_exists iptables; then
+            while iptables -t nat -C POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null; do
+                iptables -t nat -D POSTROUTING -s "$cidr" ! -d "$cidr" -j MASQUERADE 2>/dev/null || break
+            done
+            while iptables -t nat -C POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null; do
+                iptables -t nat -D POSTROUTING -s "$cidr" ! -o "$bridge" -j MASQUERADE 2>/dev/null || break
+            done
+        fi
+
+        if [ -f "$rules_file" ]; then
+            awk -v d="-A POSTROUTING -s $cidr ! -d $cidr -j MASQUERADE" \
+                -v o="-A POSTROUTING -s $cidr ! -o $bridge -j MASQUERADE" \
+                '$0 != d && $0 != o' "$rules_file" \
+                > "${rules_file}.chv-clean" \
+                && mv "${rules_file}.chv-clean" "$rules_file" \
+                || rm -f "${rules_file}.chv-clean"
+        fi
+    done
+
+    # Persistent bridge configuration: install.sh writes a networkd netdev/
+    # network pair (plus an uplink Bridge= drop-in) or an ifupdown stanza.
+    # Leaving these would recreate the bridge at the next boot.
+    rm -f "${CHV_HOST_ETC}/systemd/network/10-${bridge}.netdev" \
+          "${CHV_HOST_ETC}/systemd/network/11-${bridge}.network" 2>/dev/null || true
+    for f in "${CHV_HOST_ETC}"/systemd/network/12-*.network; do
+        [ -f "$f" ] || continue
+        if grep -Fqx "Bridge=${bridge}" "$f" 2>/dev/null; then
+            rm -f "$f" 2>/dev/null || true
+        fi
+    done
+    if [ "$bridge" = "chvbr0" ]; then
+        rm -f "${CHV_HOST_ETC}/network/interfaces.d/chvbr0" 2>/dev/null || true
+    fi
+}
+
+delete_chv_network_state() {
+    local id bridge table baseline_bridge baseline_cidr
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        case "$id" in
+            ''|*[!A-Za-z0-9_.-]*) continue ;;
+        esac
+        bridge="$(chv_bridge_name_for_network "$id")"
+        remove_chv_bridge_and_nat "$bridge" "$(chv_network_cidr "$id")"
+        if cmd_exists ip; then
+            ip netns del "ns-$id" 2>/dev/null || true
+        fi
+        if cmd_exists nft; then
+            nft delete table inet "chv-$id" 2>/dev/null || true
+        fi
+    done < <(chv_network_ids)
+
+    # The baseline bridge can predate any network row, so it has no id to
+    # derive from. Delete the configured name and the historical default; the
+    # uplink stays up.
+    baseline_bridge="${INSTALL_CHV_BRIDGE_NAME:-chvbr0}"
+    baseline_cidr="$(chv_network_cidr default)"
+    remove_chv_bridge_and_nat "$baseline_bridge" "$baseline_cidr"
+    if [ "$baseline_bridge" != "chvbr0" ]; then
+        remove_chv_bridge_and_nat chvbr0 "$baseline_cidr"
+    fi
+    rm -f "${CHV_HOST_ETC}/sysctl.d/99-chv-forward.conf" 2>/dev/null || true
+    if cmd_exists netfilter-persistent; then
+        netfilter-persistent save 2>/dev/null || true
+    fi
+
+    # Sweep any CHV-owned table whose id could not be derived above.
+    if cmd_exists nft; then
+        nft list tables 2>/dev/null \
+            | sed -n 's/^table inet \(chv-[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' \
+            | while IFS= read -r table; do
+                nft delete table inet "$table" 2>/dev/null || true
+            done || true
+    fi
+}
+
 uninstall() {
     info "Stopping and disabling CHV services..."
     local svc
-    for svc in chv-agent chv-stord chv-nwd chv-controlplane; do
+    # Stop the agent before terminating VMMs: while it is running it would
+    # observe the kills and try to reconcile the VMs back. Storage and network
+    # stay up until the VMMs are gone so removal never severs a live guest
+    # first.
+    for svc in chv-controlplane chv-agent; do
         systemctl stop "$svc" 2>/dev/null || true
         systemctl disable "$svc" 2>/dev/null || true
     done
+    terminate_chv_vmms
+    for svc in chv-stord chv-nwd; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+
+    # nwd is down: remove the bridges, netns, taps and nft tables it created.
+    delete_chv_network_state
 
     local removed_via_pkg="0"
     if cmd_exists dpkg && dpkg -s chv-controlplane >/dev/null 2>&1; then
@@ -1640,7 +1911,21 @@ uninstall() {
           /etc/systemd/system/chv-nwd.service
     rm -f /usr/lib/tmpfiles.d/chv-node.conf
     rm -rf /usr/share/chv
+    # scripts/install.sh (the qualified layout) additionally owns the UI
+    # tree, the migrations directory, and an nginx site. Removing only the
+    # package trees would leave a stale enabled site pointing at a deleted
+    # backend.
+    rm -rf /opt/chv /usr/local/share/chv/migrations
+    rm -f /etc/nginx/sites-available/chv /etc/nginx/sites-enabled/chv
+    if cmd_exists systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl reload nginx 2>/dev/null || true
+    fi
     systemctl daemon-reload
+    # A stopped agent that had to be SIGKILLed (or crashed) stays in systemd's
+    # in-memory "failed" set after its unit file is removed; clear it so a
+    # documented complete removal leaves no CHV unit state behind.
+    systemctl reset-failed chv-controlplane chv-agent chv-stord chv-nwd \
+        2>/dev/null || true
 
     if [ "$ARG_PURGE" = "1" ]; then
         info "Purging data and configuration..."

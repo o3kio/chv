@@ -33,12 +33,21 @@ After standard removal, the following remain on disk:
 
 ### What is removed
 
+Package removal stops the four services, so any running VMs are stopped
+with their CHV-owned cloud-hypervisor processes terminated before the
+software goes away. That is a VMM-level `SIGTERM` (then `SIGKILL` after
+10 s), not a guest-OS shutdown: if the guests must flush their own buffers,
+stop them through the API first. Persistent CHV data is preserved and a
+reinstall resumes from it.
+
 | Path | Contents | Removed? |
 |------|----------|----------|
 | `/usr/bin/chv*` | Binaries | ✅ Yes |
 | `/lib/systemd/system/chv-*.service` | Systemd units | ✅ Yes |
 | `/usr/share/chv` | UI assets, migrations | ✅ Yes |
 | `/usr/lib/tmpfiles.d/chv-node.conf` | tmpfiles entry (`chv-node` package) | ✅ Yes |
+| `/opt/chv`, `/usr/local/share/chv/migrations`, nginx site | `scripts/install.sh` UI tree, migrations, and edge config (when present) | ✅ Only via `scripts/install.sh --wipe` or `scripts/quick-install.sh --uninstall`; package remove/purge and an `install.sh` re-run leave them |
+| Host network state | Per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables tables (including the literal `default` network; plus the baseline `chvbr0` bridge), the live and persisted CHV `MASQUERADE` rules, `99-chv-forward.conf`, and the networkd/ifupdown bridge config | ✅ Yes (remove/purge, not upgrade) |
 
 ## Verify removal
 
@@ -73,6 +82,20 @@ sudo systemctl enable --now chv-controlplane chv-agent chv-stord chv-nwd
 ```
 
 Your previous database, caches, and configs will be intact.
+
+### Partial package removal
+
+`preremove.sh` ships with both `chv-node` and `chv-controlplane`, and it
+performs the full node teardown for either package's removal: it stops all
+four services and the VMMs the agent owns, then deletes the CHV bridges,
+namespaces, taps, nftables/iptables state, sysctl file, and the uplink
+`12-*.network` (or ifupdown) drop-in that enslaved the uplink to `chvbr0`.
+That drop-in also carried the uplink's own configuration; it is written by
+`scripts/install.sh`, and reinstalling a package does not recreate it. If you
+remove only one CHV package but intend to keep the rest running, the host
+networking stays down until you re-run the installer's network setup or
+restore the uplink configuration. For a supported removal, remove
+`chv-node`, `chv-controlplane`, and `chvctl` together.
 
 ## Complete removal (destructive)
 
@@ -124,6 +147,35 @@ sudo rm -rf /run/chv
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 ```
+
+### 7. Verify no host network state remains
+
+Package removal tears down the bridges, namespaces, tap interfaces, and
+`inet chv-*` nftables tables nwd created. Check that nothing CHV-owned is
+left (other host bridges/namespaces are not CHV's):
+
+```bash
+sudo nft list tables | grep 'inet chv-' || echo "no CHV nftables tables"
+sudo ip netns list | grep -E '^ns-([0-9a-f]+|default)( |$)' || echo "no CHV namespaces"
+ip -o link show type bridge | grep -E 'chvbr0|br-[A-Za-z0-9_.-]+' || echo "no CHV bridges"
+```
+
+The default network id is the literal `default` (namespace `ns-default`,
+nftables table `chv-default`, bridge `chvbr0`); operator-created network ids
+use the same `ns-<id>`/`chv-<id>`/`br-<id>` naming. Docker also creates
+`br-<12 hex>` bridges, so a `br-` match alone is not proof of CHV ownership:
+a CHV bridge carries `tap-[0-9a-f]{8}` slaves or is `chvbr0`. On a host upgraded from an
+older release, an orphaned table/bridge from that older layout may still be
+present. Remove it explicitly once: `nft delete table inet chv-<id>`,
+`ip netns del ns-<id>`, `ip link del dev br-<id>` (and
+`ip link del dev chvbr0`).
+
+Removal also deletes any networkd `12-*.network` drop-in that enslaved the
+uplink to a CHV bridge, because leaving it would recreate the bridge at the
+next boot. That drop-in is also what configured the uplink. Before rebooting,
+restore or verify the uplink's own network configuration (for example
+`networkctl status <uplink>` plus a `10-<uplink>.network`/DHCP stanza) so the
+host does not come back with an unconfigured NIC.
 
 ## What to back up before removal
 

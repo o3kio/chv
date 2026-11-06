@@ -21,7 +21,8 @@ The current ownership observer deliberately reports
 proof of exclusivity. The proposed protocol supplies the missing positive
 supervision boundary. It is not implemented by the existing
 `packaging/systemd/chv-agent.service`, which supervises the agent as a whole
-and uses `KillMode=mixed`, but has no per-VM unit or cgroup contract.
+(`KillMode=process`; live VMMs are adopted by the restarted agent rather than
+supervised individually), but has no per-VM unit or cgroup contract.
 
 ## Context
 

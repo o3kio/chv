@@ -147,7 +147,7 @@ Package scripts ([`../packaging/scripts/`](../packaging/scripts/)):
 | Script | Behavior |
 |---|---|
 | `postinstall.sh` | Mints `/etc/chv/encryption.env` once from `/dev/urandom` (never regenerated — regeneration would make existing encrypted credentials unrecoverable). Creates `chv` and `chv-stord` users and group memberships (`chv`→`kvm`, `chv-stord`→`disk`, `chv-stord`→`chv`). Creates state dirs; storage dirs `chv:chv-stord 0770`. Explicitly does **not** create bridges, pools, VMs, or firewall rules. Reloads systemd; does **not** enable or start services. |
-| `preremove.sh` | Stops the four services on remove/purge; skips stopping on upgrade. |
+| `preremove.sh` | On remove/purge: stops the four services (control plane and agent first), terminates CHV-owned cloud-hypervisor processes that outlive the agent, then removes the host network state nwd materializes outside `/var/lib/chv` (per-network bridges, netns, CHV tap slaves, `inet chv-*` nftables tables, baseline bridge). Skips everything on upgrade. |
 | `postremove.sh` | Preserves `/var/lib/chv`, `/etc/chv`, `/var/log/chv`. Destructive cleanup requires explicit operator action. |
 
 ## 3. Interface and port contract
@@ -673,7 +673,11 @@ found it.
   before the offline admin writes), and a documented re-run destroyed the
   enrolled agent identity (deleted cache + consumed one-time token +
   `RuntimeDirectory=chv` wiping `/run/chv`). Both are fixed in rc.5 (#727).
-  The rc.5 post-publication lane
+  The unit-level causes (`RuntimeDirectory=chv` deleting the stord/nwd
+  sockets, `KillMode=mixed` killing the VMM cgroup, and the shutdown drain
+  never unblocking the serial reader) were fixed in rc.6 (#732); rc.5's
+  quick installer worked around the runtime-dir wipe by restarting stord/nwd
+  after the agent stop. The rc.5 post-publication lane
   ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210))
   then passed all four legs, including the published quick installer in
   candidate mode (node enrolled, credential persistence across a restart, WAL

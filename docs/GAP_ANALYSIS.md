@@ -192,7 +192,7 @@ These areas were previously flagged as gaps but are now complete:
 | **RBAC middleware** | `crates/chv-webui-bff/src/router.rs:35-400` — Three-tier routing (viewer / operator / admin) with `require_operator_or_admin` and `require_admin` gates |
 | **Node state machine library** | `crates/chv-agent-core/src/cache.rs:268-276` — `StateMachine` with `transition_node_state` and transition validation |
 | **nginx WebSocket proxy** | `docs/examples/nginx/chv-ui.conf` — `/ws/vms/` location with upgrade headers |
-| **systemd services** | `docs/examples/systemd/*.service` — All 4 daemons with `KillMode=mixed` and `TimeoutStopSec=5` |
+| **systemd services** | `docs/examples/systemd/*.service` — `chv-agent` uses `KillMode=process` and `RuntimeDirectory=chv/agent`; the other three daemons keep `KillMode=mixed` and `TimeoutStopSec=5` |
 | **Pre-migration DB backup** | Automatic DB backup before migrations with 10-backup rotation |
 | **Version bump automation** | `scripts/bump-version.sh` + `Makefile` target |
 | **Dark mode** | Full implementation with `UserMenu` toggle and `[data-theme="dark"]` tokens |

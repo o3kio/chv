@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Agent restart killed every running VM and wedged the node (blocker;
+  #732).** On the rc.5 unit, `systemctl restart chv-agent` with a running VM
+  took 76 s, hit `TimeoutStopSec=75`, and systemd SIGKILLed the cgroup —
+  killing cloud-hypervisor. Three independent causes: (a) `KillMode=mixed`
+  SIGKILLs the rest of the cgroup when the main process exits; (b) the
+  graceful shutdown drain half-closed the serial socket (`SHUT_WR`) but
+  never unblocked the dedicated `spawn_blocking` reader, so Tokio's runtime
+  drop waited forever; (c) `RuntimeDirectory=chv` made systemd remove
+  `/run/chv` recursively, unlinking the separately-managed
+  `chv-stord`/`chv-nwd` sockets — the supervisor then double-spawned
+  duplicates that died on the already-bound metrics ports, leaving the node
+  `Failed` and `CreateVm` refused. A plain stop/start reproduced (c) without
+  any crash. The unit now uses `KillMode=process` (VMs outlive the agent and
+  are adopted on restart) and `RuntimeDirectory=chv/agent`. The shutdown
+  drain now waits for a bounded settle — a 200 ms floor, consecutive empty
+  receive-queue probes on the fast path, and a shared 1 s deadline — before
+  issuing `shutdown(SHUT_RD)`, so the blocking readers see EOF instead of
+  holding the process until `TimeoutStopSec`. The empty-probe streak is a
+  signal, not proof the peer stopped writing (the concurrent reader shares
+  the queue, and the deadline can fire right after a data-returning probe);
+  a write-after-shut window remains and degrades to the pre-fix,
+  `vm.reboot`-recoverable behavior.
+  Pty-transport consoles (no `shutdown(2)`) now poll the draining latch
+  instead of staying parked. Regression tests cover the late-write window,
+  the live-reader unblock, the Pty reader, and the unit contract.
+- **Removal left running VMs and host network state behind (blocker).**
+  `KillMode=process` deliberately lets VMMs outlive `chv-agent`, but the
+  removal paths did not stop them: package remove/purge, `install.sh --wipe`
+  and re-run cleanup, and `quick-install.sh --uninstall` now terminate
+  CHV-owned cloud-hypervisor processes before the binaries and data go away.
+  Those paths — and `preremove.sh` on remove/purge, never on upgrade — also
+  tear down the host state nwd materializes outside `/var/lib/chv`:
+  per-network bridges, namespaces, CHV tap slaves, and `inet chv-*` nftables
+  tables for both hex and operator-chosen ids (including the literal
+  `default` network: `ns-default`, `chv-default`, `chvbr0`), derived from
+  the control-plane database plus the CHV-owned object names. They also
+  remove the live and persisted `MASQUERADE` rules, the CHV sysctl file,
+  and the networkd/ifupdown drop-ins, and every final path clears stale
+  failed unit state. `install.sh --wipe` and
+  `quick-install.sh --uninstall` additionally remove the `install.sh` UI
+  tree, migrations, and nginx site; package removal and an `install.sh`
+  re-run do not own those paths. A sandboxed test runs all three shipped copies
+  (including `preremove.sh` under dash) against fake host tools and proves
+  non-CHV objects survive. This closes the field-plan §6.9 "network residue
+  that survives documented cleanup" blocker found during the rc.6
+  pre-window drills.
+
 ## [0.4.0-rc.5] - 2026-11-06
 
 > **Final release candidate for `v0.4.0`.** The rc.5 runtime is unchanged

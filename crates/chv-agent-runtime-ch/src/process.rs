@@ -2568,6 +2568,30 @@ impl ProcessCloudHypervisorAdapter {
         None
     }
 
+    /// How long the shutdown drain waits between receive-queue probes while
+    /// giving the VMM's serial manager time to observe `SHUT_WR`.
+    const SERIAL_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// Consecutive empty probes required before the read side is shut.
+    /// This is the evidence that the peer has stopped writing; a fixed sleep
+    /// is not, and `SHUT_RD` into a still-writing peer is the v43 freeze
+    /// trigger documented on [`Self::abandon_serial_connection`].
+    const SERIAL_DRAIN_STABLE_POLLS: u32 = 3;
+
+    /// Floor on the observation window. The stable probes are the evidence;
+    /// this keeps a cold first probe from ending the wait before the serial
+    /// manager has had a chance to observe `SHUT_WR` on a loaded host.
+    const SERIAL_DRAIN_MIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Upper bound on the settle loop so a pathological peer cannot push the
+    /// stop past `TimeoutStopSec=75` (the Core executor drain already gets
+    /// up to 60 s of that budget). Shared by every socket in one shutdown.
+    const SERIAL_DRAIN_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Final yield for healers that were mid-reconnect when the draining
+    /// latch was set, so they can abandon their fresh connection cleanly.
+    const SERIAL_DRAIN_FINAL_YIELD: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Reads a serial-socket descriptor's kernel receive queue until it
     /// would block and returns everything drained, restoring the
     /// descriptor's prior status flags. The fd is forced non-blocking for
@@ -2599,6 +2623,57 @@ impl ProcessCloudHypervisorAdapter {
             let _ = nix::fcntl::fcntl(fd, nix::fcntl::F_SETFL(saved));
         }
         drained
+    }
+
+    /// Drains a serial socket until its receive queue has stayed empty for
+    /// [`Self::SERIAL_DRAIN_STABLE_POLLS`] consecutive probes (or the
+    /// deadline expires), forwarding everything into the console fan-out.
+    ///
+    /// `SHUT_WR` alone does not prove the peer stopped writing: the serial
+    /// manager observes the EOF asynchronously, and bytes already in flight
+    /// can land after the first empty probe. The poll interval and the
+    /// [`Self::SERIAL_DRAIN_MIN_SETTLE`] floor bound how long those in-flight
+    /// bytes have to arrive; the
+    /// [`Self::SERIAL_DRAIN_SETTLE_DEADLINE`] bounds the whole wait.
+    ///
+    /// The empty-probe streak is a fast-path signal, not proof of
+    /// quiescence: the broadcaster's concurrent reader shares this socket's
+    /// receive queue, so it can consume a late write between probes. If the
+    /// deadline is reached while the peer is still writing — or a write
+    /// lands after the last probe — the subsequent `SHUT_RD` makes that
+    /// write fail EPIPE, the v43 skipped-THRE freeze trigger documented on
+    /// [`Self::abandon_serial_connection`]. That residual window degrades to
+    /// the pre-fix behavior and is recoverable with `vm.reboot`; the wait
+    /// exists to make it small, not to eliminate it. `settle_start` is
+    /// shared across all sockets so the floor and the deadline cover the
+    /// whole shutdown, not each VM separately.
+    async fn drain_serial_until_stable(
+        fd: &OwnedFd,
+        fanout: &ConsoleFanout,
+        settle_start: std::time::Instant,
+    ) -> usize {
+        let mut empty_streak = 0u32;
+        let mut total = 0usize;
+        loop {
+            let drained = Self::drain_serial_receive_queue(fd);
+            if drained.is_empty() {
+                empty_streak += 1;
+                if empty_streak >= Self::SERIAL_DRAIN_STABLE_POLLS
+                    && settle_start.elapsed() >= Self::SERIAL_DRAIN_MIN_SETTLE
+                {
+                    break;
+                }
+            } else {
+                empty_streak = 0;
+                total += drained.len();
+                fanout.send(&drained);
+            }
+            if settle_start.elapsed() >= Self::SERIAL_DRAIN_SETTLE_DEADLINE {
+                break;
+            }
+            tokio::time::sleep(Self::SERIAL_DRAIN_POLL_INTERVAL).await;
+        }
+        total
     }
 
     /// The per-connection console drain loop (issue #469): a tight
@@ -2644,6 +2719,58 @@ impl ProcessCloudHypervisorAdapter {
         }
     }
 
+    /// Pty-transport variant of [`Self::drain_console_endpoint`]. A pty has
+    /// no `shutdown(2)`, so a blocking read would park until the guest
+    /// writes or the VMM closes the master, and Tokio's runtime drop would
+    /// wait on it until `TimeoutStopSec`. Poll with a short timeout instead
+    /// and leave as soon as the console-draining latch is set, after a
+    /// final non-blocking drain of whatever is already queued.
+    fn drain_console_endpoint_until_draining(
+        cycle_fd: OwnedFd,
+        fanout: &ConsoleFanout,
+        draining: &AtomicBool,
+    ) {
+        let mut buf = [0u8; 4096];
+        loop {
+            if draining.load(Ordering::SeqCst) {
+                let leftover = Self::drain_serial_receive_queue(&cycle_fd);
+                if !leftover.is_empty() {
+                    fanout.send(&leftover);
+                }
+                return;
+            }
+            let mut pfd = nix::libc::pollfd {
+                fd: cycle_fd.as_raw_fd(),
+                events: nix::libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd whose fd is owned by this scope for the
+            // duration of the call.
+            let ready = unsafe {
+                nix::libc::poll(
+                    &mut pfd,
+                    1,
+                    Self::SERIAL_DRAIN_POLL_INTERVAL.as_millis() as i32,
+                )
+            };
+            if ready == 0 {
+                continue; // timeout: re-check the latch
+            }
+            if ready < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EINTR) {
+                    continue;
+                }
+                return;
+            }
+            match nix::unistd::read(&cycle_fd, &mut buf) {
+                Ok(0) | Err(_) => return, // endpoint lost
+                Ok(n) => {
+                    fanout.send(&buf[..n]);
+                }
+            }
+        }
+    }
+
     /// Cleanly abandons a live serial-console connection the agent has
     /// decided not to keep (heal superseded by a map replacement, failed
     /// dup, VM leaving the map). Consumes and closes the descriptor.
@@ -2672,10 +2799,20 @@ impl ProcessCloudHypervisorAdapter {
     /// 3. drop the descriptor — with an empty receive queue the close
     ///    is a FIN, not an RST.
     ///
-    /// `shutdown(SHUT_RD)` is deliberately NOT used anywhere on a live
-    /// connection: it makes the peer's writes fail EPIPE while the
-    /// connection is still open, which is itself a freeze trigger on
-    /// v43 (the skipped-THRE path above).
+    /// `shutdown(SHUT_RD)` is deliberately NOT used on a live connection
+    /// that must keep running: it makes the peer's writes fail EPIPE while
+    /// the connection is still open, which is itself a freeze trigger on
+    /// v43 (the skipped-THRE path above). The sole exception is
+    /// [`Self::drain_and_close_consoles`], where the agent is exiting:
+    /// there the read side is shut only after a bounded settle — a
+    /// [`Self::SERIAL_DRAIN_MIN_SETTLE`] floor, consecutive empty probes on
+    /// the fast path, and a shared [`Self::SERIAL_DRAIN_SETTLE_DEADLINE`] —
+    /// so Tokio's runtime drop can finish without waiting for the VMM to
+    /// close its side. The empty-probe streak is not proof the peer stopped
+    /// writing (the concurrent reader shares the queue, and the deadline can
+    /// fire right after a data-returning probe), so a write-after-shut
+    /// window remains. It degrades to the pre-fix behavior and is
+    /// recoverable with `vm.reboot`.
     async fn abandon_serial_connection(vm_id: &str, fd: OwnedFd, fanout: Option<ConsoleFanout>) {
         if let Err(e) =
             nix::sys::socket::shutdown(fd.as_raw_fd(), nix::sys::socket::Shutdown::Write)
@@ -2721,11 +2858,19 @@ impl ProcessCloudHypervisorAdapter {
     ///    serial manager observes the clean EOF it handles correctly and
     ///    detaches, which also stops it writing guest output into the
     ///    connection;
-    /// 3. after a settle delay, drain each receive queue, forwarding the
-    ///    buffered guest output into the console fan-out (scrollback +
-    ///    console.log) so the descriptors' close at process exit is a
-    ///    FIN, not an RST;
-    /// 4. yield once more so any healer that was mid-reconnect when the
+    /// 3. drain each receive queue with a bounded settle (a floor, a
+    ///    consecutive-empty-probe fast path, and a shared deadline),
+    ///    forwarding the buffered guest output into the console fan-out
+    ///    (scrollback + console.log) so the descriptors' close at process
+    ///    exit is a FIN, not an RST. The streak is a signal, not proof of
+    ///    quiescence; the wait only bounds the write-after-shut window;
+    /// 4. shut down each Socket connection's read side — the live VMM
+    ///    keeps its own write side open, so the dedicated blocking readers
+    ///    would otherwise stay parked in `read()` and Tokio's runtime drop
+    ///    would wait on them until systemd's stop timeout. Pty transports
+    ///    have no `shutdown(2)`; their readers poll the latch instead (see
+    ///    [`Self::drain_console_endpoint_until_draining`]);
+    /// 5. yield once more so any healer that was mid-reconnect when the
     ///    latch was set can acquire the (now released) vm-map lock, see
     ///    the latch, and cleanly abandon its fresh connection before
     ///    the process goes away.
@@ -2746,7 +2891,7 @@ impl ProcessCloudHypervisorAdapter {
             // behind it, and the heal re-checks the draining latch after
             // acquiring it. (Lock order vms -> fanout scrollback matches
             // every other holder.)
-            let mut vms = self.vms.write().await;
+            let vms = self.vms.write().await;
             for (vm_id, proc) in vms.iter() {
                 if !matches!(proc.serial_transport, SerialTransport::Socket(_)) {
                     continue;
@@ -2765,33 +2910,65 @@ impl ProcessCloudHypervisorAdapter {
                     "draining serial-console connections for agent shutdown"
                 );
             }
-            // Settle: let every serial manager observe the EOF, detach
-            // its client, and stop writing guest output into the
-            // connection — the drain below then converges to an empty
-            // queue that stays empty.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Settle on evidence, not a fixed sleep: keep probing each
+            // socket until its receive queue has been empty for consecutive
+            // polls. That proves the serial manager observed `SHUT_WR` and
+            // stopped writing, which is the precondition for the `SHUT_RD`
+            // below (see `drain_serial_until_stable`). Data is forwarded as
+            // it arrives so console.log keeps the shutdown tail.
+            let settle_start = std::time::Instant::now();
             for vm_id in &socket_vm_ids {
-                let Some(proc) = vms.get_mut(vm_id) else {
+                let Some(proc) = vms.get(vm_id) else {
                     continue;
                 };
-                let drained = Self::drain_serial_receive_queue(&proc.console_io);
-                if drained.is_empty() {
-                    continue;
+                let bytes = Self::drain_serial_until_stable(
+                    &proc.console_io,
+                    &proc.console_fanout,
+                    settle_start,
+                )
+                .await;
+                if bytes > 0 {
+                    info!(
+                        vm_id = %vm_id,
+                        bytes = bytes,
+                        "drained buffered console output during agent shutdown"
+                    );
                 }
-                proc.console_fanout.send(&drained);
-                info!(
-                    vm_id = %vm_id,
-                    bytes = drained.len(),
-                    "drained buffered console output during agent shutdown"
-                );
+            }
+            // Unblock the dedicated blocking-pool readers. The SHUT_WR
+            // above only tells the VMM that no more bytes will be sent;
+            // with a live VM the peer keeps its write side open, so each
+            // `spawn_blocking` reader stays parked in `read()` for the
+            // life of the guest. Tokio's `Runtime::drop` waits for
+            // blocking tasks, so the process would never exit: the stop
+            // would burn the full `TimeoutStopSec` and systemd would
+            // SIGKILL the agent (under the old `KillMode=mixed`, the
+            // VMs with it) — the exact opposite of this hook's contract.
+            // shutdown(2) applies to the socket, so it also wakes
+            // the readers' dups: their reads return EOF, the broadcaster
+            // observes the draining latch, and the runtime can drop.
+            // Buffered output was drained above, before the read side is
+            // shut, so this does not truncate the shutdown capture.
+            for vm_id in &socket_vm_ids {
+                let Some(proc) = vms.get(vm_id) else {
+                    continue;
+                };
+                if let Err(e) = nix::sys::socket::shutdown(
+                    proc.console_io.as_raw_fd(),
+                    nix::sys::socket::Shutdown::Read,
+                ) {
+                    debug!(vm_id = %vm_id, error = %e, "console read-shutdown failed (VMM gone?)");
+                }
             }
         }
         // Final yield: healers blocked on the vm-map lock when the drain
         // began release here, observe the latch, and cleanly abandon
         // their fresh connection. Without this yield the process could
         // exit first and abortively close that connection — recreating
-        // the very defect this hook exists to prevent.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // the very defect this hook exists to prevent. Pty broadcasters
+        // also observe the latch on their poll interval well inside this
+        // window.
+        tokio::time::sleep(Self::SERIAL_DRAIN_FINAL_YIELD).await;
     }
 
     /// Duplicates a console fd for a secondary consumer (broadcaster,
@@ -3132,8 +3309,18 @@ impl ProcessCloudHypervisorAdapter {
                 // the same end state the old in-task read loop panicking
                 // produced (AliveGuard drops; the next start_vm respawns).
                 let drain_fanout = fanout.clone();
+                let interruptible = matches!(&transport, SerialTransport::Pty);
+                let drain_draining = console_draining.clone();
                 let drained = tokio::task::spawn_blocking(move || {
-                    Self::drain_console_endpoint(cycle_fd, &drain_fanout)
+                    if interruptible {
+                        Self::drain_console_endpoint_until_draining(
+                            cycle_fd,
+                            &drain_fanout,
+                            &drain_draining,
+                        )
+                    } else {
+                        Self::drain_console_endpoint(cycle_fd, &drain_fanout)
+                    }
                 })
                 .await;
                 if drained.is_err() {
@@ -6958,6 +7145,196 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// A graceful stop must not park forever on a live console connection.
+    /// The drain half-closes the agent's write side so the VMM observes
+    /// EOF, but a live VMM keeps its own write side open; the dedicated
+    /// blocking reader therefore stays in `read()`. Tokio's runtime drop
+    /// waits for blocking tasks, so the agent would hang until systemd's
+    /// `TimeoutStopSec` (and, under the old `KillMode=mixed`, take the VMs
+    /// down with it). The drain's `SHUT_RD` (description-level, so it
+    /// reaches the reader's dup) must end those reads without the peer
+    /// closing first.
+    #[tokio::test]
+    async fn drain_unblocks_live_console_reader_without_peer_close() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-drain-reader");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let sock_path = dir.path().join("serial.sock");
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        let (fanout, _) = ConsoleFanout::new(Vec::new());
+        let broadcaster_alive = Arc::new(AtomicBool::new(false));
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        let _ = child.wait().await;
+
+        let client = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+        let console_io: OwnedFd = client.into();
+        let broadcaster_fd = ProcessCloudHypervisorAdapter::dup_cloexec(&console_io).unwrap();
+        {
+            let mut map = adapter.vms.write().await;
+            map.insert(
+                "vm-drain-reader".to_string(),
+                VmProcess {
+                    api_socket: vm_dir.join("vm.sock"),
+                    child: VmmChild::Owned(child),
+                    console_io,
+                    serial_transport: SerialTransport::Socket(sock_path.clone()),
+                    console_fanout: fanout.clone(),
+                    broadcaster_alive: broadcaster_alive.clone(),
+                    cpu_ticks: chv_monitoring_core::CounterState::new(),
+                    last_cpu_at: None,
+                    boot_watermark: AtomicU64::new(0),
+                },
+            );
+        }
+        broadcaster_alive.store(true, Ordering::SeqCst);
+        ProcessCloudHypervisorAdapter::spawn_pty_broadcaster(
+            adapter.vms.clone(),
+            "vm-drain-reader".to_string(),
+            broadcaster_fd,
+            SerialTransport::Socket(sock_path.clone()),
+            fanout,
+            broadcaster_alive.clone(),
+            adapter.console_draining.clone(),
+        );
+
+        // Accept the agent's connection but do NOT close it: this is the
+        // live-VMM shape the half-close alone cannot unblock.
+        let conn = loop {
+            match listener.accept() {
+                Ok((conn, _)) => break conn,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        // Let the broadcaster enter its blocking read.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            broadcaster_alive.load(Ordering::SeqCst),
+            "broadcaster must be live before the drain"
+        );
+
+        let started = std::time::Instant::now();
+        adapter.drain_and_close_consoles().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broadcaster_alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !broadcaster_alive.load(Ordering::SeqCst),
+            "the shutdown drain must unblock the console reader, not wait for the VMM to close"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the drain must not park on a live console connection"
+        );
+        drop(conn);
+    }
+
+    /// The settle before `SHUT_RD` is evidence-based: bytes the VMM writes
+    /// after observing `SHUT_WR` (already in flight) must be captured, and
+    /// an early empty probe must not be mistaken for quiescence.
+    #[tokio::test]
+    async fn drain_serial_until_stable_captures_late_writes() {
+        use std::io::Write as _;
+
+        let (agent_side, mut peer_side) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd: OwnedFd = agent_side.into();
+        let (fanout, _) = ConsoleFanout::new(Vec::new());
+
+        nix::sys::socket::shutdown(fd.as_raw_fd(), nix::sys::socket::Shutdown::Write).unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            peer_side.write_all(b"late-shutdown-tail").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+
+        let bytes = ProcessCloudHypervisorAdapter::drain_serial_until_stable(
+            &fd,
+            &fanout,
+            std::time::Instant::now(),
+        )
+        .await;
+        writer.join().unwrap();
+
+        assert_eq!(bytes, b"late-shutdown-tail".len());
+        assert_eq!(fanout.scrollback_snapshot(), b"late-shutdown-tail");
+    }
+
+    /// Pty transports have no `shutdown(2)`. Before this fix the shutdown
+    /// drain skipped them, so the blocking console reader stayed parked and
+    /// Tokio's runtime drop waited until `TimeoutStopSec=75`. The reader now
+    /// polls and observes the draining latch.
+    #[tokio::test]
+    async fn pty_console_reader_observes_the_shutdown_latch() {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let _master = pty.master; // keep the master open: no data, no HUP
+        let slave: OwnedFd = pty.slave;
+
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let vm_dir = dir.path().join("vm-pty-drain");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+
+        let adapter = ProcessCloudHypervisorAdapter::new(dir.path().join("chv"));
+        let (fanout, _) = ConsoleFanout::new(Vec::new());
+        let broadcaster_alive = Arc::new(AtomicBool::new(false));
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        let _ = child.wait().await;
+
+        let broadcaster_fd = ProcessCloudHypervisorAdapter::dup_cloexec(&slave).unwrap();
+        {
+            let mut map = adapter.vms.write().await;
+            map.insert(
+                "vm-pty-drain".to_string(),
+                VmProcess {
+                    api_socket: vm_dir.join("vm.sock"),
+                    child: VmmChild::Owned(child),
+                    console_io: slave,
+                    serial_transport: SerialTransport::Pty,
+                    console_fanout: fanout.clone(),
+                    broadcaster_alive: broadcaster_alive.clone(),
+                    cpu_ticks: chv_monitoring_core::CounterState::new(),
+                    last_cpu_at: None,
+                    boot_watermark: AtomicU64::new(0),
+                },
+            );
+        }
+        broadcaster_alive.store(true, Ordering::SeqCst);
+        ProcessCloudHypervisorAdapter::spawn_pty_broadcaster(
+            adapter.vms.clone(),
+            "vm-pty-drain".to_string(),
+            broadcaster_fd,
+            SerialTransport::Pty,
+            fanout,
+            broadcaster_alive.clone(),
+            adapter.console_draining.clone(),
+        );
+
+        // Let the broadcaster's poll loop park with no master data.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(broadcaster_alive.load(Ordering::SeqCst));
+
+        let started = std::time::Instant::now();
+        adapter.drain_and_close_consoles().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broadcaster_alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !broadcaster_alive.load(Ordering::SeqCst),
+            "the shutdown drain must unblock a Pty console reader"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "a Pty console reader must not park until TimeoutStopSec"
+        );
     }
 
     /// `vm.reboot` in cloud-hypervisor v43 tears the VM down and
