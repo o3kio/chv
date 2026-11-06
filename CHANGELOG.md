@@ -63,14 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still cannot be re-applied fails with an error naming the exact journal
   file.
 - **Firewall-rule validation now matches what the renderer can produce.**
-  The shared save gate and nwd reject IPv6 CIDRs and non-canonical numeric
-  forms nft would read as octal (leading zeros), reject `+`-prefixed CIDR
-  prefixes/ports and reversed port ranges, and the BFF save gate rejects a
-  `dest_port` on a protocol without ports (`icmp`/`all`). nwd still applies
-  rc.7 stored rulesets with such a port ignored (warning logged) so an
-  upgrade does not regress, and `sctp` destination ports are now rendered
-  instead of silently ignored. Every rejected form previously either failed
-  at nft after being journaled or broadened the rule the operator wrote.
+  The BFF save gate requires canonical IPv4 CIDRs and decimal ports/ranges
+  (it rejects IPv6, leading zeros nft would read as octal, `+` prefixes,
+  reversed ranges, and a `dest_port` on a protocol without ports). nwd
+  rejects the forms nft can never apply before journaling, and canonicalizes
+  the rc.7-storable numeric forms (leading-zero or `+`-prefixed ports,
+  non-canonical CIDR prefixes) before rendering, so a stored rc.7 ruleset
+  keeps applying instead of dying at the attach seam with no policy
+  installed. `sctp` destination ports render when canonical (rc.7 ignored
+  them); a legacy `dest_port` on `icmp`/`all`/unrenderable `sctp` is still
+  applied with the port ignored and a warning, preserving rc.7 behavior.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**

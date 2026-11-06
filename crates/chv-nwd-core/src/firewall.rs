@@ -16,6 +16,60 @@ const ALLOWED_PROTOCOLS: &[&str] = chv_common::firewall::PROTOCOLS;
 const ALLOWED_ACTIONS: &[&str] = chv_common::firewall::ACTIONS;
 const ALLOWED_DIRECTIONS: &[&str] = chv_common::firewall::DIRECTIONS;
 
+/// Canonicalize an IPv4 CIDR for rendering, accepting the non-canonical
+/// decimal prefix forms rc.7's save gate allowed.
+///
+/// nft's lexer reads a leading zero as octal: `/030` means `/24`. Rendering the
+/// legacy string literally would enforce a different block than the operator
+/// wrote, so rc.8 renders the decimal value (`/30`). Malformed and IPv6 CIDRs
+/// return `None`; rc.7 could never apply those either (the renderer emits
+/// `ip saddr`, IPv4-only).
+///
+/// Why accept legacy forms at all: the attach-time policy dispatch deliberately
+/// drops nwd's semantic error, so rejecting a stored rc.7 ruleset here would
+/// leave the new tap outside the policy chains with no error surfaced
+/// (fail-open). Canonicalizing keeps the network guarded.
+fn canonical_cidr(cidr: &str) -> Option<String> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let prefix: u32 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    // `Ipv4Addr` rejects leading-zero octets and short forms, so nft cannot
+    // reinterpret the address side.
+    let addr: std::net::Ipv4Addr = addr.parse().ok()?;
+    Some(format!("{addr}/{prefix}"))
+}
+
+/// Canonicalize a single port or ascending range for rendering, accepting the
+/// rc.7-storable forms (`+443`, `0443`, `8090-8080`).
+///
+/// Rust's parsers are decimal while nft's lexer is octal for a leading zero,
+/// so a literal round-trip can silently change the enforced port. Emit the
+/// decimal value instead. A reversed or non-numeric range returns `None`: rc.7
+/// could not apply it either (nft rejects it).
+fn canonical_port_spec(spec: &str) -> Option<String> {
+    fn endpoint(value: &str) -> Option<u16> {
+        let value = value.strip_prefix('+').unwrap_or(value);
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<u16>().ok()
+    }
+    if let Some((lo, hi)) = spec.split_once('-') {
+        let (lo, hi) = (endpoint(lo)?, endpoint(hi)?);
+        if lo > hi {
+            return None;
+        }
+        Some(format!("{lo}-{hi}"))
+    } else {
+        Some(endpoint(spec)?.to_string())
+    }
+}
+
 fn validate_rule(rule: &FirewallRule) -> Result<(), ChvError> {
     if !ALLOWED_DIRECTIONS.contains(&rule.direction.as_str()) {
         return Err(ChvError::InvalidArgument {
@@ -45,7 +99,7 @@ fn validate_rule(rule: &FirewallRule) -> Result<(), ChvError> {
         });
     }
     if let Some(ref cidr) = rule.source_cidr {
-        if !is_valid_cidr(cidr) {
+        if canonical_cidr(cidr).is_none() {
             return Err(ChvError::InvalidArgument {
                 field: "source_cidr".to_string(),
                 reason: format!("invalid CIDR: '{}'", cidr),
@@ -53,27 +107,21 @@ fn validate_rule(rule: &FirewallRule) -> Result<(), ChvError> {
         }
     }
     if let Some(ref port) = rule.dest_port {
-        if !is_valid_port_spec(port) {
+        // tcp/udp always render the port, so an unrenderable spec must be
+        // rejected before it is journaled (apply would fail and poison
+        // fail-closed recovery). sctp renders a canonical spec and otherwise
+        // falls back to the rc.7 behavior (port ignored, warning logged); icmp
+        // and all never render a port. Rejecting those legacy combinations
+        // would regress a stored rc.7 ruleset, and the unchecked attach seam
+        // would then proceed with no policy (fail-open).
+        if matches!(rule.protocol.as_str(), "tcp" | "udp") && canonical_port_spec(port).is_none() {
             return Err(ChvError::InvalidArgument {
                 field: "dest_port".to_string(),
                 reason: format!("invalid port spec: '{}'", port),
             });
         }
-        // Deliberately NOT rejected for icmp/all: rc.7's BFF accepted such a
-        // rule and nwd applied it with the port ignored, so rejecting it here
-        // would regress an upgrade (the stored ruleset would fail every
-        // dispatch). The BFF gate rejects it for new saves; the renderer logs
-        // a warning for legacy data instead of silently broadening it.
     }
     Ok(())
-}
-
-fn is_valid_cidr(cidr: &str) -> bool {
-    chv_common::firewall::is_valid_cidr(cidr)
-}
-
-fn is_valid_port_spec(port: &str) -> bool {
-    chv_common::firewall::is_valid_port_spec(port)
 }
 
 /// Policy chains (plain, non-hook) that carry CHV default-deny semantics inside
@@ -303,35 +351,60 @@ pub async fn apply_firewall_rules(
             args.push(&protocol_lower);
         }
 
+        // Canonicalize before borrowing: the argv is a Vec<&str>, so the
+        // normalized strings must outlive the pushes.
+        let cidr_match = match rule.source_cidr {
+            Some(ref cidr) => {
+                Some(
+                    canonical_cidr(cidr).ok_or_else(|| ChvError::InvalidArgument {
+                        field: "source_cidr".to_string(),
+                        reason: format!("invalid CIDR: '{}'", cidr),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let port_match = if let Some(ref port) = rule.dest_port {
+            match protocol_lower.as_str() {
+                "tcp" | "udp" | "sctp" => canonical_port_spec(port),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Source CIDR match
-        let cidr_owned;
-        if let Some(ref cidr) = rule.source_cidr {
+        if let Some(ref cidr) = cidr_match {
             args.push("ip");
             args.push("saddr");
-            cidr_owned = cidr.clone();
-            args.push(&cidr_owned);
+            args.push(cidr);
         }
 
         // Destination port match
-        let port_owned;
-        if let Some(ref port) = rule.dest_port {
-            if matches!(protocol_lower.as_str(), "tcp" | "udp" | "sctp") {
-                args.push(&protocol_lower);
-                args.push("dport");
-                port_owned = port.clone();
-                args.push(&port_owned);
-            } else {
-                // Legacy ruleset from before the save gate tightened: keep the
-                // old behavior (apply, ignore the port) instead of failing an
-                // upgrade, but say loudly that the constraint is not enforced.
-                tracing::warn!(
-                    network_table = %table,
-                    protocol = %rule.protocol,
-                    dest_port = %port,
-                    "dest_port is not valid for this protocol and is ignored; \
-                     re-save the rule to remove the field"
-                );
+        if let Some(ref port) = port_match {
+            args.push(&protocol_lower);
+            args.push("dport");
+            args.push(port);
+        } else if let Some(ref port) = rule.dest_port {
+            if matches!(protocol_lower.as_str(), "tcp" | "udp") {
+                // Validation guarantees this cannot happen; fail closed
+                // rather than silently broadening the rule if it ever does.
+                return Err(ChvError::InvalidArgument {
+                    field: "dest_port".to_string(),
+                    reason: format!("invalid port spec: '{}'", port),
+                });
             }
+            // Legacy rc.7 ruleset: nwd accepted and ignored the port for
+            // icmp/all/sctp. Preserve that (a rejected stored ruleset would
+            // leave the tap unguarded, because the attach seam drops the
+            // error), but say loudly that the constraint is not enforced.
+            tracing::warn!(
+                network_table = %table,
+                protocol = %rule.protocol,
+                dest_port = %port,
+                "dest_port cannot be rendered for this protocol and is ignored; \
+                 re-save the rule with a canonical port (or without it)"
+            );
         }
 
         // Action
@@ -386,14 +459,14 @@ fn parse_nat_rules(policy_json: &[u8]) -> Result<Vec<NatRule>, ChvError> {
 }
 
 fn validate_nat_rule(rule: &NatRule) -> Result<(), ChvError> {
-    if !is_valid_cidr(&rule.source_cidr) {
+    if canonical_cidr(&rule.source_cidr).is_none() {
         return Err(ChvError::InvalidArgument {
             field: "source_cidr".to_string(),
             reason: format!("invalid CIDR: '{}'", rule.source_cidr),
         });
     }
     if let Some(ref dest) = rule.dest_cidr {
-        if !is_valid_cidr(dest) {
+        if canonical_cidr(dest).is_none() {
             return Err(ChvError::InvalidArgument {
                 field: "dest_cidr".to_string(),
                 reason: format!("invalid CIDR: '{}'", dest),
@@ -460,11 +533,20 @@ pub async fn apply_nat_rules(
             let mut args = add_rule_prefix(table, "postrouting");
             args.extend(iif_guard.clone());
 
+            let source =
+                canonical_cidr(&rule.source_cidr).ok_or_else(|| ChvError::InvalidArgument {
+                    field: "source_cidr".to_string(),
+                    reason: format!("invalid CIDR: '{}'", rule.source_cidr),
+                })?;
             args.push("ip".to_string());
             args.push("saddr".to_string());
-            args.push(rule.source_cidr.clone());
+            args.push(source);
 
             if let Some(ref dest) = rule.dest_cidr {
+                let dest = canonical_cidr(dest).ok_or_else(|| ChvError::InvalidArgument {
+                    field: "dest_cidr".to_string(),
+                    reason: format!("invalid CIDR: '{}'", dest),
+                })?;
                 args.push("ip".to_string());
                 args.push("daddr".to_string());
                 args.push(dest.clone());
@@ -681,15 +763,15 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_cidr() {
-        assert!(is_valid_cidr("10.0.0.0/24"));
-        assert!(is_valid_cidr("192.168.1.0/16"));
+    fn test_canonical_cidr() {
+        assert!(canonical_cidr("10.0.0.0/24").is_some());
+        assert!(canonical_cidr("192.168.1.0/16").is_some());
         // The engine renders IPv4 `ip saddr` only (see chv_common::firewall).
-        assert!(!is_valid_cidr("::1/128"));
-        assert!(!is_valid_cidr("fd00::/8"));
-        assert!(!is_valid_cidr("10.0.0.0"));
-        assert!(!is_valid_cidr("not-ip/24"));
-        assert!(!is_valid_cidr("10.0.0.0/999"));
+        assert!(canonical_cidr("::1/128").is_none());
+        assert!(canonical_cidr("fd00::/8").is_none());
+        assert!(canonical_cidr("10.0.0.0").is_none());
+        assert!(canonical_cidr("not-ip/24").is_none());
+        assert!(canonical_cidr("10.0.0.0/999").is_none());
     }
 
     #[test]
@@ -831,45 +913,53 @@ mod tests {
             ),
             Err(ChvError::InvalidArgument { .. })
         ));
-        // nft reads a leading zero as octal; `/030` means /24, so a
-        // non-canonical prefix must not reach the journal.
-        assert!(matches!(
-            validate_firewall_policy(
-                br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"10.0.0.0/030"}]"#
-            ),
-            Err(ChvError::InvalidArgument { .. })
-        ));
-        for port in [
-            "8090-8080",
-            "+443",
-            "+8080-+8090",
-            "0443",
-            "0700",
-            "600-0777",
-        ] {
+        // nft reads a leading zero as octal; nwd canonicalizes the prefix to
+        // its decimal value before rendering, so a stored rc.7 ruleset keeps
+        // applying (a rejection here would be swallowed by the attach seam and
+        // leave the tap unguarded).
+        assert!(validate_firewall_policy(
+            br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"10.0.0.0/030"}]"#
+        )
+        .is_ok());
+        // Only an unrenderable port is rejected on tcp/udp. rc.7-storable
+        // forms (`+443`, `0443`, `600-0777`) are canonicalized and applied;
+        // a reversed range could never apply and is rejected before
+        // journaling.
+        for port in ["+443", "+8080-+8090", "0443", "0700", "600-0777"] {
             let payload = format!(
                 r#"[{{"direction":"inbound","protocol":"tcp","action":"accept","dest_port":"{port}"}}]"#
             );
             assert!(
-                matches!(
-                    validate_firewall_policy(payload.as_bytes()),
-                    Err(ChvError::InvalidArgument { .. })
-                ),
-                "port spec {port} would be rejected or reinterpreted by nft and must not be accepted"
+                validate_firewall_policy(payload.as_bytes()).is_ok(),
+                "legacy port spec {port} must keep applying"
             );
         }
-        // Legacy rc.7 rulesets may carry a dest_port on icmp/all. nwd keeps
-        // applying them (the port is ignored, with a warning) so an upgrade
-        // does not regress; the BFF gate rejects the combination for new saves.
-        assert!(validate_firewall_policy(
-            br#"[{"direction":"inbound","protocol":"icmp","action":"accept","dest_port":"443"}]"#
-        )
-        .is_ok());
-        assert!(validate_firewall_policy(
-            br#"[{"direction":"inbound","protocol":"all","action":"accept","dest_port":"443"}]"#
-        )
-        .is_ok());
-        // sctp does carry ports and the renderer emits `sctp dport`.
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"tcp","action":"accept","dest_port":"8090-8080"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        // Legacy rc.7 rulesets may carry a dest_port on icmp/all/sctp and any
+        // string form: rc.7 applied it with the port ignored. nwd keeps that
+        // behavior (warning logged) so an upgrade does not regress; the BFF
+        // gate rejects the combination for new saves.
+        for (protocol, port) in [
+            ("icmp", "443"),
+            ("all", "443"),
+            ("sctp", "0443"),
+            ("sctp", "8090-8080"),
+        ] {
+            let payload = format!(
+                r#"[{{"direction":"inbound","protocol":"{protocol}","action":"accept","dest_port":"{port}"}}]"#
+            );
+            assert!(
+                validate_firewall_policy(payload.as_bytes()).is_ok(),
+                "legacy {protocol} + {port} must keep applying"
+            );
+        }
+        // sctp does carry ports and the renderer emits `sctp dport` when the
+        // spec is canonical.
         assert!(validate_firewall_policy(
             br#"[{"direction":"inbound","protocol":"sctp","action":"accept","dest_port":"8080-8090"}]"#
         )
@@ -891,6 +981,45 @@ mod tests {
             validate_nat_policy(b"not json"),
             Err(ChvError::InvalidArgument { .. })
         ));
+        // rc.7 stored nat_rules verbatim and nft read `/030` as /24; rc.8
+        // canonicalizes the prefix instead of rejecting the stored entry.
+        assert!(validate_nat_policy(br#"[{"source_cidr":"10.0.0.0/030"}]"#).is_ok());
+        assert!(matches!(
+            validate_nat_policy(br#"[{"source_cidr":"10.0.0.0/+24"}]"#),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn canonicalizers_make_legacy_forms_unambiguous() {
+        // nft's octal lexer cannot reinterpret these once rendered.
+        assert_eq!(
+            canonical_cidr("10.0.0.0/030").as_deref(),
+            Some("10.0.0.0/30")
+        );
+        assert_eq!(canonical_cidr("10.0.0.0/00").as_deref(), Some("10.0.0.0/0"));
+        assert_eq!(
+            canonical_cidr("10.0.0.0/24").as_deref(),
+            Some("10.0.0.0/24")
+        );
+        assert_eq!(canonical_cidr("010.0.0.0/24"), None);
+        assert_eq!(canonical_cidr("fd00::/8"), None);
+        assert_eq!(canonical_cidr("10.0.0.0/+24"), None);
+        assert_eq!(canonical_cidr("10.0.0.0/33"), None);
+
+        assert_eq!(canonical_port_spec("443").as_deref(), Some("443"));
+        assert_eq!(canonical_port_spec("+443").as_deref(), Some("443"));
+        assert_eq!(canonical_port_spec("0443").as_deref(), Some("443"));
+        assert_eq!(canonical_port_spec("0700").as_deref(), Some("700"));
+        assert_eq!(canonical_port_spec("600-0777").as_deref(), Some("600-777"));
+        assert_eq!(
+            canonical_port_spec("+8080-+8090").as_deref(),
+            Some("8080-8090")
+        );
+        assert_eq!(canonical_port_spec("8090-8080"), None);
+        assert_eq!(canonical_port_spec("80-"), None);
+        assert_eq!(canonical_port_spec("ssh"), None);
+        assert_eq!(canonical_port_spec("0-99999"), None);
     }
 
     #[test]

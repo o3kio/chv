@@ -927,9 +927,10 @@ fn validate_firewall_ruleset(rules: &[serde_json::Value]) -> Result<(), BffError
             obj.get("dest_port"),
             vocab::is_valid_port_spec,
         )?;
-        // A port only renders for protocols that carry one. nwd now rejects the
-        // combination (silently ignoring it would broaden the rule), so the
-        // save gate must fail fast with the same truth.
+        // A port only renders for protocols that carry one. New saves must not
+        // carry the combination (silently ignoring it would broaden the rule);
+        // nwd still tolerates it for rc.7-stored rulesets (port ignored, a
+        // warning logged) so an upgrade does not fail closed at attach time.
         if obj.get("dest_port").is_some_and(|v| !v.is_null()) {
             let protocol = obj
                 .get("protocol")
