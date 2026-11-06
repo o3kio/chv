@@ -174,12 +174,17 @@ in the install output. You will be required to change it on first login.
 ## Quick Install (single command, from GitHub releases)
 
 > **Deployment status:** [CONTAINER-VERIFIED]. The fresh-host qualification
-> lane (run
-> [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140))
-> installed the published `v0.4.0-rc.1` release with this one-liner in a clean
-> Ubuntu noble container and asserted bring-up, login, enrollment, WebUI and
-> metrics (all four legs green; see the
-> [evidence report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md)).
+> lane installed the published release with this one-liner in a clean Ubuntu
+> noble container and asserted bring-up, login, enrollment, WebUI and metrics.
+> The `v0.4.0-rc.1` lane
+> ([42042149140](https://github.com/o3kio/chv/actions/runs/42042149140))
+> established the path; the `v0.4.0-rc.5` lane
+> ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210))
+> re-established it after the rc.2–rc.4 installer defects, with all four legs
+> green and the quick leg in candidate mode (node enrolled, admin credential
+> persisted across a control-plane restart, WAL retained). See the
+> [rc.1 evidence report](evidence/production-readiness/v0.4.0-rc1/fresh-host-qualification.md)
+> and the [rc.5 evidence report](evidence/production-readiness/v0.4.0-rc5/fresh-host-qualification.md).
 > The container shares the host kernel/network namespace and has no `/dev/kvm`,
 > so this is not bare-metal evidence. `scripts/install.sh` remains the
 > qualified (KVM-verified) deployment path.
@@ -197,7 +202,10 @@ in the install output. You will be required to change it on first login.
 > `v0.4.0-rc.5` (#727). The rc.4 tarball/package and upgrade path is
 > unaffected and passed its lane. See the
 > [rc.5 release notes](release/v0.4.0-rc.5-release-notes.md) §2. The rc.5
-> post-publication lane is run after publication and is not pre-claimed here.
+> post-publication lane
+> ([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210))
+> passed all four legs; see the
+> [rc.5 evidence report](evidence/production-readiness/v0.4.0-rc5/fresh-host-qualification.md).
 
 A curl-pipe-bash installer for trying CHV on a fresh Linux host — one
 command yields the control plane with the WebUI served by the binary
@@ -291,7 +299,10 @@ was run on a clean Ubuntu noble container and asserted package install,
 config generation, service bring-up, agent enrollment, WebUI serving, and all
 four `/metrics` listeners (run
 [42042149140](https://github.com/o3kio/chv/actions/runs/42042149140), tag
-`v0.4.0-rc.1`). This is the same gate shape as the container package-smoke leg
+`v0.4.0-rc.1`). The label remains [CONTAINER-VERIFIED] after the rc.5 re-run
+([42159563210](https://github.com/o3kio/chv/actions/runs/42159563210), tag
+`v0.4.0-rc.5`), which passed all four legs after the rc.4 quick-install defect
+was fixed. This is the same gate shape as the container package-smoke leg
 that ran in #549 (2026-10-08). The scope is the container contract — not
 bare-metal behavior and not guest execution.
 
