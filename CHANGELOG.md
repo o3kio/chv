@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ports render when canonical (rc.7 ignored them); a legacy `dest_port` on
   `icmp`/`all`/unrenderable `sctp` is still applied with the port ignored and
   a warning, preserving rc.7 behavior.
+- **Fabric overlay changes cannot add an unguarded interface.** A fabric
+  apply grafts a consumer veth into the tenant bridge, and the guard set is
+  what dispatches guest traffic into the policy chains (the base hooks are
+  `policy accept`). If the network's last firewall/NAT save was rejected, both
+  the overlay update and a fabric-carrying ensure now refuse before touching
+  the datapath. If a rejection races a post-graft guard refresh, the handler
+  removes the overlay, resets the bridge MTU, clears the persisted fabric
+  generation, and reports that the overlay was rolled back; retry with the
+  latest plan. The rollback is operator-visible: it tears down the network's
+  fabric overlay rather than leaving a new veth outside the guard set.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**

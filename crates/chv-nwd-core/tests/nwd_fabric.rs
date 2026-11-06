@@ -818,10 +818,97 @@ async fn update_overlay_rolls_back_when_the_guard_refresh_fails() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(
-        replay.status, "OK",
+    assert_ne!(
+        replay.error_code, "STALE_GENERATION",
         "the rolled-back generation must not leave a stale fence: {replay:?}"
     );
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .any(|c| c == "apply_fabric:net-ov-rollback:100:2:br-fab"),
+        "the older plan must be re-applied, not fenced: {:?}",
+        executor.calls()
+    );
+}
+
+#[tokio::test]
+async fn ensure_with_fabric_refuses_a_rejected_policy_before_grafting() {
+    let executor = FabricExecutor::enabled();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-ensure-reject", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+    let applied_before = executor.count("apply_fabric:");
+
+    let nat = client
+        .set_nat_policy(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-ensure-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: br#"[{"source_cidr":"not-a-cidr"}]"#.to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(nat.status, "OK");
+
+    let mut newer = fabric_topology_spec("net-ensure-reject", 3);
+    newer.fabric = fabric_plan(3, 0);
+    let refused = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(newer.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(refused.status, "error");
+    assert_eq!(
+        executor.count("apply_fabric:"),
+        applied_before,
+        "a rejected policy must not graft a veth that the guard set cannot cover"
+    );
+
+    let valid = client
+        .set_nat_policy(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-ensure-reject".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v2".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.status, "OK");
+
+    let applied = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(newer),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.status, "OK");
+    assert!(executor
+        .calls()
+        .iter()
+        .any(|c| c == "apply_fabric:net-ensure-reject:100:3:br-fab"));
 }
 
 #[tokio::test]

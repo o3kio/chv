@@ -86,6 +86,10 @@ pub struct NetworkServiceImpl<E: NetworkExecutor> {
     /// Serializes policy-journal updates with the in-memory `policy_state`
     /// mutation so concurrent firewall/NAT RPCs cannot persist a half pair.
     policy_persist: AsyncMutex<()>,
+    /// Serializes fabric datapath mutations (overlay apply/rollback and the
+    /// ensure path's fabric apply) so one operation's guard-refresh rollback
+    /// cannot tear down a concurrent operation's overlay.
+    fabric_ops: AsyncMutex<()>,
 }
 
 impl<E: NetworkExecutor> NetworkServiceImpl<E> {
@@ -103,6 +107,7 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             topology_store: None,
             policy_store: None,
             policy_persist: AsyncMutex::new(()),
+            fabric_ops: AsyncMutex::new(()),
         }
     }
 
@@ -638,6 +643,18 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // and the datapath would keep the OLD VNI, silently cross-bleeding
         // two networks.
         let existing = self.topologies.get(&spec.network_id);
+        // Serialize fabric datapath mutations across ensure/update so a
+        // rollback in one handler cannot remove the overlay a concurrent
+        // handler just applied.
+        let _fabric_guard = if spec.fabric.is_some()
+            || existing
+                .as_ref()
+                .is_some_and(|s| s.fabric_plan_generation.is_some())
+        {
+            Some(self.fabric_ops.lock().await)
+        } else {
+            None
+        };
         if let Some(existing) = existing.as_ref() {
             let new_fabric_generation = spec.fabric.as_ref().map(|f| f.plan_generation);
             if let (Some(applied_gen), Some(new_gen)) =
@@ -752,6 +769,17 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         }
 
+        // A rejected policy has no desired state to re-scope a newly grafted
+        // consumer veth with. Refuse a fabric apply before touching the
+        // datapath (the base hooks are `policy accept`; only the guard set
+        // dispatches guest traffic). Bridge-only re-ensures above are allowed:
+        // they remove fabric members instead of adding one.
+        if spec.fabric.is_some() {
+            if let Some(e) = self.rejection_error(&spec.network_id) {
+                return Ok(Response::new(Self::err_result(&e)));
+            }
+        }
+
         let fabric_intent = spec.fabric.is_some();
         let result = self.executor.ensure_topology(&spec).await;
         match result {
@@ -784,13 +812,67 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                         }
                     }
                 }
+                // Guard the newly grafted consumer veth BEFORE persisting the
+                // topology. If a concurrent rejected policy makes the refresh
+                // fail, roll the overlay back instead of leaving the veth
+                // outside the policy chains (base hooks are `policy accept`).
+                let state = Self::state_from_apply(&spec, &applied);
+                if applied.fabric_plan_generation.is_some() {
+                    if let Err(e) = self.refresh_policy_scope(&state).await {
+                        match self.executor.remove_fabric_overlay(&spec.network_id).await {
+                            Ok(()) => {
+                                self.metrics.increment_nwd_fabric_remove("success");
+                                if let Err(mtu_err) = self
+                                    .executor
+                                    .reassert_tenant_mtu(
+                                        &spec.network_id,
+                                        &spec.bridge_name,
+                                        &spec.subnet_cidr,
+                                        &spec.gateway_ip,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        network_id = %spec.network_id,
+                                        error = %mtu_err,
+                                        "failed to reset the bridge MTU after rolling back a \
+                                         fabric overlay"
+                                    );
+                                }
+                            }
+                            Err(remove_err) => {
+                                self.metrics.increment_nwd_fabric_remove("failure");
+                                error!(
+                                    network_id = %spec.network_id,
+                                    error = %remove_err,
+                                    "failed to roll back a fabric overlay after the policy guard \
+                                     refresh failed; the consumer veth may remain outside the \
+                                     guard"
+                                );
+                            }
+                        }
+                        if let Some(existing) = existing.as_ref() {
+                            self.topologies.upsert(TopologyState {
+                                vni: None,
+                                tenant_mtu: None,
+                                fabric_plan_generation: None,
+                                binding_generation: None,
+                                ..existing.clone()
+                            });
+                        }
+                        let e = ChvError::Internal {
+                            reason: format!("{e}; the fabric overlay was rolled back"),
+                        };
+                        return Ok(Response::new(Self::err_result(&e)));
+                    }
+                }
                 // Journal BEFORE the in-memory upsert: if the write fails,
                 // the retry cannot short-circuit on a topology whose durable
                 // record is missing.
                 if let Err(e) = self.journal_topology(&spec).await {
                     return Ok(Response::new(Self::err_result(&e)));
                 }
-                let state = Self::state_from_apply(&spec, &applied);
                 self.topologies.upsert(state);
                 Ok(Response::new(Self::ok_result()))
             }
@@ -1503,6 +1585,10 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         request: Request<proto::UpdateOverlayRequest>,
     ) -> Result<Response<proto::UpdateOverlayResponse>, Status> {
         self.metrics.increment_counter("nwd_update_overlay_total");
+        // Serialize with the ensure path's fabric apply/rollback so this
+        // update's rollback cannot remove an overlay a concurrent operation
+        // just applied (and vice versa).
+        let _fabric_guard = self.fabric_ops.lock().await;
         let req = request.into_inner();
 
         let state = match self.topologies.get(&req.network_id) {
@@ -1627,15 +1713,37 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 // the overlay back: leaving the new veth grafted would put it
                 // outside the guard set.
                 if let Err(e) = self.refresh_policy_scope(&updated_state).await {
-                    if let Err(remove_err) =
-                        self.executor.remove_fabric_overlay(&req.network_id).await
-                    {
-                        error!(
-                            network_id = %req.network_id,
-                            error = %remove_err,
-                            "failed to roll back a fabric overlay after the policy guard \
-                             refresh failed; the consumer veth may remain outside the guard"
-                        );
+                    match self.executor.remove_fabric_overlay(&req.network_id).await {
+                        Ok(()) => {
+                            self.metrics.increment_nwd_fabric_remove("success");
+                            if let Err(mtu_err) = self
+                                .executor
+                                .reassert_tenant_mtu(
+                                    &req.network_id,
+                                    &updated_state.bridge_name,
+                                    &updated_state.subnet_cidr,
+                                    &updated_state.gateway_ip,
+                                    None,
+                                )
+                                .await
+                            {
+                                error!(
+                                    network_id = %req.network_id,
+                                    error = %mtu_err,
+                                    "failed to reset the bridge MTU after rolling back a \
+                                     fabric overlay"
+                                );
+                            }
+                        }
+                        Err(remove_err) => {
+                            self.metrics.increment_nwd_fabric_remove("failure");
+                            error!(
+                                network_id = %req.network_id,
+                                error = %remove_err,
+                                "failed to roll back a fabric overlay after the policy guard \
+                                 refresh failed; the consumer veth may remain outside the guard"
+                            );
+                        }
                     }
                     self.topologies.upsert(TopologyState {
                         vni: None,
@@ -1644,6 +1752,12 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                         binding_generation: None,
                         ..state.clone()
                     });
+                    let e = ChvError::Internal {
+                        reason: format!(
+                            "{e}; the fabric overlay was rolled back and the \
+                                         generation fence cleared; retry with the latest plan"
+                        ),
+                    };
                     return Ok(Response::new(proto::UpdateOverlayResponse {
                         result: Some(Self::err_result(&e)),
                     }));
