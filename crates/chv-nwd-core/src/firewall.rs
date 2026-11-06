@@ -158,19 +158,35 @@ fn user_rule_insertion_plan(rules: &[FirewallRule]) -> Vec<(&'static str, &Firew
         .collect()
 }
 
+fn parse_firewall_rules(policy_json: &[u8]) -> Result<Vec<FirewallRule>, ChvError> {
+    if policy_json.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(policy_json).map_err(|e| ChvError::InvalidArgument {
+        field: "policy_json".to_string(),
+        reason: format!("failed to parse firewall rules: {}", e),
+    })
+}
+
+/// Validate a firewall payload without touching the host.
+///
+/// The RPC boundary calls this before journaling a policy as desired state.
+/// A payload the engine can never apply must be rejected up front: journaling
+/// it would turn the next documented restart into a permanent crash loop,
+/// because recovery re-applies the journal fail-closed before serving.
+pub fn validate_firewall_policy(policy_json: &[u8]) -> Result<(), ChvError> {
+    for rule in &parse_firewall_rules(policy_json)? {
+        validate_rule(rule)?;
+    }
+    Ok(())
+}
+
 pub async fn apply_firewall_rules(
     table: &str,
     owned_ifaces: &[String],
     policy_json: &[u8],
 ) -> Result<(), ChvError> {
-    let rules: Vec<FirewallRule> = if policy_json.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_slice(policy_json).map_err(|e| ChvError::InvalidArgument {
-            field: "policy_json".to_string(),
-            reason: format!("failed to parse firewall rules: {}", e),
-        })?
-    };
+    let rules = parse_firewall_rules(policy_json)?;
 
     for rule in &rules {
         validate_rule(rule)?;
@@ -343,35 +359,53 @@ pub struct NatRule {
     pub masquerade: Option<bool>,
 }
 
+fn parse_nat_rules(policy_json: &[u8]) -> Result<Vec<NatRule>, ChvError> {
+    if policy_json.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(policy_json).map_err(|e| ChvError::InvalidArgument {
+        field: "policy_json".to_string(),
+        reason: format!("failed to parse NAT rules: {}", e),
+    })
+}
+
+fn validate_nat_rule(rule: &NatRule) -> Result<(), ChvError> {
+    if !is_valid_cidr(&rule.source_cidr) {
+        return Err(ChvError::InvalidArgument {
+            field: "source_cidr".to_string(),
+            reason: format!("invalid CIDR: '{}'", rule.source_cidr),
+        });
+    }
+    if let Some(ref dest) = rule.dest_cidr {
+        if !is_valid_cidr(dest) {
+            return Err(ChvError::InvalidArgument {
+                field: "dest_cidr".to_string(),
+                reason: format!("invalid CIDR: '{}'", dest),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a NAT payload without touching the host (see
+/// [`validate_firewall_policy`]). NAT is not the isolation boundary, but an
+/// unapplicable desired-state entry would still poison restart recovery.
+pub fn validate_nat_policy(policy_json: &[u8]) -> Result<(), ChvError> {
+    for rule in &parse_nat_rules(policy_json)? {
+        validate_nat_rule(rule)?;
+    }
+    Ok(())
+}
+
 pub async fn apply_nat_rules(
     table: &str,
     owned_ifaces: &[String],
     policy_json: &[u8],
 ) -> Result<(), ChvError> {
-    let rules: Vec<NatRule> = if policy_json.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_slice(policy_json).map_err(|e| ChvError::InvalidArgument {
-            field: "policy_json".to_string(),
-            reason: format!("failed to parse NAT rules: {}", e),
-        })?
-    };
+    let rules = parse_nat_rules(policy_json)?;
 
     for rule in &rules {
-        if !is_valid_cidr(&rule.source_cidr) {
-            return Err(ChvError::InvalidArgument {
-                field: "source_cidr".to_string(),
-                reason: format!("invalid CIDR: '{}'", rule.source_cidr),
-            });
-        }
-        if let Some(ref dest) = rule.dest_cidr {
-            if !is_valid_cidr(dest) {
-                return Err(ChvError::InvalidArgument {
-                    field: "dest_cidr".to_string(),
-                    reason: format!("invalid CIDR: '{}'", dest),
-                });
-            }
-        }
+        validate_nat_rule(rule)?;
     }
 
     let iif_guard = iface_guard_args("iifname", owned_ifaces)?;
@@ -732,6 +766,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn validate_policy_rejects_unapplicable_payloads_without_touching_the_host() {
+        // The RPC journals desired state before applying it. A payload the
+        // engine can never apply must be rejected up front: journaling it
+        // would turn the next documented restart into a permanent crash loop.
+        assert!(validate_firewall_policy(b"").is_ok());
+        assert!(validate_firewall_policy(b"[]").is_ok());
+        assert!(validate_firewall_policy(
+            br#"[{"direction":"inbound","protocol":"tcp","action":"accept","dest_port":"443"}]"#
+        )
+        .is_ok());
+
+        // Malformed JSON, invalid direction, and a malformed CIDR all fail.
+        assert!(matches!(
+            validate_firewall_policy(b"{"),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"sideways","protocol":"tcp","action":"accept"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"10.0.0.1"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+
+        // NAT: same contract (BFF stores nat_rules verbatim, so this is the
+        // only validation on the path).
+        assert!(validate_nat_policy(b"").is_ok());
+        assert!(validate_nat_policy(br#"[{"source_cidr":"10.0.0.0/24"}]"#).is_ok());
+        assert!(matches!(
+            validate_nat_policy(br#"[{"source_cidr":"10.0.0.1"}]"#),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_nat_policy(b"not json"),
+            Err(ChvError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

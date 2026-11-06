@@ -541,7 +541,10 @@ The defect reproduces on the published artifact, not only in a unit test.
    in-memory record is what re-scopes the interface guard on attach. The base
    hooks are `policy accept` by design; only the guard dispatches guest
    traffic into the policy chains, so a lost guard is an isolation gap, not
-   just a missing convenience.
+   just a missing convenience. A payload the engine can never apply is rejected
+   at the RPC boundary before it is journaled (recovery replays fail-closed, so
+   a poison entry would crash-loop the daemon); if a persisted entry still
+   cannot be re-applied, startup names the exact file to remove.
 3. **Agent startup replay.** The rc.7 → rc.8 upgrade starts with an empty
    journal, while the Core store already holds the live networks. The agent
    queries nwd's owned topologies and re-ensures only the distinct
@@ -556,9 +559,14 @@ The defect reproduces on the published artifact, not only in a unit test.
 
 **Verification.** `crates/chv-nwd-core/tests/nwd_daemon.rs` covers restart →
 policy update, policy-guard recovery plus re-scope on attach, delete removing
-both journals, the idempotent path repairing a deleted journal entry, and the
-fabric exclusion; `crates/chv-agent-core/src/network_replay.rs` covers
-derivation, merge semantics, and the skip-already-owned filter.
+both journals, the idempotent path repairing a deleted journal entry, the
+fabric exclusion, and two guardrails the review added: an unapplicable
+firewall/NAT payload is rejected **before** it is journaled (a journaled
+poison entry would crash-loop recovery), and a persisted entry that still
+cannot be re-applied fails with an error naming the exact journal file.
+`crates/chv-nwd-core/src/firewall.rs` unit tests pin the pure validators.
+`crates/chv-agent-core/src/network_replay.rs` covers derivation, merge
+semantics, and the skip-already-owned filter.
 
 ## B9 follow-ups included in rc.8
 

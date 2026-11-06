@@ -16,6 +16,26 @@ const RUNTIME_DIR: &str = "/run/chv/nwd";
 /// authoritative address stays reserved.
 pub(crate) const STATE_DIR: &str = "/var/lib/chv/nwd/dhcp";
 
+/// Create the persistent reservation directory with the same `0700` contract
+/// the systemd unit enforces. The unit's `ExecStartPre=` normally creates it,
+/// but a supervisor/non-systemd start (or a directory removed at runtime) can
+/// reach the daemon-created path, and MAC→IP mappings must not be
+/// world-readable in that case.
+pub(crate) async fn ensure_state_dir() -> Result<(), ChvError> {
+    tokio::fs::create_dir_all(STATE_DIR)
+        .await
+        .map_err(|e| ChvError::Io {
+            path: STATE_DIR.to_string(),
+            source: e,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(STATE_DIR, std::fs::Permissions::from_mode(0o700)).await;
+    }
+    Ok(())
+}
+
 fn conf_path(network_id: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR).join(format!("dnsmasq-{}.conf", network_id))
 }
@@ -173,7 +193,7 @@ pub async fn ensure_dhcp_scope(
     let pid = pid_path(network_id);
 
     let _ = tokio::fs::create_dir_all(RUNTIME_DIR).await;
-    let _ = tokio::fs::create_dir_all(STATE_DIR).await;
+    let _ = crate::dhcp::ensure_state_dir().await;
 
     // Read existing config to detect if scope changed
     let existing = tokio::fs::read_to_string(&conf).await.unwrap_or_default();

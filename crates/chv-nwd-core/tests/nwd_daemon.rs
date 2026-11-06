@@ -12,7 +12,7 @@ use chv_nwd_core::executor::{
 };
 use chv_nwd_core::fabric::{AppliedFabric, ApplyReport, FabricIdentity};
 use chv_nwd_core::handlers::NetworkServiceImpl;
-use chv_nwd_core::policy_store::PolicyStore;
+use chv_nwd_core::policy_store::{PolicyStore, StoredPolicies};
 use chv_nwd_core::topology_store::TopologyStore;
 use chv_nwd_core::{NetworkServer, TopologyState, TopologyTable};
 use chv_observability::Metrics;
@@ -207,6 +207,9 @@ impl NetworkExecutor for MockExecutor {
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Simulate an executor that cannot apply a valid-looking firewall
+    /// payload (used to exercise the actionable recovery error).
+    reject_firewall: bool,
 }
 
 #[async_trait]
@@ -327,6 +330,12 @@ impl NetworkExecutor for RecordingExecutor {
             .lock()
             .unwrap()
             .push(format!("fw:{network_id}:{bridge_name}"));
+        if self.reject_firewall {
+            return Err(ChvError::InvalidArgument {
+                field: "policy_json".to_string(),
+                reason: "simulated executor rejection".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -710,7 +719,7 @@ async fn all_network_handlers_smoke() {
             network_id: "net-1".to_string(),
             policy: Some(FirewallPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -725,7 +734,7 @@ async fn all_network_handlers_smoke() {
             network_id: "net-1".to_string(),
             policy: Some(NatPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -885,7 +894,7 @@ async fn firewall_nat_and_exposure_smoke() {
             network_id: "net-fw".to_string(),
             policy: Some(FirewallPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -899,7 +908,7 @@ async fn firewall_nat_and_exposure_smoke() {
             network_id: "net-fw".to_string(),
             policy: Some(NatPolicy {
                 policy_version: "v1".to_string(),
-                policy_json: b"{}".to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         })
         .await
@@ -944,6 +953,7 @@ async fn attach_refreshes_policy_guard_scope() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let rec = RecordingExecutor {
         calls: calls.clone(),
+        reject_firewall: false,
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1045,6 +1055,7 @@ async fn concurrent_fw_nat_applies_persist_both_halves() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let rec = RecordingExecutor {
         calls: calls.clone(),
+        reject_firewall: false,
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1176,6 +1187,7 @@ async fn delete_without_state_row_runs_derived_names_local_teardown() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let rec = RecordingExecutor {
         calls: calls.clone(),
+        reject_firewall: false,
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1357,6 +1369,7 @@ async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
     let mut first = NetworkServiceImpl::new(
         Arc::new(RecordingExecutor {
             calls: calls.clone(),
+            reject_firewall: false,
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
@@ -1376,7 +1389,7 @@ async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
             network_id: "net-policy".to_string(),
             policy: Some(FirewallPolicy {
                 policy_version: "policy-9".to_string(),
-                policy_json: br#"{"rules":[]}"#.to_vec(),
+                policy_json: b"[]".to_vec(),
             }),
         }))
         .await
@@ -1394,6 +1407,7 @@ async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
     let mut second = NetworkServiceImpl::new(
         Arc::new(RecordingExecutor {
             calls: calls.clone(),
+            reject_firewall: false,
         }),
         table.clone(),
         Arc::new(Metrics::new()),
@@ -1443,6 +1457,145 @@ async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
         "attach after recovery must re-apply the recovered policy guard: {:?}",
         calls.lock().unwrap()
     );
+}
+
+/// The RPC boundary must reject a payload the engine can never apply BEFORE
+/// journaling it as desired state. The journal is replayed fail-closed at
+/// startup, so a persisted unapplicable entry would turn the next documented
+/// restart into a permanent crash loop.
+#[tokio::test]
+async fn invalid_policy_is_rejected_without_being_journaled() {
+    use chv_nwd_api::chv_nwd_api::network_service_server::NetworkService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(MockExecutor),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(topologies.clone()));
+    service.set_policy_store(Arc::new(policies.clone()));
+    let ensured = service
+        .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(bridge_only_spec("net-bad")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "OK");
+
+    // Malformed firewall JSON: the handler rejects it and nothing is journaled.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-bad".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"{".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        fw.status, "OK",
+        "an unapplicable firewall payload must fail"
+    );
+    assert!(
+        !policies.path_for("net-bad").exists(),
+        "an unapplicable firewall payload must not be journaled"
+    );
+
+    // Invalid CIDR in the NAT payload: BFF stores nat_rules verbatim, so the
+    // nwd handler is the only validation on that path.
+    let nat = service
+        .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
+            meta: None,
+            network_id: "net-bad".to_string(),
+            policy: Some(NatPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: br#"[{"source_cidr":"10.0.0.1"}]"#.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(nat.status, "OK", "an unapplicable NAT payload must fail");
+    assert!(
+        !policies.path_for("net-bad").exists(),
+        "an unapplicable NAT payload must not be journaled"
+    );
+
+    // A valid empty policy still applies and is journaled.
+    let ok = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-bad".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ok.status, "OK");
+    assert!(
+        policies.path_for("net-bad").exists(),
+        "a valid policy must still be journaled for restart recovery"
+    );
+}
+
+/// If a journal entry can no longer be applied (corruption/tampering after the
+/// RPC began rejecting unapplicable payloads), recovery must fail closed with
+/// an error that names the exact file. An opaque crash loop is a documented
+/// recovery failure (plan §6.9).
+#[tokio::test]
+async fn recovery_names_the_journal_file_when_a_policy_cannot_be_reapplied() {
+    let dir = tempfile::tempdir().unwrap();
+    let topologies = TopologyStore::new(dir.path().join("topologies"));
+    let policies = PolicyStore::new(dir.path().join("policies"));
+
+    topologies
+        .persist(&bridge_only_spec("net-poison"))
+        .await
+        .unwrap();
+    policies
+        .persist(
+            "net-poison",
+            &StoredPolicies {
+                firewall: Some(b"[]".to_vec()),
+                firewall_version: Some("v1".to_string()),
+                nat: None,
+                nat_version: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reject_firewall: true,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    service.set_topology_store(Arc::new(topologies));
+    service.set_policy_store(Arc::new(policies.clone()));
+
+    let expected = policies.path_for("net-poison").display().to_string();
+    match service.recover_topologies().await {
+        Err(ChvError::Internal { reason }) => assert!(
+            reason.contains(&expected),
+            "the recovery error must name {expected}: {reason}"
+        ),
+        other => panic!("recovery must fail closed, got {other:?}"),
+    }
 }
 
 /// A topology delete must remove the journal entry, or the next restart would

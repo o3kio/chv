@@ -765,14 +765,7 @@ impl LinuxExecutor {
         // Create the hostsfile only when absent: a restart must restore the
         // reservations recorded by `add_dhcp_host`, not truncate them.
         if tokio::fs::metadata(&hosts_path).await.is_err() {
-            if let Some(parent) = hosts_path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| ChvError::Io {
-                        path: parent.to_string_lossy().to_string(),
-                        source: e,
-                    })?;
-            }
+            crate::dhcp::ensure_state_dir().await?;
             tokio::fs::write(&hosts_path, "")
                 .await
                 .map_err(|e| ChvError::Io {
@@ -910,9 +903,7 @@ impl LinuxExecutor {
         let hosts_path = crate::dhcp::hosts_path(network_id);
         let pid_path = std::path::PathBuf::from(format!("/run/chv/nwd/dnsmasq-{}.pid", network_id));
 
-        if let Some(parent) = hosts_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
+        let _ = crate::dhcp::ensure_state_dir().await;
         let content = tokio::fs::read_to_string(&hosts_path)
             .await
             .unwrap_or_default();

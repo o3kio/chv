@@ -123,6 +123,16 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
         // would let a concurrent NAT snapshot land first and then be
         // overwritten by this older firewall-only snapshot.
         let _guard = self.policy_persist.lock().await;
+        // Re-verify ownership under the lock: a concurrent delete may have
+        // removed the topology between the handler's check and this call.
+        // Persisting now would leave a durable policy for a deleted network,
+        // which a later re-create could inherit after a restart (#227 S5).
+        if self.topologies.get(network_id).is_none() {
+            return Err(ChvError::NotFound {
+                resource: "topology".to_string(),
+                id: network_id.to_string(),
+            });
+        }
         let snapshot = {
             let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
             applied.firewall = Some(policy_json.to_vec());
@@ -148,6 +158,16 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
         policy_version: &str,
     ) -> Result<(), ChvError> {
         let _guard = self.policy_persist.lock().await;
+        // Re-verify ownership under the lock: a concurrent delete may have
+        // removed the topology between the handler's check and this call.
+        // Persisting now would leave a durable policy for a deleted network,
+        // which a later re-create could inherit after a restart (#227 S5).
+        if self.topologies.get(network_id).is_none() {
+            return Err(ChvError::NotFound {
+                resource: "topology".to_string(),
+                id: network_id.to_string(),
+            });
+        }
         let snapshot = {
             let mut applied = self.policy_state.entry(network_id.to_string()).or_default();
             applied.nat = Some(policy_json.to_vec());
@@ -325,12 +345,34 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
         if let Some((json, version)) = firewall {
             self.executor
                 .set_firewall_policy(network_id, &version, &json, &state.bridge_name)
-                .await?;
+                .await
+                .map_err(|e| {
+                    // Name the exact file: a journal entry can only become
+                    // unapplicable through corruption/tampering now that the
+                    // RPC validates before journaling, so the operator needs
+                    // an actionable path, not an opaque crash loop.
+                    ChvError::Internal {
+                        reason: format!(
+                            "cannot re-apply journaled firewall policy for {network_id} \
+                             from {}: {e}; re-apply the network policy or remove that \
+                             journal entry and restart chv-nwd",
+                            store.path_for(network_id).display()
+                        ),
+                    }
+                })?;
         }
         if let Some((json, version)) = nat {
             self.executor
                 .set_nat_policy(network_id, &version, &json, &state.bridge_name)
-                .await?;
+                .await
+                .map_err(|e| ChvError::Internal {
+                    reason: format!(
+                        "cannot re-apply journaled NAT policy for {network_id} from {}: \
+                         {e}; re-apply the network policy or remove that journal entry \
+                         and restart chv-nwd",
+                        store.path_for(network_id).display()
+                    ),
+                })?;
         }
         info!(
             network_id = %network_id,
@@ -816,11 +858,16 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // Drop the durable policy for the same reason: a stale policy
         // re-applied after a restart against a re-created network with the
         // same id would be the #227 S5 residue class. This also drops the
-        // in-memory record, which is only meaningful with a topology.
-        if let Err(e) = self.forget_policies(&req.network_id).await {
-            return Ok(Response::new(Self::err_result(&e)));
+        // in-memory record, which is only meaningful with a topology. Take
+        // the persistence lock so a policy RPC that already passed its
+        // topology check cannot re-persist an entry after this removal.
+        {
+            let _guard = self.policy_persist.lock().await;
+            if let Err(e) = self.forget_policies(&req.network_id).await {
+                return Ok(Response::new(Self::err_result(&e)));
+            }
+            self.policy_state.remove(&req.network_id);
         }
-        self.policy_state.remove(&req.network_id);
 
         Ok(Response::new(Self::ok_result()))
     }
@@ -1103,6 +1150,14 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
         };
 
+        // Reject a payload the engine can never apply BEFORE journaling it as
+        // desired state. The journal is replayed fail-closed before serving,
+        // so an unapplicable entry would turn the next documented restart
+        // into a crash loop that only manual file surgery could clear.
+        if let Err(e) = crate::firewall::validate_firewall_policy(&policy.policy_json) {
+            return Ok(Response::new(Self::err_result(&e)));
+        }
+
         // Record the DESIRED policy state regardless of apply outcome (the
         // topology is ensured at this point). A failed or partial apply must not
         // leave policy_state empty, otherwise a later NIC attach would find
@@ -1169,6 +1224,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 return Ok(Response::new(Self::err_result(&e)));
             }
         };
+
+        // Reject an unapplicable NAT payload before journaling it (see
+        // set_firewall_policy): the journal is replayed fail-closed at
+        // startup, so a permanently unapplicable entry would crash-loop nwd.
+        if let Err(e) = crate::firewall::validate_nat_policy(&policy.policy_json) {
+            return Ok(Response::new(Self::err_result(&e)));
+        }
 
         // Record the DESIRED NAT policy state regardless of apply outcome for
         // the same reason as set_firewall_policy (re-scope convergence, #227

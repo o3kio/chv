@@ -55,7 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restored and re-applied fail-closed before serving, and removed on
   topology delete. Without it, a restart followed by an attach could leave
   the new tap outside CHV default-deny (the base hooks are `policy accept`;
-  only the guard dispatches guest traffic into the policy chains).
+  only the guard dispatches guest traffic into the policy chains). An
+  unapplicable payload (malformed JSON, bad action/protocol/CIDR) is now
+  rejected at the RPC boundary before it is journaled: replay is fail-closed,
+  so a poison entry would crash-loop the daemon. A persisted entry that still
+  cannot be re-applied fails with an error naming the exact journal file.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**
@@ -84,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path.
 
 ### Qualification
-- Targeted Rust tests (`chv-nwd-core` 114 lib + 14 daemon + 24 fabric,
+- Targeted Rust tests (`chv-nwd-core` 115 lib + 16 daemon + 24 fabric,
   `chv-agent-core` startup replay 9), packaging/architecture contract tests
   79/79, `cargo fmt`, clippy `-D warnings`, and shell syntax checks are green
   in the rc.8 candidate tree. **No rc.8 real-KVM lane, post-publication
