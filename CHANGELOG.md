@@ -58,8 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the guard dispatches guest traffic into the policy chains). An
   unapplicable payload (malformed JSON, bad action/protocol/CIDR) is now
   rejected at the RPC boundary before it is journaled: replay is fail-closed,
-  so a poison entry would crash-loop the daemon. A persisted entry that still
-  cannot be re-applied fails with an error naming the exact journal file.
+  so a poison entry would crash-loop the daemon. IPv6 rule CIDRs are rejected
+  too (the engine renders `ip saddr`/`ip daddr` only). A persisted entry that
+  still cannot be re-applied fails with an error naming the exact journal
+  file.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**

@@ -347,15 +347,20 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
                 .set_firewall_policy(network_id, &version, &json, &state.bridge_name)
                 .await
                 .map_err(|e| {
-                    // Name the exact file: a journal entry can only become
-                    // unapplicable through corruption/tampering now that the
-                    // RPC validates before journaling, so the operator needs
-                    // an actionable path, not an opaque crash loop.
+                    // Name the exact file. A payload-level rejection here
+                    // means a persisted entry diverged (corruption,
+                    // tampering, or a writer that predates RPC validation);
+                    // an environmental nft failure is also possible, so the
+                    // message must not imply the entry is always the culprit.
+                    // Recovery stays fail-closed: removing the entry without
+                    // re-applying leaves the base hooks at `policy accept`.
                     ChvError::Internal {
                         reason: format!(
                             "cannot re-apply journaled firewall policy for {network_id} \
-                             from {}: {e}; re-apply the network policy or remove that \
-                             journal entry and restart chv-nwd",
+                             from {}: {e}; recovery stays fail-closed. Re-apply the \
+                             network policy once nwd is serving, or replace that entry's \
+                             payload with [] (default-deny) before restarting chv-nwd; \
+                             deleting the entry leaves the network unguarded",
                             store.path_for(network_id).display()
                         ),
                     }
@@ -368,8 +373,9 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
                 .map_err(|e| ChvError::Internal {
                     reason: format!(
                         "cannot re-apply journaled NAT policy for {network_id} from {}: \
-                         {e}; re-apply the network policy or remove that journal entry \
-                         and restart chv-nwd",
+                         {e}; recovery stays fail-closed. Re-apply the network policy \
+                         once nwd is serving, or replace that entry's payload with [] \
+                         before restarting chv-nwd",
                         store.path_for(network_id).display()
                     ),
                 })?;

@@ -40,8 +40,14 @@ pub const RULE_KEYS: &[&str] = &[
     "dest_port",
 ];
 
-/// Is `cidr` a syntactically valid IPv4/IPv6 CIDR block (nwd's engine
+/// Is `cidr` a syntactically valid **IPv4** CIDR block (nwd's engine
 /// semantics, shared with the BFF's save-time gate)?
+///
+/// The engine renders every rule as `ip saddr` / `ip daddr`, so an IPv6 block
+/// would be accepted by a generic validator and then fail deterministically at
+/// apply time. That divergence is not harmless: the policy journal records the
+/// desired payload and replay is fail-closed, so an IPv6 rule would poison the
+/// next nwd restart. Reject it at the gate until the engine renders `ip6`.
 pub fn is_valid_cidr(cidr: &str) -> bool {
     let parts: Vec<&str> = cidr.splitn(2, '/').collect();
     if parts.len() != 2 {
@@ -49,8 +55,7 @@ pub fn is_valid_cidr(cidr: &str) -> bool {
     }
     match parts[0].parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(_)) => parts[1].parse::<u8>().map(|p| p <= 32).unwrap_or(false),
-        Ok(std::net::IpAddr::V6(_)) => parts[1].parse::<u8>().map(|p| p <= 128).unwrap_or(false),
-        Err(_) => false,
+        _ => false,
     }
 }
 
@@ -120,10 +125,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cidr_validator_accepts_v4_and_v6_blocks() {
+    fn cidr_validator_accepts_v4_and_rejects_v6_blocks() {
         assert!(is_valid_cidr("10.200.0.0/24"));
         assert!(is_valid_cidr("0.0.0.0/0"));
-        assert!(is_valid_cidr("fd00::/8"));
+        // The engine renders `ip saddr` only; accepting v6 here would journal
+        // a payload that can never apply (fail-closed recovery crash loop).
+        assert!(!is_valid_cidr("fd00::/8"));
+        assert!(!is_valid_cidr("::1/128"));
         assert!(!is_valid_cidr("10.200.0.0")); // no prefix
         assert!(!is_valid_cidr("10.200.0.0/33")); // bad prefix
         assert!(!is_valid_cidr("not-an-ip/24"));

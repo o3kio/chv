@@ -655,6 +655,11 @@ async fn update_network_rejects_ui_dialect_and_malformed_rules() {
             "source_cidr",
         ),
         (
+            "ipv6 source cidr (the engine renders ip saddr only)",
+            r#"{"direction":"inbound","action":"accept","protocol":"icmp","source_cidr":"fd00::/8"}"#,
+            "source_cidr",
+        ),
+        (
             "service-name port",
             r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"ssh"}"#,
             "dest_port",
@@ -740,7 +745,7 @@ async fn update_network_accepts_full_engine_vocabulary() {
                 {{"direction":"inbound","action":"accept","protocol":"tcp","source_cidr":"10.99.0.0/24","dest_port":"443"}},
                 {{"direction":"inbound","action":"accept","protocol":"udp","dest_port":"53"}},
                 {{"direction":"outbound","action":"drop","protocol":"all"}},
-                {{"direction":"outbound","action":"reject","protocol":"sctp","source_cidr":"fd00::/8","dest_port":"8080-8090"}}
+                {{"direction":"outbound","action":"reject","protocol":"sctp","source_cidr":"172.16.0.0/12","dest_port":"8080-8090"}}
             ]}}"#
         ),
     )
@@ -754,7 +759,7 @@ async fn update_network_accepts_full_engine_vocabulary() {
     .await
     .expect("query stored policy");
     let stored = stored.unwrap_or_default();
-    for fragment in ["\"443\"", "\"53\"", "fd00::/8", "8080-8090"] {
+    for fragment in ["\"443\"", "\"53\"", "172.16.0.0/12", "8080-8090"] {
         assert!(
             stored.contains(fragment),
             "engine-vocabulary rule field {fragment} must persist verbatim: {stored}"

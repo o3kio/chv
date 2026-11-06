@@ -668,7 +668,9 @@ mod tests {
     fn test_is_valid_cidr() {
         assert!(is_valid_cidr("10.0.0.0/24"));
         assert!(is_valid_cidr("192.168.1.0/16"));
-        assert!(is_valid_cidr("::1/128"));
+        // The engine renders IPv4 `ip saddr` only (see chv_common::firewall).
+        assert!(!is_valid_cidr("::1/128"));
+        assert!(!is_valid_cidr("fd00::/8"));
         assert!(!is_valid_cidr("10.0.0.0"));
         assert!(!is_valid_cidr("not-ip/24"));
         assert!(!is_valid_cidr("10.0.0.0/999"));
@@ -797,6 +799,14 @@ mod tests {
             ),
             Err(ChvError::InvalidArgument { .. })
         ));
+        // IPv6 is rejected: the engine renders `ip saddr` only, so accepting
+        // it here would journal a payload that can never apply.
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
 
         // NAT: same contract (BFF stores nat_rules verbatim, so this is the
         // only validation on the path).
@@ -804,6 +814,10 @@ mod tests {
         assert!(validate_nat_policy(br#"[{"source_cidr":"10.0.0.0/24"}]"#).is_ok());
         assert!(matches!(
             validate_nat_policy(br#"[{"source_cidr":"10.0.0.1"}]"#),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_nat_policy(br#"[{"source_cidr":"fd00::/8"}]"#),
             Err(ChvError::InvalidArgument { .. })
         ));
         assert!(matches!(

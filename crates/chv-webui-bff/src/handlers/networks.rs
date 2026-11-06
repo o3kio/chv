@@ -956,7 +956,7 @@ fn check_optional_rule_field(
     if !is_valid(text) {
         return Err(BffError::BadRequest(format!(
             "firewall_rules[{index}]: invalid {name} '{text}' \
-             (expected a.b.c.d/p IPv4 or IPv6 CIDR, or a port like 443 / range like 8080-8090)"
+             (expected an IPv4 CIDR like 10.0.0.0/24, or a port like 443 / range like 8080-8090)"
         )));
     }
     Ok(())
