@@ -911,6 +911,94 @@ async fn ensure_with_fabric_refuses_a_rejected_policy_before_grafting() {
         .any(|c| c == "apply_fabric:net-ensure-reject:100:3:br-fab"));
 }
 
+/// If a fabric ensure's post-graft guard refresh fails, the overlay must be
+/// rolled back (the veth would otherwise sit outside the guard set), the
+/// bridge MTU reset, and the generation fence cleared so the latest plan can
+/// be retried.
+#[tokio::test]
+async fn ensure_with_fabric_rolls_back_when_the_guard_refresh_fails() {
+    let executor = FabricExecutor::with_failing_policy_apply();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-ensure-rollback", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+
+    // The desired state is recorded even though the executor apply fails, so
+    // the next fabric apply's guard refresh hits the same failure.
+    let fw = client
+        .set_firewall_policy(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-ensure-rollback".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    let mut newer = fabric_topology_spec("net-ensure-rollback", 3);
+    newer.fabric = fabric_plan(3, 0);
+    let refused = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(newer),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(refused.status, "error");
+    assert!(
+        refused.human_summary.contains("rolled back"),
+        "the error must disclose the rollback: {refused:?}"
+    );
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .any(|c| c == "remove_fabric:net-ensure-rollback"),
+        "a failed guard refresh must remove the overlay: {:?}",
+        executor.calls()
+    );
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .any(|c| c == "reassert_mtu:net-ensure-rollback:none"),
+        "the rollback must reset the bridge MTU: {:?}",
+        executor.calls()
+    );
+
+    // The cleared fence must let an older plan be re-applied (the guard
+    // refresh still fails, so the RPC errors, but not as STALE_GENERATION).
+    let mut replay_spec = fabric_topology_spec("net-ensure-rollback", 2);
+    replay_spec.fabric = fabric_plan(2, 0);
+    let replay = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(replay_spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        replay.error_code, "STALE_GENERATION",
+        "the rolled-back generation must not leave a stale fence: {replay:?}"
+    );
+}
+
 #[tokio::test]
 async fn update_overlay_without_fabric_plan_is_rejected_in_band() {
     let executor = FabricExecutor::enabled();

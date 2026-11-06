@@ -642,7 +642,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // untouched — without these fields the replay would short-circuit
         // and the datapath would keep the OLD VNI, silently cross-bleeding
         // two networks.
-        let existing = self.topologies.get(&spec.network_id);
+        let mut existing = self.topologies.get(&spec.network_id);
         // Serialize fabric datapath mutations across ensure/update so a
         // rollback in one handler cannot remove the overlay a concurrent
         // handler just applied.
@@ -655,6 +655,12 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         } else {
             None
         };
+        // The lock may have waited behind a concurrent apply: re-read the
+        // state under it, or a queued ensure would fence and short-circuit
+        // against the snapshot taken before the other operation landed.
+        if _fabric_guard.is_some() {
+            existing = self.topologies.get(&spec.network_id);
+        }
         if let Some(existing) = existing.as_ref() {
             let new_fabric_generation = spec.fabric.as_ref().map(|f| f.plan_generation);
             if let (Some(applied_gen), Some(new_gen)) =
@@ -787,6 +793,66 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 if applied.fabric_plan_generation.is_some() {
                     self.metrics.increment_nwd_fabric_apply("success");
                 }
+                // Guard the newly grafted consumer veth BEFORE persisting the
+                // topology (and before the MTU re-assert): if a concurrent
+                // rejected policy makes the refresh fail, roll the overlay
+                // back instead of leaving the veth outside the policy chains
+                // (base hooks are `policy accept`).
+                let state = Self::state_from_apply(&spec, &applied);
+                if applied.fabric_plan_generation.is_some() {
+                    if let Err(e) = self.refresh_policy_scope(&state).await {
+                        let rollback_note =
+                            match self.executor.remove_fabric_overlay(&spec.network_id).await {
+                                Ok(()) => {
+                                    self.metrics.increment_nwd_fabric_remove("success");
+                                    if let Err(mtu_err) = self
+                                        .executor
+                                        .reassert_tenant_mtu(
+                                            &spec.network_id,
+                                            &spec.bridge_name,
+                                            &spec.subnet_cidr,
+                                            &spec.gateway_ip,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        error!(
+                                            network_id = %spec.network_id,
+                                            error = %mtu_err,
+                                            "failed to reset the bridge MTU after rolling back a \
+                                             fabric overlay"
+                                        );
+                                    }
+                                    "the fabric overlay was rolled back"
+                                }
+                                Err(remove_err) => {
+                                    self.metrics.increment_nwd_fabric_remove("failure");
+                                    error!(
+                                        network_id = %spec.network_id,
+                                        error = %remove_err,
+                                        "failed to roll back a fabric overlay after the policy \
+                                         guard refresh failed; the consumer veth may remain \
+                                         outside the guard"
+                                    );
+                                    "the fabric overlay rollback FAILED; the consumer veth may \
+                                     remain grafted and unguarded"
+                                }
+                            };
+                        if let Some(existing) = existing.as_ref() {
+                            self.topologies.upsert(TopologyState {
+                                vni: None,
+                                tenant_mtu: None,
+                                fabric_plan_generation: None,
+                                binding_generation: None,
+                                ..existing.clone()
+                            });
+                        }
+                        let e = ChvError::Internal {
+                            reason: format!("{e}; {rollback_note}"),
+                        };
+                        return Ok(Response::new(Self::err_result(&e)));
+                    }
+                }
                 // Tenant MTU change (m8): the running dnsmasq still
                 // advertises the old DHCP option 26 and the existing bridge
                 // ports (TAPs, fabric consumer veth) still carry the old
@@ -808,63 +874,12 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                             )
                             .await
                         {
+                            // The overlay is already guarded by the refresh
+                            // above, so an MTU failure leaves no unguarded
+                            // member; returning before the journal/upsert
+                            // keeps the retry path intact.
                             return Ok(Response::new(Self::err_result(&e)));
                         }
-                    }
-                }
-                // Guard the newly grafted consumer veth BEFORE persisting the
-                // topology. If a concurrent rejected policy makes the refresh
-                // fail, roll the overlay back instead of leaving the veth
-                // outside the policy chains (base hooks are `policy accept`).
-                let state = Self::state_from_apply(&spec, &applied);
-                if applied.fabric_plan_generation.is_some() {
-                    if let Err(e) = self.refresh_policy_scope(&state).await {
-                        match self.executor.remove_fabric_overlay(&spec.network_id).await {
-                            Ok(()) => {
-                                self.metrics.increment_nwd_fabric_remove("success");
-                                if let Err(mtu_err) = self
-                                    .executor
-                                    .reassert_tenant_mtu(
-                                        &spec.network_id,
-                                        &spec.bridge_name,
-                                        &spec.subnet_cidr,
-                                        &spec.gateway_ip,
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        network_id = %spec.network_id,
-                                        error = %mtu_err,
-                                        "failed to reset the bridge MTU after rolling back a \
-                                         fabric overlay"
-                                    );
-                                }
-                            }
-                            Err(remove_err) => {
-                                self.metrics.increment_nwd_fabric_remove("failure");
-                                error!(
-                                    network_id = %spec.network_id,
-                                    error = %remove_err,
-                                    "failed to roll back a fabric overlay after the policy guard \
-                                     refresh failed; the consumer veth may remain outside the \
-                                     guard"
-                                );
-                            }
-                        }
-                        if let Some(existing) = existing.as_ref() {
-                            self.topologies.upsert(TopologyState {
-                                vni: None,
-                                tenant_mtu: None,
-                                fabric_plan_generation: None,
-                                binding_generation: None,
-                                ..existing.clone()
-                            });
-                        }
-                        let e = ChvError::Internal {
-                            reason: format!("{e}; the fabric overlay was rolled back"),
-                        };
-                        return Ok(Response::new(Self::err_result(&e)));
                     }
                 }
                 // Journal BEFORE the in-memory upsert: if the write fails,
@@ -1713,38 +1728,44 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 // the overlay back: leaving the new veth grafted would put it
                 // outside the guard set.
                 if let Err(e) = self.refresh_policy_scope(&updated_state).await {
-                    match self.executor.remove_fabric_overlay(&req.network_id).await {
-                        Ok(()) => {
-                            self.metrics.increment_nwd_fabric_remove("success");
-                            if let Err(mtu_err) = self
-                                .executor
-                                .reassert_tenant_mtu(
-                                    &req.network_id,
-                                    &updated_state.bridge_name,
-                                    &updated_state.subnet_cidr,
-                                    &updated_state.gateway_ip,
-                                    None,
-                                )
-                                .await
-                            {
+                    let rollback_note =
+                        match self.executor.remove_fabric_overlay(&req.network_id).await {
+                            Ok(()) => {
+                                self.metrics.increment_nwd_fabric_remove("success");
+                                if let Err(mtu_err) = self
+                                    .executor
+                                    .reassert_tenant_mtu(
+                                        &req.network_id,
+                                        &updated_state.bridge_name,
+                                        &updated_state.subnet_cidr,
+                                        &updated_state.gateway_ip,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        network_id = %req.network_id,
+                                        error = %mtu_err,
+                                        "failed to reset the bridge MTU after rolling back a \
+                                         fabric overlay"
+                                    );
+                                }
+                                "the fabric overlay was rolled back and the generation fence \
+                                 cleared; retry with the latest plan"
+                            }
+                            Err(remove_err) => {
+                                self.metrics.increment_nwd_fabric_remove("failure");
                                 error!(
                                     network_id = %req.network_id,
-                                    error = %mtu_err,
-                                    "failed to reset the bridge MTU after rolling back a \
-                                     fabric overlay"
+                                    error = %remove_err,
+                                    "failed to roll back a fabric overlay after the policy guard \
+                                     refresh failed; the consumer veth may remain outside the \
+                                     guard"
                                 );
+                                "the fabric overlay rollback FAILED and the generation fence was \
+                                 cleared; the consumer veth may remain grafted and unguarded"
                             }
-                        }
-                        Err(remove_err) => {
-                            self.metrics.increment_nwd_fabric_remove("failure");
-                            error!(
-                                network_id = %req.network_id,
-                                error = %remove_err,
-                                "failed to roll back a fabric overlay after the policy guard \
-                                 refresh failed; the consumer veth may remain outside the guard"
-                            );
-                        }
-                    }
+                        };
                     self.topologies.upsert(TopologyState {
                         vni: None,
                         tenant_mtu: None,
@@ -1753,10 +1774,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                         ..state.clone()
                     });
                     let e = ChvError::Internal {
-                        reason: format!(
-                            "{e}; the fabric overlay was rolled back and the \
-                                         generation fence cleared; retry with the latest plan"
-                        ),
+                        reason: format!("{e}; {rollback_note}"),
                     };
                     return Ok(Response::new(proto::UpdateOverlayResponse {
                         result: Some(Self::err_result(&e)),
