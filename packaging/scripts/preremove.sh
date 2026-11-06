@@ -98,7 +98,7 @@ chv_network_ids() {
         fi
         if have nft; then
             nft list tables 2>/dev/null \
-                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p'
+                | sed -n 's/^table inet chv-\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' || true
         fi
         if have ip; then
             # A netns name alone is weaker evidence than a CHV nft table or
@@ -108,7 +108,7 @@ chv_network_ids() {
             # from being deleted.
             ip netns list 2>/dev/null \
                 | awk '{print $1}' \
-                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p'
+                | sed -n 's/^ns-\([0-9a-f][0-9a-f]*\|default\)$/\1/p' || true
         fi
     } | awk '/^[A-Za-z0-9_.-]+$/' | sort -u
 }
@@ -122,6 +122,9 @@ chv_network_cidr() {
     if have sqlite3 && [ -f "$CHV_DB_PATH" ]; then
         net_cidr="$(chv_sqlite_read "$CHV_DB_PATH" \
             "SELECT cidr FROM network_desired_state WHERE network_id = '$net_id';" 2>/dev/null || true)"
+        # The root fallback can create -wal/-shm sidecars; hand them back to
+        # the service user exactly as chv_network_ids does (issue #669).
+        chown chv:chv "$CHV_DB_PATH-wal" "$CHV_DB_PATH-shm" 2>/dev/null || true
     fi
     printf '%s\n' "$net_cidr" | awk 'NF { print $1; exit }'
 }
@@ -168,14 +171,16 @@ remove_chv_bridge_and_nat() {
                     for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
                 }' "$rules_file"
             fi
+            # Union, not a precedence chain: a stale `! -o` rule must not hide
+            # the route or the database hint for the current `! -d` form.
+            if [ -n "$cidr" ]; then
+                printf '%s\n' "$cidr"
+            fi
+            if [ -n "$hint" ]; then
+                printf '%s\n' "$hint"
+            fi
         } | sort -u
     )"
-    if [ -z "$cidrs" ] && [ -n "$cidr" ]; then
-        cidrs="$cidr"
-    fi
-    if [ -z "$cidrs" ] && [ -n "$hint" ]; then
-        cidrs="$hint"
-    fi
 
     for cidr in $cidrs; do
         if have iptables; then
@@ -249,7 +254,7 @@ delete_chv_network_state() {
             | sed -n 's/^table inet \(chv-[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)$/\1/p' \
             | while IFS= read -r table; do
                 nft delete table inet "$table" 2>/dev/null || true
-            done
+            done || true
     fi
 }
 

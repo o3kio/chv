@@ -243,15 +243,21 @@ class CellHvCorePackagingTests(unittest.TestCase):
         # quick-install.sh are bash; preremove.sh must also run under dash,
         # which is what dpkg invokes. Each case gets a fresh sandbox so the
         # fakes cannot leak state between runs.
+        bash = shutil.which("bash")
         cases = [
-            ("scripts/install.sh", shutil.which("bash")),
-            ("scripts/quick-install.sh", shutil.which("bash")),
+            ("scripts/install.sh", bash),
+            ("scripts/quick-install.sh", bash),
         ]
         posix_shell = shutil.which("dash") or shutil.which("sh")
         if posix_shell:
             cases.append(("packaging/scripts/preremove.sh", posix_shell))
+        # preremove.sh ships as POSIX sh, but running the same functions
+        # under bash+pipefail pins the `|| true` guards that keep a failing
+        # nft/ip/route lookup from aborting the teardown.
+        if bash:
+            cases.append(("packaging/scripts/preremove.sh", bash))
         for relative, shell in cases:
-            with self.subTest(script=relative):
+            with self.subTest(script=relative, shell=os.path.basename(shell)):
                 self._exercise_network_cleanup(relative, shell)
 
     def _exercise_network_cleanup(self, relative, shell):
@@ -289,6 +295,17 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 # NAT rules that still name it can identify the CIDR.
                 "POSTROUTING -s 10.204.0.0/24 ! -d 10.204.0.0/24 -j MASQUERADE\n"
                 "POSTROUTING -s 10.204.0.0/24 ! -o br-gone -j MASQUERADE\n"
+                # `br-multi` carries two historical `! -o` rules; both CIDRs
+                # must be recovered, not just the first.
+                "POSTROUTING -s 10.207.0.0/24 ! -d 10.207.0.0/24 -j MASQUERADE\n"
+                "POSTROUTING -s 10.207.0.0/24 ! -o br-multi -j MASQUERADE\n"
+                "POSTROUTING -s 10.208.0.0/24 ! -d 10.208.0.0/24 -j MASQUERADE\n"
+                "POSTROUTING -s 10.208.0.0/24 ! -o br-multi -j MASQUERADE\n"
+                # `br-mix` has a live route (10.209) plus a stale historical
+                # `! -o` rule for 10.210: both must be cleaned, so the sources
+                # are unioned rather than tried in priority order.
+                "POSTROUTING -s 10.209.0.0/24 ! -d 10.209.0.0/24 -j MASQUERADE\n"
+                "POSTROUTING -s 10.210.0.0/24 ! -o br-mix -j MASQUERADE\n"
             )
 
             # A persisted-rules file with CHV lines and one that belongs to
@@ -302,6 +319,12 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "-A POSTROUTING -s 10.203.0.0/24 ! -d 10.203.0.0/24 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.204.0.0/24 ! -d 10.204.0.0/24 -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.204.0.0/24 ! -o br-gone -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.207.0.0/24 ! -d 10.207.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.207.0.0/24 ! -o br-multi -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.208.0.0/24 ! -d 10.208.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.208.0.0/24 ! -o br-multi -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.209.0.0/24 ! -d 10.209.0.0/24 -j MASQUERADE\n"
+                "-A POSTROUTING -s 10.210.0.0/24 ! -o br-mix -j MASQUERADE\n"
                 "-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE\n"
                 "COMMIT\n"
             )
@@ -323,7 +346,8 @@ class CellHvCorePackagingTests(unittest.TestCase):
             links = tmp_path / "links"
             links.write_text(
                 "tap-1234abcd\ntap-deadbeef\ntap-cafebabe\n"
-                "br-63b276315a70\nbr-0b7f28f0\nbr-net1\nchvbr0\nens19\n"
+                "br-63b276315a70\nbr-0b7f28f0\nbr-net1\nbr-multi\nbr-mix\n"
+                "chvbr0\nens19\n"
             )
             ip = bin_dir / "ip"
             ip.write_text(
@@ -342,6 +366,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "      br-63b276315a70) printf '%s\\n' '10.201.0.0/24 proto kernel scope link src 10.201.0.1' ;;\n"
                 "      br-0b7f28f0) printf '%s\\n' '10.202.0.0/24 proto kernel scope link src 10.202.0.1' ;;\n"
                 "      br-net1) printf '%s\\n' '10.203.0.0/24 proto kernel scope link src 10.203.0.1' ;;\n"
+                "      br-mix) printf '%s\\n' '10.209.0.0/24 proto kernel scope link src 10.209.0.1' ;;\n"
                 "      chvbr0) printf '%s\\n' '10.200.0.0/24 proto kernel scope link src 10.200.0.1' ;;\n"
                 '      *) exit 1 ;;\n'
                 '    esac ;;\n'
@@ -369,7 +394,8 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 'if [ "$1 $2" = "list tables" ]; then\n'
                 "  printf '%s\\n' 'table inet chv-63b27631c9c92fda4a43351c5aeeba21' "
                 "'table inet chv-0b7f28f0' 'table inet chv-default' 'table inet chv-net1' "
-                "'table inet chv-gone' 'table inet chvhs-deadbeef' 'table ip filter'\n"
+                "'table inet chv-gone' 'table inet chv-multi' 'table inet chv-mix' "
+                "'table inet chvhs-deadbeef' 'table ip filter'\n"
                 "fi\n"
             )
             sqlite3 = bin_dir / "sqlite3"
@@ -446,11 +472,15 @@ class CellHvCorePackagingTests(unittest.TestCase):
             "ip netns del ns-default",
             "ip netns del ns-net1",
             "ip netns del ns-gone",
+            "ip netns del ns-multi",
+            "ip netns del ns-mix",
             "nft delete table inet chv-63b27631c9c92fda4a43351c5aeeba21",
             "nft delete table inet chv-0b7f28f0",
             "nft delete table inet chv-default",
             "nft delete table inet chv-net1",
             "nft delete table inet chv-gone",
+            "nft delete table inet chv-multi",
+            "nft delete table inet chv-mix",
             "ip link del dev chvbr0",
             # Live NAT rules are deleted in both historical forms.
             "iptables -t nat -D POSTROUTING -s 10.200.0.0/24 ! -d 10.200.0.0/24 -j MASQUERADE",
@@ -461,6 +491,15 @@ class CellHvCorePackagingTests(unittest.TestCase):
             # surviving rule that still names the bridge.
             "iptables -t nat -D POSTROUTING -s 10.204.0.0/24 ! -d 10.204.0.0/24 -j MASQUERADE",
             "iptables -t nat -D POSTROUTING -s 10.204.0.0/24 ! -o br-gone -j MASQUERADE",
+            # Two CIDRs survive for one bridge: both are recovered.
+            "iptables -t nat -D POSTROUTING -s 10.207.0.0/24 ! -d 10.207.0.0/24 -j MASQUERADE",
+            "iptables -t nat -D POSTROUTING -s 10.207.0.0/24 ! -o br-multi -j MASQUERADE",
+            "iptables -t nat -D POSTROUTING -s 10.208.0.0/24 ! -d 10.208.0.0/24 -j MASQUERADE",
+            "iptables -t nat -D POSTROUTING -s 10.208.0.0/24 ! -o br-multi -j MASQUERADE",
+            # A live route and a stale `! -o` rule for the same bridge: both
+            # CIDRs are cleaned.
+            "iptables -t nat -D POSTROUTING -s 10.209.0.0/24 ! -d 10.209.0.0/24 -j MASQUERADE",
+            "iptables -t nat -D POSTROUTING -s 10.210.0.0/24 ! -o br-mix -j MASQUERADE",
             # The persisted rules are re-saved through the fake, never the
             # host's real netfilter-persistent.
             "netfilter-persistent save",
@@ -479,6 +518,10 @@ class CellHvCorePackagingTests(unittest.TestCase):
         self.assertNotIn("10.201.0.0/24", persisted, relative)
         self.assertNotIn("10.203.0.0/24", persisted, relative)
         self.assertNotIn("10.204.0.0/24", persisted, relative)
+        self.assertNotIn("10.207.0.0/24", persisted, relative)
+        self.assertNotIn("10.208.0.0/24", persisted, relative)
+        self.assertNotIn("10.209.0.0/24", persisted, relative)
+        self.assertNotIn("10.210.0.0/24", persisted, relative)
         self.assertIn("-A POSTROUTING -s 10.9.9.0/24 -j MASQUERADE", persisted, relative)
 
         # Bridging config that would recreate the CHV bridge is gone; another
@@ -685,7 +728,8 @@ class CellHvCorePackagingTests(unittest.TestCase):
     def _assert_install_baseline_cidr_fallback(self):
         # install.sh writes the baseline NAT rule from INSTALL_CHV_BRIDGE_CIDR.
         # If the database has no `default` row and the bridge is already gone,
-        # that value is the only source of the subnet.
+        # that value is the only source of the subnet. Cover a /24 and a
+        # host-bit-carrying /16, which install.sh writes verbatim.
         source = (ROOT / "scripts/install.sh").read_text()
         functions = "\n".join(
             re.search(rf"^{name}\(\) \{{.*?\n\}}", source, re.S | re.M).group(0)
@@ -697,64 +741,131 @@ class CellHvCorePackagingTests(unittest.TestCase):
                 "delete_chv_network_state",
             )
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = pathlib.Path(tmp)
-            bin_dir = tmp_path / "bin"
-            bin_dir.mkdir()
-            log = tmp_path / "calls.log"
-            log.write_text("")
-            etc = tmp_path / "etc"
-            (etc / "sysctl.d").mkdir(parents=True)
-            rules = tmp_path / "rules.v4"
-            rules.write_text("*nat\nCOMMIT\n")
-            ip = bin_dir / "ip"
-            ip.write_text(
-                "#!/bin/bash\n"
-                f"printf 'ip %s\\n' \"$*\" >> {log}\n"
-                "exit 1\n"
-            )
-            nft = bin_dir / "nft"
-            nft.write_text(
-                "#!/bin/bash\n"
-                f"printf 'nft %s\\n' \"$*\" >> {log}\n"
-            )
-            iptables = bin_dir / "iptables"
-            iptables.write_text(
-                "#!/bin/bash\n"
-                f"printf 'iptables %s\\n' \"$*\" >> {log}\n"
-                'case "$3" in\n'
-                "  -C) exit 1 ;;\n"
-                "  *) exit 0 ;;\n"
-                "esac\n"
-            )
-            for tool in (ip, nft, iptables):
-                tool.chmod(0o755)
-            script = (
-                "set -euo pipefail\n"
-                'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
-                'have() { command -v "$1" >/dev/null 2>&1; }\n'
-                "CHV_DB_PATH=/nonexistent.db\n"
-                "CHV_USER=chv-no-such-user\n"
-                "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
-                "INSTALL_CHV_BRIDGE_CIDR=10.206.0.1/24\n"
-                f"CHV_HOST_ETC='{etc}'\n"
-                f"CHV_IPTABLES_RULES_V4='{rules}'\n"
-                f"{functions}\n"
-                "delete_chv_network_state\n"
-            )
-            subprocess.run(
-                ["bash", "-c", script],
-                env=dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}"),
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            calls = log.read_text()
-        self.assertIn(
-            "iptables -t nat -C POSTROUTING -s 10.206.0.0/24 "
-            "! -d 10.206.0.0/24 -j MASQUERADE",
-            calls,
-        )
+        for configured, expected in (
+            ("10.206.0.1/24", "10.206.0.0/24"),
+            ("10.206.5.1/16", "10.206.5.0/16"),
+        ):
+            with self.subTest(configured=configured):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = pathlib.Path(tmp)
+                    bin_dir = tmp_path / "bin"
+                    bin_dir.mkdir()
+                    log = tmp_path / "calls.log"
+                    log.write_text("")
+                    etc = tmp_path / "etc"
+                    (etc / "sysctl.d").mkdir(parents=True)
+                    rules = tmp_path / "rules.v4"
+                    rules.write_text("*nat\nCOMMIT\n")
+                    ip = bin_dir / "ip"
+                    ip.write_text(
+                        "#!/bin/bash\n"
+                        f"printf 'ip %s\\n' \"$*\" >> {log}\n"
+                        "exit 1\n"
+                    )
+                    nft = bin_dir / "nft"
+                    nft.write_text(
+                        "#!/bin/bash\n"
+                        f"printf 'nft %s\\n' \"$*\" >> {log}\n"
+                    )
+                    iptables = bin_dir / "iptables"
+                    iptables.write_text(
+                        "#!/bin/bash\n"
+                        f"printf 'iptables %s\\n' \"$*\" >> {log}\n"
+                        'case "$3" in\n'
+                        "  -C) exit 1 ;;\n"
+                        "  *) exit 0 ;;\n"
+                        "esac\n"
+                    )
+                    for tool in (ip, nft, iptables):
+                        tool.chmod(0o755)
+                    script = (
+                        "set -euo pipefail\n"
+                        'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
+                        'have() { command -v "$1" >/dev/null 2>&1; }\n'
+                        "CHV_DB_PATH=/nonexistent.db\n"
+                        "CHV_USER=chv-no-such-user\n"
+                        "INSTALL_CHV_BRIDGE_NAME=chvbr0\n"
+                        f"INSTALL_CHV_BRIDGE_CIDR={configured}\n"
+                        f"CHV_HOST_ETC='{etc}'\n"
+                        f"CHV_IPTABLES_RULES_V4='{rules}'\n"
+                        f"{functions}\n"
+                        "delete_chv_network_state\n"
+                    )
+                    subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
+                            os.environ,
+                            PATH=f"{bin_dir}:{os.environ['PATH']}",
+                        ),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    calls = log.read_text()
+                self.assertIn(
+                    f"iptables -t nat -C POSTROUTING -s {expected} "
+                    f"! -d {expected} -j MASQUERADE",
+                    calls,
+                )
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required")
+    def test_network_id_discovery_survives_failing_nft_and_ip(self):
+        # A partially failing nft/ip must not truncate id discovery or abort
+        # the teardown under bash pipefail. Whatever the tool printed before
+        # exiting non-zero is still used.
+        for relative in (
+            "scripts/install.sh",
+            "scripts/quick-install.sh",
+            "packaging/scripts/preremove.sh",
+        ):
+            with self.subTest(script=relative):
+                source = (ROOT / relative).read_text()
+                functions = re.search(
+                    r"^chv_network_ids\(\) \{.*?\n\}", source, re.S | re.M
+                ).group(0)
+                with tempfile.TemporaryDirectory() as tmp:
+                    bin_dir = pathlib.Path(tmp) / "bin"
+                    bin_dir.mkdir()
+                    nft = bin_dir / "nft"
+                    nft.write_text(
+                        "#!/bin/bash\n"
+                        'if [ "$1 $2" = "list tables" ]; then\n'
+                        "  printf '%s\\n' 'table inet chv-deadbeef'\n"
+                        "  exit 1\n"
+                        "fi\n"
+                    )
+                    ip = bin_dir / "ip"
+                    ip.write_text(
+                        "#!/bin/bash\n"
+                        'if [ "$1 $2" = "netns list" ]; then\n'
+                        "  printf '%s\\n' ns-default\n"
+                        "  exit 1\n"
+                        "fi\n"
+                    )
+                    nft.chmod(0o755)
+                    ip.chmod(0o755)
+                    script = (
+                        "set -euo pipefail\n"
+                        'cmd_exists() { command -v "$1" >/dev/null 2>&1; }\n'
+                        'have() { command -v "$1" >/dev/null 2>&1; }\n'
+                        "CHV_DB_PATH=/nonexistent.db\n"
+                        "CHV_USER=chv-no-such-user\n"
+                        f"{functions}\n"
+                        "chv_network_ids\n"
+                    )
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        env=dict(
+                            os.environ,
+                            PATH=f"{bin_dir}:{os.environ['PATH']}",
+                        ),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                ids = result.stdout.split()
+                self.assertIn("deadbeef", ids, relative)
+                self.assertIn("default", ids, relative)
 
     def _assert_preremove_upgrade_is_a_noop(self):
         # dpkg/rpm call preremove.sh with `upgrade` (or `1`) on upgrade. The

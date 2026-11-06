@@ -1772,14 +1772,16 @@ remove_chv_bridge_and_nat() {
                     for (i = 1; i < NF; i++) if ($i == "-s") { print $(i + 1); break }
                 }' "$rules_file" || true
             fi
+            # Union, not a precedence chain: a stale `! -o` rule must not hide
+            # the route or the database hint for the current `! -d` form.
+            if [ -n "${cidr:-}" ]; then
+                printf '%s\n' "$cidr"
+            fi
+            if [ -n "$hint" ]; then
+                printf '%s\n' "$hint"
+            fi
         } | sort -u || true
     )"
-    if [ -z "$cidrs" ] && [ -n "${cidr:-}" ]; then
-        cidrs="$cidr"
-    fi
-    if [ -z "$cidrs" ] && [ -n "$hint" ]; then
-        cidrs="$hint"
-    fi
 
     for cidr in $cidrs; do
         if cmd_exists iptables; then
