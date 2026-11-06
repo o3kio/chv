@@ -660,6 +660,26 @@ async fn update_network_rejects_ui_dialect_and_malformed_rules() {
             "source_cidr",
         ),
         (
+            "plus-prefixed cidr prefix (nft rejects it)",
+            r#"{"direction":"inbound","action":"accept","protocol":"icmp","source_cidr":"10.99.0.0/+24"}"#,
+            "source_cidr",
+        ),
+        (
+            "reversed port range (nft rejects it)",
+            r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"8090-8080"}"#,
+            "dest_port",
+        ),
+        (
+            "plus-prefixed port (nft rejects it)",
+            r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"+443"}"#,
+            "dest_port",
+        ),
+        (
+            "port on a protocol without ports",
+            r#"{"direction":"inbound","action":"accept","protocol":"icmp","dest_port":"443"}"#,
+            "dest_port",
+        ),
+        (
             "service-name port",
             r#"{"direction":"inbound","action":"accept","protocol":"tcp","dest_port":"ssh"}"#,
             "dest_port",

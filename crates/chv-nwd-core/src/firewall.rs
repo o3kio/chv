@@ -59,6 +59,19 @@ fn validate_rule(rule: &FirewallRule) -> Result<(), ChvError> {
                 reason: format!("invalid port spec: '{}'", port),
             });
         }
+        // A port only renders for protocols that carry one. Silently ignoring
+        // it (the old behavior for icmp/all) broadens the rule the operator
+        // wrote, so reject the combination instead.
+        if !matches!(rule.protocol.as_str(), "tcp" | "udp" | "sctp") {
+            return Err(ChvError::InvalidArgument {
+                field: "dest_port".to_string(),
+                reason: format!(
+                    "dest_port is not valid for protocol '{}': only tcp, udp, and sctp \
+                     have ports",
+                    rule.protocol
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -310,7 +323,7 @@ pub async fn apply_firewall_rules(
         // Destination port match
         let port_owned;
         if let Some(ref port) = rule.dest_port {
-            if protocol_lower == "tcp" || protocol_lower == "udp" {
+            if matches!(protocol_lower.as_str(), "tcp" | "udp" | "sctp") {
                 args.push(&protocol_lower);
                 args.push("dport");
                 port_owned = port.clone();
@@ -807,6 +820,45 @@ mod tests {
             ),
             Err(ChvError::InvalidArgument { .. })
         ));
+        // Lexical forms Rust's parsers accept but nft rejects must not reach
+        // the journal either.
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"10.0.0.0/+24"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        for port in ["8090-8080", "+443", "+8080-+8090"] {
+            let payload = format!(
+                r#"[{{"direction":"inbound","protocol":"tcp","action":"accept","dest_port":"{port}"}}]"#
+            );
+            assert!(
+                matches!(
+                    validate_firewall_policy(payload.as_bytes()),
+                    Err(ChvError::InvalidArgument { .. })
+                ),
+                "port spec {port} would fail at nft and must be rejected"
+            );
+        }
+        // A port on a protocol without ports used to be silently ignored,
+        // broadening the rule; reject the combination.
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"icmp","action":"accept","dest_port":"443"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            validate_firewall_policy(
+                br#"[{"direction":"inbound","protocol":"all","action":"accept","dest_port":"443"}]"#
+            ),
+            Err(ChvError::InvalidArgument { .. })
+        ));
+        // sctp does carry ports and the renderer emits `sctp dport`.
+        assert!(validate_firewall_policy(
+            br#"[{"direction":"inbound","protocol":"sctp","action":"accept","dest_port":"8080-8090"}]"#
+        )
+        .is_ok());
 
         // NAT: same contract (BFF stores nat_rules verbatim, so this is the
         // only validation on the path).

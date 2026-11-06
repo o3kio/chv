@@ -62,6 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too (the engine renders `ip saddr`/`ip daddr` only). A persisted entry that
   still cannot be re-applied fails with an error naming the exact journal
   file.
+- **Firewall-rule validation now matches what the renderer can produce.**
+  The shared save gate and nwd reject IPv6 CIDRs, `+`-prefixed CIDR prefixes
+  and ports, reversed port ranges, and a `dest_port` on a protocol without
+  ports (`icmp`/`all`); `sctp` destination ports are now rendered instead of
+  silently ignored. Every one of those forms previously passed validation
+  and either failed at nft or broadened the rule the operator wrote.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**

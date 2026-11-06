@@ -927,6 +927,21 @@ fn validate_firewall_ruleset(rules: &[serde_json::Value]) -> Result<(), BffError
             obj.get("dest_port"),
             vocab::is_valid_port_spec,
         )?;
+        // A port only renders for protocols that carry one. nwd now rejects the
+        // combination (silently ignoring it would broaden the rule), so the
+        // save gate must fail fast with the same truth.
+        if obj.get("dest_port").is_some_and(|v| !v.is_null()) {
+            let protocol = obj
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !matches!(protocol, "tcp" | "udp" | "sctp") {
+                return Err(BffError::BadRequest(format!(
+                    "firewall_rules[{index}]: 'dest_port' is not valid for protocol \
+                     '{protocol}' — only tcp, udp, and sctp carry a port"
+                )));
+            }
+        }
     }
     Ok(())
 }

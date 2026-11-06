@@ -53,19 +53,35 @@ pub fn is_valid_cidr(cidr: &str) -> bool {
     if parts.len() != 2 {
         return false;
     }
+    // nft rejects `+24` and other non-digit prefixes that Rust's integer
+    // parser would accept; require plain ASCII digits so the gate agrees with
+    // the renderer exactly.
+    if parts[1].is_empty() || !parts[1].bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
     match parts[0].parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(_)) => parts[1].parse::<u8>().map(|p| p <= 32).unwrap_or(false),
         _ => false,
     }
 }
 
-/// Is `port` a valid single port or port range (`443`, `8080-8090`)?
+/// Is `port` a valid single port or ascending port range (`443`,
+/// `8080-8090`)?
+///
+/// `FromStr` accepts a leading `+` and a reversed range parses fine, but nft
+/// rejects both. A payload that passes the save gate and is then journaled
+/// would crash-loop fail-closed recovery, so the gate mirrors the renderer.
 pub fn is_valid_port_spec(port: &str) -> bool {
-    if port.contains('-') {
-        let parts: Vec<&str> = port.splitn(2, '-').collect();
-        parts.len() == 2 && parts[0].parse::<u16>().is_ok() && parts[1].parse::<u16>().is_ok()
+    fn digits(value: &str) -> Option<u16> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<u16>().ok()
+    }
+    if let Some((lo, hi)) = port.split_once('-') {
+        matches!((digits(lo), digits(hi)), (Some(lo), Some(hi)) if lo <= hi)
     } else {
-        port.parse::<u16>().is_ok()
+        digits(port).is_some()
     }
 }
 
@@ -134,6 +150,8 @@ mod tests {
         assert!(!is_valid_cidr("::1/128"));
         assert!(!is_valid_cidr("10.200.0.0")); // no prefix
         assert!(!is_valid_cidr("10.200.0.0/33")); // bad prefix
+                                                  // nft rejects a `+`-prefixed prefix; do not let it into the journal.
+        assert!(!is_valid_cidr("10.200.0.0/+24"));
         assert!(!is_valid_cidr("not-an-ip/24"));
     }
 
@@ -141,9 +159,15 @@ mod tests {
     fn port_spec_validator_accepts_ports_and_ranges() {
         assert!(is_valid_port_spec("443"));
         assert!(is_valid_port_spec("8080-8090"));
+        assert!(is_valid_port_spec("8080-8080")); // equal endpoints are valid in nft
+        assert!(is_valid_port_spec("0-65535"));
         assert!(!is_valid_port_spec("80-")); // dangling range
         assert!(!is_valid_port_spec("ssh")); // no service names
         assert!(!is_valid_port_spec("0-99999")); // out of u16
+                                                 // nft rejects both of these; Rust's FromStr/parse would accept them.
+        assert!(!is_valid_port_spec("8090-8080")); // reversed range
+        assert!(!is_valid_port_spec("+443"));
+        assert!(!is_valid_port_spec("+8080-+8090"));
     }
 
     #[test]
