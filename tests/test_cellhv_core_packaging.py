@@ -157,11 +157,16 @@ class CellHvCorePackagingTests(unittest.TestCase):
         ).group(1)
         self.assertIn(expected, cleanup)
 
+        # Package removal is deliberately surgical: the persistent root is
+        # preserved, so the journal contents are deleted with find/rmdir
+        # instead of a blanket `rm -rf` (which check-safety.sh rejects).
         preremove = (ROOT / "packaging/scripts/preremove.sh").read_text()
         cleanup = re.search(
             r"delete_chv_network_state\(\) \{(.*?)\n\}", preremove, re.S
         ).group(1)
-        self.assertIn(expected, cleanup)
+        self.assertIn('nwd_state="${CHV_DATA_DIR:-/var/lib/chv}/nwd"', cleanup)
+        self.assertIn('find "$nwd_state" -mindepth 1 -delete', cleanup)
+        self.assertNotIn("rm -rf", cleanup)
 
     def test_install_surfaces_provision_exact_private_parents(self):
         postinstall = (ROOT / "packaging/scripts/postinstall.sh").read_text()
