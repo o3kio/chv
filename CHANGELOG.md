@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.5] - 2026-11-06
+
+> **Final release candidate for `v0.4.0`.** The rc.5 runtime is unchanged
+> from rc.2/rc.3/rc.4. The delta is the repo-only quick installer (#727), the
+> qualification invariants, and documentation.
+
+### Fixed
+- **Quick install could complete with no enrolled node (blocker; #727).**
+  `scripts/quick-install.sh` started `chv-agent` in `start_services`, before
+  `seed_admin_user` performed its offline (`chv_sqlite_offline`, #722)
+  direct SQLite writes. The control-plane stop landed inside the agent's
+  single, non-retrying enrollment attempt. Enrollment failed with a
+  transport error; the agent kept its pre-enrollment certificate
+  (`CN=chv-agent`) and the configured UUID `node_id`, so every later
+  publish was rejected as an impersonation attempt
+  (`peer node_id mismatch`). The installer returned `rc=0` and the WebUI
+  worked, but `nodes` stayed empty. This is the defect the rc.4
+  post-publication lane caught as `FAIL node enrolled and visible
+  (timeout)` (run
+  [42148690329](https://github.com/o3kio/chv/actions/runs/42148690329)).
+  `start_services` now starts only stord/nwd; a new `start_agent` runs
+  after `seed_admin_user` on a fresh install (or immediately on a re-run).
+- **A documented re-run destroyed the enrolled agent identity (blocker;
+  #727).** Re-running the quick installer (the advertised upgrade path)
+  deleted `agent-cache.json`, re-staged the pre-enrollment certificate, and
+  left the already-consumed one-time bootstrap token in place. The agent
+  could not re-enroll, kept `CN=chv-agent` plus the configured `node_id`,
+  and was rejected as an impersonator; the old node row's `enrolled_at`
+  made the installer print `Local agent enrolled` anyway. The agent unit's
+  `RuntimeDirectory=chv` also removes `/run/chv` on stop, deleting the
+  stord/nwd sockets and any certs staged before the restart. A re-run now
+  preserves a usable enrolled identity (cache `enrollment_complete=true`
+  plus its durable cert/key/CA present); only a missing or incomplete
+  identity clears the cache, mints a fresh token, and seeds it. On a
+  re-run, `start_agent` stops the agent, restarts stord/nwd afterwards,
+  waits for both sockets, stages the certs, and starts the agent.
+
+### Qualification
+- Invariants pin the fresh-install ordering, re-run identity preservation,
+  cert staging after the agent stop, the stord/nwd socket wait, and
+  stop-before-restart ordering. Each pin fails when its regression is
+  reintroduced. `tests/scripts/qual-harness-invariants.sh` is 174 ok /
+  0 fail.
+
+> **`v0.4.0-rc.4`'s quick installer has both defects.** Its tarball,
+> package, and upgrade path is unaffected and passed its post-publication
+> lane, but the quick installer can complete with no enrolled node and a
+> re-run destroys the enrolled identity. Do not use the rc.4 quick
+> installer for a new install or an upgrade. rc.4 remains published and is
+> not rewritten.
+
 ## [0.4.0-rc.4] - 2026-11-06
 
 ### Fixed

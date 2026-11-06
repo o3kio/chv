@@ -2,8 +2,8 @@
 
 This guide deploys CHV on a single Linux host. The host runs the **control plane** (orchestration, API, Web UI) and Cloud Hypervisor (the VMM) as the VM runtime.
 
-> **Version:** 0.4.0 (release candidate `v0.4.0-rc.4`; `VERSION` holds the base
-> `0.4.0` and the tag carries the `-rc.4` suffix)  
+> **Version:** 0.4.0 (release candidate `v0.4.0-rc.5`; `VERSION` holds the base
+> `0.4.0` and the tag carries the `-rc.5` suffix)  
 > **Target:** Ubuntu 22.04/24.04 LTS or equivalent Linux with KVM support  
 > **Database:** SQLite (no external database service required)
 
@@ -29,11 +29,11 @@ Run the qualified all-in-one installer on a fresh Ubuntu server with root access
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo bash -s
 ```
 
-Or install a specific version (the current release candidate is `0.4.0-rc.4`;
+Or install a specific version (the current release candidate is `0.4.0-rc.5`;
 `0.3.0` remains the latest stable):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.4 bash -s
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/install.sh | sudo INSTALL_CHV_VERSION=0.4.0-rc.5 bash -s
 ```
 
 The installer script requires **bash**: it uses `set -o pipefail`, which `sh`
@@ -143,8 +143,8 @@ GPG signature check in the installer.
 > tarball with a `.sha256` sidecar alongside the `.deb`/`.rpm` packages), so
 > this resolution leg is live — tagged releases are the artifact source, and
 > the rolling `nightly` pre-release is never selected. The current release
-> candidate `v0.4.0-rc.4` is a GitHub pre-release, so the stable resolver
-> correctly skips it; install it by pinning `0.4.0-rc.4` explicitly. The
+> candidate `v0.4.0-rc.5` is a GitHub pre-release, so the stable resolver
+> correctly skips it; install it by pinning `0.4.0-rc.5` explicitly. The
 > `get.cellhv.com` hosting surface is **not stood up** (the name does not
 > resolve); see
 > [Hosting the Installer (`get.cellhv.com`)](#hosting-the-installer-getcellhvcom)
@@ -184,14 +184,19 @@ in the install output. You will be required to change it on first login.
 > so this is not bare-metal evidence. `scripts/install.sh` remains the
 > qualified (KVM-verified) deployment path.
 >
-> **Do not install `v0.4.0-rc.2` or use the `v0.4.0-rc.3` quick installer.**
-> Both paths have a blocker-class clean-install data-loss defect: a direct
-> `sqlite3` write unlinked the WAL the live control plane still held open, so
-> API writes acknowledged after install (including the first-login password
-> rotation and created users) were lost on the next restart or upgrade.
-> `v0.4.0-rc.3` fixed the `scripts/install.sh` tarball/package path (#722);
-> `v0.4.0-rc.4` fixes the quick installer (#725). See the
-> [rc.4 release notes](release/v0.4.0-rc.4-release-notes.md) §2. The rc.4
+> **Do not install `v0.4.0-rc.2`, or use the `v0.4.0-rc.3` or `v0.4.0-rc.4`
+> quick installers.** rc.2 and the rc.3 quick installer have a
+> blocker-class clean-install data-loss defect: a direct `sqlite3` write
+> unlinked the WAL the live control plane still held open, so API writes
+> acknowledged after install (including the first-login password rotation
+> and created users) were lost on the next restart or upgrade. `v0.4.0-rc.3`
+> fixed the `scripts/install.sh` tarball/package path (#722) and
+> `v0.4.0-rc.4` fixed that quick-installer defect (#725), but rc.4's quick
+> installer has two more: it can complete with no enrolled node, and a
+> documented re-run destroys the enrolled agent identity. Both are fixed in
+> `v0.4.0-rc.5` (#727). The rc.4 tarball/package and upgrade path is
+> unaffected and passed its lane. See the
+> [rc.5 release notes](release/v0.4.0-rc.5-release-notes.md) §2. The rc.5
 > post-publication lane is run after publication and is not pre-claimed here.
 
 A curl-pipe-bash installer for trying CHV on a fresh Linux host — one
@@ -207,7 +212,7 @@ curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-instal
 Or pinned to a tagged release, with a dry run available:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0-rc.4
+curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --version 0.4.0-rc.5
 curl -fsSL https://raw.githubusercontent.com/o3kio/chv/main/scripts/quick-install.sh | sudo bash -s -- --dry-run
 ```
 
@@ -230,7 +235,7 @@ package-serving shape where the control plane serves the WebUI itself
 that shape, so the script refuses them (`--version 0.3.0` fails closed)
 rather than install a host with a 404 UI. While v0.3.0 remains the latest
 stable during the v0.4.0-rc.N window, pin the pre-release explicitly:
-`--version 0.4.0-rc.4`.
+`--version 0.4.0-rc.5`.
 
 After it completes, open `http://<host-ip>:8080/` and log in as
 **admin** with the password from `/etc/chv/initial_admin_password`
