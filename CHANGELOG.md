@@ -90,8 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removes the overlay, resets the bridge MTU, clears the persisted fabric
   generation, and reports that the overlay was rolled back; retry with the
   latest plan. If the removal itself fails, the error says the veth may
-  remain grafted and unguarded. The rollback is operator-visible: it tears
-  down the network's fabric overlay rather than leaving a new veth outside the
+  remain grafted and unguarded. If the removal succeeds but the bridge-MTU
+  reset fails, the error says the overlay was rolled back while the MTU may
+  remain at the fabric value. The rollback is operator-visible: it tears down
+  the network's fabric overlay rather than leaving a new veth outside the
   guard set.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct

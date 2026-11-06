@@ -75,6 +75,8 @@ struct FabricExecutor {
     policy_apply_fails: bool,
     /// When set, an MTU re-assert to an explicit value fails (m8 ordering).
     mtu_reassert_fails: bool,
+    /// When set, the rollback's bridge-only MTU reset fails.
+    mtu_reset_fails: bool,
     /// When set, the next fabric apply pauses after recording its call so a
     /// test can queue a competing ensure behind the handler's fabric lock.
     pause_apply: Arc<std::sync::atomic::AtomicBool>,
@@ -93,6 +95,7 @@ impl FabricExecutor {
             local_delete_fails: false,
             policy_apply_fails: false,
             mtu_reassert_fails: false,
+            mtu_reset_fails: false,
             pause_apply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             apply_entered: Arc::new(tokio::sync::Notify::new()),
             apply_release: Arc::new(tokio::sync::Notify::new()),
@@ -117,6 +120,14 @@ impl FabricExecutor {
     fn with_failing_mtu_reassert() -> Self {
         Self {
             mtu_reassert_fails: true,
+            ..Self::enabled()
+        }
+    }
+
+    fn with_failing_policy_apply_and_mtu_reset() -> Self {
+        Self {
+            policy_apply_fails: true,
+            mtu_reset_fails: true,
             ..Self::enabled()
         }
     }
@@ -443,7 +454,9 @@ impl NetworkExecutor for FabricExecutor {
             .map(|m| m.to_string())
             .unwrap_or_else(|| "none".to_string());
         self.record(format!("reassert_mtu:{network_id}:{mtu}"));
-        if self.mtu_reassert_fails && tenant_mtu.is_some() {
+        if (self.mtu_reassert_fails && tenant_mtu.is_some())
+            || (self.mtu_reset_fails && tenant_mtu.is_none())
+        {
             return Err(ChvError::Internal {
                 reason: "MTU re-assert deliberately failing".to_string(),
             });
@@ -1126,6 +1139,84 @@ async fn failed_overlay_rollback_is_reported_truthfully() {
     assert!(
         !ensured.human_summary.contains("was rolled back"),
         "the ensure error must not claim a rollback that did not happen: {ensured:?}"
+    );
+}
+
+/// A successful overlay rollback whose bridge-MTU reset fails must say so:
+/// the overlay is gone but the bridge may still be at the fabric MTU.
+#[tokio::test]
+async fn rollback_reports_an_mtu_reset_failure() {
+    let executor = FabricExecutor::with_failing_policy_apply_and_mtu_reset();
+    let (socket, _dir) = spawn_server(executor.clone()).await;
+    let mut client = make_client(socket).await;
+
+    let mut spec = fabric_topology_spec("net-mtu-reset-fail", 2);
+    spec.fabric = fabric_plan(2, 0);
+    let ensure = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(spec),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensure.status, "OK");
+
+    let fw = client
+        .set_firewall_policy(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-mtu-reset-fail".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(fw.status, "OK");
+
+    let update = client
+        .update_overlay(UpdateOverlayRequest {
+            network_id: "net-mtu-reset-fail".to_string(),
+            vni: 100,
+            vtep_endpoints: vec![],
+            fdb_entries: vec![],
+            fabric: fabric_plan(3, 0),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let summary = &update.result.as_ref().unwrap().human_summary;
+    assert_eq!(update.result.as_ref().unwrap().status, "error");
+    assert!(
+        summary.contains("MTU reset failed") && summary.contains("rolled back"),
+        "the update error must disclose the MTU residue: {summary}"
+    );
+    assert!(
+        !summary.contains("rollback FAILED"),
+        "the overlay was removed, so the error must not claim the rollback failed: {summary}"
+    );
+
+    let mut newer = fabric_topology_spec("net-mtu-reset-fail", 3);
+    newer.fabric = fabric_plan(3, 0);
+    let ensured = client
+        .ensure_network_topology(EnsureNetworkTopologyRequest {
+            meta: None,
+            topology: Some(newer),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ensured.status, "error");
+    assert!(
+        ensured.human_summary.contains("MTU reset failed")
+            && ensured.human_summary.contains("rolled back"),
+        "the ensure error must disclose the MTU residue: {ensured:?}"
+    );
+    assert!(
+        !ensured.human_summary.contains("rollback FAILED"),
+        "the overlay was removed, so the error must not claim the rollback failed: {ensured:?}"
     );
 }
 
