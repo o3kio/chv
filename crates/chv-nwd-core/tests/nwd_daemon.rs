@@ -1632,7 +1632,7 @@ async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
     );
-    service.set_topology_store(Arc::new(topologies));
+    service.set_topology_store(Arc::new(topologies.clone()));
     service.set_policy_store(Arc::new(policies.clone()));
     let ensured = service
         .ensure_network_topology(TonicRequest::new(EnsureNetworkTopologyRequest {
@@ -1644,13 +1644,28 @@ async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
         .into_inner();
     assert_eq!(ensured.status, "OK");
 
-    // Rejected firewall half -> in-memory only.
-    let fw = service
+    // A valid firewall policy is journaled first.
+    let p1 = service
         .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
             meta: None,
             network_id: "net-leak".to_string(),
             policy: Some(FirewallPolicy {
                 policy_version: "v1".to_string(),
+                policy_json: b"[]".to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(p1.status, "OK");
+
+    // A rejected firewall update must not overwrite the last valid entry.
+    let fw = service
+        .set_firewall_policy(TonicRequest::new(SetFirewallPolicyRequest {
+            meta: None,
+            network_id: "net-leak".to_string(),
+            policy: Some(FirewallPolicy {
+                policy_version: "v2".to_string(),
                 policy_json:
                     br#"[{"direction":"inbound","protocol":"tcp","action":"accept","source_cidr":"fd00::/8"}]"#
                         .to_vec(),
@@ -1662,7 +1677,8 @@ async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
     assert_ne!(fw.status, "OK");
 
     // A valid NAT update snapshots the pair. The rejected firewall half must be
-    // filtered out of the durable snapshot.
+    // filtered out of the durable snapshot, and the last valid P1 must survive
+    // so post-restart attaches are still re-scoped.
     let nat = service
         .set_nat_policy(TonicRequest::new(SetNatPolicyRequest {
             meta: None,
@@ -1681,12 +1697,36 @@ async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
         .await
         .expect("a valid NAT half must be journaled");
     let stored: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert!(
-        stored["firewall"].is_null(),
-        "rejected firewall half leaked into the durable journal: {stored}"
-    );
     // Policy JSON is stored as raw bytes: `[]` is [0x5b, 0x5d].
+    assert_eq!(
+        stored["firewall"],
+        serde_json::json!([91, 93]),
+        "the last valid firewall policy must survive a rejected update: {stored}"
+    );
+    assert_eq!(stored["firewall_version"], "v1");
     assert_eq!(stored["nat"], serde_json::json!([91, 93]));
+
+    // A restart must recover P1 and re-apply it, so a later attach is scoped.
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut restarted = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: calls.clone(),
+            reject_firewall: false,
+        }),
+        Arc::new(TopologyTable::new()),
+        Arc::new(Metrics::new()),
+    );
+    restarted.set_topology_store(Arc::new(topologies));
+    restarted.set_policy_store(Arc::new(policies));
+    restarted.recover_topologies().await.unwrap();
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("fw:net-leak:")),
+        "recovery must re-apply the surviving validated firewall policy"
+    );
 }
 
 /// If a journal entry can no longer be applied (corruption/tampering after the

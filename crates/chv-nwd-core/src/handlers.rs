@@ -24,13 +24,29 @@ struct AppliedPolicies {
     nat_version: Option<String>,
 }
 
-/// Build the durable snapshot from the in-memory desired state, dropping a half
-/// that is currently rejected.
+/// In-memory rejection markers for policies that failed pre-journal validation.
 ///
-/// A rejected payload is kept in memory only so the attach-time guard refresh
-/// fails closed. Persisting it — directly, or indirectly when the other half is
-/// updated and snapshots the pair — would make fail-closed startup recovery
-/// replay an unapplicable entry and crash-loop nwd, the exact B9 poison class.
+/// The rejected payload is deliberately NOT stored in `policy_state`: that map
+/// is the desired state the durable journal snapshots, and a rejected half must
+/// never overwrite the last valid entry (otherwise a post-restart attach would
+/// find nothing to re-scope). Instead the marker makes `refresh_policy_scope`
+/// refuse a NIC attach until a valid policy replaces it — fail-closed while the
+/// last valid policy stays durable and recoverable.
+#[derive(Clone, Default)]
+struct RejectedPolicies {
+    firewall: bool,
+    nat: bool,
+}
+
+/// Build the durable snapshot from the in-memory desired state, dropping a half
+/// that does not validate.
+///
+/// Defense in depth: the rejection path only sets [`RejectedPolicies`] and never
+/// writes `policy_state`, so this should be a no-op today. It stays because a
+/// future writer (or a restored/regressed desired state) must not leak an
+/// unapplicable half into the journal through an update of the other half:
+/// fail-closed recovery would replay it and crash-loop nwd (the B9 poison
+/// class).
 fn durable_snapshot(applied: &AppliedPolicies) -> StoredPolicies {
     let firewall = applied
         .firewall
@@ -55,6 +71,7 @@ pub struct NetworkServiceImpl<E: NetworkExecutor> {
     security_policies: Arc<DashMap<String, proto::SecurityPolicy>>,
     rate_limit_policies: Arc<DashMap<String, proto::RateLimitPolicy>>,
     policy_state: Arc<DashMap<String, AppliedPolicies>>,
+    rejected_policies: Arc<DashMap<String, RejectedPolicies>>,
     ebpf: Arc<dyn EbpfManager>,
     /// Counter tracking eBPF program load failures.
     ebpf_load_failures: Arc<AtomicU32>,
@@ -80,6 +97,7 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
             security_policies: Arc::new(DashMap::new()),
             rate_limit_policies: Arc::new(DashMap::new()),
             policy_state: Arc::new(DashMap::new()),
+            rejected_policies: Arc::new(DashMap::new()),
             ebpf: Arc::new(ebpf::NoopEbpfManager),
             ebpf_load_failures: Arc::new(AtomicU32::new(0)),
             topology_store: None,
@@ -426,6 +444,21 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
     /// closed (returns an error) so an attached NIC is never left outside the
     /// default-deny boundary.
     async fn refresh_policy_scope(&self, state: &TopologyState) -> Result<(), ChvError> {
+        // A policy that failed pre-journal validation has no desired-state
+        // record (the last valid one, if any, stays intact). Refuse the attach
+        // instead of leaving the new NIC outside the guard: the attach seam
+        // drops nwd's semantic error, so returning Ok here would be fail-open.
+        if let Some(rejected) = self.rejected_policies.get(&state.network_id) {
+            if rejected.firewall || rejected.nat {
+                return Err(ChvError::Internal {
+                    reason: format!(
+                        "network {} has a rejected firewall/NAT policy (not applied); \
+                         re-save the policy before attaching a NIC",
+                        state.network_id
+                    ),
+                });
+            }
+        }
         // Snapshot semantics: if no record exists for the network there is
         // nothing to re-scope. Re-read the latest desired JSON/version
         // immediately before each apply so a concurrent policy RPC that landed
@@ -887,6 +920,7 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
                 return Ok(Response::new(Self::err_result(&e)));
             }
             self.policy_state.remove(&req.network_id);
+            self.rejected_policies.remove(&req.network_id);
         }
 
         Ok(Response::new(Self::ok_result()))
@@ -1175,19 +1209,19 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // so an unapplicable entry would turn the next documented restart
         // into a crash loop that only manual file surgery could clear.
         if let Err(e) = crate::firewall::validate_firewall_policy(&policy.policy_json) {
-            // Still record the DESIRED (unapplicable) payload in memory, but
-            // never in the journal. The attach seam deliberately drops nwd's
-            // semantic error, so returning without a record would let the next
-            // NIC attach find nothing to re-scope and proceed unguarded
-            // (fail-open). With the record, refresh_policy_scope re-attempts
-            // the invalid apply and refuses the attach — rc.7's fail-closed
-            // outcome — while a restart cannot replay the poison entry.
-            {
-                let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
-                applied.firewall = Some(policy.policy_json.clone());
-                applied.firewall_version = Some(policy.policy_version.clone());
-            }
+            // Do not touch `policy_state`: it holds the desired state the
+            // durable journal snapshots, and overwriting the last valid entry
+            // with an unapplicable payload would erase the post-restart policy
+            // (leaving a later attach unscoped). A marker makes
+            // refresh_policy_scope refuse the attach until a valid save lands.
+            self.rejected_policies
+                .entry(req.network_id.clone())
+                .or_default()
+                .firewall = true;
             return Ok(Response::new(Self::err_result(&e)));
+        }
+        if let Some(mut rejected) = self.rejected_policies.get_mut(&req.network_id) {
+            rejected.firewall = false;
         }
 
         // Record the DESIRED policy state regardless of apply outcome (the
@@ -1261,15 +1295,17 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
         // set_firewall_policy): the journal is replayed fail-closed at
         // startup, so a permanently unapplicable entry would crash-loop nwd.
         if let Err(e) = crate::firewall::validate_nat_policy(&policy.policy_json) {
-            // Same in-memory fail-closed record as the firewall path: NAT is
-            // not the isolation boundary, but an attach-time refresh failure
-            // must still be visible rather than silently skipped.
-            {
-                let mut applied = self.policy_state.entry(req.network_id.clone()).or_default();
-                applied.nat = Some(policy.policy_json.clone());
-                applied.nat_version = Some(policy.policy_version.clone());
-            }
+            // Same marker semantics as the firewall path: keep `policy_state`
+            // (and therefore the journal) on the last valid NAT entry, and
+            // refuse an attach until a valid NAT save replaces the rejection.
+            self.rejected_policies
+                .entry(req.network_id.clone())
+                .or_default()
+                .nat = true;
             return Ok(Response::new(Self::err_result(&e)));
+        }
+        if let Some(mut rejected) = self.rejected_policies.get_mut(&req.network_id) {
+            rejected.nat = false;
         }
 
         // Record the DESIRED NAT policy state regardless of apply outcome for

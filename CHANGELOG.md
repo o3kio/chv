@@ -69,15 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects the forms nft can never apply before journaling, and canonicalizes
   the rc.7-storable numeric forms (leading-zero or `+`-prefixed ports,
   mixed-radix ranges nft accepted under its octal reading, non-canonical CIDR
-  prefixes) before rendering, so a stored rc.7 ruleset keeps applying. A
-  payload that still cannot render is recorded in memory (never in the
-  journal) so the attach is refused rather than left unguarded. Where rc.7
-  accepted a non-canonical form, rc.8 enforces the decimal value the operator
-  wrote (`0443` → 443, `0100-0200` → 100-200); a decimal-reversed mixed-radix
-  range renders nft's values (`0100-99` → `64-99`) to preserve rc.7
-  enforcement. `sctp` destination ports render when canonical (rc.7 ignored
-  them); a legacy `dest_port` on `icmp`/`all`/unrenderable `sctp` is still
-  applied with the port ignored and a warning, preserving rc.7 behavior.
+  prefixes) before rendering, so a stored rc.7 ruleset still renders instead
+  of failing dispatch at the attach seam. Where rc.7 accepted a non-canonical
+  form, rc.8 enforces the decimal value the operator wrote (`0443` → 443,
+  `0100-0200` → 100-200); a decimal-reversed mixed-radix range keeps nft's
+  values (`0100-99` → `64-99`) because rc.7 applied exactly that range, and a
+  form rc.7 could not apply (`+443`, `600-0777`) is now applied at its decimal
+  meaning. A payload that still cannot render leaves a rejection marker in
+  memory (never in the journal, and the last valid journaled policy survives)
+  so the attach is refused rather than left unguarded. `sctp` destination
+  ports render when canonical (rc.7 ignored them); a legacy `dest_port` on
+  `icmp`/`all`/unrenderable `sctp` is still applied with the port ignored and
+  a warning, preserving rc.7 behavior.
 - **The rc.7 → rc.8 upgrade started with an empty journal.** The agent now
   asks nwd which topologies it already owns and replays only the distinct
   bridge-only networks referenced by a live Core VM that nwd does **not**
