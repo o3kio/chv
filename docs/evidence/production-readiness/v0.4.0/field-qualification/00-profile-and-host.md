@@ -10,7 +10,9 @@ published `v0.4.0-rc.7` pre-window upgrade/restart drill then reproduced B8
 restart loses the topology table, so the next policy update fails
 `NOT_FOUND` / `DISPATCH_FAILED`). rc.6 and rc.7 are disqualified as the
 field/stable base; `v0.4.0-rc.8` is the approved successor and final release
-candidate. See [`01-rc6-blockers.md`](01-rc6-blockers.md). The field window
+candidate, **published on 2026-11-06 and verified** (signed tag, tarball
+sidecar, eight package digests, SLSA provenance; identity below). See
+[`01-rc6-blockers.md`](01-rc6-blockers.md). The field window
 has not started. This profile is re-pinned to rc.8; keep this status blocked
 until the rc.8 upgrade/purge drill, the clean rc.8 install, the documented
 start with a guest DHCP lease and `login:` console, a policy change plus nwd
@@ -77,26 +79,34 @@ residue purge transcript is in
 
 ## Artifact identity
 
-### Target: rc.8 (publication in progress)
+### Target: rc.8 (published 2026-11-06)
 
-The rc.8 tag is not yet published at the time this profile is re-pinned. Its
-tag object, commit, tarball, sidecar, `SHA256SUMS`, eight package digests, and
-SLSA build provenance must be recorded here from the published release before
-the window opens. **No rc.8 artifact digest or provenance is claimed until it
-appears in this table.**
+Published from the `Release` workflow run
+[`42282459311`](https://github.com/o3kio/chv/actions/runs/42282459311) on tag
+push. The tarball sidecar and all eight package digests were re-verified by
+downloading the release assets and running `sha256sum -c`; the tag and merge
+commit both verify on GitHub.
 
 | Artifact | Digest / identity |
 |---|---|
-| rc.8 tag | pending publication |
-| rc.8 commit | pending publication |
-| rc.8 tarball | pending publication |
-| rc.8 tarball sidecar | pending publication |
-| rc.8 `SHA256SUMS` | pending publication |
-| rc.8 control plane deb/rpm | pending publication |
-| rc.8 monitor-agent deb/rpm | pending publication |
-| rc.8 node deb/rpm | pending publication |
-| rc.8 chvctl deb/rpm | pending publication |
+| rc.8 tag | annotated tag object `0a6639da5202ad73d0f68249a431d774c4b1b5a4`, commit `6cf634a7ba9fbcc0d70a4b9116c18482b0a25892`; tag signature verified |
+| rc.8 tarball | `chv-0.4.0-rc.8-linux-amd64.tar.gz` = `c7d27f7ed9e41a8ce99d1bcbc4b8595b4dbce5d4af60a350f78d33e97b4d576f` |
+| rc.8 tarball sidecar | `chv-0.4.0-rc.8-linux-amd64.tar.gz.sha256` = `cb0ee3d7fb3e6b47bf613bf4756df2accb36f2827237b18b24b5899bd56cc120` (verifies the tarball) |
+| rc.8 `SHA256SUMS` | `01da7d03173dfccd6feb6b0b208c2188b21df609cc5f2eed20a62a11e07d6aa8` (8 package lines) |
+| rc.8 control plane deb | `73afc3676979a63a9bb14782b2ec0478784e6b68f72e85845e2e40c51ed898e5` |
+| rc.8 monitor-agent deb | `2ed2b201463bb4cd3f3e04a9132af2b2755fd8e06fefe46918f20140f2a96d6b` |
+| rc.8 node deb | `77bf75b589d89cc056ed639e35babb9e7388558fe1530caf587c70120ba3fdc3` |
+| rc.8 chvctl deb | `cab4de41b085af9e3b4f1dfbf444f0ca21b945bb360695e8001bdbf971ef96f4` |
+| rc.8 control plane rpm | `b5602552836f79c6695168573b42823e88344cea65cee525ca2aaeb0aa0ebf90` |
+| rc.8 monitor-agent rpm | `820f0f6ee563aab9e27146f38ee4157a338d1b47b19b43e0690301cd176b1fef` |
+| rc.8 node rpm | `0df75bda17ad9cd0ff0bbc4964e00c7edc91638513c208865363506986b37378` |
+| rc.8 chvctl rpm | `7532cc17537beb8994127ac3889e83f04eec3a79d3365f6d3a056a15a2938c59` |
 | v0.3.0 tarball (upgrade start) | `chv-0.3.0-linux-amd64.tar.gz` = `45990c38f9ba0a1ca573e0c7549479464ff6a0eb763da6ecec4bf1eb376eea0d` |
+
+SLSA build provenance: GitHub attestations are present for the tarball, its
+sidecar, and all eight packages (`repos/o3kio/chv/attestations/sha256:<digest>`
+returns one sigstore bundle per artifact). `scripts/install.sh`
+`fallback_version` remains `0.3.0` through the RC window.
 
 ### Prior artifact: rc.7 (disqualified, historical)
 
