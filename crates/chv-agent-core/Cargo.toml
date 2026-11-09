@@ -40,7 +40,7 @@ nix = { workspace = true, features = ["term", "ioctl", "process", "fs", "user"] 
 jsonwebtoken = { workspace = true }
 lru = "0.18"
 toml = { workspace = true }
-sysinfo = "0.39"
+sysinfo = "0.40"
 
 [dev-dependencies]
 metrics = { workspace = true }
