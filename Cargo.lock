@@ -1223,7 +1223,7 @@ dependencies = [
  "dashmap",
  "fabric-conformance",
  "fabric-linux",
- "fabric-plan",
+ "fabric-plan 0.2.0",
  "hyper-util",
  "libc",
  "metrics",
@@ -2015,7 +2015,7 @@ version = "0.1.5"
 source = "git+https://github.com/o3kio/fabric?tag=v0.1.5#bf99a9f2134ae44b5f485fa2efcb37b103c298a2"
 dependencies = [
  "fabric-linux",
- "fabric-plan",
+ "fabric-plan 0.1.5",
  "serde_json",
 ]
 
@@ -2024,7 +2024,7 @@ name = "fabric-linux"
 version = "0.1.5"
 source = "git+https://github.com/o3kio/fabric?tag=v0.1.5#bf99a9f2134ae44b5f485fa2efcb37b103c298a2"
 dependencies = [
- "fabric-plan",
+ "fabric-plan 0.1.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2034,6 +2034,17 @@ dependencies = [
 name = "fabric-plan"
 version = "0.1.5"
 source = "git+https://github.com/o3kio/fabric?tag=v0.1.5#bf99a9f2134ae44b5f485fa2efcb37b103c298a2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fabric-plan"
+version = "0.2.0"
+source = "git+https://github.com/o3kio/fabric?tag=v0.2.0#b15c2cc977a9b53fcae805b9837e0781297d6e24"
 dependencies = [
  "serde",
  "serde_json",
