@@ -38,7 +38,7 @@ libc = "0.2"
 futures-util = "0.3"
 nix = { workspace = true, features = ["term", "ioctl", "process", "fs", "user"] }
 jsonwebtoken = { workspace = true }
-lru = "0.18"
+lru = "0.19"
 toml = { workspace = true }
 sysinfo = "0.39"
 
