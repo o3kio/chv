@@ -1,9 +1,10 @@
 # NetBox Projection — Implementation Plan (issue #239)
 
 Date: 2026-10-08
-Status: Proposed — execution starts only after the design
+Status: Executed — all slices landed (implementation 2026-10-09; status
+reconciled 2026-11-19). The design
 (`docs/design/issue-239-netbox-projection.md`), ADR-023, the component spec,
-and the two contracts are adopted.
+and the two contracts were adopted and shipped.
 
 References:
 

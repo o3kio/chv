@@ -6,7 +6,7 @@ control-plane authority). See the issue's "Design direction",
 "Required behavior", "Acceptance criteria", and "Non-goals" — all reproduced and
 resolved to decision points (DPs) below.
 
-**Status:** **IMPLEMENTED** (2026-11-19) — the design below was adopted and the
+**Status:** **IMPLEMENTED** (2026-10-09; status reconciled 2026-11-19) — the design below was adopted and the
 8-PR stack merged. Shipped evidence: `crates/chv-netbox-adapter/` (mapping,
 plan, runner, client, ownership), migration `0059_netbox_projection.sql`, the
 post-apply worker (`crates/chv-controlplane-service/src/netbox_projection_worker.rs`),
