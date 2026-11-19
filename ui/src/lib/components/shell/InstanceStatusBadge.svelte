@@ -19,8 +19,8 @@
 		},
 		stopped: {
 			label: 'STOPPED',
-			toneClass: 'text-neutral-500',
-			dotClass: 'bg-neutral-500'
+			toneClass: 'text-(--chv-color-neutral-500)',
+			dotClass: 'bg-(--chv-color-neutral-500)'
 		},
 		error: {
 			label: 'ERROR',
@@ -35,7 +35,7 @@
 		unknown: {
 			label: 'UNKNOWN',
 			toneClass: 'text-(--status-unknown-text)',
-			dotClass: 'bg-neutral-400'
+			dotClass: 'bg-(--chv-color-neutral-400)'
 		}
 	};
 

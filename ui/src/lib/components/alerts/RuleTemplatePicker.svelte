@@ -21,11 +21,11 @@
 				type="button"
 				class="text-left p-2 rounded-xs border bg-(--bg-surface) cursor-pointer transition-colors {selectedId === template.id
 					? 'border-primary'
-					: 'border-neutral-300 hover:border-neutral-400'}"
+					: 'border-(--chv-color-neutral-300) hover:border-(--chv-color-neutral-400)'}"
 				onclick={() => onSelect(template)}
 			>
-				<span class="block text-xs font-bold text-neutral-900">{template.title}</span>
-				<span class="block text-[10px] text-neutral-600 mt-0.5">{template.rule_type}</span>
+				<span class="block text-xs font-bold text-(--chv-color-neutral-900)">{template.title}</span>
+				<span class="block text-[10px] text-(--chv-color-neutral-600) mt-0.5">{template.rule_type}</span>
 			</button>
 		{/each}
 	</div>

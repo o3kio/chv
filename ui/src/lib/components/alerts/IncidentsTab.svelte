@@ -195,18 +195,18 @@
 									</Button>
 									<details class="relative">
 										<summary
-											class="list-none cursor-pointer inline-flex items-center gap-1 px-2 h-8 rounded-xs text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 text-sm font-medium"
+											class="list-none cursor-pointer inline-flex items-center gap-1 px-2 h-8 rounded-xs text-(--chv-color-neutral-600) hover:bg-(--chv-color-neutral-100) hover:text-(--chv-color-neutral-900) text-sm font-medium"
 											title="Silence"
 											onclick={(event) => event.stopPropagation()}
 										>
 											<BellOff size={13} />
 											<ChevronRight size={11} />
 										</summary>
-										<div class="absolute right-0 z-10 mt-1 flex flex-col gap-1 p-1 bg-(--bg-surface) border border-neutral-300 rounded-xs shadow-lg min-w-20">
+										<div class="absolute right-0 z-10 mt-1 flex flex-col gap-1 p-1 bg-(--bg-surface) border border-(--chv-color-neutral-300) rounded-xs shadow-lg min-w-20">
 											{#each SILENCE_PICKS as pick (pick.minutes)}
 												<button
 													type="button"
-													class="text-xs text-left px-2 py-1 rounded-xs bg-transparent border-none cursor-pointer text-neutral-700 hover:bg-neutral-100"
+													class="text-xs text-left px-2 py-1 rounded-xs bg-transparent border-none cursor-pointer text-(--chv-color-neutral-700) hover:bg-(--chv-color-neutral-100)"
 													disabled={busyAlertId === incident.alert_id}
 													onclick={(event) => {
 														event.stopPropagation();

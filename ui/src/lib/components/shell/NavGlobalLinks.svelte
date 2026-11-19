@@ -27,12 +27,12 @@
 </script>
 
 <div class="flex flex-col gap-1">
-	<div class="text-[10px] font-bold uppercase text-neutral-500 mb-1 pl-2 tracking-wider">Global</div>
+	<div class="text-[10px] font-bold uppercase text-(--chv-color-neutral-500) mb-1 pl-2 tracking-wider">Global</div>
 
 	{#each links as link}
 		<a
 			href={link.href}
-			class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive(link.href, page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
+			class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-(--chv-color-neutral-300) no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff) {isActive(link.href, page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 			aria-current={isActive(link.href, page.url.pathname) ? 'page' : undefined}
 		>
 			<link.icon size={14} />

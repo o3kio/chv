@@ -13,7 +13,7 @@
 	}: Props & { children?: import('svelte').Snippet } = $props();
 
 	const variantClasses = {
-		default: 'bg-neutral-100 text-neutral-600 border-neutral-200',
+		default: 'bg-(--chv-color-neutral-100) text-(--chv-color-neutral-600) border-(--chv-color-neutral-200)',
 		success: 'bg-success/15 text-(--color-success-dark) border-success/20',
 		warning: 'bg-warning/15 text-(--color-warning-dark) border-warning/20',
 		danger: 'bg-danger/15 text-(--color-danger-dark) border-danger/20',
@@ -21,7 +21,7 @@
 	};
 
 	const dotClasses = {
-		default: 'bg-neutral-400',
+		default: 'bg-(--chv-color-neutral-400)',
 		success: 'bg-success shadow-(--shadow-glow-success)',
 		warning: 'bg-warning',
 		danger: 'bg-danger',

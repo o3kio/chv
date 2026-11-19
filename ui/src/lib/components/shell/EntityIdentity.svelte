@@ -14,7 +14,7 @@
 			? 'text-primary bg-[rgba(var(--color-primary-rgb),0.1)]'
 			: type === 'vm'
 				? 'text-(--color-accent) bg-[rgba(var(--color-accent-rgb),0.1)]'
-				: 'text-neutral-500'
+				: 'text-(--chv-color-neutral-500)'
 	);
 </script>
 
@@ -25,7 +25,7 @@
 		{:else}<Database size={18} />{/if}
 	</div>
 	<div class="flex flex-col gap-0.5">
-		<h3 class="text-sm font-extrabold text-neutral-900 m-0 leading-none">{label}</h3>
-		<span class="text-[9px] font-bold text-neutral-400 font-mono">ID // {id.slice(0, 12)}</span>
+		<h3 class="text-sm font-extrabold text-(--chv-color-neutral-900) m-0 leading-none">{label}</h3>
+		<span class="text-[9px] font-bold text-(--chv-color-neutral-400) font-mono">ID // {id.slice(0, 12)}</span>
 	</div>
 </section>

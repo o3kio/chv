@@ -30,18 +30,18 @@
 	let describedBy = $derived([errorId, hintId].filter(Boolean).join(' ') || undefined);
 
 	const baseClasses =
-		'w-full py-2.5 px-3.5 text-sm rounded-xs bg-(--bg-surface) text-neutral-900 transition-all duration-150 ease-in-out focus:outline-hidden disabled:bg-neutral-100 disabled:text-neutral-400 disabled:cursor-not-allowed placeholder:text-neutral-400';
+		'w-full py-2.5 px-3.5 text-sm rounded-xs bg-(--bg-surface) text-(--chv-color-neutral-900) transition-all duration-150 ease-in-out focus:outline-hidden disabled:bg-(--chv-color-neutral-100) disabled:text-(--chv-color-neutral-400) disabled:cursor-not-allowed placeholder:text-(--chv-color-neutral-400)';
 
 	const errorClasses =
 		'border-danger shadow-[0_0_0_3px_var(--color-danger-glow)] hover:border-danger focus:border-danger focus:shadow-[0_0_0_3px_var(--color-danger-glow)]';
 
 	const normalClasses =
-		'border-neutral-300 hover:border-neutral-400 focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]';
+		'border-(--chv-color-neutral-300) hover:border-(--chv-color-neutral-400) focus:border-primary focus:shadow-[0_0_0_3px_var(--color-primary-glow)]';
 </script>
 
 <div class="flex flex-col gap-2">
 	{#if label}
-		<label for={inputId} class="text-sm font-medium text-neutral-700 flex items-center gap-1">
+		<label for={inputId} class="text-sm font-medium text-(--chv-color-neutral-700) flex items-center gap-1">
 			{label}
 			{#if required}
 				<span class="text-danger" aria-hidden="true">*</span>
@@ -66,7 +66,7 @@
 			{error}
 		</span>
 	{:else if hint}
-		<span id={hintId} class="text-xs text-neutral-500">
+		<span id={hintId} class="text-xs text-(--chv-color-neutral-500)">
 			{hint}
 		</span>
 	{/if}

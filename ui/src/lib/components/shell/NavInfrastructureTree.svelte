@@ -84,21 +84,21 @@
 </script>
 
 <div class="flex flex-col gap-1">
-	<div class="text-[10px] font-bold uppercase text-neutral-500 mb-1 pl-2 tracking-wider">Infrastructure</div>
+	<div class="text-[10px] font-bold uppercase text-(--chv-color-neutral-500) mb-1 pl-2 tracking-wider">Infrastructure</div>
 
 	<div class="flex flex-col pl-2">
 		{#if liveState.inventoryLoading}
-			<div class="py-2 px-4 text-[10px] text-neutral-500 flex items-center gap-2">
+			<div class="py-2 px-4 text-[10px] text-(--chv-color-neutral-500) flex items-center gap-2">
 				<Loader2 size={12} class="animate-spin" />
 				<span>Syncing fleet...</span>
 			</div>
 		{:else if filteredNodes.length === 0}
-			<div class="py-2 px-4 text-[10px] text-neutral-500">No hosts enrolled.</div>
+			<div class="py-2 px-4 text-[10px] text-(--chv-color-neutral-500)">No hosts enrolled.</div>
 		{:else}
 			<div class="flex flex-col">
 				<button
 					type="button"
-					class="flex items-center gap-2 text-(length:--chv-text-sm) text-neutral-400 no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff)"
+					class="flex items-center gap-2 text-(length:--chv-text-sm) text-(--chv-color-neutral-400) no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff)"
 					aria-expanded={openGroups['cloud-1']}
 					aria-controls="group-cloud-1"
 					onclick={() => onToggleGroup('cloud-1')}
@@ -109,10 +109,10 @@
 				</button>
 
 				{#if openGroups['cloud-1']}
-					<div id="group-cloud-1" class="ml-2 pl-2 border-l border-neutral-700 flex flex-col gap-0.5">
+					<div id="group-cloud-1" class="ml-2 pl-2 border-l border-(--chv-color-neutral-700) flex flex-col gap-0.5">
 						<div class="flex flex-col">
 							<button type="button"
-								class="flex items-center gap-2 text-(length:--chv-text-sm) text-neutral-400 no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff)"
+								class="flex items-center gap-2 text-(length:--chv-text-sm) text-(--chv-color-neutral-400) no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff)"
 								aria-expanded={openGroups['hosts']}
 								aria-controls="group-hosts"
 								onclick={() => onToggleGroup('hosts')}
@@ -123,7 +123,7 @@
 							</button>
 
 							{#if openGroups['hosts']}
-								<div id="group-hosts" class="ml-2 pl-2 border-l border-neutral-700 flex flex-col gap-0.5">
+								<div id="group-hosts" class="ml-2 pl-2 border-l border-(--chv-color-neutral-700) flex flex-col gap-0.5">
 									{#each filteredNodes as node}
 										{@const hostExpanded = openGroups[getNodeExpandedKey(node.id)] ?? true}
 										{@const hostVms = vmsByNode.get(node.id) ?? []}
@@ -137,24 +137,24 @@
 													>
 														<ChevronDown size={10} class={!hostExpanded ? '-rotate-90' : ''} />
 														<div
-															class="w-1.5 h-1.5 rounded-full {node.status === 'online' ? 'bg-success' : node.status === 'error' ? 'bg-danger' : 'bg-neutral-600'}"
+															class="w-1.5 h-1.5 rounded-full {node.status === 'online' ? 'bg-success' : node.status === 'error' ? 'bg-danger' : 'bg-(--chv-color-neutral-600)'}"
 															aria-hidden="true"
 														></div>
 														<span class="truncate">{node.name}</span>
 													</button>
 
 													{#if hostExpanded}
-														<div id="group-{node.id}" class="ml-2 pl-2 border-l border-neutral-700 flex flex-col gap-0.5">
+														<div id="group-{node.id}" class="ml-2 pl-2 border-l border-(--chv-color-neutral-700) flex flex-col gap-0.5">
 															<div class="app-nav__instance-list app-nav__instance-list--direct">
 																{#if hostVms.length === 0}
-																	<div class="py-1 px-2 text-[10px] text-neutral-500">No instances.</div>
+																	<div class="py-1 px-2 text-[10px] text-(--chv-color-neutral-500)">No instances.</div>
 																{:else}
 																	{#each hostVms as vm}
 																		{@const inst = vmToTreeItem(vm)}
 																		{@const isVmActive = isActive(`/vms/${vm.id}`, page.url.pathname)}
 																		<div
 																			class="app-nav__instance-row group
-																			{isVmActive ? 'app-nav__tree-link--active' : 'hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) text-neutral-400'}"
+																			{isVmActive ? 'app-nav__tree-link--active' : 'hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff) text-(--chv-color-neutral-400)'}"
 																			role="button"
 																			tabindex="0"
 																			onclick={() => onSelectVm(vm.id, vm.name)}

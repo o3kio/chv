@@ -9,7 +9,7 @@
 
 <div class="flex flex-col gap-3">
 	<div class="flex flex-col gap-[0.35rem]">
-		<div class="flex justify-between text-[9px] font-extrabold text-neutral-500">
+		<div class="flex justify-between text-[9px] font-extrabold text-(--chv-color-neutral-500)">
 			<span>CPU_PRESSURE</span>
 			<span>{Math.round(cpuUsage)}%</span>
 		</div>
@@ -18,7 +18,7 @@
 		</div>
 	</div>
 	<div class="flex flex-col gap-[0.35rem]">
-		<div class="flex justify-between text-[9px] font-extrabold text-neutral-500">
+		<div class="flex justify-between text-[9px] font-extrabold text-(--chv-color-neutral-500)">
 			<span>RAM_RESERVATION</span>
 			<span>{Math.round(memoryUsagePercent)}%</span>
 		</div>

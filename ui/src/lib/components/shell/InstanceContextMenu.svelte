@@ -121,8 +121,8 @@
 					{action.enabled
 						? action.dangerous
 							? 'text-danger hover:bg-(--color-danger-light)'
-							: 'text-(--color-sidebar-text) hover:bg-neutral-800'
-						: 'text-neutral-600 cursor-not-allowed'}
+							: 'text-(--color-sidebar-text) hover:bg-(--chv-color-neutral-800)'
+						: 'text-(--chv-color-neutral-600) cursor-not-allowed'}
 				"
 				onclick={() => handleActionClick(action.id)}
 				title={action.disabledReason ?? action.label}
@@ -131,7 +131,7 @@
 				<Icon size={14} aria-hidden="true" />
 				<span class="flex-1">{action.label}</span>
 				{#if !action.enabled && action.disabledReason}
-					<span class="text-(length:--chv-text-xs) text-neutral-600 truncate max-w-24">
+					<span class="text-(length:--chv-text-xs) text-(--chv-color-neutral-600) truncate max-w-24">
 						{action.disabledReason}
 					</span>
 				{/if}

@@ -131,7 +131,7 @@
   <button
     bind:this={triggerElement}
     type="button"
-    class="w-full flex items-center gap-3 px-2 py-2 rounded-sm hover:bg-neutral-800/50 cursor-pointer transition-colors duration-150 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-2"
+    class="w-full flex items-center gap-3 px-2 py-2 rounded-sm hover:bg-(--chv-color-neutral-800)/50 cursor-pointer transition-colors duration-150 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-2"
     onclick={toggleMenu}
     onkeydown={handleKeyDown}
     aria-haspopup="true"
@@ -143,7 +143,7 @@
     </div>
     <div class="flex-1 min-w-0 text-left">
       <div class="text-sm font-medium text-white truncate">{userName}</div>
-      <div class="text-[10px] text-neutral-500 truncate">{userEmail}</div>
+      <div class="text-[10px] text-(--chv-color-neutral-500) truncate">{userEmail}</div>
     </div>
   </button>
   
@@ -152,7 +152,7 @@
     <div
       bind:this={menuElement}
       id="user-menu"
-      class="absolute left-0 right-0 bottom-full mb-2 bg-neutral-800 border border-neutral-700 rounded-lg shadow-xl overflow-hidden z-50"
+      class="absolute left-0 right-0 bottom-full mb-2 bg-(--chv-color-neutral-800) border border-(--chv-color-neutral-700) rounded-lg shadow-xl overflow-hidden z-50"
       role="menu"
       aria-orientation="vertical"
       aria-labelledby="user-menu-trigger"
@@ -164,7 +164,7 @@
         {@const Icon = item.icon}
         <button
           type="button"
-          class="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-neutral-300 hover:bg-primary/15 hover:text-(--color-primary-light) transition-colors duration-150 focus-visible:outline-hidden focus-visible:bg-primary/15 focus-visible:text-(--color-primary-light) {focusIndex === index ? 'bg-primary/15 text-(--color-primary-light)' : ''}"
+          class="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-(--chv-color-neutral-300) hover:bg-primary/15 hover:text-(--color-primary-light) transition-colors duration-150 focus-visible:outline-hidden focus-visible:bg-primary/15 focus-visible:text-(--color-primary-light) {focusIndex === index ? 'bg-primary/15 text-(--color-primary-light)' : ''}"
           role="menuitem"
           onclick={() => handleItemClick(item.href)}
           tabindex="-1"
@@ -177,7 +177,7 @@
       <!-- Theme Toggle -->
       <button
         type="button"
-        class="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-neutral-300 hover:bg-primary/15 hover:text-(--color-primary-light) transition-colors duration-150 focus-visible:outline-hidden focus-visible:bg-primary/15 focus-visible:text-(--color-primary-light) {focusIndex === menuItems.length ? 'bg-primary/15 text-(--color-primary-light)' : ''}"
+        class="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-(--chv-color-neutral-300) hover:bg-primary/15 hover:text-(--color-primary-light) transition-colors duration-150 focus-visible:outline-hidden focus-visible:bg-primary/15 focus-visible:text-(--color-primary-light) {focusIndex === menuItems.length ? 'bg-primary/15 text-(--color-primary-light)' : ''}"
         role="menuitem"
         onclick={handleThemeToggle}
         tabindex="-1"
@@ -187,12 +187,12 @@
       </button>
       
       <!-- Divider -->
-      <div class="h-px bg-neutral-700 my-1"></div>
+      <div class="h-px bg-(--chv-color-neutral-700) my-1"></div>
       
       <!-- Logout -->
       <button
         type="button"
-        class="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-neutral-300 hover:bg-red-500/15 hover:text-red-400 transition-colors duration-150 focus-visible:outline-hidden focus-visible:bg-red-500/15 focus-visible:text-red-400 {focusIndex === menuItems.length + 1 ? 'bg-red-500/15 text-red-400' : ''}"
+        class="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-(--chv-color-neutral-300) hover:bg-red-500/15 hover:text-red-400 transition-colors duration-150 focus-visible:outline-hidden focus-visible:bg-red-500/15 focus-visible:text-red-400 {focusIndex === menuItems.length + 1 ? 'bg-red-500/15 text-red-400' : ''}"
         role="menuitem"
         onclick={handleLogout}
         tabindex="-1"

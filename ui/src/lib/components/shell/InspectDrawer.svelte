@@ -86,24 +86,24 @@
 			<EntityIdentity type={active.type} label={active.label ?? ''} id={active.id ?? ''} />
 
 			{#if isLoading}
-				<div class="py-12 flex flex-col items-center gap-3 text-[10px] font-extrabold text-neutral-500">
+				<div class="py-12 flex flex-col items-center gap-3 text-[10px] font-extrabold text-(--chv-color-neutral-500)">
 					<Loader2 size={16} class="animate-spin" />
 					<span>COLLECTING_TELEMETRY...</span>
 				</div>
 			{:else if details}
 				<div class="flex flex-col gap-6">
 					<div class="flex flex-col gap-2.5">
-						<div class="text-[9px] font-extrabold text-neutral-500 uppercase tracking-widest">Operational Posture</div>
+						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">Operational Posture</div>
 						<PostureCard status={details.status} actual_state={details.actual_state} />
 					</div>
 
 					<div class="flex flex-col gap-2.5">
-						<div class="text-[9px] font-extrabold text-neutral-500 uppercase tracking-widest">System Pulse</div>
+						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">System Pulse</div>
 						<MetricBars cpuUsage={0} memoryUsagePercent={0} />
 					</div>
 
 					<div class="flex flex-col gap-2.5">
-						<div class="text-[9px] font-extrabold text-neutral-500 uppercase tracking-widest">Properties</div>
+						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">Properties</div>
 						<PropertyMesh
 							architecture={details.architecture}
 							providerType={details.provider_type}
@@ -111,7 +111,7 @@
 					</div>
 
 					<div class="flex flex-col gap-2.5">
-						<div class="text-[9px] font-extrabold text-neutral-500 uppercase tracking-widest">Actions</div>
+						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">Actions</div>
 						<MutationControls />
 					</div>
 

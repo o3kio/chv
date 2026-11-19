@@ -75,7 +75,7 @@
   }
 </script>
 
-<aside class="sidebar h-screen flex flex-col bg-(--bg-sidebar) text-neutral-400">
+<aside class="sidebar h-screen flex flex-col bg-(--bg-sidebar) text-(--chv-color-neutral-400)">
   <div class="px-6 py-8">
     <div class="flex items-center gap-3">
       <div class="bg-primary p-2 rounded-lg shadow-lg shadow-(--color-primary)/20">
@@ -95,7 +95,7 @@
         class={`group relative flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 ${
           isActive
             ? 'bg-primary/10 text-white shadow-xs'
-            : 'hover:bg-neutral-800/50 hover:text-neutral-100'
+            : 'hover:bg-(--chv-color-neutral-800)/50 hover:text-(--chv-color-neutral-100)'
         }`}
         href={item.href}
         on:click={() => item.href === '/events' && clearBadge()}
@@ -106,7 +106,7 @@
         
         <item.icon 
           size={18} 
-          class={`transition-colors duration-200 ${isActive ? 'text-primary' : 'text-neutral-500 group-hover:text-neutral-300'}`} 
+          class={`transition-colors duration-200 ${isActive ? 'text-primary' : 'text-(--chv-color-neutral-500) group-hover:text-(--chv-color-neutral-300)'}`} 
         />
         
         <span class="flex-1">{item.label}</span>
@@ -120,14 +120,14 @@
     {/each}
   </nav>
 
-  <div class="p-4 border-t border-neutral-800">
+  <div class="p-4 border-t border-(--chv-color-neutral-800)">
     <div class="flex items-center gap-3 px-3 py-2">
-      <div class="w-8 h-8 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-neutral-300">
+      <div class="w-8 h-8 rounded-full bg-(--chv-color-neutral-800) border border-(--chv-color-neutral-700) flex items-center justify-center text-[10px] font-bold text-(--chv-color-neutral-300)">
         AD
       </div>
       <div class="min-w-0">
         <div class="text-xs font-semibold text-white truncate">Administrator</div>
-        <div class="text-[10px] text-neutral-500 truncate">chv-v0.4.0-alpha</div>
+        <div class="text-[10px] text-(--chv-color-neutral-500) truncate">chv-v0.4.0-alpha</div>
       </div>
     </div>
   </div>
