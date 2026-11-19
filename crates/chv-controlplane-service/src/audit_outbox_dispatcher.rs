@@ -11,10 +11,11 @@
 //! The worker is deliberately model-free: it never re-derives row
 //! content, so redaction happens exactly once at enqueue.
 //!
-//! ## Rollout status (PR 1)
+//! ## Rollout status
 //!
-//! No request path enqueues yet. The worker is mounted and drains an
-//! empty table; adoption lands in PR 2 (BFF) and PR 3 (gRPC).
+//! Adopted: the pure-DB BFF mutations (PR 2) and the three enrollment
+//! gRPC RPCs (PR 3a). Unadopted paths never enqueue, so in a deployment
+//! with no adopted traffic the worker simply drains an empty table.
 
 use chv_controlplane_store::{AuditOutboxRepository, AuditOutboxRow, StoreError};
 use std::sync::Arc;

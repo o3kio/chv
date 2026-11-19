@@ -205,6 +205,9 @@ impl InventoryService for InventoryServiceImplementation {
                     // prevents). The fabric plan compiler surfaces
                     // unreachable peers (fail closed) instead of guessing.
                     peer_addr.map(derive_underlay_endpoint).as_deref(),
+                    // Inventory reports are not audited mutations: no
+                    // outbox coupling on this path (#706).
+                    None,
                 )
                 .await?;
         }
@@ -270,13 +273,16 @@ impl InventoryService for InventoryServiceImplementation {
                 }
 
                 self.node_repo
-                    .append_version(&NodeVersionInput {
-                        node_id: node_id.clone(),
-                        component_name: name.into(),
-                        version,
-                        source: Some(SOURCE_PERIODIC.into()),
-                        reported_unix_ms: now,
-                    })
+                    .append_version(
+                        &NodeVersionInput {
+                            node_id: node_id.clone(),
+                            component_name: name.into(),
+                            version,
+                            source: Some(SOURCE_PERIODIC.into()),
+                            reported_unix_ms: now,
+                        },
+                        None,
+                    )
                     .await?;
             }
         }

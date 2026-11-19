@@ -1,8 +1,9 @@
 use crate::error::ControlPlaneServiceError;
 use async_trait::async_trait;
 use chv_controlplane_store::{
-    BootstrapTokenRepository, BootstrapTokenValidation, NodeBootstrapResultInput,
-    NodeInventoryInput, NodeRepository, NodeUpsertInput, NodeVersionInput, VtepRepository,
+    AuditOutboxInsert, BootstrapTokenRepository, BootstrapTokenValidation,
+    NodeBootstrapResultInput, NodeInventoryInput, NodeRepository, NodeUpsertInput,
+    NodeVersionInput, VtepRepository,
 };
 use chv_controlplane_types::domain::NodeId;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -86,16 +87,66 @@ pub(crate) async fn issue_unrevoked_node_certificate(
     )))
 }
 
+/// Handler-side handle to one adopted mutation's audit evidence (#706).
+///
+/// Mirrors the BFF's `AuditOutboxTicket`: [`Self::insert`] is the
+/// pre-minted outbox row the service enqueues inside its final mutation
+/// transaction, and the committed flag is flipped by the service
+/// immediately after that store call returns `Ok` (i.e. the enqueue
+/// committed). The gRPC adapter's check-or-insert reads the flag to tell
+/// "nothing was enqueued" from "the evidence is durable even though the
+/// final check failed", so a check error can never produce a duplicate
+/// row.
+pub struct AdoptedAudit<'a> {
+    insert: &'a AuditOutboxInsert,
+    committed: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<'a> AdoptedAudit<'a> {
+    pub fn new(
+        insert: &'a AuditOutboxInsert,
+        committed: &'a std::sync::atomic::AtomicBool,
+    ) -> Self {
+        Self { insert, committed }
+    }
+
+    /// The row to enqueue in the mutation's final transaction.
+    pub fn insert(&self) -> &AuditOutboxInsert {
+        self.insert
+    }
+
+    /// Record that this request's enqueue committed with its mutation.
+    /// Called right after the adopted store call returns `Ok`; every
+    /// adopted store method enqueues as its last fallible statement, so
+    /// `Ok` there means the evidence is durable.
+    pub fn mark_committed(&self) {
+        self.committed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn was_committed(&self) -> bool {
+        self.committed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 #[async_trait]
 pub trait EnrollmentService: Send + Sync {
     /// `peer_addr` is the transport-level remote address of the gRPC call
     /// (from `tonic::Request::remote_addr`). It is used to derive the
     /// node's fabric underlay endpoint when the request does not carry
     /// one explicitly.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the implementation enqueues it inside its **final**
+    /// mutation transaction so the evidence commits with the mutation or
+    /// not at all. `None` means "not coupled": in-process/BFF callers and
+    /// adapters running without an audit store pass `None` and the caller
+    /// keeps the post-hoc direct insert.
     async fn enroll_node(
         &self,
         request: proto::EnrollmentRequest,
         peer_addr: Option<SocketAddr>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError>;
 
     /// Rotate a node's certificate.
@@ -110,16 +161,24 @@ pub trait EnrollmentService: Send + Sync {
     /// `allow_insecure` is the dev-mode (`CHV_ALLOW_INSECURE=1`) bypass. It
     /// still records the new serial, but skips the presented/stored equality
     /// check; it must never be set in production.
+    ///
+    /// `audit` follows [`Self::enroll_node`]: the outbox row commits with
+    /// the compare-and-swap that records the new serial (and is never
+    /// enqueued when the swap loses the race).
     async fn rotate_node_certificate(
         &self,
         request: proto::RotateNodeCertificateRequest,
         presented_serial: Option<String>,
         allow_insecure: bool,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::enroll_node`]: the outbox row commits with
+    /// the bootstrap-result upsert.
     async fn report_bootstrap_result(
         &self,
         request: proto::ReportBootstrapResultRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 }
 
@@ -180,6 +239,7 @@ impl EnrollmentService for EnrollmentServiceImplementation {
         &self,
         request: proto::EnrollmentRequest,
         peer_addr: Option<SocketAddr>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError> {
         match self
             .token_repo
@@ -316,16 +376,38 @@ impl EnrollmentService for EnrollmentServiceImplementation {
             })
             .await?;
 
-        // Persist versions as history
+        // Register versions as history
+        //
+        // #706: the audit-outbox row rides the **final** fail-closed write
+        // of the enrollment sequence so evidence and mutation share one
+        // commit. A node that reports a fabric identity finishes on
+        // `register_fabric_identity`; a node that does not finishes here
+        // (the legacy VTEP upsert that follows is best-effort and can never
+        // fail the RPC). Everything earlier — token consumption, the node
+        // row, the inventory row — commits separately: a crash mid-sequence
+        // still leaves a partially applied enrollment with no outbox row.
+        // That is the documented residual risk for this RPC (see
+        // `docs/specs/component/audit-log.md`); folding enrollment into one
+        // transaction is a follow-up, not part of this change.
+        let reports_fabric_identity = !inventory.wireguard_public_key.is_empty();
+        let version_audit = if reports_fabric_identity { None } else { audit };
+        let fabric_audit = if reports_fabric_identity { audit } else { None };
+
         self.node_repo
-            .append_version(&NodeVersionInput {
-                node_id: node_id.clone(),
-                component_name: COMPONENT_AGENT.into(),
-                version: versions.chv_agent_version,
-                source: Some(SOURCE_ENROLLMENT.into()),
-                reported_unix_ms: now,
-            })
+            .append_version(
+                &NodeVersionInput {
+                    node_id: node_id.clone(),
+                    component_name: COMPONENT_AGENT.into(),
+                    version: versions.chv_agent_version,
+                    source: Some(SOURCE_ENROLLMENT.into()),
+                    reported_unix_ms: now,
+                },
+                version_audit.map(AdoptedAudit::insert),
+            )
             .await?;
+        if let Some(audit) = version_audit {
+            audit.mark_committed();
+        }
 
         // Register VTEP for overlay networking
         if !inventory.vtep_ip.is_empty() {
@@ -372,8 +454,12 @@ impl EnrollmentService for EnrollmentServiceImplementation {
                     // compiler surfaces unreachable peers (fail closed)
                     // instead of guessing.
                     peer_addr.map(derive_underlay_endpoint).as_deref(),
+                    fabric_audit.map(AdoptedAudit::insert),
                 )
                 .await?;
+            if let Some(audit) = fabric_audit {
+                audit.mark_committed();
+            }
         }
 
         Ok(proto::EnrollmentResponse {
@@ -396,6 +482,7 @@ impl EnrollmentService for EnrollmentServiceImplementation {
         request: proto::RotateNodeCertificateRequest,
         presented_serial: Option<String>,
         allow_insecure: bool,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError> {
         let node_id = NodeId::new(request.node_id).map_err(|e| {
             ControlPlaneServiceError::InvalidArgument(format!("invalid node_id: {}", e))
@@ -474,11 +561,16 @@ impl EnrollmentService for EnrollmentServiceImplementation {
         // concurrent rotation won the race, do not hand out this key material.
         match stored_serial.as_deref() {
             Some(expected) => {
-                if !self
+                let rotated = self
                     .node_repo
-                    .rotate_certificate_serial(&node_id, expected, &cert.serial)
-                    .await?
-                {
+                    .rotate_certificate_serial(
+                        &node_id,
+                        expected,
+                        &cert.serial,
+                        audit.map(AdoptedAudit::insert),
+                    )
+                    .await?;
+                if !rotated {
                     return Err(ControlPlaneServiceError::Conflict(format!(
                         "certificate rotation for node {node_id} lost a concurrent rotation \
                          race; retry with the current certificate"
@@ -490,9 +582,16 @@ impl EnrollmentService for EnrollmentServiceImplementation {
             // local development/tests keep working.
             None => {
                 self.node_repo
-                    .update_certificate_serial(&node_id, &cert.serial)
+                    .update_certificate_serial(
+                        &node_id,
+                        &cert.serial,
+                        audit.map(AdoptedAudit::insert),
+                    )
                     .await?;
             }
+        }
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         Ok(proto::RotateNodeCertificateResponse {
@@ -512,6 +611,7 @@ impl EnrollmentService for EnrollmentServiceImplementation {
     async fn report_bootstrap_result(
         &self,
         request: proto::ReportBootstrapResultRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let node_id = NodeId::new(request.node_id).map_err(|e| {
             ControlPlaneServiceError::InvalidArgument(format!("invalid node_id: {}", e))
@@ -526,20 +626,26 @@ impl EnrollmentService for EnrollmentServiceImplementation {
 
         // PERSIST BOOTSTRAP RESULT
         self.node_repo
-            .upsert_bootstrap_result(&NodeBootstrapResultInput {
-                node_id,
-                operation_id: if meta.operation_id.is_empty() {
-                    None
-                } else {
-                    Some(meta.operation_id.clone())
+            .upsert_bootstrap_result(
+                &NodeBootstrapResultInput {
+                    node_id,
+                    operation_id: if meta.operation_id.is_empty() {
+                        None
+                    } else {
+                        Some(meta.operation_id.clone())
+                    },
+                    success,
+                    error_message: if success { None } else { Some(request.message) },
+                    details: None, // bootstrap report doesn't have details_json yet
+                    started_unix_ms: None,
+                    completed_unix_ms: self.now_ms(),
                 },
-                success,
-                error_message: if success { None } else { Some(request.message) },
-                details: None, // bootstrap report doesn't have details_json yet
-                started_unix_ms: None,
-                completed_unix_ms: self.now_ms(),
-            })
+                audit.map(AdoptedAudit::insert),
+            )
             .await?;
+        if let Some(audit) = audit {
+            audit.mark_committed();
+        }
 
         Ok(proto::AckResponse {
             result: Some(proto::ResultMeta {
@@ -738,5 +844,119 @@ mod tests {
 
         assert_eq!(issued.serial, "cccccccc");
         assert_eq!(issuer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod audit_coupling_tests {
+    use super::*;
+    use chv_controlplane_store::{test_util::TestDb, AuditLogInsert, AuditOutboxInsert};
+    use std::sync::Arc;
+
+    fn outbox_insert(outbox_id: &str, metadata: String) -> AuditOutboxInsert {
+        AuditOutboxInsert {
+            outbox_id: outbox_id.into(),
+            audit_id: format!("audit-{outbox_id}"),
+            payload: AuditLogInsert {
+                occurred_at_ms: 1_000,
+                actor_id: "node-a".into(),
+                actor_username: "node-a".into(),
+                actor_role: "node".into(),
+                action: "RotateNodeCertificate".into(),
+                method: "gRPC".into(),
+                path: "chv.controlplane.node.v1.EnrollmentService/RotateNodeCertificate".into(),
+                resource_kind: Some("node".into()),
+                resource_id: Some("node-a".into()),
+                outcome: "success".into(),
+                status_code: 200,
+                correlation_id: None,
+                operation_id: None,
+                source_ip: None,
+                metadata,
+            },
+            created_at_ms: 1_000,
+        }
+    }
+
+    struct StaticSerialIssuer;
+
+    #[async_trait]
+    impl CertificateIssuer for StaticSerialIssuer {
+        async fn issue_node_certificate(
+            &self,
+            _node_id: &NodeId,
+        ) -> Result<IssuedCertificate, ControlPlaneServiceError> {
+            Ok(IssuedCertificate {
+                certificate_pem: vec![],
+                private_key_pem: vec![],
+                ca_pem: vec![],
+                serial: "serial-new".into(),
+            })
+        }
+    }
+
+    /// An adopted rotation whose audit payload exceeds the store's 16 KiB
+    /// bound must fail closed: the transaction is rolled back, so neither
+    /// the new serial nor an outbox row exists.
+    #[tokio::test]
+    async fn oversized_audit_payload_rolls_back_the_adopted_rotation() {
+        let db = TestDb::new().await;
+        let node_repo = NodeRepository::new(db.pool.clone());
+        node_repo
+            .upsert_node(&NodeUpsertInput {
+                node_id: NodeId::new("node-a").unwrap(),
+                hostname: "node-a".into(),
+                display_name: "node-a".into(),
+                certificate_serial: Some("old-serial".into()),
+                agent_version: None,
+                control_plane_version: None,
+                enrolled_unix_ms: 1_000,
+                last_seen_unix_ms: 1_000,
+            })
+            .await
+            .expect("seed node");
+
+        let service = EnrollmentServiceImplementation::new(
+            node_repo.clone(),
+            BootstrapTokenRepository::new(db.pool.clone()),
+            Some(Arc::new(StaticSerialIssuer)),
+            VtepRepository::new(db.pool.clone()),
+        );
+
+        // > the 16 KiB payload bound enforced by `enqueue_on_tx`.
+        let oversized = outbox_insert("ob-oversized", "x".repeat(16 * 1024 + 1));
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        let coupling = AdoptedAudit::new(&oversized, &committed);
+        let error = service
+            .rotate_node_certificate(
+                proto::RotateNodeCertificateRequest {
+                    meta: Some(proto::RequestMeta::default()),
+                    node_id: "node-a".into(),
+                },
+                Some("old-serial".into()),
+                false,
+                Some(&coupling),
+            )
+            .await
+            .expect_err("oversized evidence must fail the mutation closed");
+        assert!(
+            matches!(error, ControlPlaneServiceError::Store(_)),
+            "expected a store validation error, got {error:?}"
+        );
+
+        assert_eq!(
+            node_repo
+                .get_certificate_serial(&NodeId::new("node-a").unwrap())
+                .await
+                .expect("read serial")
+                .as_deref(),
+            Some("old-serial"),
+            "the certificate rotation must roll back"
+        );
+        let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count outbox");
+        assert_eq!(outbox_rows, 0, "no outbox row survives the rollback");
     }
 }

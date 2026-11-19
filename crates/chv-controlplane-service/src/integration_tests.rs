@@ -1888,6 +1888,7 @@ mod fabric_dispatch {
                 "pub-aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 1500,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1897,6 +1898,7 @@ mod fabric_dispatch {
                 "node-b",
                 "pub-bBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
                 0,
+                None,
                 None,
             )
             .await

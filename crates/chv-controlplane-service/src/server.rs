@@ -1,4 +1,4 @@
-use crate::enrollment::EnrollmentService;
+use crate::enrollment::{AdoptedAudit, EnrollmentService};
 use crate::inventory::InventoryService;
 use crate::lifecycle::LifecycleService;
 use crate::peer_identity::{verify_peer_matches, InsecurePeer, PeerCertificateSerial, PeerNodeId};
@@ -6,12 +6,14 @@ use crate::reconcile::ReconcileService;
 use crate::revocation::RevocationSnapshot;
 use crate::telemetry::TelemetryService;
 use chv_controlplane_store::{
-    AuditLogInsert, AuditLogRepository, AUDIT_ANONYMOUS_ACTOR_ID, AUDIT_ANONYMOUS_ROLE,
-    AUDIT_ANONYMOUS_USERNAME, AUDIT_OUTCOME_DENIED, AUDIT_OUTCOME_FAILED, AUDIT_OUTCOME_SUCCESS,
+    AuditLogInsert, AuditLogRepository, AuditOutboxInsert, AuditOutboxRepository,
+    AUDIT_ANONYMOUS_ACTOR_ID, AUDIT_ANONYMOUS_ROLE, AUDIT_ANONYMOUS_USERNAME, AUDIT_OUTCOME_DENIED,
+    AUDIT_OUTCOME_FAILED, AUDIT_OUTCOME_SUCCESS,
 };
 use chv_controlplane_types::domain::{NodeId, ResourceKind};
 use control_plane_node_api::control_plane_node_api as proto;
 use serde_json::json;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -129,6 +131,31 @@ impl GrpcAuditContext {
     fn path(&self) -> String {
         format!("{}/{}", self.service, self.action)
     }
+
+    /// Build the already-redacted row for this request and the given final
+    /// status. Both the direct path and the pre-minted outbox payload use
+    /// this one constructor so they cannot drift.
+    fn entry(&self, status_code: i64, outcome: &str) -> AuditLogInsert {
+        AuditLogInsert {
+            occurred_at_ms: chv_common::now_unix_ms(),
+            actor_id: self.actor_id.clone(),
+            actor_username: self.actor_username.clone(),
+            actor_role: self.actor_role.to_string(),
+            action: capped_audit_field(self.action.to_string()),
+            method: "gRPC".to_string(),
+            path: capped_audit_field(self.path()),
+            resource_kind: self
+                .resource_kind
+                .map(|kind| capped_audit_field(kind.to_string())),
+            resource_id: self.resource_id.clone(),
+            outcome: outcome.to_string(),
+            status_code,
+            correlation_id: None,
+            operation_id: self.operation_id.clone(),
+            source_ip: self.source_ip.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 fn audit_status(code: tonic::Code) -> (i64, &'static str) {
@@ -168,25 +195,7 @@ async fn record_grpc_audit(
         return Ok(());
     };
     let (status_code, outcome) = audit_status(code);
-    let entry = AuditLogInsert {
-        occurred_at_ms: chv_common::now_unix_ms(),
-        actor_id: context.actor_id.clone(),
-        actor_username: context.actor_username.clone(),
-        actor_role: context.actor_role.to_string(),
-        action: capped_audit_field(context.action.to_string()),
-        method: "gRPC".to_string(),
-        path: capped_audit_field(context.path()),
-        resource_kind: context
-            .resource_kind
-            .map(|kind| capped_audit_field(kind.to_string())),
-        resource_id: context.resource_id.clone(),
-        outcome: outcome.to_string(),
-        status_code,
-        correlation_id: None,
-        operation_id: context.operation_id.clone(),
-        source_ip: context.source_ip.clone(),
-        metadata: context.metadata.clone(),
-    };
+    let entry = context.entry(status_code, outcome);
 
     match repo.insert(&entry).await {
         Ok(audit_id) => {
@@ -216,16 +225,79 @@ async fn record_grpc_audit(
     }
 }
 
+/// Server-minted identity for one adopted mutation's audit-outbox row
+/// (#706).
+///
+/// Both ids are UUIDv4 values minted here — never read from the wire. The
+/// ticket is the emitter half of the check-or-insert composition: the
+/// adapter hands the matching [`AuditOutboxInsert`] to the service (whose
+/// final transaction commits it) and keeps the ids to look the row up after
+/// the call returns.
+struct GrpcAuditTicket {
+    outbox_id: String,
+    audit_id: String,
+    /// True once the service's final transaction containing the enqueue
+    /// committed. Mirrors the BFF ticket's `was_committed` flag.
+    committed: AtomicBool,
+}
+
+impl GrpcAuditTicket {
+    fn mint() -> Self {
+        Self {
+            outbox_id: uuid::Uuid::new_v4().simple().to_string(),
+            audit_id: uuid::Uuid::new_v4().simple().to_string(),
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    /// The row an adopted service enqueues inside its final transaction.
+    /// `outcome`/`status_code` are the commit-time prediction
+    /// (`success`/200); [`AuditOutboxRepository::finalize_pending`] patches
+    /// them when the final response is not a success.
+    fn outbox_insert(&self, context: &GrpcAuditContext) -> AuditOutboxInsert {
+        AuditOutboxInsert {
+            outbox_id: self.outbox_id.clone(),
+            audit_id: self.audit_id.clone(),
+            payload: context.entry(200, AUDIT_OUTCOME_SUCCESS),
+            // Re-stamped at enqueue by the store, so the row's timestamp
+            // is the commit attempt, not request start.
+            created_at_ms: chv_common::now_unix_ms(),
+        }
+    }
+}
+
+/// Bundle the ticket's committed flag with the row the service enqueues.
+/// Both are minted together, so the two options always agree.
+fn adopted_coupling<'a>(
+    ticket: Option<&'a GrpcAuditTicket>,
+    insert: Option<&'a AuditOutboxInsert>,
+) -> Option<AdoptedAudit<'a>> {
+    match (ticket, insert) {
+        (Some(ticket), Some(insert)) => Some(AdoptedAudit::new(insert, &ticket.committed)),
+        _ => None,
+    }
+}
+
 async fn finish_audited<T>(
     audit: Option<&AuditLogRepository>,
     context: &GrpcAuditContext,
+    ticket: Option<&GrpcAuditTicket>,
+    coupling: Option<&AdoptedAudit<'_>>,
     result: Result<Response<T>, Status>,
 ) -> Result<Response<T>, Status> {
     let code = match &result {
         Ok(_) => tonic::Code::Ok,
         Err(status) => status.code(),
     };
-    let audit_failed = record_grpc_audit(audit, context, code).await.is_err();
+    let audit_failed = match (audit, ticket, coupling) {
+        (Some(repo), Some(ticket), Some(coupling)) => {
+            finish_adopted_grpc_audit(repo, context, ticket, coupling, code, result.is_ok()).await
+        }
+        // Unadopted RPCs (every lifecycle/reconcile handler and any
+        // enrollment call made without a ticket) keep the original
+        // post-hoc insert byte-for-byte.
+        _ => record_grpc_audit(audit, context, code).await.is_err(),
+    };
     if audit_failed && result.is_ok() {
         // Mirror the BFF: a committed mutation without a durable row must
         // not be reported as success.
@@ -236,6 +308,138 @@ async fn finish_audited<T>(
         // Preserve denials/failures; the loud audit error above is the
         // operator signal that the row is missing.
         result
+    }
+}
+
+/// Check-or-insert composition for an adopted gRPC mutation (#706).
+///
+/// The outbox primary key is this request's idempotency key, so the
+/// tx-coupled path and the direct path compose without a double write:
+///
+/// - row present → the evidence committed with the mutation's final
+///   transaction; never insert a second row (patch outcome/status when the
+///   final response is not success);
+/// - row absent → denied, failed before commit, rolled back, or the service
+///   did not adopt; today's direct post-hoc insert runs unchanged;
+/// - check failed → consult the coupling's committed flag: a committed
+///   enqueue means the evidence is durable in the outbox even though this
+///   check failed, so skip the insert to avoid a duplicate and log loudly;
+///   otherwise nothing was enqueued and the direct insert runs.
+///
+/// Returns `true` only when a successful mutation's evidence could not be
+/// persisted (the caller then fails closed) — a durable outbox row is always
+/// a success from here, even if its outcome patch races the dispatcher.
+async fn finish_adopted_grpc_audit(
+    repo: &AuditLogRepository,
+    context: &GrpcAuditContext,
+    ticket: &GrpcAuditTicket,
+    coupling: &AdoptedAudit<'_>,
+    code: tonic::Code,
+    succeeded: bool,
+) -> bool {
+    let outbox = AuditOutboxRepository::new(repo.pool().clone());
+    match outbox.get(&ticket.outbox_id).await {
+        Ok(Some(_)) => {
+            if succeeded {
+                tracing::debug!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id,
+                    audit_id = %ticket.audit_id,
+                    "gRPC audit row committed with the mutation"
+                );
+            } else {
+                let (status_code, outcome) = audit_status(code);
+                patch_final_outcome(&outbox, ticket, outcome, status_code).await;
+            }
+            false
+        }
+        Ok(None) => {
+            if coupling.was_committed() {
+                // The service's enqueue committed with its mutation, yet
+                // the row is gone (only possible if it was manually
+                // deleted or pruned early). Inserting is the
+                // evidence-preserving action; log the broken invariant.
+                tracing::error!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id,
+                    "gRPC audit outbox row committed with the mutation but is now missing; \
+                     writing the direct row"
+                );
+            }
+            // Denied, failed before commit, rolled back, unadopted, or a
+            // broken invariant: fall through to today's post-hoc insert.
+            record_grpc_audit(Some(repo), context, code).await.is_err()
+        }
+        Err(error) => {
+            // Invariant: every adopted service enqueues as the **last
+            // fallible operation** of its final transaction (see
+            // `enqueue_adopted_row`), so a successful call implies the
+            // row committed and a failed call implies nothing was
+            // enqueued. The coupling's committed flag records that fact
+            // explicitly, so even if a future service enqueues and then
+            // fails, this fallback cannot double-write.
+            // If the RPC also failed, the retained row keeps its
+            // commit-time prediction: the patch cannot read the row this
+            // check could not (same limit as patch_final_outcome).
+            if coupling.was_committed() {
+                tracing::error!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id,
+                    error = %error,
+                    "gRPC audit outbox check failed after the mutation's enqueue committed; \
+                     skipping the direct insert to avoid a duplicate row"
+                );
+                false
+            } else {
+                tracing::warn!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id,
+                    error = %error,
+                    "gRPC audit outbox check failed before any enqueue; falling back to the \
+                     direct insert"
+                );
+                record_grpc_audit(Some(repo), context, code).await.is_err()
+            }
+        }
+    }
+}
+
+/// Patch an already-committed outbox row's outcome/status. The mutation
+/// committed, so the evidence row must stay; only its recorded result
+/// changes.
+async fn patch_final_outcome(
+    outbox: &AuditOutboxRepository,
+    ticket: &GrpcAuditTicket,
+    outcome: &str,
+    status_code: i64,
+) {
+    match outbox
+        .finalize_pending(
+            &ticket.outbox_id,
+            outcome,
+            status_code,
+            chv_common::now_unix_ms(),
+        )
+        .await
+    {
+        Ok(true) => {}
+        // The dispatcher (or a replay) already converted the row, so it
+        // keeps the commit-time outcome. Evidence is durable either way.
+        Ok(false) => tracing::warn!(
+            target: "audit",
+            outbox_id = %ticket.outbox_id,
+            outcome,
+            status_code,
+            "audit row was already dispatched with its commit-time outcome; \
+             the final status could not be recorded"
+        ),
+        Err(error) => tracing::warn!(
+            target: "audit",
+            outbox_id = %ticket.outbox_id,
+            error = %error,
+            "failed to patch the committed audit row's final outcome; \
+             it keeps the commit-time outcome"
+        ),
     }
 }
 
@@ -264,7 +468,7 @@ macro_rules! audited_service_call {
             Ok(Response::new(resp))
         }
         .await;
-        finish_audited($self.audit.as_ref(), &context, result).await
+        finish_audited($self.audit.as_ref(), &context, None, None, result).await
     }};
 }
 
@@ -440,6 +644,15 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
         let _span = tracing::info_span!("enroll_node", %op_id);
+        // #706: mint this request's audit ticket before the call so the
+        // service can commit its outbox row with the final mutation
+        // transaction. The payload's `resource_id` is the inventory-derived
+        // node id (the same value `issued_node_id` echoes back on success);
+        // a failed enrollment therefore records the wire-asserted fallback,
+        // exactly as the direct path always has.
+        let ticket = self.audit.as_ref().map(|_| GrpcAuditTicket::mint());
+        let outbox_insert = ticket.as_ref().map(|ticket| ticket.outbox_insert(&context));
+        let coupling = adopted_coupling(ticket.as_ref(), outbox_insert.as_ref());
         // Transport-level peer address: the enrollment path derives the
         // node's fabric underlay endpoint from it (see
         // EnrollmentService::enroll_node). Must be read before
@@ -447,7 +660,7 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
         let peer_addr = request.remote_addr();
         let result = self
             .service
-            .enroll_node(request.into_inner(), peer_addr)
+            .enroll_node(request.into_inner(), peer_addr, coupling.as_ref())
             .instrument(_span)
             .await
             .map_err(tonic::Status::from)
@@ -457,7 +670,14 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
                 context.resource_id = Some(issued_node_id);
             }
         }
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(
+            self.audit.as_ref(),
+            &context,
+            ticket.as_ref(),
+            coupling.as_ref(),
+            result,
+        )
+        .await
     }
 
     async fn rotate_node_certificate(
@@ -473,6 +693,11 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             None,
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
+        // #706: the outbox row commits with the compare-and-swap that
+        // records the new serial.
+        let ticket = self.audit.as_ref().map(|_| GrpcAuditTicket::mint());
+        let outbox_insert = ticket.as_ref().map(|ticket| ticket.outbox_insert(&context));
+        let coupling = adopted_coupling(ticket.as_ref(), outbox_insert.as_ref());
         let result = async {
             enforce_peer_node_id(
                 &request,
@@ -499,14 +724,26 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             let _span = tracing::info_span!("rotate_node_certificate", %op_id);
             let resp = self
                 .service
-                .rotate_node_certificate(request.into_inner(), presented_serial, allow_insecure)
+                .rotate_node_certificate(
+                    request.into_inner(),
+                    presented_serial,
+                    allow_insecure,
+                    coupling.as_ref(),
+                )
                 .instrument(_span)
                 .await
                 .map_err(tonic::Status::from)?;
             Ok(Response::new(resp))
         }
         .await;
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(
+            self.audit.as_ref(),
+            &context,
+            ticket.as_ref(),
+            coupling.as_ref(),
+            result,
+        )
+        .await
     }
 
     async fn report_bootstrap_result(
@@ -522,6 +759,10 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             None,
         );
         let op_id = extract_op_id(&request).unwrap_or_default();
+        // #706: the outbox row commits with the bootstrap-result upsert.
+        let ticket = self.audit.as_ref().map(|_| GrpcAuditTicket::mint());
+        let outbox_insert = ticket.as_ref().map(|ticket| ticket.outbox_insert(&context));
+        let coupling = adopted_coupling(ticket.as_ref(), outbox_insert.as_ref());
         let result = async {
             enforce_peer_node_id(
                 &request,
@@ -536,14 +777,21 @@ impl proto::enrollment_service_server::EnrollmentService for EnrollmentServer {
             let _span = tracing::info_span!("report_bootstrap_result", %op_id);
             let resp = self
                 .service
-                .report_bootstrap_result(request.into_inner())
+                .report_bootstrap_result(request.into_inner(), coupling.as_ref())
                 .instrument(_span)
                 .await
                 .map_err(tonic::Status::from)?;
             Ok(Response::new(resp))
         }
         .await;
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(
+            self.audit.as_ref(),
+            &context,
+            ticket.as_ref(),
+            coupling.as_ref(),
+            result,
+        )
+        .await
     }
 }
 
@@ -845,7 +1093,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             "create_volume is not served by the control plane lifecycle; the standalone volume \
                  create journals via the BFF (#513)",
         ));
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(self.audit.as_ref(), &context, None, None, result).await
     }
 
     /// #522 (DP1, adopted): the volume delete journals BFF-direct
@@ -874,7 +1122,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             "delete_volume is not served by the control plane lifecycle; the volume delete \
                  journals via the BFF (#522)",
         ));
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(self.audit.as_ref(), &context, None, None, result).await
     }
 
     /// #355 (PR 1 of the decomposition): the network policy update
@@ -903,7 +1151,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             "apply_network_policy is not served by the control plane lifecycle; the network \
                  policy update journals via the BFF (#355)",
         ));
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(self.audit.as_ref(), &context, None, None, result).await
     }
 
     async fn start_vm(
@@ -1463,7 +1711,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
             Ok(Response::new(resp))
         }
         .await;
-        finish_audited(self.audit.as_ref(), &context, result).await
+        finish_audited(self.audit.as_ref(), &context, None, None, result).await
     }
 }
 

@@ -16,20 +16,36 @@ detection, triage, and safe restart. It promises no manual data-loss
 recovery path we cannot honour.
 
 > **Rollout status (#706 half 1).** The outbox is live for the adopted
-> BFF routes listed below (PR 2). On those routes a pending row means
-> the mutation **committed** and its evidence row is waiting for the
-> dispatcher. The response was normally 2xx, but a committed mutation
-> whose final response was later patched to a non-2xx (e.g. a downstream
-> middleware failure) keeps its pending row too — with `outcome` and
-> `status_code` rewritten to match; see the patch note below. The gRPC
-> surface and every unadopted BFF route still use the direct post-hoc
-> insert; their rows never appear in this table, and their narrow crash
-> window remains open (tracked under #706).
+> BFF routes and the three adopted gRPC enrollment RPCs listed below.
+> On those paths a pending row means the mutation **committed** and its
+> evidence row is waiting for the dispatcher. The response was normally
+> 2xx, but a committed mutation whose final response was later patched
+> to a non-2xx (e.g. a downstream middleware failure) keeps its pending
+> row too — with `outcome` and `status_code` rewritten to match; see the
+> patch note below. The gRPC lifecycle/reconcile surfaces and every
+> unadopted BFF route still use the direct post-hoc insert; their rows
+> never appear in this table, and their narrow crash window remains open
+> (tracked under #706).
 >
-> Adopted routes: `POST /v1/users/create`, `/v1/users/update`,
+> Adopted BFF routes: `POST /v1/users/create`, `/v1/users/update`,
 > `/v1/users/delete`, `/v1/tokens/create`, `/v1/tokens/revoke`,
 > `/v1/networks/create`, `/v1/networks/update`, `/v1/networks/delete`,
 > and the final transaction of `POST /v1/vms/import`.
+>
+> Adopted gRPC RPCs: `EnrollNode`, `RotateNodeCertificate`, and
+> `ReportBootstrapResult`.
+>
+> **Enrollment specifics.** For `RotateNodeCertificate` and
+> `ReportBootstrapResult` the outbox row commits with the single
+> mutation transaction. For `EnrollNode` it commits with the **final**
+> fail-closed write of the sequence (fabric-identity registration when
+> the node reports a key, otherwise the version-history append): the
+> one-time bootstrap-token consumption, the node row, and the inventory
+> row commit earlier. A pending row therefore means "the enrollment's
+> final write committed, evidence is queued". The inverse is **not**
+> true: the token can be consumed and a crash can leave a pending-less,
+> partially applied enrollment with no row at all. That gap is a
+> documented residual risk, not something this table can show.
 >
 > A non-zero `chv_audit_outbox_pending` on a build without this adoption
 > (or with no adopted traffic) means something wrote the table out of
@@ -180,6 +196,13 @@ the handler returns, with no retry. A crash in that narrow window can
 still yield an unrecorded mutation until adoption lands. The outbox
 cannot detect or recover rows that were never enqueued.
 
+For `EnrollNode` specifically: if the trail has no row for an enrollment
+attempt at all, check whether the bootstrap token was consumed (the
+`bootstrap_tokens.used_at` column) and whether a node/inventory row
+exists. A consumed token with no node row means the process died after
+the token commit and before the final write — there is no outbox row to
+replay, and the operator must issue a fresh token.
+
 ## 4. Configuration
 
 ```toml
@@ -195,15 +218,47 @@ steady state. Changing either value requires a restart.
 Retention prunes up to 5,000 **dispatched** rows per pass. Pending rows
 are never pruned, regardless of age.
 
-## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF adoption)
+## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a gRPC)
 
-- **Audit loss / double-write:** the check-or-insert composition is what
-  keeps this safe on adopted routes: a present outbox row suppresses the
-  direct insert, an absent one takes the direct path, and a failed check
-  after a committed enqueue skips the direct insert rather than risk a
-  duplicate. The BFF integration suite covers adopted success, rollback,
-  crash-before-middleware, injected post-commit 500, unadopted routes,
-  and the oversized-actor fail-closed case.
+- **Audit loss / double-write (BFF):** the check-or-insert composition is
+  what keeps this safe on adopted routes: a present outbox row suppresses
+  the direct insert, an absent one takes the direct path, and a failed
+  check after a committed enqueue skips the direct insert rather than
+  risk a duplicate. The BFF integration suite covers adopted success,
+  rollback, crash-before-middleware, injected post-commit 500, unadopted
+  routes, and the oversized-actor fail-closed case.
+- **Audit loss / double-write (gRPC enrollment):** the adapter mints a
+  per-request `outbox_id`/`audit_id` (UUIDv4, never from the wire) and
+  applies the same check-or-insert in `finish_audited`. A committed
+  outbox row suppresses the direct insert; a missing row takes the
+  direct path (denied, rolled back, or unadopted); a failed check
+  consults the request's committed flag, set by the service once its
+  final transaction committed the enqueue, and skips the insert rather
+  than risk a duplicate. The adoption tests cover one dispatched row per
+  adopted RPC, a service that enqueues and then fails (exactly one row,
+  `finalize_pending` rewrites its outcome/status — removing the patch
+  fails the test), the failed/denied direct row with no outbox row,
+  crash replay, an unadopted lifecycle RPC, and the oversized-payload
+  rollback. Rows are stamped at enqueue (not request start), so a
+  pending row's timestamp is the commit attempt.
+- **`EnrollNode` multi-commit risk (PR 3a):** the outbox row rides the
+  final fail-closed write only. Token consumption is a separate, earlier
+  commit; a crash between it and the final write leaves a
+  partially-applied enrollment **and no outbox row**, and the consumed
+  one-time token means the operator must issue a new token (or remove
+  the half-enrolled node). This PR does not claim to close that window;
+  folding enrollment into one transaction is follow-up work.
+- **Lock scope (PR 3a):** the adopted store methods take an optional
+  outbox row and open a transaction only when one is present;
+  `register_fabric_identity` already had a transaction, and the rotation
+  compare-and-swap / bootstrap-result upsert gain a one-statement
+  transaction plus the INSERT. The transaction is held for the store
+  call only (never across certificate minting or transport work), so no
+  new lock ordering is introduced.
+- **Remaining surfaces stay post-hoc:** the gRPC lifecycle and reconcile
+  services (agent-ack fan-out, large surface) and every unadopted BFF
+  route still insert after the handler returns, with the original narrow
+  crash window. Denied and failed requests stay post-hoc by design.
 - **Lock scope (PR 2):** `users`/`tokens` mutations that were autocommit
   single statements are now wrapped in
   `begin_with("BEGIN IMMEDIATE;")` so the mutation and the outbox INSERT
@@ -222,9 +277,12 @@ are never pruned, regardless of age.
   commits with the middleware never running (the crash made static) is
   replayed exactly once by the dispatcher, and a commit failure after a
   successful enqueue leaves neither the mutation nor the outbox row. The
-  design's `SIGKILL` end-to-end test (long dispatch interval, kill,
-  restart) is **not implemented yet** and is a follow-up; this runbook
-  does not claim one.
+  gRPC adoption suite does the same for the enrollment RPCs and also
+  pins the post-commit-failure patch path (one row, rewritten
+  outcome/status; removing `finalize_pending` fails it). The design's
+  `SIGKILL` end-to-end test (long dispatch interval, kill, restart) is
+  **not implemented yet** and is a follow-up; this runbook does not claim
+  one.
 - **Migration:** `0071_audit_outbox.sql` is additive (one table, two
   indexes). No backfill, no change to `audit_log`. It runs through the
   normal startup migrator; disk-full remains the only new startup

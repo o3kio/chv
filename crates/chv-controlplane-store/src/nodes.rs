@@ -1,3 +1,4 @@
+use crate::audit_outbox::{enqueue_adopted_row, AuditOutboxInsert};
 use crate::{StoreError, StorePool};
 use chv_controlplane_types::domain::{Generation, NodeId, NodeState};
 
@@ -504,14 +505,45 @@ impl NodeRepository {
         )
     }
 
-    pub async fn append_version(&self, input: &NodeVersionInput) -> Result<(), StoreError> {
+    /// Append a version-history row.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the append and the outbox enqueue share one transaction, so
+    /// the evidence commits with the mutation or not at all. Enrollment
+    /// passes it only when this is its final fail-closed write (a node that
+    /// reports no fabric identity); every other caller passes `None` and
+    /// keeps the original autocommit statement.
+    pub async fn append_version(
+        &self,
+        input: &NodeVersionInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::append_version_on(&mut conn, input).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::append_version_on(&mut tx, input).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn append_version_on(
+        conn: &mut sqlx::SqliteConnection,
+        input: &NodeVersionInput,
+    ) -> Result<(), StoreError> {
         sqlx::query(INSERT_NODE_VERSION_SQL)
             .bind(input.node_id.as_str())
             .bind(&input.component_name)
             .bind(&input.version)
             .bind(&input.source)
             .bind(input.reported_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         Ok(())
     }
@@ -603,8 +635,39 @@ impl NodeRepository {
     /// `expected` (a concurrent rotation won the race) or the node row no
     /// longer exists. Callers MUST treat `Ok(false)` as "do not hand out the
     /// newly issued certificate" — see `EnrollmentServiceImplementation`.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the rotation and the outbox enqueue share one transaction —
+    /// but only when the compare-and-swap matched: a lost race commits
+    /// neither the rotation nor its evidence (the adapter then records the
+    /// failed request on the direct path).
     pub async fn rotate_certificate_serial(
         &self,
+        node_id: &NodeId,
+        expected: &str,
+        new: &str,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<bool, StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::rotate_certificate_serial_on(&mut conn, node_id, expected, new).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                if !Self::rotate_certificate_serial_on(&mut tx, node_id, expected, new).await? {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(true)
+            }
+        }
+    }
+
+    async fn rotate_certificate_serial_on(
+        conn: &mut sqlx::SqliteConnection,
         node_id: &NodeId,
         expected: &str,
         new: &str,
@@ -613,21 +676,47 @@ impl NodeRepository {
             .bind(node_id.as_str())
             .bind(expected)
             .bind(new)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
 
         Ok(result.rows_affected() == 1)
     }
 
+    /// Overwrite a node's certificate serial (insecure/dev legacy rows only).
+    ///
+    /// `audit` follows [`Self::rotate_certificate_serial`]: when present the
+    /// update and the outbox enqueue are one transaction, and a missing node
+    /// row commits neither.
     pub async fn update_certificate_serial(
         &self,
+        node_id: &NodeId,
+        serial: &str,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::update_certificate_serial_on(&mut conn, node_id, serial).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::update_certificate_serial_on(&mut tx, node_id, serial).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn update_certificate_serial_on(
+        conn: &mut sqlx::SqliteConnection,
         node_id: &NodeId,
         serial: &str,
     ) -> Result<(), StoreError> {
         let result = sqlx::query(UPDATE_NODE_CERTIFICATE_SQL)
             .bind(node_id.as_str())
             .bind(serial)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
 
         if result.rows_affected() == 0 {
@@ -640,8 +729,33 @@ impl NodeRepository {
         Ok(())
     }
 
+    /// Persist a bootstrap result report.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the upsert and the outbox enqueue share one transaction, so
+    /// the evidence commits with the mutation or not at all.
     pub async fn upsert_bootstrap_result(
         &self,
+        input: &NodeBootstrapResultInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::upsert_bootstrap_result_on(&mut conn, input).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::upsert_bootstrap_result_on(&mut tx, input).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn upsert_bootstrap_result_on(
+        conn: &mut sqlx::SqliteConnection,
         input: &NodeBootstrapResultInput,
     ) -> Result<(), StoreError> {
         sqlx::query(UPSERT_BOOTSTRAP_RESULT_SQL)
@@ -652,7 +766,7 @@ impl NodeRepository {
             .bind(&input.details)
             .bind(input.started_unix_ms)
             .bind(input.completed_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         Ok(())
     }

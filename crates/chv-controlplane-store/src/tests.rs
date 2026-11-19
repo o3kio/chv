@@ -107,12 +107,12 @@ async fn test_bootstrap_result_repeatable_upsert() {
     };
 
     // First write
-    repo.upsert_bootstrap_result(&input)
+    repo.upsert_bootstrap_result(&input, None)
         .await
         .expect("First write failed");
 
     // Second write (updates existing row via ON CONFLICT)
-    repo.upsert_bootstrap_result(&input).await.expect(
+    repo.upsert_bootstrap_result(&input, None).await.expect(
         "Second write failed - should have succeeded with ON CONFLICT and updated_at now()",
     );
 }
@@ -156,7 +156,9 @@ async fn test_update_certificate_serial_missing_node() {
     let repo = NodeRepository::new(pool);
     let node_id = NodeId::new("non-existent-node").unwrap();
 
-    let result = repo.update_certificate_serial(&node_id, "serial-123").await;
+    let result = repo
+        .update_certificate_serial(&node_id, "serial-123", None)
+        .await;
 
     match result {
         Err(StoreError::NotFound { entity, id }) => {
@@ -220,7 +222,7 @@ async fn test_rotate_certificate_serial_is_compare_and_swap() {
 
     assert!(
         !repo
-            .rotate_certificate_serial(&node_id, "stale", "serial-b")
+            .rotate_certificate_serial(&node_id, "stale", "serial-b", None)
             .await
             .unwrap(),
         "stale expected serial must not update"
@@ -234,7 +236,7 @@ async fn test_rotate_certificate_serial_is_compare_and_swap() {
     );
 
     assert!(
-        repo.rotate_certificate_serial(&node_id, "serial-a", "serial-b")
+        repo.rotate_certificate_serial(&node_id, "serial-a", "serial-b", None)
             .await
             .unwrap(),
         "matching expected serial must update"
@@ -245,6 +247,88 @@ async fn test_rotate_certificate_serial_is_compare_and_swap() {
             .unwrap()
             .as_deref(),
         Some("serial-b")
+    );
+}
+
+/// #706: an adopted rotation whose compare-and-swap loses the race must
+/// commit neither the new serial nor the outbox row — the adapter then
+/// records the failed request on the direct path. A later successful swap
+/// commits both in one transaction.
+#[tokio::test]
+async fn test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap() {
+    let test_db = TestDb::new().await;
+    let repo = NodeRepository::new(test_db.pool.clone());
+    let node_id = NodeId::new("node-serial-cas-audit").unwrap();
+    seed_node_for_serial_test(&repo, &node_id, Some("serial-a")).await;
+
+    let audit = AuditOutboxInsert {
+        outbox_id: "ob-cas-audit".into(),
+        audit_id: "audit-cas-audit".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-serial-cas-audit".into(),
+            actor_username: "node-serial-cas-audit".into(),
+            actor_role: "node".into(),
+            action: "RotateNodeCertificate".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.EnrollmentService/RotateNodeCertificate".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-serial-cas-audit".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    assert!(
+        !repo
+            .rotate_certificate_serial(&node_id, "stale", "serial-b", Some(&audit))
+            .await
+            .unwrap(),
+        "a lost compare-and-swap reports false"
+    );
+    assert_eq!(
+        repo.get_certificate_serial(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("serial-a"),
+        "the rotation must be rolled back"
+    );
+    let outbox_count = |pool: StorePool| async move {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        count
+    };
+    assert_eq!(
+        outbox_count(test_db.pool.clone()).await,
+        0,
+        "a lost compare-and-swap must not enqueue evidence"
+    );
+
+    assert!(
+        repo.rotate_certificate_serial(&node_id, "serial-a", "serial-b", Some(&audit))
+            .await
+            .unwrap(),
+        "a matching compare-and-swap commits"
+    );
+    assert_eq!(
+        repo.get_certificate_serial(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("serial-b")
+    );
+    assert_eq!(
+        outbox_count(test_db.pool.clone()).await,
+        1,
+        "the successful rotation commits its evidence"
     );
 }
 
@@ -349,7 +433,7 @@ async fn test_rotate_certificate_serial_refuses_revoked_serial() {
 
     assert!(
         !node_repo
-            .rotate_certificate_serial(&node_id, "serial-a", "serial-b")
+            .rotate_certificate_serial(&node_id, "serial-a", "serial-b", None)
             .await
             .unwrap(),
         "a revoked serial must never be exchangeable for fresh key material"
@@ -1250,7 +1334,7 @@ async fn concurrent_fabric_identity_registrations_get_distinct_fabric_ips() {
         let repo = repo.clone();
         let node_id = format!("node-m2-{i}");
         handles.push(tokio::spawn(async move {
-            repo.register_fabric_identity(&node_id, &format!("pub-m2-{i}"), 1500, None)
+            repo.register_fabric_identity(&node_id, &format!("pub-m2-{i}"), 1500, None, None)
                 .await
         }));
     }
@@ -1343,15 +1427,27 @@ async fn second_registration_does_not_overwrite_stored_underlay_endpoint() {
     seed_fabric_node_row(&pool, "node-ep-pin").await;
 
     // First registration pins the endpoint.
-    repo.register_fabric_identity("node-ep-pin", "pub-ep-1", 1500, Some("198.51.100.10:65001"))
-        .await
-        .expect("first registration must succeed");
+    repo.register_fabric_identity(
+        "node-ep-pin",
+        "pub-ep-1",
+        1500,
+        Some("198.51.100.10:65001"),
+        None,
+    )
+    .await
+    .expect("first registration must succeed");
 
     // A re-report through a different observed peer address (e.g. an
     // LB/proxy reconnection) must not rotate the pinned endpoint.
-    repo.register_fabric_identity("node-ep-pin", "pub-ep-2", 1400, Some("203.0.113.99:65001"))
-        .await
-        .expect("re-registration must succeed");
+    repo.register_fabric_identity(
+        "node-ep-pin",
+        "pub-ep-2",
+        1400,
+        Some("203.0.113.99:65001"),
+        None,
+    )
+    .await
+    .expect("re-registration must succeed");
 
     let entry = repo.get_vtep("node-ep-pin").await.expect("row must exist");
     assert_eq!(
@@ -1371,7 +1467,7 @@ async fn second_registration_does_not_overwrite_stored_underlay_endpoint() {
     );
 
     // A re-report WITHOUT an endpoint must not erase the pinned value.
-    repo.register_fabric_identity("node-ep-pin", "pub-ep-3", 0, None)
+    repo.register_fabric_identity("node-ep-pin", "pub-ep-3", 0, None, None)
         .await
         .expect("re-registration without an endpoint must succeed");
     let entry = repo.get_vtep("node-ep-pin").await.expect("row must exist");
@@ -1383,7 +1479,7 @@ async fn second_registration_does_not_overwrite_stored_underlay_endpoint() {
     // A node with no endpoint yet still gets one on its first
     // endpoint-carrying registration.
     seed_fabric_node_row(&pool, "node-ep-late").await;
-    repo.register_fabric_identity("node-ep-late", "pub-ep-late", 1500, None)
+    repo.register_fabric_identity("node-ep-late", "pub-ep-late", 1500, None, None)
         .await
         .expect("registration without an endpoint must succeed");
     repo.register_fabric_identity(
@@ -1391,6 +1487,7 @@ async fn second_registration_does_not_overwrite_stored_underlay_endpoint() {
         "pub-ep-late",
         1500,
         Some("[2001:db8::1]:65001"),
+        None,
     )
     .await
     .expect("registration with an endpoint must succeed");
@@ -1422,7 +1519,7 @@ async fn get_fabric_peers_for_network_returns_peers_in_node_id_order() {
     let nodes = ["node-ord-m", "node-ord-z", "node-ord-a", "node-ord-b"];
     for node_id in nodes {
         seed_fabric_node_row(&pool, node_id).await;
-        repo.register_fabric_identity(node_id, &format!("pub-{node_id}"), 1500, None)
+        repo.register_fabric_identity(node_id, &format!("pub-{node_id}"), 1500, None, None)
             .await
             .expect("fabric identity registration must succeed");
     }

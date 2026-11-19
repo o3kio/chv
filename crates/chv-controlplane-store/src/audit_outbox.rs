@@ -21,11 +21,12 @@
 //! `INSERT OR IGNORE`) makes an `outbox_id` collision a loud store
 //! error; the emitter mints the key exactly once per request.
 //!
-//! ## Rollout status (PR 1)
+//! ## Rollout status
 //!
-//! This module is plumbing only. No request path enqueues yet; the
-//! table is created empty and the dispatcher finds nothing. Adoption
-//! follows in later PRs (BFF, then gRPC).
+//! Adopted: the pure-DB BFF mutations (PR 2) and the three enrollment
+//! gRPC RPCs (`EnrollNode`, `RotateNodeCertificate`,
+//! `ReportBootstrapResult`) in PR 3a. Every other request path still
+//! writes its audit row post-hoc and never touches this table.
 
 use crate::audit_log::{insert_row_on_tx, AuditLogInsert};
 use crate::{StoreError, StorePool};
@@ -143,6 +144,41 @@ pub async fn enqueue_on_tx(
         .execute(&mut **tx)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Re-stamp an already-built insert for enqueue: the payload's
+/// `occurred_at_ms` and the row's `created_at_ms` become the enqueue
+/// (commit-attempt) time, mirroring the BFF's `outbox_insert` stamp. The
+/// caller's insert is cloned, never mutated, so the pre-minted row the
+/// emitter handed down stays untouched.
+pub(crate) fn stamped_at_enqueue(input: &AuditOutboxInsert) -> AuditOutboxInsert {
+    let now_ms = chv_common::now_unix_ms();
+    AuditOutboxInsert {
+        outbox_id: input.outbox_id.clone(),
+        audit_id: input.audit_id.clone(),
+        payload: AuditLogInsert {
+            occurred_at_ms: now_ms,
+            ..input.payload.clone()
+        },
+        created_at_ms: now_ms,
+    }
+}
+
+/// Enqueue an adopted gRPC row as the **last fallible statement** of the
+/// mutation transaction, stamped at enqueue time.
+///
+/// #706 invariant: nothing fallible may follow this call before the
+/// commit, so `Ok` from the enclosing store call means the evidence
+/// committed with the mutation — the fact the gRPC adapter's
+/// check-or-insert relies on. The adapter also records that fact in the
+/// request's committed flag, so its `get`-error fallback stays
+/// duplicate-free even if a future service ever enqueues and then fails.
+pub(crate) async fn enqueue_adopted_row(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    audit: &AuditOutboxInsert,
+) -> Result<(), StoreError> {
+    enqueue_on_tx(tx, &stamped_at_enqueue(audit)).await?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -449,6 +485,25 @@ mod tests {
             .await
             .expect("count audit");
         count
+    }
+
+    #[test]
+    fn adopted_rows_are_stamped_at_enqueue_not_at_mint() {
+        let input = outbox_input("ob-stamp", 1_000);
+        let stamped = stamped_at_enqueue(&input);
+        assert_eq!(stamped.outbox_id, input.outbox_id);
+        assert_eq!(stamped.audit_id, input.audit_id);
+        assert!(
+            stamped.payload.occurred_at_ms > 1_000,
+            "occurred_at_ms must be the enqueue time, not the mint time"
+        );
+        assert_eq!(
+            stamped.created_at_ms, stamped.payload.occurred_at_ms,
+            "created_at_ms is the enqueue/due time and matches the row timestamp"
+        );
+        // The emitter's pre-minted insert is not mutated.
+        assert_eq!(input.payload.occurred_at_ms, 1_000);
+        assert_eq!(input.created_at_ms, 1_000);
     }
 
     #[tokio::test]
