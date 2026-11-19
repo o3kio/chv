@@ -1,7 +1,7 @@
 # ADR-023 NetBox Projection as a Bounded Downstream Inventory Adapter
 
 Date: 2026-10-08
-Status: Proposed (companion design: `docs/design/issue-239-netbox-projection.md`; issue: kubedoio/chv#239)
+Status: Accepted (implemented 2026-10; status reconciled 2026-11-19; companion design: `docs/design/issue-239-netbox-projection.md`; issue: kubedoio/chv#239)
 
 ## Context
 

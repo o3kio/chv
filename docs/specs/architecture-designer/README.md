@@ -49,7 +49,7 @@ docs/
 - [`component/architecture-designer-ui.md`](../component/architecture-designer-ui.md)
 - [`component/architecture-designer-validation.md`](../component/architecture-designer-validation.md)
 - [`component/architecture-designer-security.md`](../component/architecture-designer-security.md)
-- [`component/architecture-designer-netbox-projection.md`](../component/architecture-designer-netbox-projection.md) — **Proposed** (#239, ADR-023; test doubles per ADR-024/#586)
+- [`component/architecture-designer-netbox-projection.md`](../component/architecture-designer-netbox-projection.md) — **Implemented** (2026-10; #239, ADR-023; test doubles per ADR-024/#586)
 
 ## Contracts
 
@@ -57,8 +57,8 @@ docs/
 - [`contracts/graph-contract.md`](contracts/graph-contract.md) — Topology graph model (nodes/edges)
 - [`contracts/api-contract.md`](contracts/api-contract.md) — Designer backend-for-frontend (BFF) API surface
 - [`contracts/validation-plan-contract.md`](contracts/validation-plan-contract.md) — Validation result + plan result formats
-- [`contracts/netbox-mapping-contract.md`](contracts/netbox-mapping-contract.md) — **Proposed** (#239): versioned CHV→NetBox object mapping, ownership custom fields, plan entries, retention
-- [`contracts/netbox-api-contract.md`](contracts/netbox-api-contract.md) — **Proposed** (#239): NetBox projection BFF endpoints, wire shapes, error codes, events
+- [`contracts/netbox-mapping-contract.md`](contracts/netbox-mapping-contract.md) — **Accepted** (implemented 2026-10; #239): versioned CHV→NetBox object mapping, ownership custom fields, plan entries, retention
+- [`contracts/netbox-api-contract.md`](contracts/netbox-api-contract.md) — **Accepted** (implemented 2026-10; #239): NetBox projection BFF endpoints, wire shapes, error codes, events
 
 ## Examples and schema
 

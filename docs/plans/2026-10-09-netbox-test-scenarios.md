@@ -1,8 +1,8 @@
 # NetBox Integration Test Scenarios — Implementation Plan
 
 Date: 2026-10-09
-Status: Proposed — execution starts only after this plan and ADR-024 are
-adopted (tracking issue: kubedoio/chv#586).
+Status: Executed — shipped 2026-10-09 with ADR-024 (tracking issue
+kubedoio/chv#586, closed 2026-10-09).
 
 References:
 

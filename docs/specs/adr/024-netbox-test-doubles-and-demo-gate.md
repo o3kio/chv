@@ -1,7 +1,7 @@
 # ADR-024 NetBox Test Doubles and the Plain-HTTP Demo Gate
 
 Date: 2026-10-09
-Status: Proposed (companion plan: `docs/plans/2026-10-09-netbox-test-scenarios.md`; issue: kubedoio/chv#586)
+Status: Accepted (implemented 2026-10-09; status reconciled 2026-11-19; companion plan: `docs/plans/2026-10-09-netbox-test-scenarios.md`; issue: kubedoio/chv#586)
 
 ## Context
 
