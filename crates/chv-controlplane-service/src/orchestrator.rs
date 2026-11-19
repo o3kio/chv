@@ -5972,7 +5972,7 @@ mod tests {
             ),
         ] {
             vtep_repo
-                .register_fabric_identity(node_id, public_key, 0, None)
+                .register_fabric_identity(node_id, public_key, 0, None, None)
                 .await
                 .expect("register fabric identity");
             sqlx::query("UPDATE vtep_registry SET underlay_endpoint = ? WHERE node_id = ?")

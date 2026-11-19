@@ -1,5 +1,6 @@
 //! VTEP registry and VNI allocation for overlay networking.
 
+use crate::audit_outbox::{enqueue_on_tx, AuditOutboxInsert};
 use crate::{StoreError, StorePool};
 
 /// Repository for VTEP (Virtual Tunnel Endpoint) registry operations.
@@ -211,6 +212,7 @@ impl VtepRepository {
         public_key: &str,
         underlay_mtu: u32,
         underlay_endpoint: Option<&str>,
+        audit: Option<&AuditOutboxInsert>,
     ) -> Result<(), StoreError> {
         // Two registrations may race on the same free fabric IP; the loser
         // trips the unique index (migration 0054) and retries with a
@@ -219,7 +221,13 @@ impl VtepRepository {
         let mut attempt = 1;
         loop {
             match self
-                .register_fabric_identity_once(node_id, public_key, underlay_mtu, underlay_endpoint)
+                .register_fabric_identity_once(
+                    node_id,
+                    public_key,
+                    underlay_mtu,
+                    underlay_endpoint,
+                    audit,
+                )
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -254,6 +262,7 @@ impl VtepRepository {
         public_key: &str,
         underlay_mtu: u32,
         underlay_endpoint: Option<&str>,
+        audit: Option<&AuditOutboxInsert>,
     ) -> Result<(), StoreError> {
         let underlay_mtu = if underlay_mtu == 0 {
             None
@@ -300,6 +309,15 @@ impl VtepRepository {
                 .bind(node_id)
                 .execute(&mut *tx)
                 .await?;
+        }
+
+        // #706: the caller's pre-minted audit-outbox row commits with the
+        // fabric identity, so enrollment evidence cannot be lost between
+        // this commit and the post-hoc audit insert. A failed attempt
+        // (including a lost fabric-IP race) rolls the enqueue back with the
+        // mutation and the retry enqueues again.
+        if let Some(audit) = audit {
+            enqueue_on_tx(&mut tx, audit).await?;
         }
 
         tx.commit().await?;

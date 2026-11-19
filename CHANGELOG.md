@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **gRPC enrollment mutations adopt the audit outbox (#706 half 1, PR 3a).**
+  `EnrollNode`, `RotateNodeCertificate`, and `ReportBootstrapResult` now
+  commit their audit row inside the mutation's transaction: the adapter
+  mints a server-side `outbox_id`/`audit_id` ticket, hands the outbox row
+  to the service, and `finish_audited` performs the same check-or-insert
+  as the BFF middleware (a committed row suppresses the direct insert and
+  `finalize_pending` patches a non-success outcome; a missing row keeps
+  the direct post-hoc insert). The adopted store methods take an optional
+  outbox row and open a transaction only when one is present; the
+  rotation compare-and-swap, bootstrap-result upsert, version-history
+  append, and fabric-identity registration enqueue inside it. The crash
+  window (mutation's final commit lands, process dies before the audit
+  insert) closes for these three RPCs. `EnrollNode` remains
+  multi-statement: its one-time token consumption plus the node/inventory
+  rows commit earlier, so a crash mid-sequence can still leave a
+  partially applied enrollment with no outbox row — a disclosed residual
+  risk, not a covered case. The gRPC lifecycle and reconcile surfaces
+  keep the direct post-hoc path. Verification is deterministic (one
+  dispatched row per adopted RPC, failed/denied direct row with no outbox
+  row, crash replay, unadopted lifecycle RPC, oversized-payload rollback);
+  no `SIGKILL` end-to-end test is claimed. See
+  `docs/specs/component/audit-log.md` and
+  `docs/runbooks/audit-outbox.md`.
 - **BFF privileged mutations adopt the audit outbox (#706 half 1, PR 2).**
   The middleware now mints a server-side `outbox_id`/`audit_id` ticket per
   audited request and, after the handler returns, performs check-or-insert

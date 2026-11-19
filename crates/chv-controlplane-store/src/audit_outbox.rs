@@ -21,11 +21,12 @@
 //! `INSERT OR IGNORE`) makes an `outbox_id` collision a loud store
 //! error; the emitter mints the key exactly once per request.
 //!
-//! ## Rollout status (PR 1)
+//! ## Rollout status
 //!
-//! This module is plumbing only. No request path enqueues yet; the
-//! table is created empty and the dispatcher finds nothing. Adoption
-//! follows in later PRs (BFF, then gRPC).
+//! Adopted: the pure-DB BFF mutations (PR 2) and the three enrollment
+//! gRPC RPCs (`EnrollNode`, `RotateNodeCertificate`,
+//! `ReportBootstrapResult`) in PR 3a. Every other request path still
+//! writes its audit row post-hoc and never touches this table.
 
 use crate::audit_log::{insert_row_on_tx, AuditLogInsert};
 use crate::{StoreError, StorePool};

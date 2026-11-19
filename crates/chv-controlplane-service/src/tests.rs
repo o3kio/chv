@@ -1082,7 +1082,7 @@ async fn test_enrollment_extended_inventory_persistence() {
     };
 
     service
-        .enroll_node(request, None)
+        .enroll_node(request, None, None)
         .await
         .expect("Enrollment failed");
 
@@ -1255,7 +1255,7 @@ async fn test_enrollment_registers_fabric_identity() {
     };
 
     service
-        .enroll_node(request, None)
+        .enroll_node(request, None, None)
         .await
         .expect("enrollment with fabric identity must succeed");
 
@@ -1390,7 +1390,7 @@ async fn test_enrollment_with_peer_addr_derives_underlay_endpoint() {
     // WireGuard port.
     let peer_addr: std::net::SocketAddr = "203.0.113.9:55555".parse().unwrap();
     service
-        .enroll_node(request, Some(peer_addr))
+        .enroll_node(request, Some(peer_addr), None)
         .await
         .expect("enrollment with a peer address must succeed");
 
@@ -1482,7 +1482,7 @@ async fn test_enrollment_with_ipv6_peer_addr_stores_bracketed_endpoint() {
 
     let peer_addr: std::net::SocketAddr = "[2001:db8:42::1]:55555".parse().unwrap();
     service
-        .enroll_node(request, Some(peer_addr))
+        .enroll_node(request, Some(peer_addr), None)
         .await
         .expect("enrollment over an IPv6 transport must succeed");
 
@@ -1550,7 +1550,7 @@ async fn test_inventory_re_report_does_not_rotate_pinned_underlay_endpoint() {
     // Enrollment through the node's real address pins the endpoint.
     let enroll_peer: std::net::SocketAddr = "198.51.100.23:44444".parse().unwrap();
     service
-        .enroll_node(request, Some(enroll_peer))
+        .enroll_node(request, Some(enroll_peer), None)
         .await
         .expect("enrollment must succeed");
 
@@ -1629,7 +1629,9 @@ async fn test_rotate_certificate_missing_node() {
         }),
     };
 
-    let result = service.rotate_node_certificate(request, None, false).await;
+    let result = service
+        .rotate_node_certificate(request, None, false, None)
+        .await;
     match result {
         Err(ControlPlaneServiceError::NotFound(_)) => { /* Correct */ }
         other => panic!("Expected NotFound error for missing node, got {:?}", other),
@@ -1692,6 +1694,7 @@ async fn test_rotate_certificate_accepts_matching_presented_serial() {
             rotate_certificate_request("node-rot"),
             Some("old-serial".into()),
             false,
+            None,
         )
         .await
         .expect("matching serial must rotate");
@@ -1717,6 +1720,7 @@ async fn test_rotate_certificate_rejects_stale_presented_serial() {
             rotate_certificate_request("node-rot"),
             Some("stale-serial".into()),
             false,
+            None,
         )
         .await;
 
@@ -1743,7 +1747,7 @@ async fn test_rotate_certificate_rejects_missing_presented_serial() {
     seed_node_with_certificate_serial(&node_repo, "node-rot", Some("old-serial")).await;
 
     let result = service
-        .rotate_node_certificate(rotate_certificate_request("node-rot"), None, false)
+        .rotate_node_certificate(rotate_certificate_request("node-rot"), None, false, None)
         .await;
 
     assert!(
@@ -1770,6 +1774,7 @@ async fn test_rotate_certificate_rejects_legacy_null_serial() {
             rotate_certificate_request("node-legacy"),
             Some("any-serial".into()),
             false,
+            None,
         )
         .await;
 
@@ -1798,7 +1803,7 @@ async fn test_rotate_certificate_insecure_mode_succeeds_without_presented_serial
     seed_node_with_certificate_serial(&node_repo, "node-dev", Some("old-serial")).await;
 
     service
-        .rotate_node_certificate(rotate_certificate_request("node-dev"), None, true)
+        .rotate_node_certificate(rotate_certificate_request("node-dev"), None, true, None)
         .await
         .expect("insecure/dev mode must preserve the bypass");
 
@@ -1818,7 +1823,12 @@ async fn test_rotate_certificate_insecure_mode_bootstraps_legacy_null_serial() {
     seed_node_with_certificate_serial(&node_repo, "node-dev-legacy", None).await;
 
     service
-        .rotate_node_certificate(rotate_certificate_request("node-dev-legacy"), None, true)
+        .rotate_node_certificate(
+            rotate_certificate_request("node-dev-legacy"),
+            None,
+            true,
+            None,
+        )
         .await
         .expect("insecure/dev mode must still update a legacy NULL serial");
 
@@ -1863,7 +1873,7 @@ async fn test_report_bootstrap_result_persistence() {
     };
 
     service
-        .report_bootstrap_result(request)
+        .report_bootstrap_result(request, None)
         .await
         .expect("Report failed");
 
@@ -2053,7 +2063,7 @@ async fn test_enrollment_rejects_invalid_bootstrap_token() {
         }),
     };
 
-    let result = service.enroll_node(request, None).await;
+    let result = service.enroll_node(request, None, None).await;
     match result {
         Err(ControlPlaneServiceError::Unauthorized(_)) => { /* Correct */ }
         other => panic!(

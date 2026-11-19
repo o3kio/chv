@@ -331,7 +331,7 @@ mod tests {
         endpoint: Option<&str>,
     ) {
         let repo = VtepRepository::new(pool.clone());
-        repo.register_fabric_identity(node_id, public_key, underlay_mtu, None)
+        repo.register_fabric_identity(node_id, public_key, underlay_mtu, None, None)
             .await
             .expect("register fabric identity");
         if let Some(endpoint) = endpoint {
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(id_b.fabric_ip.as_deref(), Some("100.100.0.2"));
 
         // Re-registration keeps the allocated IP and updates the MTU.
-        repo.register_fabric_identity("node-a", "pub-a", 1500, None)
+        repo.register_fabric_identity("node-a", "pub-a", 1500, None, None)
             .await
             .unwrap();
         let id_a = repo.get_fabric_identity("node-a").await.unwrap().unwrap();

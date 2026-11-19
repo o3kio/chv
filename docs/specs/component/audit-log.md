@@ -133,8 +133,8 @@ exceeded, the writer is aborted and queued events are lost **uncounted**
 
 The crash window (a mutation commits before its audit row is written)
 remains open for the denial writer and for every mutation site not
-coupled to the audit outbox; the BFF adoption below closes it for the
-listed routes and tracks the rest under #706.
+coupled to the audit outbox; the BFF and enrollment adoption below
+closes it for the listed routes and tracks the rest under #706.
 
 ## Mounting
 
@@ -171,7 +171,7 @@ Layer order (outermost first) and why:
 | Column | Meaning |
 |---|---|
 | `audit_id` | Server-minted 128-bit id (primary key). |
-| `occurred_at_ms` | Epoch-millisecond completion timestamp; for an adopted HTTP mutation it is stamped at enqueue (the commit attempt) and replayed verbatim by the dispatcher. |
+| `occurred_at_ms` | Epoch-millisecond completion timestamp; for an adopted mutation it is stamped at enqueue (the commit attempt) and replayed verbatim by the dispatcher. |
 | `actor_id`, `actor_username`, `actor_role` | Verified claims, or the explicit anonymous marker. |
 | `action` | Stable action. HTTP: dotted, derived from method/path, e.g. `vm.create`. gRPC: the protobuf RPC name, e.g. `StartVm`; interceptor rejections use the fixed literal `interceptor_denied` (not an RPC name). |
 | `method`, `path` | Request shape; never the query string. HTTP: verb + matched route. gRPC: `gRPC` + `<fully-qualified service>/<RpcName>`. The only gRPC rows without an RPC suffix are interceptor rejections, whose `path` is `<fully-qualified gRPC service>`: server-side tonic does not expose `GrpcMethod` (it is inserted only by generated client code) and `tonic::Request` drops the HTTP URI. |
@@ -215,10 +215,11 @@ that user's privileged actions.
 A request is classified once, executed once, and then the middleware
 attempts one insert. Under a healthy database this is exactly one row
 per mutating request, including failed and denied attempts. Adopted BFF
-routes keep the same exactly-one-row guarantee through a different
-emitter: the handler commits the row into `audit_outbox` with the
-mutation and the middleware's check-or-insert skips the direct insert
-(see the transactional-outbox section below).
+routes and the three adopted enrollment RPCs keep the same
+exactly-one-row guarantee through a different emitter: the handler
+commits the row into `audit_outbox` with the mutation and the emitter's
+check-or-insert skips the direct insert (see the transactional-outbox
+section below).
 
 For the direct (post-hoc) path, the insert happens **after** the handler
 returns. If the insert fails:
@@ -253,11 +254,22 @@ returns. If the insert fails:
   re-enroll. This is the deliberate fail-closed tradeoff, not automatic
   recovery.
 
+**Adopted enrollment RPCs.** `EnrollNode`, `RotateNodeCertificate`, and
+`ReportBootstrapResult` commit their evidence row with the mutation's
+final transaction (see the transactional-outbox section), so the
+post-hoc insert above is skipped on success. The failure modes are
+narrower but not gone: an enqueue failure fails the final transaction
+(the adapter then records the failed request once on the direct path),
+and a crash before the final transaction commits is not covered for the
+earlier enrollment writes. The `EnrollNode` token caveat stands — the
+token is consumed in an earlier commit, so a rolled-back enrollment
+still burns it and the operator must issue a new one.
+
 Residual risk: the mutation has already happened when the insert is
 attempted. A 500 `AUDIT_LOG_WRITE_FAILED` therefore does not roll the
 mutation back; it tells the caller the audit trail is incomplete.
 
-### Transactional outbox (BFF adopted; gRPC not yet)
+### Transactional outbox (BFF and enrollment gRPC adopted)
 
 The control plane ships an `audit_outbox` table (migration `0071`) and a
 bounded dispatcher for it (#706 half 1). Mutation sites are adopted
@@ -280,17 +292,28 @@ single-transaction mutations:
 | `POST /v1/networks/delete` | `network.delete` | the existing transaction now also enqueues |
 | `POST /v1/vms/import` | `vm.import` | the **final** transaction couples the VM/volume/operation rows; the filesystem work happens before it |
 
-**Not adopted (still post-hoc).** Every other audited route — notably
-`vm.delete`, `volume.delete`, snapshot/clone/restore mutations, anything
-that performs filesystem or agent RPC work inside the handler, the
-guest-agent browser routes, and the whole gRPC surface (PR 3). They keep
-today's direct insert and its narrow crash window. Denied and failed
-requests also stay post-hoc: there is no state change to lose.
+**Adopted in PR 3a (gRPC enrollment).** The adapter mints the ticket and
+passes the outbox row into the service, which enqueues it inside its
+final mutation transaction:
 
-**Check-or-insert.** For every classified HTTP mutation the middleware
-mints (server-side, UUIDv4, never read from a request header or body) an
-`outbox_id` and a pre-minted `audit_id`, and puts them on the request as
-an `AuditOutboxTicket`. An adopted handler passes its mutation
+| RPC | Action | Shape |
+|---|---|---|
+| `EnrollNode` | `EnrollNode` | the **final** fail-closed write carries the row: `register_fabric_identity` when the node reports a fabric key, otherwise the version-history append. Token consumption, the node row, and the inventory row commit earlier and are **not** coupled (residual risk below) |
+| `RotateNodeCertificate` | `RotateNodeCertificate` | the compare-and-swap that records the new serial and the outbox row are one transaction; a lost race enqueues neither and the adapter records the conflict on the direct path |
+| `ReportBootstrapResult` | `ReportBootstrapResult` | the bootstrap-result upsert and the outbox row are one transaction |
+
+**Not adopted (still post-hoc).** Every other audited route — notably
+the whole gRPC `LifecycleService` and `ReconcileService` surfaces, the
+`Unimplemented` shims, `vm.delete`, `volume.delete`,
+snapshot/clone/restore mutations, anything that performs filesystem or
+agent RPC work inside the handler, and the guest-agent browser routes.
+They keep today's direct insert and its narrow crash window. Denied and
+failed requests also stay post-hoc: there is no state change to lose.
+
+**Check-or-insert (HTTP).** For every classified HTTP mutation the
+middleware mints (server-side, UUIDv4, never read from a request header
+or body) an `outbox_id` and a pre-minted `audit_id`, and puts them on the
+request as an `AuditOutboxTicket`. An adopted handler passes its mutation
 transaction to `commit_adopted_mutation`, which calls `enqueue_on_tx`
 immediately before the commit. After the handler returns the middleware
 checks the outbox by primary key:
@@ -307,12 +330,35 @@ checks the outbox by primary key:
   durable outbox row and skips the direct insert; otherwise it falls back
   to the direct insert.
 
+**Check-or-insert (gRPC).** The three adopted enrollment RPCs use the
+same composition in `finish_audited`: the adapter mints an
+`outbox_id`/`audit_id` pair (UUIDv4, never from the wire), hands the
+`AuditOutboxInsert` to the service, and after the RPC returns:
+
+- **row present** → the evidence committed with the mutation's final
+  transaction; the direct insert is skipped. A non-success final status
+  patches the pending row via `finalize_pending` (the mutation and its
+  evidence stay; only the recorded outcome changes).
+- **row absent** → denied, failed before commit, rolled back, or the
+  service did not adopt. The adapter inserts directly, exactly as the
+  unadopted path always has.
+- **check fails after a successful call** → the adopted service commits
+  its enqueue with its final transaction, so the evidence is durable in
+  the outbox even though the check failed; the adapter skips the direct
+  insert (no duplicate) and logs loudly. After a failed call nothing was
+  enqueued, so it falls back to the direct insert.
+
 No path produces two rows for one request, and no adopted success path
 produces zero rows: the outbox row and the mutation are one commit. The
 verification evidence is `crates/chv-webui-bff/tests/audit_log.rs`
 (adopted success, rollback after the `BEGIN IMMEDIATE` mutation
 transaction, crash between commit and middleware return, injected
-post-commit non-2xx, unadopted route, oversized actor, distinct ids).
+post-commit non-2xx, unadopted route, oversized actor, distinct ids) and
+the `server_audit_*` adoption tests in
+`crates/chv-controlplane-service/src/server_audit_tests.rs` (one
+dispatched row per adopted RPC, rollback/denial with no outbox row,
+crash replay, unadopted lifecycle RPC still direct, oversized payload
+rolls back).
 
 The contract adoption relies on:
 
@@ -343,13 +389,17 @@ The contract adoption relies on:
   the middleware records that failed request once on the direct path.
   Denied/failed/unadopted paths keep the direct post-hoc insert above.
 - **The crash window closes only where mutation and outbox share a
-  commit.** Multi-statement mutations (notably `EnrollNode`, whose
-  token consumption and node upsert are separate commits) couple only
-  the final transaction; a crash between commits remains a
-  half-applied mutation with no outbox row. `vms/import` has the same
-  shape: its temporary-directory setup and file move precede the final
-  transaction. Folding enrollment into one transaction is follow-up
-  work.
+  commit.** On the three adopted enrollment RPCs the row commits with
+  the mutation's **final** transaction, so a crash after that commit and
+  before the adapter's post-hoc insert loses nothing: the dispatcher
+  replays the row. `EnrollNode` remains multi-statement: its one-time
+  token consumption is a separate, earlier commit, as are the node and
+  inventory rows. A crash between those commits and the final one leaves
+  a partially applied enrollment with **no** outbox row — the token can
+  be consumed with no enrollment evidence. That is a residual risk, not
+  a covered case; folding enrollment into one transaction is follow-up
+  work. `vms/import` has the same shape: its temporary-directory setup
+  and file move precede the final transaction.
 
 **Lock scope.** Wrapping the formerly autocommit `users`/`tokens`
 statements in a transaction extends the SQLite write lock by one INSERT
@@ -360,6 +410,15 @@ their first statement is a write; a deferred `BEGIN` would only defer
 the same lock and risk a `SQLITE_BUSY` at the outbox INSERT instead of
 at `BEGIN`. `networks/update`, `networks/delete`, and `vms/import`
 already held a transaction, so only the extra INSERT is new there.
+
+On gRPC the adopted store methods take an optional outbox row and open a
+transaction only when one is present (otherwise they keep the original
+autocommit statement). `register_fabric_identity` already had its own
+transaction, so enrollment adds only the INSERT there; the rotation
+compare-and-swap and the bootstrap-result upsert gain a one-statement
+transaction (plus the INSERT) on the adopted path. The transaction is
+held for the store call only — never across certificate minting or
+transport work — so no new lock ordering is introduced.
 
 **Actor-field cap (NIT 5 decision).** The store caps the serialized
 payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
@@ -390,15 +449,24 @@ batches; pending rows are never pruned. This cleanup is plumbing, not
 evidence deletion — `audit_log` retention is separate.
 
 **Verification scope.** The crash window and the tx coupling are proven
-deterministically by `crates/chv-webui-bff/tests/audit_log.rs` (the
+deterministically by `crates/chv-webui-bff/tests/audit_log.rs` and the
+gRPC adoption tests in
+`crates/chv-controlplane-service/src/server_audit_tests.rs` (the
 `SIGKILL` end-to-end test from the design is a follow-up, not
-implemented): an adopted handler that commits with the middleware never
+implemented): an adopted mutation that commits with the emitter never
 running is replayed exactly once by the dispatcher, and a **commit
 failure after a successful enqueue** (the
 `commit_failure_after_a_successful_enqueue_rolls_back_mutation_and_outbox`
 test, using a deferred foreign key that SQLite only checks at `COMMIT`)
 leaves neither the mutation nor the outbox row — which a pool/autocommit
-enqueue could not satisfy.
+enqueue could not satisfy. The gRPC tests additionally cover each
+adopted RPC's dispatched row, the failed/denied direct row with no
+outbox row, crash replay, an unadopted lifecycle RPC, and the oversized
+payload rollback (`oversized_audit_payload_rolls_back_the_adopted_rotation`
+in `enrollment.rs`). The store suite pins the rotation transaction's
+atomicity directly
+(`test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap`:
+a lost compare-and-swap commits neither the serial nor the outbox row).
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see
