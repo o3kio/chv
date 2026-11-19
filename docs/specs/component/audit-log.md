@@ -310,11 +310,11 @@ transaction:
 
 | RPC | Action | Shape |
 |---|---|---|
-| `ApplyNodeDesiredState` | `ApplyNodeDesiredState` | `set_state_preserving_policy` and the outbox row are one transaction (a one-statement transaction on the adopted path) |
+| `ApplyNodeDesiredState` | `ApplyNodeDesiredState` | `set_state_preserving_policy` and the outbox row are one transaction (the single mutation statement plus the outbox INSERT on the adopted path) |
 | `ApplyVmDesiredState` | `ApplyVmDesiredState` | the existing desired-state upsert transaction now also enqueues; a stale generation rolls both back |
 | `ApplyVolumeDesiredState` | `ApplyVolumeDesiredState` | as above |
 | `ApplyNetworkDesiredState` | `ApplyNetworkDesiredState` | as above, including the exposure rows; a `Deleting` tombstone or stale generation rolls everything back |
-| `AcknowledgeDesiredStateVersion` | `AcknowledgeDesiredStateVersion` | the observed-state acknowledgement and the outbox row are one transaction (one-statement transaction on the adopted path); a missing observed-state row enqueues neither |
+| `AcknowledgeDesiredStateVersion` | `AcknowledgeDesiredStateVersion` | the observed-state acknowledgement and the outbox row are one transaction (the single mutation statement plus the outbox INSERT on the adopted path); a missing observed-state row enqueues neither |
 
 **Not adopted (still post-hoc).** Every other audited route — notably
 the whole gRPC `LifecycleService` surface (agent-ack fan-out and
@@ -471,15 +471,17 @@ On gRPC the adopted store methods take an optional outbox row and open a
 transaction only when one is present (otherwise they keep the original
 autocommit statement). `register_fabric_identity` already had its own
 transaction, so enrollment adds only the INSERT there; the rotation
-compare-and-swap and the bootstrap-result upsert gain a one-statement
-transaction (plus the INSERT) on the adopted path. On the reconcile path
+compare-and-swap and the bootstrap-result upsert gain a transaction
+around the mutation statement plus the outbox INSERT on the adopted
+path. On the reconcile path
 `upsert_vm`, `upsert_volume`, and `upsert_network_with_exposures`
 already opened a transaction, so only the INSERT is new;
 `set_state_preserving_policy` and the four observed-state
-acknowledgements gain a one-statement transaction on the adopted path.
-Every transaction is held for the store call only — never across
-certificate minting, the convergence event append, the operation-status
-update, or transport work — so no new lock ordering is introduced.
+acknowledgements gain a transaction around the mutation statement plus
+the outbox INSERT on the adopted path. Every transaction is held for the
+store call only — never across certificate minting, the convergence
+event append, the operation-status update, or transport work — so no new
+lock ordering is introduced.
 
 **Actor-field cap (NIT 5 decision).** The store caps the serialized
 payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
@@ -533,15 +535,21 @@ desired-state change, one direct failed row); a missing observed-state
 row on `AcknowledgeDesiredStateVersion` (one direct 404 row, no outbox
 row); crash replay; the post-commit-failure patch path (a reconcile
 service that enqueues and then fails keeps exactly one row whose
-outcome/status are patched); and the unadopted shape (a service that
-ignores the ticket writes one direct row and no outbox row). The store
-suite pins the rotation transaction's atomicity directly
+outcome/status are patched); the unadopted shape (a service that
+ignores the ticket writes one direct row and no outbox row); and both
+check-error branches of the gRPC composition (a committed enqueue whose
+lookup fails must not direct-insert and is replayed from the durable
+row; an uncommitted one falls back to exactly one direct failed row).
+The store suite pins the rotation transaction's atomicity directly
 (`test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap`:
 a lost compare-and-swap commits neither the serial nor the outbox row)
 and the reconcile upsert's
 (`test_upsert_vm_audit_is_atomic_with_the_desired_state_write`: a stale
 generation commits neither the fragment nor the outbox row, an accepted
-one commits both with the pre-minted ids).
+one commits both with the pre-minted ids;
+`test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write`:
+a successful enqueue whose COMMIT fails rolls the desired-state write
+back too).
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see

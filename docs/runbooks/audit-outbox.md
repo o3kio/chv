@@ -280,17 +280,17 @@ are never pruned, regardless of age.
 - **Lock scope (PR 3a):** the adopted store methods take an optional
   outbox row and open a transaction only when one is present;
   `register_fabric_identity` already had a transaction, and the rotation
-  compare-and-swap / bootstrap-result upsert gain a one-statement
-  transaction plus the INSERT. The transaction is held for the store
-  call only (never across certificate minting or transport work), so no
-  new lock ordering is introduced.
+  compare-and-swap / bootstrap-result upsert gain a transaction around
+  the mutation statement plus the outbox INSERT. The transaction is held
+  for the store call only (never across certificate minting or transport
+  work), so no new lock ordering is introduced.
 - **Lock scope (PR 3b):** `upsert_vm`, `upsert_volume`, and
   `upsert_network_with_exposures` already held their desired-state
   transaction, so only the extra INSERT is new.
   `set_state_preserving_policy` and the four observed-state
-  acknowledgements gain a one-statement transaction on the adopted path.
-  The transaction never spans the convergence event append or the
-  operation-status update.
+  acknowledgements gain a transaction around the mutation statement plus
+  the outbox INSERT on the adopted path. The transaction never spans the
+  convergence event append or the operation-status update.
 - **Remaining surfaces stay post-hoc:** the gRPC lifecycle service
   (agent-ack fan-out, large surface) and every unadopted BFF route still
   insert after the handler returns, with the original narrow crash

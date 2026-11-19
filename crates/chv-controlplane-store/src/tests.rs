@@ -843,6 +843,121 @@ async fn test_upsert_vm_audit_is_atomic_with_the_desired_state_write() {
     assert_eq!(audit_id, "audit-ob-reconcile-accepted");
 }
 
+/// #706 PR 3b: an enqueue that succeeds but whose **commit** fails must
+/// roll the desired-state mutation back too.
+///
+/// The trigger below writes a child row with a deferred foreign key that
+/// has no parent, so SQLite accepts the outbox INSERT and rejects the
+/// COMMIT. The generation assertion is the discriminator: if the enqueue
+/// were decoupled (a pool/autocommit statement after `tx.commit()`), the
+/// desired-state write would already be durable and the outbox rollback
+/// would not touch it. The outbox-count assertion guards the coupled
+/// path's own cleanliness (it also holds under a decoupled enqueue, whose
+/// autocommit statement rolls the trigger's child back on its own).
+#[tokio::test]
+async fn test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = DesiredStateRepository::new(pool.clone());
+
+    let input = VmDesiredStateInput {
+        vm_id: ResourceId::new("vm-audit-commit-fail").unwrap(),
+        node_id: None,
+        display_name: "audit-commit-fail".to_string(),
+        tenant_id: None,
+        placement_policy: None,
+        desired_generation: Generation::new(5),
+        desired_status: Some("Running".to_string()),
+        requested_by: Some("test".to_string()),
+        updated_by: Some("test".to_string()),
+        target_node_id: None,
+        cpu_count: Some(2),
+        memory_bytes: Some(1024),
+        image_ref: Some("img".to_string()),
+        boot_mode: None,
+        desired_power_state: Some("on".to_string()),
+        vsock_enabled: None,
+        requested_unix_ms: 1000,
+    };
+    repo.upsert_vm(&input, None).await.unwrap();
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-reconcile-commit-fail".into(),
+        audit_id: "audit-ob-reconcile-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "ApplyVmDesiredState".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.ReconcileService/ApplyVmDesiredState".into(),
+            resource_kind: Some("vm".into()),
+            resource_id: Some("vm-audit-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+    let mut newer = input.clone();
+    newer.desired_generation = Generation::new(6);
+    newer.requested_unix_ms = 2000;
+
+    let error = repo
+        .upsert_vm(&newer, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-audit-commit-fail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generation, 5,
+        "the desired-state write must roll back with the evidence"
+    );
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
+}
+
 // ── #384: transactional clone target materialization ──────────────────────
 //
 // `materialize_clone_target` is the clone path's store core: ONE

@@ -1978,3 +1978,240 @@ async fn server_audit_reconcile_oversized_payload_rolls_back_the_adopted_write()
     );
     assert!(!coupling.was_committed());
 }
+
+// ---------------------------------------------------------------------------
+// #706 review — the two check-error branches of `finish_adopted_grpc_audit`.
+//
+// The outbox lookup is made to fail deterministically by renaming the table
+// inside the service fake (no sleeps, no race). This exercises exactly the
+// `Err(error)` arm: a committed enqueue must not be duplicated on the direct
+// path, and an uncommitted one must not vanish from the trail.
+// ---------------------------------------------------------------------------
+
+/// Reconcile fake that commits the evidence through the real store, then
+/// hides `audit_outbox` so the adapter's check-or-insert `get` fails.
+struct ReconcileCommitThenHideOutbox {
+    pool: StorePool,
+    audit_id: std::sync::Mutex<Option<String>>,
+}
+
+#[tonic::async_trait]
+impl ReconcileService for ReconcileCommitThenHideOutbox {
+    async fn apply_node_desired_state(
+        &self,
+        _request: proto::ApplyNodeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn apply_vm_desired_state(
+        &self,
+        _request: proto::ApplyVmDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        let audit = audit.expect("the adapter passes the coupling");
+        let audit_id = audit.insert().audit_id.clone();
+        let mut tx = self.pool.begin().await.expect("begin adopted tx");
+        chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
+            .await
+            .expect("enqueue evidence");
+        tx.commit().await.expect("commit evidence");
+        audit.mark_committed();
+        *self.audit_id.lock().expect("audit id lock") = Some(audit_id);
+        sqlx::query("ALTER TABLE audit_outbox RENAME TO audit_outbox_hidden")
+            .execute(&self.pool)
+            .await
+            .expect("hide outbox table");
+        Ok(ok_ack())
+    }
+
+    async fn apply_volume_desired_state(
+        &self,
+        _request: proto::ApplyVolumeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn apply_network_desired_state(
+        &self,
+        _request: proto::ApplyNetworkDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn acknowledge_desired_state_version(
+        &self,
+        _request: proto::AcknowledgeDesiredStateVersionRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_check_error_after_committed_enqueue_skips_direct_insert() {
+    let db = TestDb::new().await;
+    let fake = Arc::new(ReconcileCommitThenHideOutbox {
+        pool: db.pool.clone(),
+        audit_id: std::sync::Mutex::new(None),
+    });
+    let server =
+        ReconcileServer::new(fake.clone()).with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let request = peer_request(
+        proto::ApplyVmDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "")),
+            node_id: "node-a".into(),
+            vm_id: "vm-check-error".into(),
+            fragment: Some(desired_state_fragment("vm-check-error", "vm", "1", "{}")),
+        },
+        "node-a",
+    );
+    // The adapter's `get` fails ("no such table"); `was_committed()` is
+    // true, so it must skip the direct insert and preserve the 2xx.
+    server
+        .apply_vm_desired_state(request)
+        .await
+        .expect("a committed mutation stays successful when the check fails");
+
+    assert!(
+        audit_rows(&db.pool).await.is_empty(),
+        "a committed enqueue must not be double-written on the direct path"
+    );
+
+    // Restore the table: the durable row is still there for replay.
+    sqlx::query("ALTER TABLE audit_outbox_hidden RENAME TO audit_outbox")
+        .execute(&db.pool)
+        .await
+        .expect("restore outbox table");
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "the committed row survives the failed check");
+    let expected_audit_id = fake
+        .audit_id
+        .lock()
+        .expect("audit id lock")
+        .clone()
+        .expect("fake captured the ticket audit id");
+    assert_eq!(rows[0].audit_id, expected_audit_id);
+
+    let dispatched = dispatch_one(&db, rows[0].created_at_ms).await;
+    assert_eq!(
+        dispatched[0].audit_id, expected_audit_id,
+        "replay reuses the pre-minted audit id"
+    );
+    assert_eq!(dispatched[0].action, "ApplyVmDesiredState");
+    assert_eq!(dispatched[0].outcome, "success");
+    assert_eq!(audit_rows(&db.pool).await.len(), 1, "exactly one row");
+}
+
+/// Reconcile fake that hides the outbox table and fails before enqueueing.
+struct ReconcileHideOutboxThenFail {
+    pool: StorePool,
+}
+
+#[tonic::async_trait]
+impl ReconcileService for ReconcileHideOutboxThenFail {
+    async fn apply_node_desired_state(
+        &self,
+        _request: proto::ApplyNodeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn apply_vm_desired_state(
+        &self,
+        _request: proto::ApplyVmDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        // No enqueue: the failure happens before any evidence is written.
+        sqlx::query("ALTER TABLE audit_outbox RENAME TO audit_outbox_hidden")
+            .execute(&self.pool)
+            .await
+            .expect("hide outbox table");
+        Err(ControlPlaneServiceError::Internal(
+            "pre-commit failure".into(),
+        ))
+    }
+
+    async fn apply_volume_desired_state(
+        &self,
+        _request: proto::ApplyVolumeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn apply_network_desired_state(
+        &self,
+        _request: proto::ApplyNetworkDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn acknowledge_desired_state_version(
+        &self,
+        _request: proto::AcknowledgeDesiredStateVersionRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_check_error_before_enqueue_falls_back_to_direct_insert() {
+    let db = TestDb::new().await;
+    let server = ReconcileServer::new(Arc::new(ReconcileHideOutboxThenFail {
+        pool: db.pool.clone(),
+    }))
+    .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let request = peer_request(
+        proto::ApplyVmDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "")),
+            node_id: "node-a".into(),
+            vm_id: "vm-check-error-uncommitted".into(),
+            fragment: Some(desired_state_fragment(
+                "vm-check-error-uncommitted",
+                "vm",
+                "1",
+                "{}",
+            )),
+        },
+        "node-a",
+    );
+    // The adapter's `get` fails; `was_committed()` is false, so the direct
+    // insert must run and the service error must be preserved (no panic).
+    let status = server
+        .apply_vm_desired_state(request)
+        .await
+        .expect_err("the service failure must be preserved");
+    assert_eq!(status.code(), Code::Internal);
+
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "an uncommitted check error must fall back to exactly one direct row"
+    );
+    assert_eq!(rows[0].action, "ApplyVmDesiredState");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 500);
+    assert_eq!(
+        rows[0].resource_id.as_deref(),
+        Some("vm-check-error-uncommitted")
+    );
+
+    sqlx::query("ALTER TABLE audit_outbox_hidden RENAME TO audit_outbox")
+        .execute(&db.pool)
+        .await
+        .expect("restore outbox table");
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "nothing was enqueued, so the outbox stays empty"
+    );
+}

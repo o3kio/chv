@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   couples the observed-state acknowledgement (a missing observed-state
   row enqueues neither). The store methods take an optional outbox row;
   the upserts already held a transaction, while the node state patch and
-  the four observed-state acknowledgements gain a one-statement
-  transaction on the adopted path. **Residual window (per-write, not
+  the four observed-state acknowledgements gain a transaction around the
+  mutation statement plus the outbox INSERT. **Residual window (per-write, not
   per-RPC):** the convergence event append that follows each apply
   (and, for the acknowledgement, the operation-status update) is a
   separate commit — a crash in between keeps the state change and its
