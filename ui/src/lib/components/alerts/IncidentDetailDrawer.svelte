@@ -93,7 +93,7 @@
 		>
 			<header class="flex items-start justify-between gap-3 px-4 py-3 border-b border-(--shell-line) bg-(--shell-surface-muted) sticky top-0">
 				<div class="min-w-0">
-					<h3 class="text-(length:--text-sm) font-bold text-(--shell-text) m-0">
+					<h3 class="text-(length:--chv-text-sm) font-bold text-(--shell-text) m-0">
 						Incident detail
 					</h3>
 					<p class="text-[10px] text-(--shell-text-muted) m-0 mt-0.5 break-all">

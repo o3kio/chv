@@ -57,7 +57,7 @@
 
 	.meta-hint {
 		font-size: 10px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		margin-top: 0.5rem;
 		line-height: 1.4;
 	}
@@ -85,11 +85,11 @@
 
 	.tag.warning { background: rgba(var(--color-warning-rgb), 0.1); color: var(--color-warning); }
 	.tag.healthy { background: rgba(var(--color-success-rgb), 0.1); color: var(--color-success); }
-	.tag.neutral { background: var(--bg-surface-muted); color: var(--color-neutral-500); }
+	.tag.neutral { background: var(--bg-surface-muted); color: var(--chv-color-neutral-500); }
 
 	.role-item .desc {
 		font-size: 9px;
 		font-weight: 700;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
 </style>

@@ -84,7 +84,7 @@
 		font-size: 10px;
 		font-weight: 700;
 		text-transform: uppercase;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		letter-spacing: 0.05em;
 	}
 
@@ -112,15 +112,15 @@
 	}
 
 	.value {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		font-weight: 700;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		line-height: 1;
 	}
 
 	.unit {
 		font-size: 10px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		font-weight: 500;
 	}
 

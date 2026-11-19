@@ -26,17 +26,17 @@
 
 <div class="flex flex-col gap-2">
 	{#if tasks.length === 0}
-		<p class="text-(length:--text-xs) text-(--shell-text-muted) py-2 text-center">{emptyText ?? 'No recent tasks recorded for this resource.'}</p>
+		<p class="text-(length:--chv-text-xs) text-(--shell-text-muted) py-2 text-center">{emptyText ?? 'No recent tasks recorded for this resource.'}</p>
 	{:else}
 		{#each tasks as task (task.task_id)}
 			{@const failure = getTaskFailureCause(task)}
 			<div class="flex justify-between items-center p-2 bg-(--shell-surface-muted) border border-(--shell-line) rounded-sm gap-4">
 				<div class="flex flex-col gap-[0.15rem] min-w-0 flex-1">
 					<div class="flex items-center gap-2 justify-between">
-						<span class="font-semibold text-(length:--text-sm) text-(--shell-text) whitespace-nowrap overflow-hidden text-ellipsis">{task.summary}</span>
+						<span class="font-semibold text-(length:--chv-text-sm) text-(--shell-text) whitespace-nowrap overflow-hidden text-ellipsis">{task.summary}</span>
 						<StatusBadge label={task.status} tone={task.tone} />
 					</div>
-					<div class="flex items-center gap-[0.35rem] text-(length:--text-xs) text-(--shell-text-muted)">
+					<div class="flex items-center gap-[0.35rem] text-(length:--chv-text-xs) text-(--shell-text-muted)">
 						<span>{task.operation}</span>
 						{#if task.started_at}
 							<span class="opacity-50">·</span>
@@ -53,7 +53,7 @@
 								<StatusBadge label={failure.code} tone="failed" />
 							{/if}
 							{#if failure.message}
-								<p class="text-(length:--text-xs) text-(--shell-text-muted) whitespace-pre-wrap wrap-break-word m-0">{failure.message}</p>
+								<p class="text-(length:--chv-text-xs) text-(--shell-text-muted) whitespace-pre-wrap wrap-break-word m-0">{failure.message}</p>
 							{/if}
 						</div>
 					{/if}

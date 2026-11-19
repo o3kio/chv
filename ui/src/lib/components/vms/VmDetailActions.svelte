@@ -116,7 +116,7 @@
 	}
 
 	.confirm-text {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--color-danger-dark);
 		font-weight: 600;
 	}

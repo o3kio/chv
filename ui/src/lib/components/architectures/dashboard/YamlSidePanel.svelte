@@ -76,7 +76,7 @@
 		gap: 0.75rem;
 		padding: 1rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 	}
 
@@ -88,10 +88,10 @@
 	}
 
 	.panel-title {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
 		margin: 0;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}
@@ -106,35 +106,35 @@
 		overflow: auto;
 		padding: 0.75rem;
 		margin: 0;
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 12px;
 		line-height: 1.5;
-		color: var(--color-neutral-900);
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px solid var(--color-neutral-200);
+		color: var(--chv-color-neutral-900);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
 		white-space: pre;
 	}
 
 	.empty {
 		padding: 1rem;
-		border: 1px dashed var(--color-neutral-300);
+		border: 1px dashed var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		text-align: center;
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 	}
 
 	.empty-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.empty-text {
 		margin: 0.25rem auto 0;
 		max-width: 480px;
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 </style>

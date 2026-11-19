@@ -76,13 +76,13 @@
 <style>
 	.identity-id {
 		font-weight: 800;
-		font-family: var(--font-mono);
-		color: var(--color-neutral-900);
+		font-family: var(--chv-font-mono);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.cell-text {
 		font-size: 11px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.action-strip {
@@ -118,7 +118,7 @@
 
 	.empty-hint {
 		font-size: 11px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		padding: 2rem;
 		text-align: center;
 	}

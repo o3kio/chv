@@ -23,7 +23,7 @@
 		align-items: center;
 		gap: 0.35rem;
 		font-size: 10px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.dot {

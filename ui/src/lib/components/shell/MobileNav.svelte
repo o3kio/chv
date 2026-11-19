@@ -184,6 +184,6 @@
 
 	.logo-subtitle {
 		font-size: 0.625rem;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
 </style>

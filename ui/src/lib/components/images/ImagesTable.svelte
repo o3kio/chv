@@ -84,14 +84,14 @@
 
 	.artifact-name {
 		font-weight: 700;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.artifact-tag {
 		font-size: 8px;
 		font-weight: 800;
 		color: #ffffff;
-		background: var(--color-neutral-400);
+		background: var(--chv-color-neutral-400);
 		padding: 1px 3px;
 		border-radius: 2px;
 	}
@@ -99,7 +99,7 @@
 	.btn-icon-destructive {
 		background: transparent;
 		border: 1px solid transparent;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		padding: 4px;
 		border-radius: 4px;
 		cursor: pointer;

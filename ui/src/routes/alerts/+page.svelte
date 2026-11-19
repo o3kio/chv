@@ -219,13 +219,13 @@
 		border-bottom: 2px solid transparent;
 		font-size: 10px;
 		font-weight: 800;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		cursor: pointer;
 		letter-spacing: 0.05em;
 	}
 
 	.tab-btn:hover {
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.tab-btn.is-active {

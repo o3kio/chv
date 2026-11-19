@@ -42,7 +42,7 @@
 	const c = $derived(config[status] ?? config.unknown);
 </script>
 
-<span class="inline-flex items-center gap-1.5 text-(length:--text-xs) font-medium {c.toneClass}" aria-label="Status: {c.label}">
+<span class="inline-flex items-center gap-1.5 text-(length:--chv-text-xs) font-medium {c.toneClass}" aria-label="Status: {c.label}">
 	<span class="w-[6px] h-[6px] rounded-full {c.dotClass}" aria-hidden="true"></span>
 	{#if showText}
 		<span>{c.label}</span>

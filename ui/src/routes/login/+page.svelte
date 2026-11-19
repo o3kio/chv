@@ -233,14 +233,14 @@
   .brand-text .title {
     font-size: 1.1rem;
     font-weight: 700;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .brand-text .subtitle {
     font-size: 0.65rem;
     text-transform: uppercase;
     font-weight: 600;
-    color: var(--color-neutral-400);
+    color: var(--chv-color-neutral-400);
     letter-spacing: 0.05em;
   }
 
@@ -248,7 +248,7 @@
     font-size: 0.75rem;
     text-transform: uppercase;
     font-weight: 700;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     letter-spacing: 0.1em;
     margin: 0;
   }
@@ -270,7 +270,7 @@
     font-size: 10px;
     text-transform: uppercase;
     font-weight: 700;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     letter-spacing: 0.05em;
   }
 
@@ -280,8 +280,8 @@
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-xs);
     padding: 0.75rem 1rem;
-    font-size: var(--text-sm);
-    color: var(--color-neutral-900);
+    font-size: var(--chv-text-sm);
+    color: var(--chv-color-neutral-900);
     transition: all 0.2s ease;
   }
 
@@ -356,7 +356,7 @@
 
   .login-footer p {
     font-size: 10px;
-    color: var(--color-neutral-400);
+    color: var(--chv-color-neutral-400);
     line-height: 1.5;
     margin: 0;
   }

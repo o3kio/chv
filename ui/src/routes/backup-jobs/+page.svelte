@@ -43,9 +43,9 @@
     align-items: flex-start;
     max-width: 52rem;
     padding: 1.25rem;
-    border: 1px solid var(--color-neutral-200);
+    border: 1px solid var(--chv-color-neutral-200);
     border-radius: 0.5rem;
-    background: var(--color-neutral-0, #fff);
+    background: var(--chv-color-neutral-0, #fff);
   }
 
   .fence-icon {
@@ -72,7 +72,7 @@
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
   }
 
   h1 {
@@ -86,7 +86,7 @@
     margin: 0;
     font-size: 0.875rem;
     line-height: 1.55;
-    color: var(--color-neutral-600);
+    color: var(--chv-color-neutral-600);
   }
 
   code {

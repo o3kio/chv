@@ -26,7 +26,7 @@
 	role="article"
 >
 	{#if header}
-		<div class="border-b border-neutral-100 bg-(--color-neutral-50) {paddingClasses[padding]}">
+		<div class="border-b border-neutral-100 bg-(--chv-color-neutral-50) {paddingClasses[padding]}">
 			{@render header()}
 		</div>
 	{/if}
@@ -34,7 +34,7 @@
 		{@render children?.()}
 	</div>
 	{#if footer}
-		<div class="border-t border-neutral-100 bg-(--color-neutral-50) {paddingClasses[padding]}">
+		<div class="border-t border-neutral-100 bg-(--chv-color-neutral-50) {paddingClasses[padding]}">
 			{@render footer()}
 		</div>
 	{/if}

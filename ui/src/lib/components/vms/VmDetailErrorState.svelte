@@ -175,14 +175,14 @@
 	}
 
 	.recovery-hero__copy h2 {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		line-height: 1.2;
 		color: var(--shell-text);
 	}
 
 	.recovery-hero__copy p {
 		margin-top: 0.4rem;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		line-height: 1.55;
 		color: var(--shell-text);
 		max-width: 46rem;
@@ -191,7 +191,7 @@
 	.recovery-hero__copy span {
 		display: block;
 		margin-top: 0.55rem;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		line-height: 1.5;
 		color: var(--shell-text-muted);
 	}
@@ -215,12 +215,12 @@
 	}
 
 	.recovery-action strong {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--shell-text);
 	}
 
 	.recovery-action span {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		line-height: 1.5;
 		color: var(--shell-text-muted);
 	}
@@ -236,7 +236,7 @@
 		gap: 0.55rem;
 		padding-left: 1rem;
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		line-height: 1.5;
 		color: var(--shell-text);
 	}
@@ -253,12 +253,12 @@
 	}
 
 	.recovery-facts p {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--shell-text);
 	}
 
 	.recovery-facts span {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		line-height: 1.5;
 		color: var(--shell-text-muted);
 	}

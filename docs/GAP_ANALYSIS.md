@@ -197,7 +197,7 @@ These areas were previously flagged as gaps but are now complete:
 | **Version bump automation** | `scripts/bump-version.sh` + `Makefile` target |
 | **Dark mode** | Full implementation with `UserMenu` toggle and `[data-theme="dark"]` tokens |
 | **Command palette** | `ui/src/lib/components/shell/CommandPalette.svelte` — fuzzy-search with 16 commands |
-| **Design token alignment** | Earthy palette applied to `app.css`, `tailwind.config.cjs`, and all components |
+| **Design token alignment** | Earthy palette applied via `app.css` design tokens (`--chv-*` where a name would collide with a Tailwind v4 theme namespace) and all components |
 | **Error handling alignment** | `crates/chv-webui-bff/src/error.rs` — no `unreachable!()` panic paths |
 | **Logging alignment** | `crates/chv-config/src/lib.rs` — `tracing` replaces `eprintln!` |
 | **Async runtime safety** | `crates/chv-agent-core/src/console_server.rs`, `crates/chv-controlplane-service/src/container.rs` — `tokio::sync::Mutex` in async paths |

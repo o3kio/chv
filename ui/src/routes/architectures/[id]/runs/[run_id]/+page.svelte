@@ -205,8 +205,8 @@
 		background: none;
 		border: none;
 		padding: 0;
-		font-size: var(--text-xs);
-		color: var(--color-neutral-500);
+		font-size: var(--chv-text-xs);
+		color: var(--chv-color-neutral-500);
 		cursor: pointer;
 		align-self: flex-start;
 	}
@@ -215,22 +215,22 @@
 		outline: none;
 	}
 	.page-title {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		font-weight: 700;
 		margin: 0;
-		font-family: var(--font-mono, monospace);
+		font-family: var(--chv-font-mono, monospace);
 	}
-	.page-subtitle { margin: 0; font-size: var(--text-sm); color: var(--color-neutral-600); }
+	.page-subtitle { margin: 0; font-size: var(--chv-text-sm); color: var(--chv-color-neutral-600); }
 	.header-status { display: flex; gap: 0.5rem; align-items: center; }
 	.polling {
 		font-size: 11px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		font-style: italic;
 	}
 	.facts {
 		padding: 0.75rem 1rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 	}
 	.dl {
@@ -245,16 +245,16 @@
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
-	.dl dd { margin: 0; font-size: var(--text-sm); color: var(--color-neutral-900); }
+	.dl dd { margin: 0; font-size: var(--chv-text-sm); color: var(--chv-color-neutral-900); }
 	.banner {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.4rem;
 		padding: 0.6rem 0.85rem;
 		border-radius: var(--radius-xs);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 	.banner-error {
 		background: rgba(220, 38, 38, 0.08);
@@ -274,11 +274,11 @@
 	.ops-section { display: flex; flex-direction: column; gap: 0.5rem; }
 	.ops-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 	.ops-list {
 		list-style: none;
@@ -288,7 +288,7 @@
 		flex-direction: column;
 		gap: 0.4rem;
 	}
-	.ops-fallback { margin: 0; font-size: var(--text-sm); color: var(--color-neutral-600); }
+	.ops-fallback { margin: 0; font-size: var(--chv-text-sm); color: var(--chv-color-neutral-600); }
 	.link {
 		color: var(--color-primary);
 		text-decoration: none;
@@ -303,6 +303,6 @@
 		border: 1px solid rgba(220, 38, 38, 0.4);
 		border-radius: var(--radius-xs);
 		color: rgb(153, 27, 27);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 </style>

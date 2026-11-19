@@ -109,7 +109,7 @@
 		gap: 0.75rem;
 		padding: 1rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 	}
 
@@ -129,10 +129,10 @@
 	}
 
 	.panel-title {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
 		margin: 0;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}
@@ -164,7 +164,7 @@
 		display: inline-flex;
 		gap: 0.4rem;
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.findings-list {
@@ -178,22 +178,22 @@
 
 	.empty {
 		padding: 1rem;
-		border: 1px dashed var(--color-neutral-300);
+		border: 1px dashed var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		text-align: center;
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 	}
 
 	.empty-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.empty-text {
 		margin: 0.25rem 0 0 0;
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 </style>

@@ -28,7 +28,7 @@
 		primary:
 			'bg-linear-to-br from-primary to-(--color-primary-active) text-white shadow-[0_2px_8px_var(--color-primary-glow)] hover:shadow-[0_4px_12px_rgba(var(--color-primary-rgb),0.35)] hover:-translate-y-px active:translate-y-0',
 		secondary:
-			'bg-(--bg-surface) text-neutral-700 border border-neutral-300 hover:bg-(--color-neutral-50) hover:border-neutral-400',
+			'bg-(--bg-surface) text-neutral-700 border border-neutral-300 hover:bg-(--chv-color-neutral-50) hover:border-neutral-400',
 		ghost:
 			'bg-transparent text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900',
 		danger: 'bg-danger text-white hover:bg-(--color-danger-dark)'

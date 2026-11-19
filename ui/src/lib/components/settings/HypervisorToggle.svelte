@@ -37,12 +37,12 @@
 	.toggle-meta .label {
 		font-size: 11px;
 		font-weight: 800;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.toggle-meta .desc {
 		font-size: 10px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		line-height: 1.4;
 	}
 </style>

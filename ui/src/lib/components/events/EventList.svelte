@@ -326,7 +326,7 @@
   }
 
   .event-list:hover {
-    box-shadow: var(--shadow-md);
+    box-shadow: var(--chv-shadow-md);
   }
 
   .event-item {

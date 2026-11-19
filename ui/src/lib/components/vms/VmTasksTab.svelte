@@ -47,7 +47,7 @@
 
 <style>
 	.empty-hint {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		text-align: center;
 		padding: 1rem 0;
@@ -60,7 +60,7 @@
 	.events-table {
 		width: 100%;
 		border-collapse: collapse;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 	}
 
 	.events-table th {
@@ -103,7 +103,7 @@
 	}
 
 	.severity-badge--info {
-		background: var(--color-neutral-100, #f3f4f6);
-		color: var(--color-neutral-600, #4b5563);
+		background: var(--chv-color-neutral-100, #f3f4f6);
+		color: var(--chv-color-neutral-600, #4b5563);
 	}
 </style>

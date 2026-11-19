@@ -22,6 +22,6 @@
 		border: 1px solid rgba(59, 130, 246, 0.4);
 		border-radius: var(--radius-xs);
 		color: rgb(30, 64, 175);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 </style>

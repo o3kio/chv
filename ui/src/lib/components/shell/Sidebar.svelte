@@ -157,10 +157,10 @@
     background: transparent;
   }
   .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: var(--color-neutral-700);
+    background: var(--chv-color-neutral-700);
     border-radius: 10px;
   }
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: var(--color-neutral-600);
+    background: var(--chv-color-neutral-600);
   }
 </style>

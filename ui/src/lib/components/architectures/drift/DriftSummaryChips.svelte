@@ -62,9 +62,9 @@
 		font-size: 11px;
 		font-weight: 600;
 		border-radius: var(--radius-xs);
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px solid var(--color-neutral-200);
-		color: var(--color-neutral-600);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px solid var(--chv-color-neutral-200);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.chip-active {

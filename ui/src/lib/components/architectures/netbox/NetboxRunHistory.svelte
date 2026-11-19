@@ -124,21 +124,21 @@
 
 <style>
 	.history { display: flex; flex-direction: column; gap: 0.6rem; }
-	.hint { font-size: 12px; color: var(--color-neutral-500); }
+	.hint { font-size: 12px; color: var(--chv-color-neutral-500); }
 	.empty {
 		padding: 1rem;
-		border: 1px dashed var(--color-neutral-300);
+		border: 1px dashed var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		text-align: center;
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 	}
 	.empty-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
-	.empty-text { margin: 0.25rem 0 0 0; font-size: 12px; color: var(--color-neutral-600); }
+	.empty-text { margin: 0.25rem 0 0 0; font-size: 12px; color: var(--chv-color-neutral-600); }
 	.rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
 	.row {
 		display: flex;
@@ -147,7 +147,7 @@
 		flex-wrap: wrap;
 		padding: 0.4rem 0.6rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
 	}
 	.row-selected { border-color: var(--color-primary); }
@@ -185,8 +185,8 @@
 	.status-running { background: #1d4ed8; }
 	.status-succeeded { background: #15803d; }
 	.status-failed { background: #b91c1c; }
-	.row-trigger, .row-mode { font-size: 11px; font-weight: 600; color: var(--color-neutral-500); }
-	.row-summary { font-size: 12px; color: var(--color-neutral-700); }
-	.row-time { font-size: 11px; color: var(--color-neutral-400); margin-left: auto; }
+	.row-trigger, .row-mode { font-size: 11px; font-weight: 600; color: var(--chv-color-neutral-500); }
+	.row-summary { font-size: 12px; color: var(--chv-color-neutral-700); }
+	.row-time { font-size: 11px; color: var(--chv-color-neutral-400); margin-left: auto; }
 	.row-error { flex-basis: 100%; font-size: 12px; color: rgb(153, 27, 27); }
 </style>

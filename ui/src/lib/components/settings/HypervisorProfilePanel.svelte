@@ -101,7 +101,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.field-label {
 		font-size: 10px;
 		font-weight: 800;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	select {
@@ -110,8 +110,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 		border-radius: var(--radius-xs);
 		padding: 0.35rem 0.5rem;
 		font-size: 11px;
-		font-family: var(--font-mono);
-		color: var(--color-neutral-900);
+		font-family: var(--chv-font-mono);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.safety-sign {

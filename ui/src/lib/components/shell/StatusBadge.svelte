@@ -17,4 +17,4 @@
 	};
 </script>
 
-<span class="inline-flex items-center border rounded-full px-2 py-[0.15rem] text-(length:--text-xs) font-semibold tracking-[0.08em] uppercase whitespace-nowrap {toneClasses[tone]}">{label}</span>
+<span class="inline-flex items-center border rounded-full px-2 py-[0.15rem] text-(length:--chv-text-xs) font-semibold tracking-[0.08em] uppercase whitespace-nowrap {toneClasses[tone]}">{label}</span>

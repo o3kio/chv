@@ -29,6 +29,6 @@
 	});
 </script>
 
-<span class="font-mono text-(length:--text-xs) {finishedMs ? 'text-(--shell-text-muted)' : 'text-(--shell-accent) font-medium'}">
+<span class="font-mono text-(length:--chv-text-xs) {finishedMs ? 'text-(--shell-text-muted)' : 'text-(--shell-accent) font-medium'}">
 	{duration}
 </span>

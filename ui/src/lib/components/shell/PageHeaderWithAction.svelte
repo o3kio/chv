@@ -16,8 +16,8 @@
 			<page.icon size={20}></page.icon>
 		</div>
 		<div>
-			<div class="text-(length:--text-xs) font-semibold tracking-[0.12em] uppercase text-(--shell-text-muted)">{page.eyebrow}</div>
-			<h1 class="mt-[0.2rem] text-(length:--text-3xl) leading-[1.05] text-(--shell-text)">{page.title}</h1>
+			<div class="text-(length:--chv-text-xs) font-semibold tracking-[0.12em] uppercase text-(--shell-text-muted)">{page.eyebrow}</div>
+			<h1 class="mt-[0.2rem] text-(length:--chv-text-3xl) leading-[1.05] text-(--shell-text)">{page.title}</h1>
 		</div>
 		{#if actions}
 			<div class="flex ml-auto gap-2 items-center">
@@ -27,7 +27,7 @@
 	</div>
 
 	<div class="flex flex-wrap items-center justify-between gap-x-5 gap-y-[0.9rem]">
-		<p class="max-w-3xl text-(length:--text-sm) leading-relaxed text-(--shell-text-secondary)">{page.description}</p>
+		<p class="max-w-3xl text-(length:--chv-text-sm) leading-relaxed text-(--shell-text-secondary)">{page.description}</p>
 		<div class="flex flex-wrap gap-[0.55rem]">
 			{#each page.badges as badge}
 				<StatusBadge {...badge} />

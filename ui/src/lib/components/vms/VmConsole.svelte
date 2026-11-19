@@ -304,7 +304,7 @@
 		terminal = new Terminal({
 			cursorBlink: true,
 			fontSize: 13,
-			fontFamily: rootStyle.getPropertyValue('--font-mono').trim() || 'monospace',
+			fontFamily: rootStyle.getPropertyValue('--chv-font-mono').trim() || 'monospace',
 			allowProposedApi: true,
 			scrollback: 10000,
 			theme: {
@@ -428,7 +428,7 @@
 		padding: 0.45rem 0.65rem;
 		background: var(--shell-surface-muted);
 		border-bottom: 1px solid var(--shell-line);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 	}
 
 	.toolbar-left {
@@ -463,7 +463,7 @@
 
 	.console-meta {
 		color: var(--shell-text-muted);
-		font-family: var(--font-mono);
+		font-family: var(--chv-font-mono);
 	}
 
 	.toolbar-btn {
@@ -515,6 +515,6 @@
 		background: var(--color-danger-light);
 		border-bottom: 1px solid var(--color-danger);
 		color: var(--color-danger-dark);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 	}
 </style>

@@ -63,7 +63,7 @@
   .form-group label {
     font-size: 9px;
     font-weight: 800;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     letter-spacing: 0.1em;
   }
 
@@ -74,7 +74,7 @@
     padding: 0.5rem;
     font-size: 11px;
     font-weight: 700;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .protocol-hint {
@@ -87,7 +87,7 @@
   }
 
   .protocol-hint span { font-size: 9px; font-weight: 800; color: var(--color-primary); }
-  .protocol-hint p { font-size: 10px; color: var(--color-neutral-600); margin: 0; }
+  .protocol-hint p { font-size: 10px; color: var(--chv-color-neutral-600); margin: 0; }
 
   .file-ingest {
     padding: 2rem !important;

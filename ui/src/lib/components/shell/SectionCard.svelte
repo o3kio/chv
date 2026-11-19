@@ -24,7 +24,7 @@
 	<header class="flex justify-between items-center px-3 py-[0.65rem] border-b border-(--shell-line) bg-(--shell-surface-muted)">
 		<div class="flex items-center gap-2">
 			{#if Icon}<Icon size={14} class="text-(--shell-text-muted)" />{/if}
-			<h3 class="text-(length:--text-xs) font-bold uppercase tracking-wider text-(--shell-text-muted) m-0">{title}</h3>
+			<h3 class="text-(length:--chv-text-xs) font-bold uppercase tracking-wider text-(--shell-text-muted) m-0">{title}</h3>
 			{#if badgeLabel}
 				<span class="text-[10px] font-bold px-[0.4rem] py-[0.1rem] rounded-full {badgeToneClasses[badgeTone]}">{badgeLabel}</span>
 			{/if}
@@ -36,7 +36,7 @@
 		{/if}
 	</header>
 	{#if !collapsed}
-		<div class="p-3 text-(length:--text-sm)">
+		<div class="p-3 text-(length:--chv-text-sm)">
 			{@render children()}
 		</div>
 	{/if}

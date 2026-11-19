@@ -151,13 +151,13 @@
 		height: 100%;
 		padding: 1rem;
 		background: var(--bg-surface, #fff);
-		border-left: 1px solid var(--color-neutral-200, #ddd5c8);
+		border-left: 1px solid var(--chv-color-neutral-200, #ddd5c8);
 		display: flex;
 		flex-direction: column;
 		gap: 0.75rem;
 		overflow-y: auto;
-		font-family: var(--font-sans, 'IBM Plex Sans', system-ui, sans-serif);
-		color: var(--color-neutral-900, #191612);
+		font-family: var(--chv-font-sans, 'IBM Plex Sans', system-ui, sans-serif);
+		color: var(--chv-color-neutral-900, #191612);
 	}
 	.inspector-header {
 		display: flex;
@@ -172,16 +172,16 @@
 		min-width: 0;
 	}
 	.kind-label {
-		font-size: var(--text-xs, 0.6875rem);
+		font-size: var(--chv-text-xs, 0.6875rem);
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-700, #423b33);
+		color: var(--chv-color-neutral-700, #423b33);
 	}
 	.node-id {
-		font-family: var(--font-mono, 'IBM Plex Mono', monospace);
+		font-family: var(--chv-font-mono, 'IBM Plex Mono', monospace);
 		font-size: 11px;
-		color: var(--color-neutral-500, #75695b);
+		color: var(--chv-color-neutral-500, #75695b);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -189,18 +189,18 @@
 	.close {
 		appearance: none;
 		background: transparent;
-		border: 1px solid var(--color-neutral-300, #c7bcac);
+		border: 1px solid var(--chv-color-neutral-300, #c7bcac);
 		border-radius: var(--radius-sm, 0.25rem);
 		width: 28px;
 		height: 28px;
 		font-size: 18px;
 		line-height: 1;
 		cursor: pointer;
-		color: var(--color-neutral-700, #423b33);
+		color: var(--chv-color-neutral-700, #423b33);
 		flex: 0 0 auto;
 	}
 	.close:hover {
-		background: var(--color-neutral-100, #efe9df);
+		background: var(--chv-color-neutral-100, #efe9df);
 	}
 	.close:focus-visible {
 		outline: 2px solid var(--color-primary, #8f5a2a);
@@ -208,12 +208,12 @@
 	}
 	.name-row {
 		padding-bottom: 0.5rem;
-		border-bottom: 1px solid var(--color-neutral-200, #ddd5c8);
+		border-bottom: 1px solid var(--chv-color-neutral-200, #ddd5c8);
 	}
 	.hint {
 		margin: 0.25rem 0 0 0;
-		font-size: var(--text-xs, 0.6875rem);
-		color: var(--color-neutral-500, #75695b);
+		font-size: var(--chv-text-xs, 0.6875rem);
+		color: var(--chv-color-neutral-500, #75695b);
 		line-height: 1.3;
 	}
 	.fields {

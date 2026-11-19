@@ -32,7 +32,7 @@
 	{#each links as link}
 		<a
 			href={link.href}
-			class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive(link.href, page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
+			class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive(link.href, page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 			aria-current={isActive(link.href, page.url.pathname) ? 'page' : undefined}
 		>
 			<link.icon size={14} />

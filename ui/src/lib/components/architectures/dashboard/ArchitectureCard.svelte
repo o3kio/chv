@@ -81,7 +81,7 @@
 		gap: 0.5rem;
 		padding: 1rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 		text-decoration: none;
 		color: inherit;
@@ -111,14 +111,14 @@
 
 	.card-title {
 		font-weight: 600;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-900);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.card-description {
 		margin: 0;
-		font-size: var(--text-xs);
-		color: var(--color-neutral-600);
+		font-size: var(--chv-text-xs);
+		color: var(--chv-color-neutral-600);
 		line-height: 1.4;
 		display: -webkit-box;
 		-webkit-line-clamp: 2;
@@ -132,7 +132,7 @@
 		justify-content: space-between;
 		align-items: center;
 		font-size: 11px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.env-badge {
@@ -145,8 +145,8 @@
 	}
 
 	.env-dev {
-		background: var(--color-neutral-100);
-		color: var(--color-neutral-700);
+		background: var(--chv-color-neutral-100);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.env-staging {
@@ -165,8 +165,8 @@
 		text-transform: uppercase;
 		padding: 0.1rem 0.4rem;
 		border-radius: var(--radius-xs);
-		background: var(--color-neutral-100);
-		color: var(--color-neutral-700);
+		background: var(--chv-color-neutral-100);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.status-pill.status-applied {

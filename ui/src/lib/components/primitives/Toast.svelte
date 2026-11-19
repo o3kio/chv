@@ -63,7 +63,7 @@
 		top: 0;
 		bottom: 0;
 		width: 3px;
-		background: var(--color-neutral-300);
+		background: var(--chv-color-neutral-300);
 	}
 
 	.toast--success .toast-indicator { background: var(--color-success); }
@@ -83,7 +83,7 @@
 		flex: 1;
 		font-size: 11px;
 		font-weight: 600;
-		color: var(--color-neutral-800);
+		color: var(--chv-color-neutral-800);
 		line-height: 1.4;
 	}
 
@@ -91,7 +91,7 @@
 		flex-shrink: 0;
 		background: transparent;
 		border: none;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		cursor: pointer;
 		padding: 2px;
 		display: grid;
@@ -100,6 +100,6 @@
 	}
 
 	.toast-close:hover {
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 </style>

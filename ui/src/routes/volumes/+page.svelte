@@ -261,13 +261,13 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.volume-name {
 		font-weight: 800;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
     letter-spacing: 0.02em;
 	}
 
 	.cell-text {
 		font-size: 11px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.audit-summary {
@@ -280,7 +280,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		display: flex;
 		justify-content: space-between;
 		font-size: 10px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		padding: 0.35rem 0.5rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);
@@ -288,13 +288,13 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.summary-row span:last-child {
 		font-weight: 800;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.empty-hint {
 		font-size: 10px;
 		font-weight: 700;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		padding: 1rem;
 		text-align: center;
 		text-transform: uppercase;
@@ -316,7 +316,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		padding: 0.5rem 0.75rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);
-		color: var(--color-neutral-800);
+		color: var(--chv-color-neutral-800);
     border-left: 2px solid transparent;
 	}
 
@@ -333,7 +333,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.res-name {
 		font-size: 11px;
 		font-weight: 800;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
 	}
 
 	.res-issue {

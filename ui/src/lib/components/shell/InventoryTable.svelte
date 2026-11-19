@@ -34,14 +34,14 @@
 		{#if emptySnippet}
 			{@render emptySnippet()}
 		{:else}
-			<div class="p-8 text-center text-(--shell-text-muted) text-(length:--text-sm)" role="status">No inventory matched current filters.</div>
+			<div class="p-8 text-center text-(--shell-text-muted) text-(length:--chv-text-sm)" role="status">No inventory matched current filters.</div>
 		{/if}
 	{:else}
 		<table class="w-full border-collapse text-left">
 			<thead>
 				<tr>
 					{#each columns as col}
-						<th class="bg-(--shell-surface-muted) px-3 py-[0.45rem] text-(length:--text-xs) font-semibold uppercase tracking-wider text-(--shell-text-muted) border-b border-(--shell-line) whitespace-nowrap {col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}" scope="col">{col.label}</th>
+						<th class="bg-(--shell-surface-muted) px-3 py-[0.45rem] text-(length:--chv-text-xs) font-semibold uppercase tracking-wider text-(--shell-text-muted) border-b border-(--shell-line) whitespace-nowrap {col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}" scope="col">{col.label}</th>
 					{/each}
 				</tr>
 			</thead>
@@ -50,7 +50,7 @@
 					<tr class="hover:bg-[rgba(143,90,42,0.02)] {rowIndex === rows.length - 1 ? "[&_td]:border-b-0" : ""}">
 						{#each columns as col, i}
 							{@const val = (row as Record<string, unknown>)[col.key]}
-							<td class="px-3 py-[0.4rem] border-b border-(--shell-line) text-(length:--text-sm) text-(--shell-text-secondary) align-middle whitespace-nowrap {col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}">
+							<td class="px-3 py-[0.4rem] border-b border-(--shell-line) text-(length:--chv-text-sm) text-(--shell-text-secondary) align-middle whitespace-nowrap {col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'}">
 								{#if cell}
 									{@render cell({ column: col, row })}
 								{:else if i === 0 && rowHref?.(row)}

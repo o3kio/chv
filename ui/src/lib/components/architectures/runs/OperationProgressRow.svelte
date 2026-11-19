@@ -46,21 +46,21 @@
 		gap: 0.25rem;
 		padding: 0.55rem 0.85rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
 	}
 	.head { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
 	.ref {
-		font-family: var(--font-mono, monospace);
-		font-size: var(--text-sm);
-		color: var(--color-neutral-900);
+		font-family: var(--chv-font-mono, monospace);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-900);
 		font-weight: 600;
 	}
 	.action {
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 		font-size: 11px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 	.status {
 		display: inline-block;

@@ -249,7 +249,7 @@
 		flex-direction: column;
 		height: 100%;
 		min-height: 500px;
-		box-shadow: var(--shadow-sm);
+		box-shadow: var(--chv-shadow-sm);
 		overflow: hidden;
 	}
 
@@ -279,7 +279,7 @@
 		align-items: center;
 		justify-content: center;
 		gap: 1rem;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		font-size: 11px;
 	}
 

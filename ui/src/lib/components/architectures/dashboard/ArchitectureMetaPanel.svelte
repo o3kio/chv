@@ -228,7 +228,7 @@
 		gap: 0.75rem;
 		padding: 1rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 	}
 
@@ -240,10 +240,10 @@
 	}
 
 	.panel-title {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
 		margin: 0;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}
@@ -259,17 +259,17 @@
 		display: grid;
 		grid-template-columns: 140px 1fr;
 		gap: 0.75rem;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 
 	.meta-row dt {
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		font-weight: 600;
 	}
 
 	.meta-row dd {
 		margin: 0;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		word-break: break-word;
 	}
 
@@ -286,20 +286,20 @@
 	}
 
 	.field label {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.field input,
 	.field textarea,
 	.field select {
 		padding: 0.5rem 0.65rem;
-		font-size: var(--text-sm);
-		border: 1px solid var(--color-neutral-300);
+		font-size: var(--chv-text-sm);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		background: var(--bg-surface);
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		font-family: inherit;
 	}
 

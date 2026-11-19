@@ -139,7 +139,7 @@
 	}
 
 	.description {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--shell-text-muted);
 		line-height: 1.5;
 		margin: 0;
@@ -152,7 +152,7 @@
 	}
 
 	.field label {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 600;
 		color: var(--shell-text-muted);
 		text-transform: uppercase;
@@ -165,7 +165,7 @@
 		border-radius: 0.25rem;
 		background: var(--shell-surface);
 		color: var(--shell-text);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		outline: none;
 		transition: border-color 0.15s;
 	}
@@ -175,7 +175,7 @@
 	}
 
 	.loading-hint {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		text-align: center;
 		padding: 1rem 0;
@@ -191,14 +191,14 @@
 		border: 1px solid var(--status-failed-border);
 		border-radius: 0.25rem;
 		color: var(--status-failed-text);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 
 	.field .checkbox-label {
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 500;
 		color: var(--shell-text);
 		text-transform: none;
@@ -222,7 +222,7 @@
 		border: 1px solid var(--status-warning-border);
 		border-radius: 0.25rem;
 		color: var(--status-warning-text);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		line-height: 1.5;
 	}
 

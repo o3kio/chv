@@ -291,14 +291,14 @@ import Button from '#lib/components/primitives/Button.svelte';
     padding: 0.35rem 0.75rem;
     font-size: 10px;
     font-weight: 700;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     text-transform: uppercase;
     border-radius: var(--radius-xs);
     transition: all 0.1s ease;
   }
 
   .tab-item:hover {
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .tab-item.active {

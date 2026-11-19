@@ -240,7 +240,7 @@
 		<input
 			type="search"
 			placeholder="Search resources..."
-			class="min-w-0 flex-1 border-0 bg-transparent py-[0.35rem] px-0 text-(length:--text-xs) text-(--color-sidebar-text-active,#ffffff) placeholder:text-neutral-500"
+			class="min-w-0 flex-1 border-0 bg-transparent py-[0.35rem] px-0 text-(length:--chv-text-xs) text-(--color-sidebar-text-active,#ffffff) placeholder:text-neutral-500"
 			bind:value={searchQuery}
 			aria-label="Search fleet resources"
 		/>
@@ -266,7 +266,7 @@
 					<a
 						href="/architectures/new"
 						data-testid="nav-architecture-designer"
-						class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive('/architectures/new', page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
+						class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive('/architectures/new', page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 						aria-current={isActive('/architectures/new', page.url.pathname) ? 'page' : undefined}
 					>
 						<Compass size={14} />
@@ -275,7 +275,7 @@
 					<a
 						href="/architectures"
 						data-testid="nav-saved-topologies"
-						class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {page.url.pathname === '/architectures' || (page.url.pathname.startsWith('/architectures/') && !page.url.pathname.startsWith('/architectures/new')) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
+						class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {page.url.pathname === '/architectures' || (page.url.pathname.startsWith('/architectures/') && !page.url.pathname.startsWith('/architectures/new')) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 						aria-current={page.url.pathname === '/architectures' || (page.url.pathname.startsWith('/architectures/') && !page.url.pathname.startsWith('/architectures/new')) ? 'page' : undefined}
 					>
 						<LayoutGrid size={14} />
@@ -289,7 +289,7 @@
 		<div class="flex flex-col gap-1">
 			<a
 				href="/"
-				class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive('/', page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
+				class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-neutral-300 no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff) {isActive('/', page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 				aria-current={isActive('/', page.url.pathname) ? 'page' : undefined}
 			>
 				<House size={14} />
@@ -329,13 +329,13 @@
 		gap: 0.35rem;
 		padding: 0.25rem 0.75rem;
 		font-size: 0.7rem;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 	.status-dot {
 		width: 6px;
 		height: 6px;
 		border-radius: 50%;
-		background: var(--color-neutral-400);
+		background: var(--chv-color-neutral-400);
 	}
 	.status-dot.connected {
 		background: var(--color-success);

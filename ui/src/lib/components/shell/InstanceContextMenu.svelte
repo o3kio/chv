@@ -117,7 +117,7 @@
 				type="button"
 				role="menuitem"
 				disabled={!action.enabled}
-				class="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-(length:--text-sm) transition-colors
+				class="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-(length:--chv-text-sm) transition-colors
 					{action.enabled
 						? action.dangerous
 							? 'text-danger hover:bg-(--color-danger-light)'
@@ -131,7 +131,7 @@
 				<Icon size={14} aria-hidden="true" />
 				<span class="flex-1">{action.label}</span>
 				{#if !action.enabled && action.disabledReason}
-					<span class="text-(length:--text-xs) text-neutral-600 truncate max-w-24">
+					<span class="text-(length:--chv-text-xs) text-neutral-600 truncate max-w-24">
 						{action.disabledReason}
 					</span>
 				{/if}

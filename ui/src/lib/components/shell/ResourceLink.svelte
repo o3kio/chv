@@ -27,5 +27,5 @@
 	{#if !compact}
 		<span class="text-[10px] uppercase font-bold text-(--shell-text-muted) tracking-wider">{config.label}</span>
 	{/if}
-	<span class="text-(length:--text-sm) whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px] {compact ? 'text-(length:--text-xs)' : ''}">{label}</span>
+	<span class="text-(length:--chv-text-sm) whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px] {compact ? 'text-(length:--chv-text-xs)' : ''}">{label}</span>
 </a>

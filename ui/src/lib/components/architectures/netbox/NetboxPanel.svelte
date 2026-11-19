@@ -250,7 +250,7 @@
 		gap: 1rem;
 		padding: 1rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 	}
 	.panel-header {
@@ -263,20 +263,20 @@
 	.header-left { display: flex; flex-direction: column; gap: 0.25rem; }
 	.header-right { display: flex; align-items: center; gap: 0.5rem; }
 	.panel-title {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
 		margin: 0;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}
-	.panel-sub { font-size: 12px; color: var(--color-neutral-500); }
+	.panel-sub { font-size: 12px; color: var(--chv-color-neutral-500); }
 	.section {
 		display: flex;
 		flex-direction: column;
 		gap: 0.6rem;
 		padding-top: 0.75rem;
-		border-top: 1px solid var(--color-neutral-200);
+		border-top: 1px solid var(--chv-color-neutral-200);
 	}
 	.section-header {
 		display: flex;
@@ -287,9 +287,9 @@
 	}
 	.section-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
-	.hint { margin: 0; font-size: 12px; color: var(--color-neutral-500); }
+	.hint { margin: 0; font-size: 12px; color: var(--chv-color-neutral-500); }
 </style>

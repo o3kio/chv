@@ -53,7 +53,7 @@
 	}
 
 	.status-unknown {
-		background: var(--color-neutral-500, #6b7280);
+		background: var(--chv-color-neutral-500, #6b7280);
 	}
 
 	.status-no_drift {

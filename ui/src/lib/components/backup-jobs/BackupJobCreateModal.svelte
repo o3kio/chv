@@ -87,7 +87,7 @@
   .form-group label {
     font-size: 9px;
     font-weight: 800;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     letter-spacing: 0.1em;
   }
 
@@ -99,6 +99,6 @@
     padding: 0.5rem;
     font-size: 11px;
     font-weight: 700;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 </style>

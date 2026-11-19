@@ -235,15 +235,15 @@ import Button from '#lib/components/primitives/Button.svelte';
   .quota-block__header .label {
     font-size: 10px;
     font-weight: 800;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     letter-spacing: 0.05em;
   }
 
   .quota-block__header .p-val {
     font-size: 14px;
     font-weight: 800;
-    color: var(--color-neutral-900);
-    font-family: var(--font-mono);
+    color: var(--chv-color-neutral-900);
+    font-family: var(--chv-font-mono);
   }
 
   .quota-block__header .p-val.high {
@@ -264,24 +264,24 @@ import Button from '#lib/components/primitives/Button.svelte';
     display: flex;
     align-items: baseline;
     gap: 0.25rem;
-    font-family: var(--font-mono);
+    font-family: var(--chv-font-mono);
   }
 
   .val-pair .used {
     font-size: 20px;
     font-weight: 800;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .val-pair .sep {
     font-size: 14px;
-    color: var(--color-neutral-400);
+    color: var(--chv-color-neutral-400);
   }
 
   .val-pair .limit {
     font-size: 14px;
     font-weight: 700;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
   }
 
   .progress-track {
@@ -330,7 +330,7 @@ import Button from '#lib/components/primitives/Button.svelte';
     display: flex;
     justify-content: space-between;
     font-size: 10px;
-    color: var(--color-neutral-600);
+    color: var(--chv-color-neutral-600);
     padding: 0.35rem 0.5rem;
     background: var(--bg-surface-muted);
     border-radius: var(--radius-xs);
@@ -338,12 +338,12 @@ import Button from '#lib/components/primitives/Button.svelte';
 
   .summary-row span:last-child {
     font-weight: 700;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .empty-hint {
     font-size: 11px;
-    color: var(--color-neutral-400);
+    color: var(--chv-color-neutral-400);
     padding: 1rem;
     text-align: center;
   }

@@ -98,7 +98,7 @@
 			<div class="flex flex-col">
 				<button
 					type="button"
-					class="flex items-center gap-2 text-(length:--text-sm) text-neutral-400 no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff)"
+					class="flex items-center gap-2 text-(length:--chv-text-sm) text-neutral-400 no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff)"
 					aria-expanded={openGroups['cloud-1']}
 					aria-controls="group-cloud-1"
 					onclick={() => onToggleGroup('cloud-1')}
@@ -112,7 +112,7 @@
 					<div id="group-cloud-1" class="ml-2 pl-2 border-l border-neutral-700 flex flex-col gap-0.5">
 						<div class="flex flex-col">
 							<button type="button"
-								class="flex items-center gap-2 text-(length:--text-sm) text-neutral-400 no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff)"
+								class="flex items-center gap-2 text-(length:--chv-text-sm) text-neutral-400 no-underline bg-transparent border-none cursor-pointer rounded-xs text-left py-1 pr-2 pl-0 hover:bg-neutral-800 hover:text-(--color-sidebar-text-active,#ffffff)"
 								aria-expanded={openGroups['hosts']}
 								aria-controls="group-hosts"
 								onclick={() => onToggleGroup('hosts')}
@@ -213,9 +213,9 @@
 		border: 0;
 		border-radius: var(--radius-xs);
 		background: transparent;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		cursor: pointer;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		text-align: left;
 		text-decoration: none;
 		transition:
@@ -224,11 +224,11 @@
 	}
 
 	.app-nav__tree-row--host {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 
 	.app-nav__tree-row:hover {
-		background: var(--color-neutral-800);
+		background: var(--chv-color-neutral-800);
 		color: var(--color-sidebar-text-active, #ffffff);
 	}
 
@@ -240,8 +240,8 @@
 		min-height: 1.625rem;
 		padding: 0.25rem 0.45rem;
 		border-radius: var(--radius-xs);
-		color: var(--color-neutral-400);
-		font-size: var(--text-sm);
+		color: var(--chv-color-neutral-400);
+		font-size: var(--chv-text-sm);
 		text-decoration: none;
 		transition:
 			background-color 120ms ease-in-out,
@@ -249,7 +249,7 @@
 	}
 
 	.app-nav__infrastructure-link:hover {
-		background: var(--color-neutral-800);
+		background: var(--chv-color-neutral-800);
 		color: var(--color-sidebar-text-active, #ffffff);
 	}
 
@@ -259,7 +259,7 @@
 
 	.app-nav__tree-count {
 		font-size: 10px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.app-nav__instance-list {
@@ -268,7 +268,7 @@
 		gap: 0.125rem;
 		margin-left: 1.225rem;
 		padding-left: 0.45rem;
-		border-left: 1px solid var(--color-neutral-700);
+		border-left: 1px solid var(--chv-color-neutral-700);
 	}
 
 	.app-nav__instance-list--direct {
@@ -284,7 +284,7 @@
 		min-height: 1.625rem;
 		padding: 0.25rem 0.35rem;
 		border-radius: var(--radius-xs);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		transition:
 			background-color 120ms ease-in-out,
 			color 120ms ease-in-out;
@@ -299,7 +299,7 @@
 		border: 0;
 		border-radius: var(--radius-xs);
 		background: transparent;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		cursor: pointer;
 		opacity: 0;
 		transition:
@@ -314,7 +314,7 @@
 	}
 
 	.app-nav__instance-action:hover {
-		background: var(--color-neutral-700);
+		background: var(--chv-color-neutral-700);
 		color: var(--color-sidebar-text-active, #ffffff);
 	}
 

@@ -69,11 +69,11 @@
 		flex-direction: column;
 		gap: 0.35rem;
 		padding: 0.65rem 0.85rem;
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-left-width: 3px;
 		border-radius: var(--radius-xs);
 		background: var(--bg-surface);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 
 	.finding-error {
@@ -132,14 +132,14 @@
 	}
 
 	.code {
-		font-family: var(--font-mono, monospace);
+		font-family: var(--chv-font-mono, monospace);
 		font-size: 12px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.message {
 		margin: 0;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		line-height: 1.4;
 	}
 
@@ -153,9 +153,9 @@
 	.path {
 		flex: 1 1 auto;
 		min-width: 0;
-		font-family: var(--font-mono, monospace);
+		font-family: var(--chv-font-mono, monospace);
 		font-size: 11px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -165,17 +165,17 @@
 		flex: 0 0 auto;
 		display: inline-block;
 		padding: 0.1rem 0.45rem;
-		font-family: var(--font-mono, monospace);
+		font-family: var(--chv-font-mono, monospace);
 		font-size: 11px;
-		color: var(--color-neutral-700);
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px solid var(--color-neutral-300);
+		color: var(--chv-color-neutral-700);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		cursor: pointer;
 	}
 
 	.resource-pill:hover {
-		background: var(--color-neutral-100);
+		background: var(--chv-color-neutral-100);
 	}
 
 	.resource-pill:focus-visible {
@@ -186,12 +186,12 @@
 	.suggestion {
 		margin: 0;
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		line-height: 1.4;
 	}
 
 	.suggestion-prefix {
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 </style>

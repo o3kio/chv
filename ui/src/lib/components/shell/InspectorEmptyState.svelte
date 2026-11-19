@@ -6,5 +6,5 @@
 	<div class="text-neutral-200">
 		<Database size={32} />
 	</div>
-	<p class="text-(length:--text-sm) font-medium text-(--shell-text-muted) max-w-[16rem] leading-relaxed">Select a node or VM to inspect its live status and metadata.</p>
+	<p class="text-(length:--chv-text-sm) font-medium text-(--shell-text-muted) max-w-[16rem] leading-relaxed">Select a node or VM to inspect its live status and metadata.</p>
 </div>

@@ -185,7 +185,7 @@ Host-scoped Networks/Storage/Images navigate to the global page with a host filt
 ## 6. Visual Density Rules
 
 - Tree row height: ~28–32px (`py-1.5` to `py-2`)
-- Tree font size: 12–13px (`text-[length:var(--text-sm)]` which is 13px)
+- Tree font size: 12–13px (`text-(length:--chv-text-sm)` which is 13px)
 - Section labels: 10px uppercase bold (`text-[10px] font-bold uppercase`)
 - Selected row: clear background tint + left accent marker
 - Instance status: visible as text (e.g., "RUNNING", "STOPPED") next to the name, not color-only

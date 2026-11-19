@@ -37,8 +37,8 @@
 		padding: 0.25rem 0.6rem;
 		font-size: 10px;
 		font-weight: 700;
-		font-family: var(--font-mono);
-		color: var(--color-neutral-500);
+		font-family: var(--chv-font-mono);
+		color: var(--chv-color-neutral-500);
 		background: transparent;
 		border: none;
 		border-radius: var(--radius-xs);
@@ -46,7 +46,7 @@
 	}
 
 	.range-button:hover {
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.range-button.active {
