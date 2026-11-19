@@ -1,3 +1,4 @@
+use crate::denial_audit::{run_writer, DenialAuditSink};
 use crate::enrollment::EnrollmentServiceImplementation;
 use crate::error::ControlPlaneServiceError;
 use crate::inventory::InventoryServiceImplementation;
@@ -6,6 +7,7 @@ use crate::monitoring_ingest::MonitoringIngestImplementation;
 use crate::peer_identity::PeerIdentityInterceptor;
 use crate::reconcile::ReconcileServiceImplementation;
 use crate::revocation::run_refresh_loop;
+use crate::server::{ENROLLMENT_SERVICE_PATH, LIFECYCLE_SERVICE_PATH, RECONCILE_SERVICE_PATH};
 use crate::telemetry::TelemetryServiceImplementation;
 use chv_controlplane_store::{AuditLogRepository, CertificateRevocationRepository, StorePool};
 use control_plane_node_api::control_plane_node_api as proto;
@@ -14,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
+
+const INVENTORY_SERVICE_PATH: &str = "chv.controlplane.node.v1.InventoryService";
+const TELEMETRY_SERVICE_PATH: &str = "chv.controlplane.node.v1.TelemetryService";
+const MONITORING_SERVICE_PATH: &str = "chv.controlplane.node.v1.MonitoringService";
 
 pub struct ControlPlaneRuntime {
     bind_addr: SocketAddr,
@@ -246,14 +252,38 @@ impl ControlPlaneService {
             )))
         };
 
-        let make_intercept = || {
-            let interceptor = interceptor.clone();
+        // One repository for both the audited server adapters and the
+        // interceptor-denial writer; the pool is cheap to clone.
+        let grpc_audit = AuditLogRepository::new(self.components.store_pool.clone());
+
+        // Interceptor-level rejections happen before the handler and would
+        // otherwise leave only metrics/warn logs. In secure mode, queue them
+        // for the durable audit writer; the bounded channel and the writer's
+        // dedupe keep a rejection flood from stalling the listener.
+        let (denial_sink, denial_rx) = if self.runtime.allow_insecure() {
+            (None, None)
+        } else {
+            let (sink, rx) = DenialAuditSink::channel();
+            (Some(sink), Some(rx))
+        };
+
+        let make_intercept = |service: &'static str| {
+            let mut interceptor = interceptor.clone().with_service(service);
+            if let Some(sink) = &denial_sink {
+                interceptor = interceptor.with_denial_audit(sink.clone());
+            }
             #[allow(clippy::result_large_err)]
             // tonic::Status is the required error type for tonic interceptors.
             move |req: tonic::Request<()>| interceptor.intercept(req)
         };
 
-        let make_enrollment_intercept = || {
+        let mut enrollment_interceptor =
+            enrollment_interceptor.with_service(ENROLLMENT_SERVICE_PATH);
+        if let Some(sink) = &denial_sink {
+            enrollment_interceptor = enrollment_interceptor.with_denial_audit(sink.clone());
+        }
+
+        let make_enrollment_intercept = move || {
             let interceptor = enrollment_interceptor.clone();
             #[allow(clippy::result_large_err)]
             move |req: tonic::Request<()>| interceptor.intercept(req)
@@ -265,7 +295,7 @@ impl ControlPlaneService {
                     self.components.enrollment_service.clone(),
                 ))
                 .with_revocation(revocation.clone())
-                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
+                .with_audit(grpc_audit.clone()),
                 make_enrollment_intercept(),
             );
 
@@ -274,7 +304,7 @@ impl ControlPlaneService {
                 crate::server::InventoryServer::new(Arc::new(
                     self.components.inventory_service.clone(),
                 )),
-                make_intercept(),
+                make_intercept(INVENTORY_SERVICE_PATH),
             );
 
         let telemetry_server =
@@ -282,7 +312,7 @@ impl ControlPlaneService {
                 crate::server::TelemetryServer::new(Arc::new(
                     self.components.telemetry_service.clone(),
                 )),
-                make_intercept(),
+                make_intercept(TELEMETRY_SERVICE_PATH),
             );
 
         let reconcile_server =
@@ -290,8 +320,8 @@ impl ControlPlaneService {
                 crate::server::ReconcileServer::new(Arc::new(
                     self.components.reconcile_service.clone(),
                 ))
-                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
-                make_intercept(),
+                .with_audit(grpc_audit.clone()),
+                make_intercept(RECONCILE_SERVICE_PATH),
             );
 
         let lifecycle_server =
@@ -299,8 +329,8 @@ impl ControlPlaneService {
                 crate::server::LifecycleServer::new(Arc::new(
                     self.components.lifecycle_service.clone(),
                 ))
-                .with_audit(AuditLogRepository::new(self.components.store_pool.clone())),
-                make_intercept(),
+                .with_audit(grpc_audit.clone()),
+                make_intercept(LIFECYCLE_SERVICE_PATH),
             );
 
         let monitoring_server =
@@ -308,7 +338,7 @@ impl ControlPlaneService {
                 crate::server::MonitoringServer::new(Arc::new(
                     self.components.monitoring_ingest_service.clone(),
                 )),
-                make_intercept(),
+                make_intercept(MONITORING_SERVICE_PATH),
             );
 
         if self.runtime.tls_config().is_some() {
@@ -337,6 +367,17 @@ impl ControlPlaneService {
             };
         }
 
+        // Start the denial writer only once startup cannot fail before serve
+        // (TLS configuration above can return early), so no task leaks on the
+        // early error path.
+        let denial_writer = denial_rx.map(|rx| {
+            tokio::spawn(run_writer(
+                grpc_audit.clone(),
+                rx,
+                self.runtime.shutdown_rx.clone(),
+            ))
+        });
+
         let mut shutdown_rx = self.runtime.shutdown_rx.clone();
         let grpc_result = server
             .layer(chv_observability::GrpcMetricsLayer::new())
@@ -357,6 +398,25 @@ impl ControlPlaneService {
         if let Some(handle) = handle {
             if let Err(e) = handle.await {
                 error!("HTTP admin server join error: {}", e);
+            }
+        }
+
+        // Drain queued denials on a clean shutdown. On listener failure the
+        // writer still has its shutdown signal; we simply abort it instead of
+        // waiting for the drain because the listener error is authoritative.
+        if let Some(writer) = denial_writer {
+            if grpc_result.is_err() {
+                writer.abort();
+            } else {
+                let abort_handle = writer.abort_handle();
+                match tokio::time::timeout(Duration::from_secs(5), writer).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("denial audit writer task failed: {}", e),
+                    Err(_) => {
+                        abort_handle.abort();
+                        warn!("denial audit writer did not finish within 5s; aborted");
+                    }
+                }
             }
         }
 

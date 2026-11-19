@@ -16,9 +16,9 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
-const LIFECYCLE_SERVICE_PATH: &str = "chv.controlplane.node.v1.LifecycleService";
-const ENROLLMENT_SERVICE_PATH: &str = "chv.controlplane.node.v1.EnrollmentService";
-const RECONCILE_SERVICE_PATH: &str = "chv.controlplane.node.v1.ReconcileService";
+pub(crate) const LIFECYCLE_SERVICE_PATH: &str = "chv.controlplane.node.v1.LifecycleService";
+pub(crate) const ENROLLMENT_SERVICE_PATH: &str = "chv.controlplane.node.v1.EnrollmentService";
+pub(crate) const RECONCILE_SERVICE_PATH: &str = "chv.controlplane.node.v1.ReconcileService";
 
 /// Bound the stored identifier fields (same limits as the BFF trail) so a
 /// hostile request cannot inflate audit rows.
