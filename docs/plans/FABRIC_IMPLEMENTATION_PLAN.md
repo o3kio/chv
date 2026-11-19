@@ -3,7 +3,7 @@
 Status: In execution
 Date: 2026-09-28
 Decision source: [ADR-021](../specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md) — stretched-L2 fabric (VXLAN head-end replication over WireGuard)
-Shared provider: [o3kio/fabric](https://github.com/o3kio/fabric) (tag `v0.1.0`) — `fabric-plan` / `fabric-linux` / `fabric-conformance`, governed by `contracts/fabric-provider-v1.md`
+Shared provider: [o3kio/fabric](https://github.com/o3kio/fabric) (tag `v0.2.0`) — `fabric-plan` / `fabric-linux` / `fabric-conformance`, governed by `contracts/fabric-provider-v2.md`
 Tracking: issue #270
 
 ## Goal

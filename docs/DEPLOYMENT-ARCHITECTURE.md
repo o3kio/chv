@@ -98,7 +98,7 @@ KVM-VERIFIED, and multi-host behavior is reported as unproven.
 | `chv-controlplane` | Single control-plane daemon | Orchestrator (desired-state operations), node enrollment, CA issuer, SQLite persistence. Embeds the backend-for-frontend (BFF) on its HTTP listener. gRPC on `127.0.0.1:8443` (mTLS), HTTP/BFF on `127.0.0.1:8080`. | [QUALIFIED — KVM-VERIFIED] ([m4.1](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.1-harness.md), [m4.3](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.3-lifecycle.md)) |
 | `chv-agent` | Node lifecycle agent | VM lifecycle; spawns, supervises, and adopts `cloud-hypervisor`; serial-console WebSocket on `127.0.0.1:8444`; metrics on `127.0.0.1:9901` (qualification config uses `127.0.0.1:9100`). Hosts the CellHV Core single-writer lifecycle authority (`authority_mode = "core-managed"` is the qualified default). Supervises `chv-stord` and `chv-nwd` as a fallback when no daemon is already serving their socket (for example, when their units are absent). | [QUALIFIED — KVM-VERIFIED] (as above) |
 | `chv-stord` | Storage daemon | Volumes, pools, images, snapshots. Backends: local file and LVM (qualified, §7); Ceph RBD and iSCSI are coded but unqualified. Opt-in mTLS migration TCP listener, disabled by default. | Storage paths: [QUALIFIED — KVM-VERIFIED] within profiles ([m4.5](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.5-storage.md)); Ceph/iSCSI: [CODE-SUPPORTED, UNQUALIFIED] |
-| `chv-nwd` | Network daemon | Bridges, taps, per-network namespaces, nftables policy, dnsmasq DHCP/DNS. Stretched-L2 VXLAN + WireGuard fabric via `fabric-linux` v0.1.5 (`Cargo.toml` pin) — disabled and fails closed in the qualification configuration. | Local-bridge topology + host-safety gate: [QUALIFIED — KVM-VERIFIED] ([m4.4](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.4-network.md)); fabric: [DESIGN-ONLY] ([ADR-021](specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md)) |
+| `chv-nwd` | Network daemon | Bridges, taps, per-network namespaces, nftables policy, dnsmasq DHCP/DNS. Stretched-L2 VXLAN + WireGuard fabric via `fabric-linux` v0.2.0 (`Cargo.toml` pin) — disabled and fails closed in the qualification configuration. | Local-bridge topology + host-safety gate: [QUALIFIED — KVM-VERIFIED] ([m4.4](evidence/production-readiness/v0.3.0-rc1/04-real-host-qualification/m4.4-network.md)); fabric: [DESIGN-ONLY] ([ADR-021](specs/adr/021-stretched-l2-vxlan-her-wireguard-fabric.md)) |
 | `chvctl` | CLI client | Talks to the BFF on `:8080`. Packaged standalone; not part of `chv-node`. | [QUALIFIED — KVM-VERIFIED] as the campaign's driver surface (all prompt-04 scenarios drive chvctl/BFF/API) |
 
 ### 2.2 Web UI and edge
@@ -114,7 +114,7 @@ KVM-VERIFIED, and multi-host behavior is reported as unproven.
 |---|---|---|
 | Cloud Hypervisor | Qualified pin **v53.0** (moved from v43.0 by the #448 re-qualification campaign — decision D6, option (b); `scripts/integration/kvm-smoke.sh` default `v53.0`) | `scripts/install.sh` downloads the same **v53.0** and verifies the qualified sha256 digests before install (campaign evidence: [v53.0 tree](evidence/vmm-requalification/v53.0/README.md)). |
 | rust-hypervisor-firmware | 0.5.0 (qualification firmware; `scripts/install.sh` `FIRMWARE_URL`) | `scripts/install.sh` uses a pre-placed `/root/CLOUDHV.fd` when present; otherwise it downloads and sha256-verifies the pinned 0.5.0 build to `/var/lib/chv/hypervisor-fw`. The former commented-out download is fixed in this branch — a clean host now gets firmware. |
-| fabric-linux | v0.1.5 (`Cargo.toml` git tag pin) | Consumed by `chv-nwd` for the (design-only) fabric. |
+| fabric-linux | v0.2.0 (`Cargo.toml` git tag pin) | Consumed by `chv-nwd` for the (design-only) fabric. |
 | Host OS | Linux x86_64; `.deb` (Debian/Ubuntu) + `.rpm` | Qualified on Ubuntu noble amd64; `.rpm` built but untested in prompt-04 (declaration §3, m4.2). |
 
 ### 2.4 Package set (nfpm; `.deb` and `.rpm`)
@@ -391,7 +391,7 @@ implemented, so it does not change this status.**
 accepted; not qualified).**
 
 The fabric (kernel VXLAN head-end replication over a WireGuard mesh, ports
-65001/udp and 4789/udp, `fabric-linux` v0.1.5 provider) fails closed in the
+65001/udp and 4789/udp, `fabric-linux` v0.2.0 provider) fails closed in the
 qualification configuration. The agent logs a benign, non-fatal
 fabric-identity warning at enrollment when the nwd fabric provider is
 disabled (`failed to fetch fabric identity from nwd; reporting empty fabric

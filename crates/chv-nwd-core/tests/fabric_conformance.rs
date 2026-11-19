@@ -4,7 +4,7 @@
 //! against the reference in-memory fake kernel (`fabric_linux::RecordingRunner`).
 //! Running it here as an integration test keeps the CHV build pinned to a
 //! `fabric` provider revision that satisfies the fabric provider contract
-//! (`contracts/fabric-provider-v1.md` in the o3kio/fabric repository), so a
+//! (`contracts/fabric-provider-v2.md` in the o3kio/fabric repository), so a
 //! future provider bump that breaks the contract fails CHV CI instead of
 //! surfacing on hosts.
 //!

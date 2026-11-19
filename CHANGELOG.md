@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature-gated, so `rsa` left the lockfile (the crate itself is still
   pulled, just without that dependency).
 
+### Changed
+- **Fabric provider crates bumped to v0.2.0.** `fabric-plan`,
+  `fabric-linux`, and `fabric-conformance` move together from the v0.1.5
+  tag to v0.2.0 (the coordinated bump replaces the per-crate Dependabot
+  PRs #744/#747, each of which left duplicate provider versions in
+  `Cargo.lock`). Two dataplane fixes are included: stale learned unicast
+  FDB rows are withdrawn when a peer leaves a Realm (v0.2.0), and the
+  HER-shrink path uses a device-filtered `bridge fdb show` parse so stale
+  flood entries are actually removed (v0.1.6). Plan and journal formats
+  are unchanged — no persisted-state migration.
+
 ## [0.4.0-rc.8] - 2026-11-06
 
 > **Final release candidate for `v0.4.0` and the base for the stable tag.**
