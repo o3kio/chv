@@ -352,10 +352,14 @@ The contract adoption relies on:
   work.
 
 **Lock scope.** Wrapping the formerly autocommit `users`/`tokens`
-statements in `begin()` extends the SQLite write lock by one INSERT (the
-outbox row) per adopted mutation; it introduces no new lock ordering.
-`networks` and `vms/import` already held a transaction, so only the extra
-INSERT is new.
+statements in a transaction extends the SQLite write lock by one INSERT
+(the outbox row) per adopted mutation; it introduces no new lock
+ordering. Those transactions, and `networks/create`, use
+`BEGIN IMMEDIATE` — the repo's write-serializing discipline — because
+their first statement is a write; a deferred `BEGIN` would only defer
+the same lock and risk a `SQLITE_BUSY` at the outbox INSERT instead of
+at `BEGIN`. `networks/update`, `networks/delete`, and `vms/import`
+already held a transaction, so only the extra INSERT is new there.
 
 **Actor-field cap (NIT 5 decision).** The store caps the serialized
 payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
@@ -363,16 +367,38 @@ payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
 is never silently truncated. An oversized payload makes enqueue fail, the
 mutation transaction rolls back (no mutation without durable evidence),
 and the middleware records the failed request once on the direct path
-(which does not truncate the actor either). In practice only a
-pathologically long `actor_username` can reach the bound — the
-path-derived fields are capped at 256 characters and `sub`/`role` are
-server-generated vocabularies. Covered by
+(which does not truncate the actor either). Covered by
 `oversized_actor_fails_closed_and_rolls_back` in the BFF audit tests.
+
+**Username bound (review S2).** To keep that fail-closed path
+unreachable for API-created users, `POST /v1/users/create` rejects a
+`username` longer than 256 characters with the existing validation shape
+(400 `BAD_REQUEST`, no truncation). `users/update` has no rename field,
+so there is nothing else to bound. Residual risk, stated honestly: the
+bound is enforced only on this creation path. A username longer than 256
+characters that already exists in the database (created before this
+change, written out-of-band, or seeded/managed outside the BFF) still
+works for login and still yields an oversized `actor_username`; that
+user's adopted mutations would fail closed until the row is corrected.
+The login/JWT path itself performs no username-length validation beyond
+the request body limit — it does not need one to be correct, but it does
+not close the legacy-row case.
 
 Dispatched outbox rows are kept for 7 days (`[audit]
 outbox_retention_days`, validated 1..=365) and pruned in bounded
 batches; pending rows are never pruned. This cleanup is plumbing, not
 evidence deletion — `audit_log` retention is separate.
+
+**Verification scope.** The crash window and the tx coupling are proven
+deterministically by `crates/chv-webui-bff/tests/audit_log.rs` (the
+`SIGKILL` end-to-end test from the design is a follow-up, not
+implemented): an adopted handler that commits with the middleware never
+running is replayed exactly once by the dispatcher, and a **commit
+failure after a successful enqueue** (the
+`commit_failure_after_a_successful_enqueue_rolls_back_mutation_and_outbox`
+test, using a deferred foreign key that SQLite only checks at `COMMIT`)
+leaves neither the mutation nor the outbox row — which a pool/autocommit
+enqueue could not satisfy.
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see

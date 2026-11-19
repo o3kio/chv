@@ -111,10 +111,11 @@ pub async fn create_token(
     // Mutation plus audit evidence in one transaction (#706). The
     // autocommit INSERT becomes a two-statement write transaction
     // (INSERT + outbox INSERT); disclosed as the intentional lock-scope
-    // change.
+    // change. BEGIN IMMEDIATE matches the repo's write-serializing
+    // discipline (the first statement is a write).
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 
@@ -187,7 +188,7 @@ pub async fn revoke_token(
 
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 

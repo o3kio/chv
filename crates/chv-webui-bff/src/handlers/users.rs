@@ -6,6 +6,17 @@ use crate::auth::BearerToken;
 use crate::router::AppState;
 use crate::BffError;
 
+/// Maximum accepted `username` length, in characters (#706 review S2).
+///
+/// Matches the audit middleware's 256-character cap on path-derived
+/// fields. The audit outbox rejects a serialized row over 16 KiB
+/// (fail-closed), so an unbounded username could otherwise make every
+/// subsequent adopted mutation by that user fail with a 500. Rejecting
+/// it at creation keeps the fail-closed path unreachable for usernames
+/// created through this API. Never truncate: a silently shortened
+/// identity would be worse than a clear 400.
+const MAX_USERNAME_LEN: usize = 256;
+
 #[derive(sqlx::FromRow)]
 struct UserRow {
     user_id: String,
@@ -72,6 +83,16 @@ pub async fn create_user(
         return Err(BffError::BadRequest("username must not be empty".into()));
     }
 
+    // #706 review S2: bound the identity so the audit outbox's 16 KiB
+    // fail-closed path stays unreachable for API-created users. Same
+    // `BadRequest` shape as the other field validations (400), and no
+    // truncation — see `MAX_USERNAME_LEN`.
+    if username.chars().count() > MAX_USERNAME_LEN {
+        return Err(BffError::BadRequest(format!(
+            "username must be at most {MAX_USERNAME_LEN} characters"
+        )));
+    }
+
     let password = payload
         .get("password")
         .and_then(|v| v.as_str())
@@ -116,9 +137,13 @@ pub async fn create_user(
     // commits both, or the error rolls the insert back. The write lock
     // now spans the INSERT plus one outbox INSERT (previously the INSERT
     // was autocommit) — disclosed as the intentional lock-scope change.
+    // BEGIN IMMEDIATE (the repo's write-serializing discipline) takes the
+    // write lock up front: the first statement here is a write, so a
+    // deferred BEGIN would only defer the same lock and risk a busy error
+    // at the outbox INSERT instead.
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 
@@ -222,7 +247,7 @@ pub async fn update_user(
     // INSERT.
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 
@@ -317,7 +342,7 @@ pub async fn delete_user(
 
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 

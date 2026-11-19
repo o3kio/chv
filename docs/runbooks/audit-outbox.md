@@ -17,11 +17,14 @@ recovery path we cannot honour.
 
 > **Rollout status (#706 half 1).** The outbox is live for the adopted
 > BFF routes listed below (PR 2). On those routes a pending row means
-> the mutation **committed** (the response was 2xx) and its evidence row
-> is waiting for the dispatcher. The gRPC surface and every unadopted
-> BFF route still use the direct post-hoc insert; their rows never appear
-> in this table, and their narrow crash window remains open (tracked
-> under #706).
+> the mutation **committed** and its evidence row is waiting for the
+> dispatcher. The response was normally 2xx, but a committed mutation
+> whose final response was later patched to a non-2xx (e.g. a downstream
+> middleware failure) keeps its pending row too — with `outcome`/`status`
+> rewritten to match; see the patch note below. The gRPC surface and
+> every unadopted BFF route still use the direct post-hoc insert; their
+> rows never appear in this table, and their narrow crash window remains
+> open (tracked under #706).
 >
 > Adopted routes: `POST /v1/users/create`, `/v1/users/update`,
 > `/v1/users/delete`, `/v1/tokens/create`, `/v1/tokens/revoke`,
@@ -212,6 +215,14 @@ are never pruned, regardless of age.
   change), and the middleware records the failed attempt once on the
   direct path. Only a pathologically long `actor_username` can reach the
   bound.
+- **Verification scope:** the crash window is proven deterministically by
+  integration tests, not by a real process kill: an adopted handler that
+  commits with the middleware never running (the crash made static) is
+  replayed exactly once by the dispatcher, and a commit failure after a
+  successful enqueue leaves neither the mutation nor the outbox row. The
+  design's `SIGKILL` end-to-end test (long dispatch interval, kill,
+  restart) is **not implemented yet** and is a follow-up; this runbook
+  does not claim one.
 - **Migration:** `0071_audit_outbox.sql` is additive (one table, two
   indexes). No backfill, no change to `audit_log`. It runs through the
   normal startup migrator; disk-full remains the only new startup

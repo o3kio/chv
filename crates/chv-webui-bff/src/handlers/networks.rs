@@ -310,7 +310,7 @@ pub async fn create_network(
 
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 

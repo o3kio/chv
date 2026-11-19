@@ -26,7 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering). Adopted enqueues **fail closed** on the store's 16 KiB
   payload cap: an oversized actor is never truncated — the mutation
   transaction rolls back and the failed attempt is recorded once on the
-  direct path. See `docs/specs/component/audit-log.md` and
+  direct path. To keep that path unreachable for API-created users,
+  `POST /v1/users/create` now rejects usernames longer than 256
+  characters with the existing 400 `BAD_REQUEST` shape (never truncated);
+  usernames that already exceed the bound out-of-band remain a disclosed
+  residual risk. The new `users`/`tokens` transactions use
+  `BEGIN IMMEDIATE` (the repo's write-serializing discipline), and the
+  crash-window evidence is deterministic integration tests — the design's
+  `SIGKILL` end-to-end test is a follow-up, not claimed. See
+  `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 
 ### Added

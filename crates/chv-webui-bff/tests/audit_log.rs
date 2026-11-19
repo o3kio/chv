@@ -551,6 +551,110 @@ async fn handler_error_after_begin_rolls_back_without_an_outbox_row() {
 }
 
 #[tokio::test]
+async fn commit_failure_after_a_successful_enqueue_rolls_back_mutation_and_outbox() {
+    let state = build_state().await;
+
+    // #706 review S1: pin the tx-coupling seam itself. The fixture above
+    // fails *before* `commit_adopted_mutation` runs, so it would stay
+    // green even if the enqueue wrote outside the mutation transaction.
+    // Here the enqueue succeeds and the failure happens at COMMIT:
+    // `audit_outbox` gets an AFTER INSERT trigger that writes a child row
+    // whose `DEFERRABLE INITIALLY DEFERRED` foreign key has no parent, so
+    // SQLite reports "FOREIGN KEY constraint failed" on COMMIT, not on
+    // INSERT. An enqueue on the pool/autocommit would survive the
+    // rollback; an in-transaction enqueue cannot.
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&state.pool)
+        .await
+        .expect("create guard parent");
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&state.pool)
+    .await
+    .expect("create guard child");
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&state.pool)
+    .await
+    .expect("create audit_outbox guard trigger");
+    let fk_enforced: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&state.pool)
+        .await
+        .expect("read foreign_keys pragma");
+    assert_eq!(
+        fk_enforced, 1,
+        "deferred FK enforcement requires foreign_keys=ON"
+    );
+
+    // Real adopted handler, real ticket, real transaction. Calling it
+    // directly keeps the error visible: an enqueue failure is
+    // "failed to record audit evidence", while a commit failure is
+    // "failed to commit transaction: …". Only the latter proves the
+    // enqueue ran inside the transaction and was rolled back with it.
+    let ticket = AuditOutboxTicket::from_payload(AuditLogInsert {
+        occurred_at_ms: 1_000,
+        actor_id: "u-admin".to_string(),
+        actor_username: "admin".to_string(),
+        actor_role: "admin".to_string(),
+        action: "network.create".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/networks/create".to_string(),
+        resource_kind: Some("network".to_string()),
+        resource_id: None,
+        outcome: "success".to_string(),
+        status_code: 200,
+        correlation_id: Some("s1-commit-seam".to_string()),
+        operation_id: None,
+        source_ip: None,
+        metadata: r#"{"auth_source":"bearer_jwt"}"#.to_string(),
+    });
+    let result = chv_webui_bff::handlers::networks::create_network(
+        chv_webui_bff::BearerToken(claims("u-admin", "admin", "admin")),
+        axum::extract::State(state.clone()),
+        AuditTicket(Some(ticket)),
+        axum::Json(serde_json::json!({ "name": "s1-network", "cidr": "10.44.0.0/24" })),
+    )
+    .await;
+
+    match result {
+        Err(BffError::Internal(message)) => assert!(
+            message.contains("failed to commit transaction"),
+            "expected the COMMIT to fail after a successful enqueue, got: {message}"
+        ),
+        Err(other) => panic!("expected a commit failure, got {other:?}"),
+        Ok(_) => panic!("the guarded commit must not succeed"),
+    }
+
+    // (a) The evidence row did not survive the rollback…
+    assert!(
+        outbox_rows(&state).await.is_empty(),
+        "a commit failure must take the outbox row with it"
+    );
+    assert_eq!(
+        scalar_count(&state, "SELECT COUNT(*) FROM audit_outbox").await,
+        0
+    );
+    // (b) …and neither did the mutation.
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM networks WHERE display_name = 's1-network'"
+        )
+        .await,
+        0,
+        "fail-closed: a commit failure must not leave a half-applied mutation"
+    );
+    assert_eq!(
+        scalar_count(&state, "SELECT COUNT(*) FROM network_desired_state").await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn unadopted_route_keeps_the_direct_row_and_writes_no_outbox_row() {
     let state = build_state().await;
     let admin = token(&state, "u-admin", "admin", "admin");
@@ -703,6 +807,88 @@ async fn oversized_actor_fails_closed_and_rolls_back() {
         oversized_username.chars().count(),
         "the direct fallback path never truncates the actor identity"
     );
+}
+
+#[tokio::test]
+async fn username_at_the_256_char_cap_is_accepted_and_one_over_is_rejected() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // #706 review S2: bound the identity at creation so the outbox's
+    // 16 KiB fail-closed path is unreachable for API-created users. 256
+    // characters is the documented maximum (matching the audit
+    // path-field cap) and is accepted end-to-end through the adopted
+    // path.
+    let at_cap = "u".repeat(256);
+    let response = send(
+        &state,
+        post_json(
+            "/v1/users/create",
+            Some(&admin),
+            serde_json::json!({
+                "username": at_cap,
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM users WHERE length(username) = 256"
+        )
+        .await,
+        1,
+        "256 characters is accepted, stored verbatim (never truncated)"
+    );
+    let outbox = outbox_rows(&state).await;
+    assert_eq!(outbox.len(), 1, "the adopted mutation enqueued its row");
+    dispatch_audit_outbox(&state).await;
+    let rows = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "success");
+
+    // 257 characters is rejected with the existing validation shape (400
+    // `BAD_REQUEST`), before any transaction opens: no mutation, no
+    // outbox row, one direct failed row.
+    let over_cap = "u".repeat(257);
+    let response = send(
+        &state,
+        post_json(
+            "/v1/users/create",
+            Some(&admin),
+            serde_json::json!({
+                "username": over_cap,
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(&body_bytes(response).await);
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(body["message"], "username must be at most 256 characters");
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM users WHERE length(username) = 257"
+        )
+        .await,
+        0,
+        "an over-cap username is never stored or truncated"
+    );
+    assert_eq!(
+        scalar_count(&state, "SELECT COUNT(*) FROM audit_outbox").await,
+        1,
+        "only the accepted request enqueued; the rejected one never opened a transaction"
+    );
+    let rows = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(rows.len(), 2, "accepted row + direct rejection row");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 400);
 }
 
 #[tokio::test]

@@ -291,10 +291,12 @@ pub async fn import_vm(
         )));
     }
 
-    // The final transaction couples the VM/volume/operation rows to the
-    // audit evidence (#706). Filesystem work above and the intermediate
-    // commits are outside this transaction — the residual multi-statement
-    // risk is documented in the audit-log spec.
+    // The single DB write unit below: the VM/volume/desired-state/
+    // operation rows and the audit evidence commit together (#706). The
+    // filesystem work (temp-dir setup and the disk-image move) happens
+    // before this transaction opens, and there are no intermediate DB
+    // commits; the residual filesystem risk is documented in the
+    // audit-log spec.
     commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("vms:").await;
     state.cache.invalidate("volumes:").await;
