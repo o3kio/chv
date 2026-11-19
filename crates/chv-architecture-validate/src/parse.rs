@@ -164,9 +164,12 @@ metadata:
     }
 
     /// YAML 1.2 scalar semantics — the behavior `serde_yaml` had, which this
-    /// crate's configs were written against. Only `true`/`false` are booleans;
-    /// YAML 1.1 spellings such as `n`, `yes`, and `on` must stay strings.
-    /// Coercing `name: n` to `false` would silently corrupt a topology.
+    /// crate's configs were written against. The core schema resolves only the
+    /// spellings `true`/`True`/`TRUE` and `false`/`False`/`FALSE` to booleans;
+    /// arbitrary casing such as `tRuE` and YAML 1.1 spellings such as `n`,
+    /// `yes`, and `on` must stay strings. Coercing `name: n` to `false` would
+    /// silently corrupt a topology, and `tRuE` silently becoming a boolean
+    /// would hide a typo behind a surprising value.
     #[test]
     fn yaml_12_scalars_stay_strings() {
         let raw = parse_value(
@@ -179,6 +182,7 @@ metadata:
             ("yes_val", "yes"),
             ("on_val", "on"),
             ("off_val", "off"),
+            ("true_weird", "tRuE"),
         ] {
             assert_eq!(
                 raw.get(key).and_then(|v| v.as_str()),
@@ -186,7 +190,7 @@ metadata:
                 "{key} must remain the string {expected:?}"
             );
         }
-        for key in ["true_val", "true_mixed", "true_weird"] {
+        for key in ["true_val", "true_mixed"] {
             assert_eq!(raw.get(key), Some(&serde_json::Value::Bool(true)), "{key}");
         }
         for key in ["false_val", "false_upper"] {
