@@ -44,24 +44,50 @@
 //! the audit row. `metadata` is built from a tiny allowlist (the auth
 //! mechanism classification only). The durable store's insert API takes
 //! the already-redacted JSON object.
+//!
+//! # Transactional coupling (#706 half 1, PR 2)
+//!
+//! Mutating handlers that are pure database work in one transaction
+//! *adopt* the audit outbox: the middleware mints a per-request
+//! [`AuditOutboxTicket`], the handler passes its mutation transaction to
+//! [`commit_adopted_mutation`], and the outbox row commits with the
+//! mutation or not at all. After the handler returns the middleware
+//! performs **check-or-insert** against the outbox primary key:
+//!
+//! - row present → the evidence row is already durable; the direct
+//!   insert is skipped (`finalize_pending` patches the row if the final
+//!   response is not 2xx/3xx);
+//! - row absent → denied, failed, rolled back, or unadopted; the direct
+//!   post-hoc insert runs exactly as before.
+//!
+//! `outbox_id` and `audit_id` are server-minted UUIDs; no client-supplied
+//! identifier is ever read or trusted. Denied and unadopted paths keep the
+//! original crash window — losing a denial row loses no state change.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
-    http::{Method, StatusCode},
+    extract::{ConnectInfo, FromRequestParts, Request, State},
+    http::{request::Parts, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use chv_controlplane_store::{
-    AuditLogInsert, AuditLogRepository, AUDIT_ANONYMOUS_ACTOR_ID, AUDIT_ANONYMOUS_ROLE,
+    audit_outbox::enqueue_on_tx as enqueue_audit_on_tx, AuditLogInsert, AuditLogRepository,
+    AuditOutboxInsert, AuditOutboxRepository, AUDIT_ANONYMOUS_ACTOR_ID, AUDIT_ANONYMOUS_ROLE,
     AUDIT_ANONYMOUS_USERNAME, AUDIT_OUTCOME_DENIED, AUDIT_OUTCOME_FAILED, AUDIT_OUTCOME_SUCCESS,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::auth::{authenticate_headers, AuthSource};
 use crate::router::AppState;
+use crate::BffError;
 
 /// Legacy tracing-only emitter retained for existing handler call sites.
 /// The durable row is written by [`record_privileged_mutation`]; this
@@ -97,6 +123,159 @@ const MAX_AUDIT_FIELD_LEN: usize = 256;
 
 fn capped_field(value: String) -> String {
     value.chars().take(MAX_AUDIT_FIELD_LEN).collect()
+}
+
+/// Server-minted, request-scoped audit-outbox ticket (#706 half 1).
+///
+/// `Clone` is cheap (`Arc`): the middleware keeps one handle to read the
+/// commit flag after the handler returns while the request extensions
+/// carry the other to the handler. The ids are minted with UUIDv4 and are
+/// **never** read from a header, body, or query string.
+#[derive(Clone, Debug)]
+pub struct AuditOutboxTicket(Arc<AuditOutboxTicketState>);
+
+#[derive(Debug)]
+struct AuditOutboxTicketState {
+    outbox_id: String,
+    audit_id: String,
+    /// The already-redacted row. `outcome`/`status_code` are the
+    /// commit-time prediction `success`/200; the middleware patches them
+    /// with `finalize_pending` if the final response is not 2xx/3xx.
+    payload: AuditLogInsert,
+    /// Set only after the mutation transaction **commits** with the
+    /// outbox row. The middleware uses it to distinguish "the handler
+    /// adopted but the post-handler check failed" (never insert twice)
+    /// from "nothing was enqueued" (fall back to the direct insert).
+    committed: AtomicBool,
+}
+
+impl AuditOutboxTicket {
+    /// Mint a ticket for one request from its fully-redacted base row.
+    pub fn from_payload(payload: AuditLogInsert) -> Self {
+        Self(Arc::new(AuditOutboxTicketState {
+            outbox_id: Uuid::new_v4().simple().to_string(),
+            audit_id: Uuid::new_v4().simple().to_string(),
+            payload,
+            committed: AtomicBool::new(false),
+        }))
+    }
+
+    /// Idempotency key of this request's outbox row.
+    pub fn outbox_id(&self) -> &str {
+        &self.0.outbox_id
+    }
+
+    /// Pre-minted `audit_log` primary key the dispatcher will reuse.
+    pub fn audit_id(&self) -> &str {
+        &self.0.audit_id
+    }
+
+    /// True once the mutation transaction containing this ticket's
+    /// outbox row has committed.
+    pub fn was_committed(&self) -> bool {
+        self.0.committed.load(Ordering::SeqCst)
+    }
+
+    fn mark_committed(&self) {
+        self.0.committed.store(true, Ordering::SeqCst);
+    }
+
+    /// Build the store input stamped at enqueue time. `occurred_at_ms`
+    /// is overwritten so the row's timestamp is the commit attempt, not
+    /// request start.
+    fn outbox_insert(&self) -> AuditOutboxInsert {
+        let now_ms = chv_common::now_unix_ms();
+        AuditOutboxInsert {
+            outbox_id: self.0.outbox_id.clone(),
+            audit_id: self.0.audit_id.clone(),
+            payload: AuditLogInsert {
+                occurred_at_ms: now_ms,
+                ..self.0.payload.clone()
+            },
+            created_at_ms: now_ms,
+        }
+    }
+}
+
+/// Handler-side handle to the request's [`AuditOutboxTicket`].
+///
+/// Infallible: `None` when the handler is mounted without the audit
+/// middleware (`bff_router_unaudited` standalone) or invoked directly by
+/// a test. An adopted handler then commits its mutation **without**
+/// enqueueing, and the outer middleware (if any) takes the direct path —
+/// exactly today's behavior for an unadopted route.
+#[derive(Clone, Debug, Default)]
+pub struct AuditTicket(pub Option<AuditOutboxTicket>);
+
+impl AuditTicket {
+    pub fn as_ref(&self) -> Option<&AuditOutboxTicket> {
+        self.0.as_ref()
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for AuditTicket {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Request extensions are server-side only: a client cannot forge
+        // this ticket, so a handler can never be tricked into enqueueing
+        // an attacker-chosen `outbox_id`.
+        Ok(Self(parts.extensions.get::<AuditOutboxTicket>().cloned()))
+    }
+}
+
+/// Commit a mutation transaction with its audit evidence attached.
+///
+/// This is the single adoption seam: the handler executes its mutation
+/// statements on `tx`, then hands the transaction here. When a ticket is
+/// present the outbox row is enqueued **inside the same transaction**
+/// immediately before the commit, so the mutation and its evidence share
+/// one commit — the crash window in issue #706 closes at exactly these
+/// sites.
+///
+/// **Fail-closed (NIT 5 decision).** Enqueue validates the serialized
+/// `AuditLogInsert` (≤ 16 KiB, the store's existing bound). An oversized
+/// row — in practice only a pathologically long `actor_username`, since
+/// the other fields are capped at construction — is *not* silently
+/// truncated: the error rolls the mutation transaction back (the caller
+/// returns the error and `tx` is dropped), so no mutation exists without
+/// its evidence. The middleware then records the failed request on the
+/// direct path, exactly once. This is covered by
+/// `oversized_actor_fails_closed_and_rolls_back` in
+/// `tests/audit_log.rs`.
+pub async fn commit_adopted_mutation(
+    mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    ticket: Option<&AuditOutboxTicket>,
+) -> Result<(), BffError> {
+    if let Some(ticket) = ticket {
+        let insert = ticket.outbox_insert();
+        if let Err(error) = enqueue_audit_on_tx(&mut tx, &insert).await {
+            // Loud and structured: an adopted mutation must not commit
+            // without durable evidence. Returning here drops `tx`, which
+            // rolls the mutation back.
+            tracing::error!(
+                target: "audit",
+                outbox_id = %ticket.outbox_id(),
+                audit_id = %ticket.audit_id(),
+                error = %error,
+                "AUDIT OUTBOX ENQUEUE FAILED — rolling back the mutation transaction"
+            );
+            return Err(BffError::Internal(
+                "failed to record audit evidence".to_string(),
+            ));
+        }
+    }
+    tx.commit().await.map_err(|e| {
+        tracing::error!(error = %e, "adopted mutation commit failed");
+        BffError::Internal(format!("failed to commit transaction: {}", e))
+    })?;
+    // Only after a successful commit: a rolled-back ticket must never
+    // suppress the middleware's direct insert.
+    if let Some(ticket) = ticket {
+        ticket.mark_committed();
+    }
+    Ok(())
 }
 
 /// Middleware: append exactly one durable audit row for every mutating
@@ -145,20 +324,16 @@ pub async fn record_privileged_mutation(
         ),
     };
 
-    let mut req = req;
-    req.extensions_mut()
-        .insert(crate::auth::VerifiedAuth(decoded));
-
-    let response = next.run(req).await;
-    let status = response.status();
-    let outcome = outcome_for_status(status);
-    let status_code = i64::from(status.as_u16());
-
     // The metadata object is an explicit allowlist. Do not add request
     // headers, bodies, query strings, or handler payloads here.
     let metadata = json!({ "auth_source": auth_source.as_str() }).to_string();
 
-    let entry = AuditLogInsert {
+    // Build the redacted row once. Outcome/status are the commit-time
+    // prediction for an adopted handler (`success`/200); the final
+    // outcome is only known after the handler returns and is applied
+    // below — directly, or via `finalize_pending` when the row already
+    // committed inside the mutation.
+    let base_entry = AuditLogInsert {
         occurred_at_ms: chv_common::now_unix_ms(),
         actor_id: actor.sub,
         actor_username: actor.username,
@@ -168,12 +343,93 @@ pub async fn record_privileged_mutation(
         path: capped_field(path),
         resource_kind: classification.resource_kind.map(capped_field),
         resource_id: classification.resource_id.map(capped_field),
-        outcome: outcome.to_string(),
-        status_code,
+        outcome: AUDIT_OUTCOME_SUCCESS.to_string(),
+        status_code: 200,
         correlation_id,
         operation_id,
         source_ip,
         metadata,
+    };
+
+    // One ticket per request, server-minted and unforgeable. Adopted
+    // handlers enqueue it on their own transaction; unadopted handlers
+    // ignore it and the direct insert below runs unchanged.
+    let ticket = AuditOutboxTicket::from_payload(base_entry.clone());
+    let mut req = req;
+    req.extensions_mut().insert(ticket.clone());
+    req.extensions_mut()
+        .insert(crate::auth::VerifiedAuth(decoded));
+
+    let response = next.run(req).await;
+    let status = response.status();
+    let outcome = outcome_for_status(status);
+    let status_code = i64::from(status.as_u16());
+
+    // Check-or-insert: the outbox primary key is this request's
+    // idempotency key, so the tx-coupled path and the direct path
+    // compose without a double write.
+    let outbox = AuditOutboxRepository::new(state.pool.clone());
+    match outbox.get(ticket.outbox_id()).await {
+        Ok(Some(_)) => {
+            // The handler committed its mutation and the evidence row
+            // with it. Never insert a second row.
+            if !status.is_success() && !status.is_redirection() {
+                patch_final_outcome(&outbox, &ticket, outcome, status_code).await;
+            } else {
+                tracing::debug!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id(),
+                    audit_id = %ticket.audit_id(),
+                    status = status_code,
+                    "audit row queued by the adopted handler"
+                );
+            }
+            return response;
+        }
+        Ok(None) => {
+            if ticket.was_committed() {
+                // The handler committed with an enqueued row, yet the
+                // row is gone (only possible if it was manually
+                // deleted or pruned years early). Inserting is the
+                // evidence-preserving action; log the broken invariant.
+                tracing::error!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id(),
+                    "audit outbox row committed with the mutation but is now missing; \
+                     writing the direct row"
+                );
+            }
+            // Denied, failed before commit, rolled back, or unadopted:
+            // fall through to today's post-hoc insert.
+        }
+        Err(error) => {
+            if ticket.was_committed() {
+                // The enqueue committed with the mutation, so the
+                // evidence is durable in the outbox even though this
+                // check failed. Do NOT insert a second row for it.
+                tracing::error!(
+                    target: "audit",
+                    outbox_id = %ticket.outbox_id(),
+                    error = %error,
+                    "audit outbox check failed after the handler committed its evidence; \
+                     skipping the direct insert to avoid a duplicate row"
+                );
+                return response;
+            }
+            tracing::warn!(
+                target: "audit",
+                outbox_id = %ticket.outbox_id(),
+                error = %error,
+                "audit outbox check failed before any enqueue; falling back to the direct insert"
+            );
+        }
+    }
+
+    let entry = AuditLogInsert {
+        occurred_at_ms: chv_common::now_unix_ms(),
+        outcome: outcome.to_string(),
+        status_code,
+        ..base_entry
     };
 
     match AuditLogRepository::new(state.pool.clone())
@@ -226,6 +482,53 @@ pub async fn record_privileged_mutation(
                 response
             }
         }
+    }
+}
+
+/// Patch the already-committed outbox row when the final response is not
+/// a success. The mutation committed, so the evidence row must stay; only
+/// its recorded outcome/status change.
+async fn patch_final_outcome(
+    outbox: &AuditOutboxRepository,
+    ticket: &AuditOutboxTicket,
+    outcome: &str,
+    status_code: i64,
+) {
+    match outbox
+        .finalize_pending(
+            ticket.outbox_id(),
+            outcome,
+            status_code,
+            chv_common::now_unix_ms(),
+        )
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            target: "audit",
+            outbox_id = %ticket.outbox_id(),
+            audit_id = %ticket.audit_id(),
+            status = status_code,
+            outcome = outcome,
+            "adopted mutation committed but the final response was not a success; \
+             patched the pending outbox row"
+        ),
+        Ok(false) => tracing::warn!(
+            target: "audit",
+            outbox_id = %ticket.outbox_id(),
+            audit_id = %ticket.audit_id(),
+            status = status_code,
+            outcome = outcome,
+            "adopted mutation committed but its outbox row was already dispatched; \
+             the evidence row keeps the commit-time success prediction"
+        ),
+        Err(error) => tracing::error!(
+            target: "audit",
+            outbox_id = %ticket.outbox_id(),
+            audit_id = %ticket.audit_id(),
+            error = %error,
+            "failed to patch the pending audit outbox row; it keeps the \
+             commit-time success prediction"
+        ),
     }
 }
 
@@ -863,5 +1166,45 @@ mod tests {
             outcome_for_status(StatusCode::INTERNAL_SERVER_ERROR),
             AUDIT_OUTCOME_FAILED
         );
+    }
+
+    fn ticket_payload() -> AuditLogInsert {
+        AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "u-1".into(),
+            actor_username: "alice".into(),
+            actor_role: "admin".into(),
+            action: "user.create".into(),
+            method: "POST".into(),
+            path: "/v1/users/create".into(),
+            resource_kind: Some("user".into()),
+            resource_id: None,
+            outcome: AUDIT_OUTCOME_SUCCESS.into(),
+            status_code: 200,
+            correlation_id: Some("corr-1".into()),
+            operation_id: None,
+            source_ip: None,
+            metadata: r#"{"auth_source":"bearer_jwt"}"#.into(),
+        }
+    }
+
+    #[test]
+    fn tickets_mint_distinct_ids_and_start_uncommitted() {
+        let first = AuditOutboxTicket::from_payload(ticket_payload());
+        let second = AuditOutboxTicket::from_payload(ticket_payload());
+
+        assert_ne!(first.outbox_id(), second.outbox_id());
+        assert_ne!(first.audit_id(), second.audit_id());
+        assert_eq!(first.outbox_id().len(), 32, "UUIDv4 simple form");
+        assert_eq!(first.audit_id().len(), 32);
+        assert!(!first.was_committed());
+        assert!(!second.was_committed());
+
+        // The store input is stamped at enqueue time (not request start).
+        let input = first.outbox_insert();
+        assert_eq!(input.outbox_id, first.outbox_id());
+        assert_eq!(input.audit_id, first.audit_id());
+        assert_eq!(input.created_at_ms, input.payload.occurred_at_ms);
+        assert!(input.payload.occurred_at_ms >= 1_000);
     }
 }

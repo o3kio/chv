@@ -398,6 +398,8 @@ async fn import_vm_as(state: AppState, vm_name: &str) -> (StatusCode, serde_json
     let result = chv_webui_bff::handlers::imports::import_vm(
         chv_webui_bff::BearerToken(claims),
         axum::extract::State(state),
+        // Direct invocation without the audit middleware: no ticket.
+        chv_webui_bff::audit::AuditTicket(None),
         axum::Extension(None),
         multipart,
     )

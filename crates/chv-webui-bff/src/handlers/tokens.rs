@@ -2,6 +2,7 @@ use axum::{extract::State, response::Json};
 use rand::RngExt;
 use serde_json::{json, Value};
 
+use crate::audit::{commit_adopted_mutation, AuditTicket};
 use crate::auth::BearerToken;
 use crate::router::AppState;
 use crate::BffError;
@@ -74,6 +75,7 @@ pub async fn list_tokens(
 pub async fn create_token(
     State(state): State<AppState>,
     BearerToken(claims): BearerToken,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
@@ -106,6 +108,16 @@ pub async fn create_token(
     let raw_token = format!("chv_{}", hex::encode(rand_bytes_32()));
     let token_hash = chv_common::sha256_hex(&raw_token);
 
+    // Mutation plus audit evidence in one transaction (#706). The
+    // autocommit INSERT becomes a two-statement write transaction
+    // (INSERT + outbox INSERT); disclosed as the intentional lock-scope
+    // change.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
+
     sqlx::query(
         "INSERT INTO api_tokens (token_id, user_id, name, token_hash, scope) VALUES (?, ?, ?, ?, ?)",
     )
@@ -114,19 +126,24 @@ pub async fn create_token(
     .bind(name)
     .bind(&token_hash)
     .bind(scope)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "create_token db insert failed");
         BffError::Internal(format!("failed to create token: {e}"))
     })?;
 
+    // Read the server-generated timestamp on the same transaction so it
+    // cannot observe a different snapshot than the insert. A failure
+    // keeps today's "unknown" fallback and does not fail the mutation.
     let created_at =
         sqlx::query_scalar::<_, String>("SELECT created_at FROM api_tokens WHERE token_id = ?")
             .bind(&token_id)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut *tx)
             .await
             .unwrap_or_else(|_| "unknown".to_string());
+
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("overview").await;
 
     Ok(Json(json!({
@@ -141,6 +158,7 @@ pub async fn create_token(
 pub async fn revoke_token(
     State(state): State<AppState>,
     BearerToken(claims): BearerToken,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
@@ -167,15 +185,23 @@ pub async fn revoke_token(
         return Err(BffError::NotFound(format!("token {} not found", token_id)));
     }
 
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
+
     sqlx::query("DELETE FROM api_tokens WHERE token_id = ? AND user_id = ?")
         .bind(&token_id)
         .bind(&claims.sub)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "revoke_token db delete failed");
             BffError::Internal(format!("failed to revoke token: {e}"))
         })?;
+
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("overview").await;
 
     Ok(Json(json!({

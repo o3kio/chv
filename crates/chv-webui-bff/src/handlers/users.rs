@@ -1,6 +1,7 @@
 use axum::{extract::State, response::Json};
 use serde_json::{json, Value};
 
+use crate::audit::{commit_adopted_mutation, AuditTicket};
 use crate::auth::BearerToken;
 use crate::router::AppState;
 use crate::BffError;
@@ -57,6 +58,7 @@ pub async fn list_users(
 pub async fn create_user(
     State(state): State<AppState>,
     BearerToken(claims): BearerToken,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_admin(&claims)?;
@@ -109,6 +111,17 @@ pub async fn create_user(
 
     let user_id = chv_common::gen_resource_id();
 
+    // The mutation and its audit evidence share one transaction (#706):
+    // `commit_adopted_mutation` enqueues the request's outbox ticket and
+    // commits both, or the error rolls the insert back. The write lock
+    // now spans the INSERT plus one outbox INSERT (previously the INSERT
+    // was autocommit) — disclosed as the intentional lock-scope change.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
+
     sqlx::query(
         "INSERT INTO users (user_id, username, password_hash, role, display_name, email) VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -118,7 +131,7 @@ pub async fn create_user(
     .bind(role)
     .bind(&display_name)
     .bind(&email)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "create_user db insert failed");
@@ -128,6 +141,8 @@ pub async fn create_user(
             BffError::Internal("failed to create user".into())
         }
     })?;
+
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("overview").await;
 
     Ok(Json(json!({
@@ -140,6 +155,7 @@ pub async fn create_user(
 pub async fn update_user(
     State(state): State<AppState>,
     BearerToken(claims): BearerToken,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_admin(&claims)?;
@@ -200,6 +216,16 @@ pub async fn update_user(
         None
     };
 
+    // One transaction for the UPDATE and its audit evidence (#706). The
+    // existing read used to determine the token-version bump stays
+    // outside, so the write lock spans only the UPDATE plus the outbox
+    // INSERT.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
+
     if let Some(ref hash) = resolved_password_hash {
         // Admin password reset revokes every prior session (#660): a stolen
         // cookie must not survive the standard compromise response.
@@ -212,7 +238,7 @@ pub async fn update_user(
         .bind(&resolved_email)
         .bind(hash)
         .bind(&user_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "update_user db update failed");
@@ -234,13 +260,15 @@ pub async fn update_user(
         .bind(&resolved_email)
         .bind(bump_token_version)
         .bind(&user_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "update_user db update failed");
             BffError::Internal("failed to update user".into())
         })?;
     }
+
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("overview").await;
 
     Ok(Json(json!({
@@ -255,6 +283,7 @@ pub async fn update_user(
 pub async fn delete_user(
     State(state): State<AppState>,
     BearerToken(claims): BearerToken,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_admin(&claims)?;
@@ -286,14 +315,22 @@ pub async fn delete_user(
         return Err(BffError::NotFound(format!("user {} not found", user_id)));
     }
 
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
+
     sqlx::query("DELETE FROM users WHERE user_id = ?")
         .bind(&user_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "delete_user db delete failed");
             BffError::Internal("failed to delete user".into())
         })?;
+
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("overview").await;
 
     Ok(Json(json!({

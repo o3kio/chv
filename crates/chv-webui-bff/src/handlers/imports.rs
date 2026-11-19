@@ -5,6 +5,7 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
+use crate::audit::{commit_adopted_mutation, AuditTicket};
 use crate::router::AppState;
 use crate::BffError;
 
@@ -14,6 +15,7 @@ const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 pub async fn import_vm(
     crate::auth::BearerToken(claims): crate::auth::BearerToken,
     State(state): State<AppState>,
+    ticket: AuditTicket,
     Extension(correlation_id): Extension<Option<String>>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, BffError> {
@@ -289,9 +291,11 @@ pub async fn import_vm(
         )));
     }
 
-    tx.commit()
-        .await
-        .map_err(|e| BffError::Internal(format!("failed to commit transaction: {}", e)))?;
+    // The final transaction couples the VM/volume/operation rows to the
+    // audit evidence (#706). Filesystem work above and the intermediate
+    // commits are outside this transaction — the residual multi-statement
+    // risk is documented in the audit-log spec.
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
     state.cache.invalidate("vms:").await;
     state.cache.invalidate("volumes:").await;
     state.cache.invalidate("overview").await;

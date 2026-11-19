@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BFF privileged mutations adopt the audit outbox (#706 half 1, PR 2).**
+  The middleware now mints a server-side `outbox_id`/`audit_id` ticket per
+  audited request and, after the handler returns, performs check-or-insert
+  against `audit_outbox`: a committed outbox row suppresses the direct
+  `audit_log` insert (and `finalize_pending` patches the outcome when the
+  final status is not 2xx/3xx), while an absent row keeps today's direct
+  insert. Adopted routes are the pure-DB, single-transaction BFF
+  mutations: `users` create/update/delete, `tokens` create/revoke,
+  `networks` create/update/delete, and the final transaction of
+  `vms/import`. The crash window (mutation commits, process dies before
+  the audit row) closes for exactly these routes; vm/volume deletes,
+  filesystem/agent-RPC handlers, and the whole gRPC surface keep the
+  direct post-hoc path until later PRs. Wrapping the formerly autocommit
+  `users`/`tokens` statements in `begin()` is a disclosed lock-scope
+  change (one extra INSERT under the same write lock, no new lock
+  ordering). Adopted enqueues **fail closed** on the store's 16 KiB
+  payload cap: an oversized actor is never truncated — the mutation
+  transaction rolls back and the failed attempt is recorded once on the
+  direct path. See `docs/specs/component/audit-log.md` and
+  `docs/runbooks/audit-outbox.md`.
+
 ### Added
 - **Transactional audit-outbox plumbing (#706 half 1).** Migration `0071`
   adds an `audit_outbox` table, `chv-controlplane-store` gains
@@ -18,10 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_dispatch_failures_total`). `[audit]` gains
   `outbox_dispatch_interval_secs` (default 1) and
   `outbox_retention_days` (default 7, validated 1..=365).
-  **No behavior change yet:** no request path enqueues into the outbox,
-  so it ships empty, the dispatcher finds nothing, and every mutation
-  keeps today's direct post-hoc insert (including its crash window).
-  Adoption follows in PR 2 (BFF) and PR 3 (gRPC). See
+  The plumbing itself changes no request behavior; adoption lands in
+  PR 2 (BFF, above) and PR 3 (gRPC). See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 

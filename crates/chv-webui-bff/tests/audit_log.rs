@@ -14,10 +14,12 @@ use axum::http::{header, Request, StatusCode};
 use chv_common::SystemClock;
 use chv_controlplane_store::{
     AlertRepository, AlertRuleRepository, ApplyRunRepository, AuditLogFilter, AuditLogInsert,
-    AuditLogRepository, AuditLogRow, BackupRepository, DesiredStateRepository,
-    DriftReportRepository, EventRepository, ImageRepository, NetworkRepository, NodeRepository,
-    NotificationOutboxRepository, ObservedStateRepository, OperationRepository, TopologyRepository,
+    AuditLogRepository, AuditLogRow, AuditOutboxRepository, AuditOutboxRow, BackupRepository,
+    DesiredStateRepository, DriftReportRepository, EventRepository, ImageRepository,
+    NetworkRepository, NodeRepository, NotificationOutboxRepository, ObservedStateRepository,
+    OperationRepository, TopologyRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
 };
+use chv_webui_bff::audit::{AuditOutboxTicket, AuditTicket};
 use chv_webui_bff::auth::Claims;
 use chv_webui_bff::mutations::MutationService;
 use chv_webui_bff::{AppState, BffError};
@@ -176,6 +178,10 @@ async fn build_state() -> AppState {
 }
 
 fn token(state: &AppState, sub: &str, username: &str, role: &str) -> String {
+    token_with_username(state, sub, username, role)
+}
+
+fn token_with_username(state: &AppState, sub: &str, username: &str, role: &str) -> String {
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
@@ -197,6 +203,18 @@ fn token(state: &AppState, sub: &str, username: &str, role: &str) -> String {
         &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
     )
     .expect("encode test token")
+}
+
+fn claims(sub: &str, username: &str, role: &str) -> Claims {
+    Claims {
+        sub: sub.to_string(),
+        username: username.to_string(),
+        role: role.to_string(),
+        exp: 0,
+        must_change_password: false,
+        aud: None,
+        token_version: None,
+    }
 }
 
 fn post_json(path: &str, token: Option<&str>, body: serde_json::Value) -> Request<Body> {
@@ -245,6 +263,61 @@ async fn all_rows(state: &AppState) -> Vec<AuditLogRow> {
     .fetch_all(&state.pool)
     .await
     .expect("query audit rows")
+}
+
+async fn outbox_rows(state: &AppState) -> Vec<AuditOutboxRow> {
+    sqlx::query_as::<_, AuditOutboxRow>(
+        "SELECT * FROM audit_outbox ORDER BY created_at_ms ASC, outbox_id ASC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .expect("query audit outbox rows")
+}
+
+/// One dispatcher pass, mirroring `AuditOutboxDispatcher::dispatch_pass`:
+/// claim due rows with the production 60 s lease, then complete each in
+/// its own insert-and-mark transaction. The worker itself lives in
+/// `chv-controlplane-service`, which depends on this crate; the
+/// integration test drives the exact store operations instead of adding
+/// a dev-dependency cycle.
+async fn dispatch_audit_outbox(state: &AppState) {
+    let repo = AuditOutboxRepository::new(state.pool.clone());
+    let now_ms = chv_common::now_unix_ms() + 1;
+    let claimed = repo
+        .claim_due(now_ms, 60_000, 128)
+        .await
+        .expect("claim due outbox rows");
+    for row in claimed {
+        assert!(
+            repo.complete(&row.outbox_id, now_ms)
+                .await
+                .expect("complete outbox row"),
+            "claimed row {} must complete",
+            row.outbox_id
+        );
+    }
+}
+
+async fn scalar_count(state: &AppState, sql: &'static str) -> i64 {
+    let (count,): (i64,) = sqlx::query_as(sql)
+        .fetch_one(&state.pool)
+        .await
+        .expect("scalar count");
+    count
+}
+
+/// Test-only inner middleware: turn every response into a 500 *after* the
+/// handler committed, so the audit layer's `finalize_pending` path is
+/// exercised deterministically (no adopted handler returns non-2xx after
+/// commit in production code).
+async fn force_internal_error(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(req).await;
+    let (mut parts, body) = response.into_parts();
+    parts.status = StatusCode::INTERNAL_SERVER_ERROR;
+    axum::response::Response::from_parts(parts, body)
 }
 
 fn body_json(body: &[u8]) -> serde_json::Value {
@@ -308,6 +381,22 @@ async fn exactly_one_row_per_successful_mutation() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    // `/v1/users/create` is an adopted route: the handler committed the
+    // mutation and the outbox row together, so the middleware must NOT
+    // have written a second (direct) row. The evidence row is not in
+    // `audit_log` yet — that is the dispatcher's job.
+    assert!(
+        all_rows(&state).await.is_empty(),
+        "adopted success must not write a direct audit row"
+    );
+    let outbox = outbox_rows(&state).await;
+    assert_eq!(outbox.len(), 1, "exactly one outbox row");
+    assert_eq!(outbox[0].status, AUDIT_OUTBOX_PENDING);
+    assert_eq!(outbox[0].attempts, 0);
+
+    // One dispatcher pass converts it into exactly one evidence row.
+    dispatch_audit_outbox(&state).await;
+
     let rows = rows_for_path(&state, "/v1/users/create").await;
     assert_eq!(rows.len(), 1, "one request must write exactly one row");
     let row = &rows[0];
@@ -322,11 +411,347 @@ async fn exactly_one_row_per_successful_mutation() {
         .correlation_id
         .as_deref()
         .is_some_and(|id| !id.is_empty()));
+    assert_eq!(row.audit_id, outbox[0].audit_id, "pre-minted id is reused");
+    assert_eq!(
+        outbox_rows(&state).await[0].status,
+        AUDIT_OUTBOX_DISPATCHED,
+        "the outbox row is dispatched, not left pending"
+    );
+    // Exactly one row across both emitters for this request.
+    assert_eq!(all_rows(&state).await.len(), 1);
+    assert_eq!(
+        scalar_count(&state, "SELECT COUNT(*) FROM audit_outbox").await,
+        1
+    );
 
     // A read request must not add a row.
     let response = send(&state, get("/v1/health", Some(&admin))).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(all_rows(&state).await.len(), 1);
+}
+
+#[tokio::test]
+async fn adopted_commit_survives_a_crash_before_the_middleware_returns() {
+    let state = build_state().await;
+
+    // Build the ticket exactly as the middleware would (server-minted
+    // ids, redacted row, commit-time success prediction) and run the
+    // adopted handler directly. The handler commits the mutation + the
+    // outbox row; the middleware never runs — this is the crash window
+    // made deterministic.
+    let ticket = AuditOutboxTicket::from_payload(AuditLogInsert {
+        occurred_at_ms: 1_000,
+        actor_id: "u-admin".to_string(),
+        actor_username: "admin".to_string(),
+        actor_role: "admin".to_string(),
+        action: "user.create".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/users/create".to_string(),
+        resource_kind: Some("user".to_string()),
+        resource_id: None,
+        outcome: "success".to_string(),
+        status_code: 200,
+        correlation_id: Some("crash-window-correlation".to_string()),
+        operation_id: None,
+        source_ip: None,
+        metadata: r#"{"auth_source":"bearer_jwt"}"#.to_string(),
+    });
+
+    let created = chv_webui_bff::handlers::users::create_user(
+        axum::extract::State(state.clone()),
+        chv_webui_bff::BearerToken(claims("u-admin", "admin", "admin")),
+        AuditTicket(Some(ticket.clone())),
+        axum::Json(serde_json::json!({
+            "username": "crash-window-user",
+            "password": "Sup3rSecretPassw0rd!",
+            "role": "viewer"
+        })),
+    )
+    .await;
+    assert!(created.is_ok(), "handler commits");
+
+    // Crash: no middleware, no direct row. The mutation and its
+    // evidence intent are both durable.
+    assert!(all_rows(&state).await.is_empty());
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM users WHERE username = 'crash-window-user'"
+        )
+        .await,
+        1
+    );
+    let outbox = outbox_rows(&state).await;
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].status, AUDIT_OUTBOX_PENDING);
+    assert_eq!(outbox[0].audit_id, ticket.audit_id());
+
+    // Post-crash replay (the dispatcher's immediate startup pass).
+    dispatch_audit_outbox(&state).await;
+
+    let rows = all_rows(&state).await;
+    assert_eq!(rows.len(), 1, "the outbox replays exactly one row");
+    assert_eq!(rows[0].audit_id, ticket.audit_id());
+    assert_eq!(rows[0].actor_id, "u-admin");
+    assert_eq!(
+        rows[0].correlation_id.as_deref(),
+        Some("crash-window-correlation")
+    );
+    assert_eq!(outbox_rows(&state).await[0].status, AUDIT_OUTBOX_DISPATCHED);
+}
+
+#[tokio::test]
+async fn handler_error_after_begin_rolls_back_without_an_outbox_row() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // A network row without its desired-state row is the documented
+    // "legacy residue" 500 path in `update_network`: the handler has
+    // already opened its write transaction when it fails. The whole
+    // transaction — including any outbox enqueue — must roll back, and
+    // the middleware must write one direct `failed` row.
+    sqlx::query(
+        "INSERT INTO networks (network_id, display_name, network_class, owner_id) \
+         VALUES ('net-legacy-residue', 'legacy', 'bridge', 'u-admin')",
+    )
+    .execute(&state.pool)
+    .await
+    .expect("seed legacy network");
+
+    let response = send(
+        &state,
+        post_json(
+            "/v1/networks/update",
+            Some(&admin),
+            serde_json::json!({ "network_id": "net-legacy-residue", "cidr": "10.9.0.0/24" }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        outbox_rows(&state).await.is_empty(),
+        "a rolled-back transaction must not leave an outbox row"
+    );
+    let rows = rows_for_path(&state, "/v1/networks/update").await;
+    assert_eq!(rows.len(), 1, "exactly one direct failure row");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 500);
+    assert_eq!(rows[0].actor_id, "u-admin");
+    // The transaction rolled back: no desired-state row was created.
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM network_desired_state \
+             WHERE network_id = 'net-legacy-residue'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn unadopted_route_keeps_the_direct_row_and_writes_no_outbox_row() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // `/v1/auth/logout` is a successful mutation that is deliberately not
+    // adopted (it is a self-service auth action, not one of the pure-DB
+    // admin mutations): today's direct row is the contract.
+    let response = send(
+        &state,
+        post_json("/v1/auth/logout", Some(&admin), serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = rows_for_path(&state, "/v1/auth/logout").await;
+    assert_eq!(rows.len(), 1, "unadopted success writes the direct row");
+    assert_eq!(rows[0].outcome, "success");
+    assert!(outbox_rows(&state).await.is_empty());
+
+    // Denials on adopted routes also stay on the direct path: the handler
+    // never starts its transaction.
+    let viewer = token(&state, "u-viewer", "viewer-1", "viewer");
+    let response = send(
+        &state,
+        post_json(
+            "/v1/users/create",
+            Some(&viewer),
+            serde_json::json!({
+                "username": "denied-user",
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let denied = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].outcome, "denied");
+    assert_eq!(denied[0].status_code, 403);
+    assert!(outbox_rows(&state).await.is_empty());
+}
+
+#[tokio::test]
+async fn adopted_mutation_that_ends_non_2xx_patches_the_pending_row() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+
+    // Compose the audit layer exactly as production does, but wrap the
+    // routes in a test-only layer that rewrites the final status to 500
+    // *after* the handler committed. No adopted handler can do this in
+    // production code, so the test injects it to prove `finalize_pending`
+    // rewrites the outcome instead of emitting a second row.
+    let app = chv_webui_bff::bff_router_unaudited(state.clone())
+        .layer(axum::middleware::from_fn(force_internal_error))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            chv_webui_bff::audit::record_privileged_mutation,
+        ))
+        .layer(axum::middleware::from_fn(
+            chv_webui_bff::correlation_middleware::extract_correlation_id,
+        ))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(post_json(
+            "/v1/users/create",
+            Some(&admin),
+            serde_json::json!({
+                "username": "post-commit-500-user",
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            }),
+        ))
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // The mutation committed (the 500 is the injected wrapper, not the
+    // handler), so the evidence row must exist and be durable — in the
+    // outbox, patched, with no direct duplicate.
+    assert!(all_rows(&state).await.is_empty());
+    let outbox = outbox_rows(&state).await;
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].status, AUDIT_OUTBOX_PENDING);
+    let payload = outbox[0].parse_payload().expect("payload parses");
+    assert_eq!(payload.outcome, "failed");
+    assert_eq!(payload.status_code, 500);
+    assert_eq!(payload.actor_id, "u-admin");
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM users WHERE username = 'post-commit-500-user'"
+        )
+        .await,
+        1,
+        "the mutation itself committed"
+    );
+
+    dispatch_audit_outbox(&state).await;
+    let rows = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 500);
+    assert_eq!(rows[0].audit_id, outbox[0].audit_id);
+}
+
+#[tokio::test]
+async fn oversized_actor_fails_closed_and_rolls_back() {
+    let state = build_state().await;
+    // NIT 5 decision: a payload over the store's 16 KiB bound is NOT
+    // silently truncated. Enqueue fails, the adopted mutation transaction
+    // rolls back (no mutation, no outbox row), and the middleware records
+    // the failed request on the direct path — exactly one row.
+    let oversized_username = "x".repeat(17 * 1024);
+    let admin = token_with_username(&state, "u-admin", &oversized_username, "admin");
+
+    let response = send(
+        &state,
+        post_json(
+            "/v1/users/create",
+            Some(&admin),
+            serde_json::json!({
+                "username": "oversized-actor-user",
+                "password": "Sup3rSecretPassw0rd!",
+                "role": "viewer"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM users WHERE username = 'oversized-actor-user'"
+        )
+        .await,
+        0,
+        "fail-closed: no mutation without durable evidence"
+    );
+    assert!(outbox_rows(&state).await.is_empty());
+
+    let rows = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(rows.len(), 1, "exactly one direct failure row");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 500);
+    assert_eq!(
+        rows[0].actor_username.chars().count(),
+        oversized_username.chars().count(),
+        "the direct fallback path never truncates the actor identity"
+    );
+}
+
+#[tokio::test]
+async fn client_supplied_outbox_ids_are_ignored_and_requests_get_distinct_ids() {
+    let state = build_state().await;
+    let admin = token(&state, "u-admin", "admin", "admin");
+    let forged = "client-chosen-outbox-id";
+
+    for username in ["distinct-ids-1", "distinct-ids-2"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/users/create")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+            // Hostile client metadata must never become the ticket key.
+            .header("x-outbox-id", forged)
+            .header("x-audit-id", forged)
+            .body(Body::from(
+                serde_json::json!({
+                    "username": username,
+                    "password": "Sup3rSecretPassw0rd!",
+                    "role": "viewer"
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+        let response = send(&state, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let outbox = outbox_rows(&state).await;
+    assert_eq!(outbox.len(), 2);
+    assert!(outbox.iter().all(|row| row.outbox_id != forged));
+    assert!(outbox.iter().all(|row| row.audit_id != forged));
+    assert_ne!(outbox[0].outbox_id, outbox[1].outbox_id);
+    assert_ne!(outbox[0].audit_id, outbox[1].audit_id);
+
+    dispatch_audit_outbox(&state).await;
+    let rows = rows_for_path(&state, "/v1/users/create").await;
+    assert_eq!(rows.len(), 2, "two requests, two rows");
+    assert_ne!(rows[0].audit_id, rows[1].audit_id);
+    assert_eq!(
+        scalar_count(
+            &state,
+            "SELECT COUNT(*) FROM audit_outbox WHERE status = 'dispatched'"
+        )
+        .await,
+        2
+    );
 }
 
 #[tokio::test]
@@ -350,6 +775,10 @@ async fn failed_mutation_is_recorded_as_failed() {
     assert_eq!(rows[0].outcome, "failed");
     assert_eq!(rows[0].status_code, 400);
     assert_eq!(rows[0].actor_username, "admin");
+    assert!(
+        outbox_rows(&state).await.is_empty(),
+        "a pre-transaction validation failure never enqueues"
+    );
 }
 
 #[tokio::test]
@@ -589,6 +1018,27 @@ async fn credentials_are_never_persisted_in_the_audit_trail() {
     let response = send(&state, request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    // The adopted path's redaction contract applies to the outbox payload
+    // too — the dispatcher replays it verbatim.
+    let outbox = outbox_rows(&state).await;
+    assert_eq!(outbox.len(), 1);
+    let outbox_dump = format!("{:?}", outbox[0]);
+    for secret in [
+        password,
+        admin.as_str(),
+        cookie_token,
+        s3_secret,
+        "Authorization",
+        "Cookie",
+        "chv_session",
+    ] {
+        assert!(
+            !outbox_dump.contains(secret),
+            "outbox payload contains forbidden credential material {secret:?}: {outbox_dump}"
+        );
+    }
+
+    dispatch_audit_outbox(&state).await;
     let rows = all_rows(&state).await;
     assert_eq!(rows.len(), 1);
     let dump = format!("{:?}", rows[0]);
@@ -749,6 +1199,8 @@ async fn client_supplied_identifiers_are_capped() {
     let response = send(&state, request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    // `/v1/users/create` is adopted, so its row arrives via the outbox.
+    dispatch_audit_outbox(&state).await;
     let rows = rows_for_path(&state, "/v1/users/create").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -814,6 +1266,11 @@ async fn audit_write_failure_fails_closed_with_correlation_handle() {
     // but the response must not claim success without its durable
     // record. The 500 replacement carries the correlation id so the
     // operator can find what the mutation actually did (review M3).
+    //
+    // `/v1/auth/logout` is used because it is an *unadopted* mutation:
+    // the direct insert is still the only emitter for it, so the
+    // fail-closed 500 path is reachable. Adopted routes instead queue
+    // their row in the outbox (covered by the adoption tests above).
     sqlx::query("DROP TABLE audit_log")
         .execute(&state.pool)
         .await
@@ -821,15 +1278,7 @@ async fn audit_write_failure_fails_closed_with_correlation_handle() {
 
     let response = send(
         &state,
-        post_json(
-            "/v1/users/create",
-            Some(&admin),
-            serde_json::json!({
-                "username": "unrecorded-user",
-                "password": "Sup3rSecretPassw0rd!",
-                "role": "viewer"
-            }),
-        ),
+        post_json("/v1/auth/logout", Some(&admin), serde_json::json!({})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

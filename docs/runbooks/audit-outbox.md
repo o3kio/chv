@@ -15,12 +15,22 @@ attempt ceiling**: the dispatcher retries forever. This runbook covers
 detection, triage, and safe restart. It promises no manual data-loss
 recovery path we cannot honour.
 
-> **Rollout status (#706 half 1).** The table, dispatcher, and metrics
-> shipped before any request path adopted them. On a build without PR 2
-> or PR 3, the outbox is empty by design and `chv_audit_outbox_pending`
-> should be 0. A non-zero value on such a build means a path was adopted
-> unexpectedly or something wrote the table out of band — investigate
-> before assuming adoption.
+> **Rollout status (#706 half 1).** The outbox is live for the adopted
+> BFF routes listed below (PR 2). On those routes a pending row means
+> the mutation **committed** (the response was 2xx) and its evidence row
+> is waiting for the dispatcher. The gRPC surface and every unadopted
+> BFF route still use the direct post-hoc insert; their rows never appear
+> in this table, and their narrow crash window remains open (tracked
+> under #706).
+>
+> Adopted routes: `POST /v1/users/create`, `/v1/users/update`,
+> `/v1/users/delete`, `/v1/tokens/create`, `/v1/tokens/revoke`,
+> `/v1/networks/create`, `/v1/networks/update`, `/v1/networks/delete`,
+> and the final transaction of `POST /v1/vms/import`.
+>
+> A non-zero `chv_audit_outbox_pending` on a build without this adoption
+> (or with no adopted traffic) means something wrote the table out of
+> band — investigate before assuming adoption.
 
 ## What exists where
 
@@ -32,9 +42,14 @@ recovery path we cannot honour.
 | Configuration | `/etc/chv/controlplane.toml`, `[audit]` (`outbox_dispatch_interval_secs`, `outbox_retention_days`) |
 | Admin read surface | `POST /v1/audit-log`, `POST /v1/audit-log/export` — reads `audit_log` only; pending outbox rows are never exposed |
 
-A pending outbox row is **not** evidence that the mutation failed. It
-means the mutation committed and its evidence row has not been written
-to `audit_log` yet.
+A pending outbox row is **not** evidence that the mutation failed. On an
+adopted route it means the mutation committed — the caller already got
+its 2xx — and the evidence row has not been written to `audit_log` yet.
+Evidence is delayed, not lost. A non-2xx final response on an adopted
+route is patched into the pending row (`outcome`/`status_code`) before
+dispatch; if the dispatcher wins that race the row keeps its commit-time
+`success` prediction and the control plane logs the mismatch with the
+`outbox_id`.
 
 ## 1. Signals
 
@@ -177,19 +192,30 @@ steady state. Changing either value requires a restart.
 Retention prunes up to 5,000 **dispatched** rows per pass. Pending rows
 are never pruned, regardless of age.
 
-## 5. Change-risk notes (PR 1 plumbing)
+## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF adoption)
 
-- **Audit loss / double-write:** adoption (PR 2/3) is what changes
-  request behavior. This PR only creates the table and drains it; it
-  cannot add, remove, or duplicate a current `audit_log` row.
+- **Audit loss / double-write:** the check-or-insert composition is what
+  keeps this safe on adopted routes: a present outbox row suppresses the
+  direct insert, an absent one takes the direct path, and a failed check
+  after a committed enqueue skips the direct insert rather than risk a
+  duplicate. The BFF integration suite covers adopted success, rollback,
+  crash-before-middleware, injected post-commit 500, unadopted routes,
+  and the oversized-actor fail-closed case.
+- **Lock scope (PR 2):** `users`/`tokens` mutations that were autocommit
+  single statements are now wrapped in `begin()` so the mutation and the
+  outbox INSERT commit together. The write lock is held for one extra
+  INSERT; no new lock ordering is introduced. `networks` and
+  `vms/import` already held a transaction, so only the INSERT is new.
+- **Oversized actor (PR 2, NIT 5):** adopted sites fail closed. A payload
+  over the store's 16 KiB bound is not truncated; enqueue fails, the
+  mutation transaction rolls back (the caller sees a 500 and no state
+  change), and the middleware records the failed attempt once on the
+  direct path. Only a pathologically long `actor_username` can reach the
+  bound.
 - **Migration:** `0071_audit_outbox.sql` is additive (one table, two
   indexes). No backfill, no change to `audit_log`. It runs through the
   normal startup migrator; disk-full remains the only new startup
   failure class, identical to every other migration.
-- **Lock scope:** enqueue (once adopted) is one INSERT inside a
-  transaction the mutation already holds — no new lock ordering. The
-  dispatcher's `complete` transaction is one INSERT plus one indexed
-  UPDATE, and busy errors back off.
 - **Throughput:** at most 128 rows/pass at 1 pass/s, far below SQLite
   write throughput. Dispatched rows are pruned after 7 days; outbox size
   is bounded by mutation volume × dispatch lag.
