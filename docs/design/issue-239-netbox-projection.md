@@ -6,19 +6,23 @@ control-plane authority). See the issue's "Design direction",
 "Required behavior", "Acceptance criteria", and "Non-goals" — all reproduced and
 resolved to decision points (DPs) below.
 
-**Status:** **PROPOSED** — analysis of the current implementation (§1), gap
-analysis (§2), and a design with decision points (§4–§12). Not yet adopted; no
-code landed. The full documentation set for #239 (design → ADR → spec →
-contracts → plan) is:
+**Status:** **IMPLEMENTED** (2026-11-19) — the design below was adopted and the
+8-PR stack merged. Shipped evidence: `crates/chv-netbox-adapter/` (mapping,
+plan, runner, client, ownership), migration `0059_netbox_projection.sql`, the
+post-apply worker (`crates/chv-controlplane-service/src/netbox_projection_worker.rs`),
+the BFF `/v1/architectures/netbox/*` routes, the UI `NetboxPanel`, and the
+end-to-end evidence in `docs/evidence/netbox-projection-e2e.md`. Issue #239 is
+closed; this document remains the design of record. The full documentation set
+for #239 (design → ADR → spec → contracts → plan) is:
 
 | Document | Path | Status |
 |---|---|---|
-| Design (this file) | `docs/design/issue-239-netbox-projection.md` | Proposed |
-| ADR | [`docs/specs/adr/023-netbox-projection.md`](../specs/adr/023-netbox-projection.md) | Proposed |
-| Component spec | [`docs/specs/component/architecture-designer-netbox-projection.md`](../specs/component/architecture-designer-netbox-projection.md) | Proposed |
-| Mapping contract | [`docs/specs/architecture-designer/contracts/netbox-mapping-contract.md`](../specs/architecture-designer/contracts/netbox-mapping-contract.md) | Proposed |
-| API contract | [`docs/specs/architecture-designer/contracts/netbox-api-contract.md`](../specs/architecture-designer/contracts/netbox-api-contract.md) | Proposed |
-| Implementation plan | [`docs/plans/2026-10-08-netbox-projection-implementation-plan.md`](../plans/2026-10-08-netbox-projection-implementation-plan.md) | Proposed |
+| Design (this file) | `docs/design/issue-239-netbox-projection.md` | Implemented |
+| ADR | [`docs/specs/adr/023-netbox-projection.md`](../specs/adr/023-netbox-projection.md) | Accepted |
+| Component spec | [`docs/specs/component/architecture-designer-netbox-projection.md`](../specs/component/architecture-designer-netbox-projection.md) | Implemented |
+| Mapping contract | [`docs/specs/architecture-designer/contracts/netbox-mapping-contract.md`](../specs/architecture-designer/contracts/netbox-mapping-contract.md) | Implemented |
+| API contract | [`docs/specs/architecture-designer/contracts/netbox-api-contract.md`](../specs/architecture-designer/contracts/netbox-api-contract.md) | Implemented |
+| Implementation plan | [`docs/plans/2026-10-08-netbox-projection-implementation-plan.md`](../plans/2026-10-08-netbox-projection-implementation-plan.md) | Executed |
 
 The DP recommendations below are the design of record for those documents;
 the plan's PR sequence is the execution path.
