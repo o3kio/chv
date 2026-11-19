@@ -53,10 +53,11 @@ unused-ignored-advisory = "deny"
 # rsa entry since sqlx-mysql 0.9 dropped its `rsa` dependency (2026-11-19).
 #
 # Removed 2026-09-29 (prompt 03 reconciliation, issue #230):
-#   RUSTSEC-2023-0071 (rsa) — `rsa` is unreachable in the build graph
-#     (sqlx-mysql never compiled; sqlite-only features), so cargo-deny does
-#     not encounter it. The entry REMAINS in .cargo/audit.toml because
-#     cargo-audit is lockfile-wide — see above.
+#   RUSTSEC-2023-0071 (rsa) — `rsa` was unreachable in the build graph
+#     (sqlx-mysql never compiled; sqlite-only features), so cargo-deny did
+#     not encounter it. The entry remained in .cargo/audit.toml while
+#     cargo-audit (lockfile-wide) still saw the crate; both files dropped it
+#     on 2026-11-19 when sqlx-mysql 0.9 made `rsa` optional.
 #   RUSTSEC-2026-0173 (proc-macro-error2) — the crate left the dependency
 #     graph entirely (tabled 0.22 dropped it); issue #146 closed.
 #   RUSTSEC-2026-0204 (crossbeam-epoch) — crossbeam-epoch 0.9.21 is outside
