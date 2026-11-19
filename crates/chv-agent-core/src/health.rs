@@ -19,8 +19,10 @@ pub fn check_host_resources() -> ResourcePressure {
     use sysinfo::{Disks, System};
 
     // sysinfo 0.40 made these constructors fallible. Resource pressure is a
-    // health signal, not a data path: a transient `/proc` error must degrade
-    // to "no pressure" (with a log line), never panic the agent.
+    // health signal, not a data path: keep the agent infallible by degrading
+    // to "no pressure" (with a log line). On Linux the constructors currently
+    // cannot fail (`SystemInner`/`DisksInner::new()` return `Ok`); refresh
+    // failures still surface as zero/stale values, as they did on 0.39.
     let mut memory_total = 0;
     let mut memory_used = 0;
     match System::new() {

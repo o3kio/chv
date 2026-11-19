@@ -121,6 +121,7 @@ impl NodeOsSource for NodeOsSampleSource {
         let mut samples = Vec::with_capacity(16);
 
         let NodeOsSnapshot {
+            sysinfo_available,
             observed_at_ms,
             cpu_capacity_ratio,
             cpu_observed_at_ms,
@@ -162,24 +163,31 @@ impl NodeOsSource for NodeOsSampleSource {
             )?);
         }
 
-        samples.push(node_sample(
-            &self.node_id,
-            "node.memory.total_bytes",
-            observed_at_ms,
-            Some(SampleValue::Integer(memory_total_bytes)),
-        )?);
-        samples.push(node_sample(
-            &self.node_id,
-            "node.memory.available_bytes",
-            observed_at_ms,
-            Some(SampleValue::Integer(memory_available_bytes)),
-        )?);
-        samples.push(node_sample(
-            &self.node_id,
-            "node.swap.used_bytes",
-            observed_at_ms,
-            Some(SampleValue::Integer(swap_used_bytes)),
-        )?);
+        // Memory/swap are sysinfo-backed. If sysinfo is unavailable the
+        // struct carries placeholders; emit them as unavailable rather than
+        // as real zero observations (available=0 is alert-shaped).
+        for (metric, value) in [
+            ("node.memory.total_bytes", memory_total_bytes),
+            ("node.memory.available_bytes", memory_available_bytes),
+            ("node.swap.used_bytes", swap_used_bytes),
+        ] {
+            let err =
+                |e: chv_monitoring_core::model::SampleError| SamplerError::Source(e.to_string());
+            let mut b = SampleBuilder::new(
+                TargetKind::Node,
+                &self.node_id,
+                metric,
+                Source::NodeOs,
+                observed_at_ms,
+            )
+            .map_err(err)?;
+            if sysinfo_available {
+                b = b.value(SampleValue::Integer(value));
+            } else {
+                b = b.quality(SampleQuality::Unavailable);
+            }
+            samples.push(b.build().map_err(err)?);
+        }
 
         for (metric, value) in [
             ("node.fs.total_bytes", root_fs_total_bytes),
