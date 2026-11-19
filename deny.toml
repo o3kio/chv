@@ -199,6 +199,6 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 #
 # o3kio/fabric: the shared Kubedo stretched-L2 fabric provider
 # (fabric-plan / fabric-linux / fabric-conformance) consumed by chv-nwd per
-# ADR-021. Pinned to immutable release tags (v0.1.0); governed upstream by
-# contracts/fabric-provider-v1.md.
+# ADR-021. Pinned to immutable release tags (v0.2.0); governed upstream by
+# contracts/fabric-provider-v2.md.
 allow-git = ["https://github.com/o3kio/fabric"]
