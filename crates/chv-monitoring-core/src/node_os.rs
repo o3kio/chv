@@ -63,7 +63,12 @@ pub struct NodeOsSnapshot {
 /// is the CPU-interval fix. Not `Clone`: cloning would fork the retained
 /// CPU baseline and reintroduce the fresh-system defect.
 pub struct NodeOsCollector {
-    sys: System,
+    /// `None` while sysinfo initialisation keeps failing. sysinfo 0.40 made
+    /// `System::new()` fallible, and this collector must stay infallible so
+    /// a transient `/proc` error cannot take the agent metrics listener
+    /// down. A snapshot taken while degraded reports zeroed memory/disk
+    /// values and no CPU ratio, and every snapshot retries initialisation.
+    sys: Option<System>,
     last_cpu_refresh: Option<Instant>,
     last_cpu_ratio: Option<f64>,
     last_cpu_observed_ms: u64,
@@ -74,7 +79,9 @@ impl NodeOsCollector {
     /// reports `cpu_capacity_ratio: None`.
     pub fn new() -> Self {
         NodeOsCollector {
-            sys: System::new(),
+            sys: System::new().map_err(|err| {
+                tracing::warn!(error = %err, "sysinfo System initialisation failed; metrics degraded")
+            }).ok(),
             last_cpu_refresh: None,
             last_cpu_ratio: None,
             last_cpu_observed_ms: 0,
@@ -87,43 +94,64 @@ impl NodeOsCollector {
     pub fn snapshot(&mut self) -> NodeOsSnapshot {
         let now_ms = unix_now_ms();
 
-        // CPU: refresh only when sysinfo's minimum interval has elapsed
-        // since the last refresh — refreshing inside the interval would
-        // reset the baseline and make the next "interval" shorter than
-        // claimed. When not eligible, retain the last valid reading
-        // (with its own timestamp).
-        let eligible = self
-            .last_cpu_refresh
-            .map(|t| t.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
-            .unwrap_or(true);
-        if eligible {
-            self.sys.refresh_cpu_usage();
-            // A fresh System's first refresh is the since-boot average;
-            // only a refresh on a System that already saw a previous
-            // refresh measures the elapsed interval.
-            let measured_interval = self.last_cpu_refresh.is_some();
-            let usage = self.sys.global_cpu_usage();
-            if measured_interval && usage.is_finite() && usage >= 0.0 {
-                self.last_cpu_ratio = Some((usage as f64 / 100.0).clamp(0.0, 1.0));
-                self.last_cpu_observed_ms = now_ms;
-            }
-            self.last_cpu_refresh = Some(Instant::now());
+        // Retry while degraded: an init failure is treated as transient and
+        // must not disable host metrics for the agent's whole lifetime.
+        if self.sys.is_none() {
+            self.sys = System::new()
+                .map_err(
+                    |err| tracing::debug!(error = %err, "sysinfo System re-initialisation failed"),
+                )
+                .ok();
         }
 
-        self.sys.refresh_memory();
-        let memory_total_bytes = self.sys.total_memory();
-        let memory_available_bytes = self.sys.available_memory();
-        let swap_used_bytes = self.sys.used_swap();
+        let mut memory_total_bytes = 0;
+        let mut memory_available_bytes = 0;
+        let mut swap_used_bytes = 0;
+        if let Some(sys) = self.sys.as_mut() {
+            // CPU: refresh only when sysinfo's minimum interval has elapsed
+            // since the last refresh — refreshing inside the interval would
+            // reset the baseline and make the next "interval" shorter than
+            // claimed. When not eligible, retain the last valid reading
+            // (with its own timestamp).
+            let eligible = self
+                .last_cpu_refresh
+                .map(|t| t.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
+                .unwrap_or(true);
+            if eligible {
+                sys.refresh_cpu_usage();
+                // A fresh System's first refresh is the since-boot average;
+                // only a refresh on a System that already saw a previous
+                // refresh measures the elapsed interval.
+                let measured_interval = self.last_cpu_refresh.is_some();
+                let usage = sys.global_cpu_usage();
+                if measured_interval && usage.is_finite() && usage >= 0.0 {
+                    self.last_cpu_ratio = Some((usage as f64 / 100.0).clamp(0.0, 1.0));
+                    self.last_cpu_observed_ms = now_ms;
+                }
+                self.last_cpu_refresh = Some(Instant::now());
+            }
+
+            sys.refresh_memory();
+            memory_total_bytes = sys.total_memory();
+            memory_available_bytes = sys.available_memory();
+            swap_used_bytes = sys.used_swap();
+        }
 
         // Disks carry no interval semantics; a refreshed list per cycle is
         // the documented per-scrape precedent. The root mount is the
         // filesystem the pressure checks and dashboards reason about.
-        let disks = Disks::new_with_refreshed_list();
-        let (root_fs_total_bytes, root_fs_available_bytes) = disks
-            .iter()
-            .find(|d| d.mount_point() == Path::new("/"))
-            .map(|d| (Some(d.total_space()), Some(d.available_space())))
-            .unwrap_or((None, None));
+        let (root_fs_total_bytes, root_fs_available_bytes) = match Disks::new_with_refreshed_list()
+        {
+            Ok(disks) => disks
+                .iter()
+                .find(|d| d.mount_point() == Path::new("/"))
+                .map(|d| (Some(d.total_space()), Some(d.available_space())))
+                .unwrap_or((None, None)),
+            Err(err) => {
+                tracing::debug!(error = %err, "sysinfo disk listing failed");
+                (None, None)
+            }
+        };
 
         let (load1, load5, load15) = read_loadavg();
 
