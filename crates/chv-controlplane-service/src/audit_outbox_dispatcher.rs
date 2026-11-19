@@ -158,27 +158,6 @@ impl AuditOutboxDispatcher {
     /// One bounded pass with an injectable clock (tests never sleep).
     /// Returns the number of rows converted into `audit_log` rows.
     pub async fn dispatch_pass(&self, now_ms: i64) -> Result<usize, StoreError> {
-        // Cleanup first: a large prune must not delay due evidence.
-        let cutoff = now_ms.saturating_sub(self.retention_ms);
-        match self
-            .outbox
-            .prune_dispatched_before(cutoff, PRUNE_BATCH_ROWS)
-            .await
-        {
-            Ok(pruned) if pruned > 0 => tracing::info!(
-                target: "audit",
-                pruned,
-                retention_ms = self.retention_ms,
-                "audit outbox pruned old dispatched rows"
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                target: "audit",
-                error = %error,
-                "audit outbox prune failed; previous rows remain"
-            ),
-        }
-
         let claimed = match self
             .outbox
             .claim_due(now_ms, CLAIM_LEASE_MS, DISPATCH_BATCH_ROWS)
@@ -187,6 +166,10 @@ impl AuditOutboxDispatcher {
             Ok(rows) => rows,
             Err(error) => {
                 metrics::counter!("chv_audit_outbox_dispatch_failures_total").increment(1);
+                // A failed claim is exactly when pending/oldest-age
+                // gauges matter most; refresh them best-effort so they
+                // do not go stale until a pass succeeds.
+                self.record_pending_stats(now_ms).await;
                 return Err(error);
             }
         };
@@ -238,6 +221,37 @@ impl AuditOutboxDispatcher {
             }
         }
 
+        // Prune only after dispatch: cleanup must never delay due
+        // evidence. It stays bounded (PRUNE_BATCH_ROWS) so a large
+        // backlog cannot hold the write lock for a whole pass.
+        let cutoff = now_ms.saturating_sub(self.retention_ms);
+        match self
+            .outbox
+            .prune_dispatched_before(cutoff, PRUNE_BATCH_ROWS)
+            .await
+        {
+            Ok(pruned) if pruned > 0 => tracing::info!(
+                target: "audit",
+                pruned,
+                retention_ms = self.retention_ms,
+                "audit outbox pruned old dispatched rows"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "audit",
+                error = %error,
+                "audit outbox prune failed; previous rows remain"
+            ),
+        }
+
+        self.record_pending_stats(now_ms).await;
+
+        Ok(dispatched)
+    }
+
+    /// Best-effort stuck-outbox gauges. Errors are logged and never
+    /// fail the pass; the next pass retries.
+    async fn record_pending_stats(&self, now_ms: i64) {
         match self.outbox.pending_stats(now_ms).await {
             Ok((pending, oldest_age_ms)) => {
                 metrics::gauge!("chv_audit_outbox_pending").set(pending as f64);
@@ -257,8 +271,6 @@ impl AuditOutboxDispatcher {
                 "audit outbox pending stats failed; gauges are stale"
             ),
         }
-
-        Ok(dispatched)
     }
 
     fn retry_at(&self, row: &AuditOutboxRow, now_ms: i64) -> i64 {

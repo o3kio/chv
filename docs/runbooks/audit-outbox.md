@@ -58,8 +58,11 @@ journalctl -u chv-controlplane | grep -E 'audit outbox|SQLITE_BUSY'
 
 A pass that dispatches rows logs `audit outbox dispatch pass completed`;
 per-row failures log the `outbox_id`, `attempts`, `next_attempt_ms`, and
-`last_error`. A health check that needs a line per pass can run with
-`RUST_LOG=chv_controlplane_service=debug` (debug-level pending summary).
+`last_error`. There is no per-pass log line otherwise. A healthy or empty
+outbox emits no outbox log lines at any level **except** routine prune
+notices when retention-aged dispatched rows are removed (and the
+debug-level pending summary, which requires `pending > 0`), so silence —
+or only occasional prune notices — is normal.
 
 ## 2. Triage
 
@@ -88,7 +91,8 @@ systemctl status chv-controlplane
 journalctl -u chv-controlplane --since '15 min ago' | grep 'audit outbox'
 ```
 
-No outbox lines at all is normal when nothing is pending. A repeating
+No dispatch or error lines is normal when nothing is pending; the only
+routine line is the occasional prune notice. A repeating
 `SQLITE_BUSY` warning means another writer is holding the database; the
 worker backs off 250 ms → 5 s per pass and keeps retrying.
 

@@ -190,6 +190,16 @@ impl AuditOutboxRepository {
     /// mid-batch lets the rows return on lease expiry — no reaper.
     /// Fairness order is `(created_at_ms, outbox_id)`; read order is
     /// unaffected because `occurred_at_ms` is stamped at enqueue.
+    ///
+    /// Deliberate index tradeoff: fairness sorts by
+    /// `(created_at_ms, outbox_id)`, which is not the
+    /// `(status, next_attempt_at_ms)` index order. The due-set scan is
+    /// still index-bounded by `status = 'pending' AND
+    /// next_attempt_at_ms <= now`, and at expected volumes (mutation
+    /// rate far below the 128-row dispatch batch) the due set is small,
+    /// so the extra sort is cheap. Under a large backlog the claim may
+    /// sort a bigger due set than strictly necessary; fairness and
+    /// bounded batching take priority over that degenerate case.
     pub async fn claim_due(
         &self,
         now_ms: i64,
@@ -298,6 +308,7 @@ impl AuditOutboxRepository {
         outbox_id: &str,
         outcome: &str,
         status_code: i64,
+        now_ms: i64,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(String,)> = sqlx::query_as(
@@ -325,7 +336,7 @@ impl AuditOutboxRepository {
         )
         .bind(outbox_id)
         .bind(updated_payload)
-        .bind(chv_common::now_unix_ms())
+        .bind(now_ms)
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() == 0 {
@@ -622,7 +633,7 @@ mod tests {
             .expect("enqueue");
 
         assert!(repo
-            .finalize_pending("ob-fin", AUDIT_OUTCOME_DENIED, 403)
+            .finalize_pending("ob-fin", AUDIT_OUTCOME_DENIED, 403, 1_500)
             .await
             .expect("finalize"));
         let row = repo.get("ob-fin").await.expect("get").expect("row");
@@ -635,7 +646,7 @@ mod tests {
         assert!(repo.complete("ob-fin", 2_000).await.expect("complete"));
         assert!(
             !repo
-                .finalize_pending("ob-fin", AUDIT_OUTCOME_SUCCESS, 200)
+                .finalize_pending("ob-fin", AUDIT_OUTCOME_SUCCESS, 200, 3_000)
                 .await
                 .expect("finalize dispatched"),
             "a dispatched row is never rewritten"

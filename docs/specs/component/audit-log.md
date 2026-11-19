@@ -291,6 +291,15 @@ The contract the plumbing provides, and what adoption changes:
   half-applied mutation with no outbox row. Folding enrollment into one
   transaction is follow-up work.
 
+**Adoption constraint — payload cap.** Enqueue rejects a serialized
+`AuditLogInsert` larger than 16 KiB, while the current direct-insert
+path has no explicit bound on actor fields. Before adopting a site,
+PR 2/3 must either validate/cap the actor fields so the row fits, or
+explicitly disclose that an oversized row fails **enqueue** — which,
+for an adopted path, rolls back the mutation transaction itself
+(fail-closed: no mutation without its evidence). Silent truncation is
+not permitted.
+
 Dispatched outbox rows are kept for 7 days (`[audit]
 outbox_retention_days`, validated 1..=365) and pruned in bounded
 batches; pending rows are never pruned. This cleanup is plumbing, not
