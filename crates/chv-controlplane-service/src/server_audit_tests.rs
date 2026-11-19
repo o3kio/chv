@@ -4,7 +4,8 @@
 
 use crate::audit_outbox_dispatcher::AuditOutboxDispatcher;
 use crate::enrollment::{
-    CertificateIssuer, EnrollmentService, EnrollmentServiceImplementation, IssuedCertificate,
+    AdoptedAudit, CertificateIssuer, EnrollmentService, EnrollmentServiceImplementation,
+    IssuedCertificate,
 };
 use crate::error::ControlPlaneServiceError;
 use crate::lifecycle::LifecycleService;
@@ -119,7 +120,7 @@ impl EnrollmentService for MockEnrollment {
         &self,
         request: proto::EnrollmentRequest,
         _peer_addr: Option<std::net::SocketAddr>,
-        _audit: Option<&chv_controlplane_store::AuditOutboxInsert>,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError> {
         if self.fail_enroll {
             return Err(ControlPlaneServiceError::Unauthorized(
@@ -146,7 +147,7 @@ impl EnrollmentService for MockEnrollment {
         request: proto::RotateNodeCertificateRequest,
         _presented_serial: Option<String>,
         _allow_insecure: bool,
-        _audit: Option<&chv_controlplane_store::AuditOutboxInsert>,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError> {
         Ok(proto::RotateNodeCertificateResponse {
             result: Some(proto::ResultMeta {
@@ -165,9 +166,58 @@ impl EnrollmentService for MockEnrollment {
     async fn report_bootstrap_result(
         &self,
         _request: proto::ReportBootstrapResultRequest,
-        _audit: Option<&chv_controlplane_store::AuditOutboxInsert>,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         Ok(ok_ack())
+    }
+}
+
+/// A service that commits its audit evidence and then fails anyway — the
+/// forward-compatible shape the check-or-insert fallback must survive.
+/// It drives the adapter's patch path: the row exists and the response is
+/// a failure, so `finalize_pending` must rewrite outcome/status instead of
+/// writing a second row.
+struct EnqueueThenFail {
+    pool: StorePool,
+}
+
+#[tonic::async_trait]
+impl EnrollmentService for EnqueueThenFail {
+    async fn enroll_node(
+        &self,
+        _request: proto::EnrollmentRequest,
+        _peer_addr: Option<std::net::SocketAddr>,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError> {
+        unreachable!("only report_bootstrap_result is exercised")
+    }
+
+    async fn rotate_node_certificate(
+        &self,
+        _request: proto::RotateNodeCertificateRequest,
+        _presented_serial: Option<String>,
+        _allow_insecure: bool,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError> {
+        unreachable!("only report_bootstrap_result is exercised")
+    }
+
+    async fn report_bootstrap_result(
+        &self,
+        _request: proto::ReportBootstrapResultRequest,
+        audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        let audit = audit.expect("the adapter passes the coupling");
+        let mut tx = self.pool.begin().await.expect("begin adopted tx");
+        chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
+            .await
+            .expect("enqueue evidence");
+        tx.commit().await.expect("commit evidence");
+        audit.mark_committed();
+        // Deliberately breaks "enqueue is the last fallible operation".
+        Err(ControlPlaneServiceError::Internal(
+            "post-commit failure".into(),
+        ))
     }
 }
 
@@ -1122,6 +1172,8 @@ async fn server_audit_adopted_crash_replay_writes_exactly_one_row() {
         },
         created_at_ms: now,
     };
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let coupling = AdoptedAudit::new(&insert, &committed);
     service
         .report_bootstrap_result(
             proto::ReportBootstrapResultRequest {
@@ -1130,23 +1182,29 @@ async fn server_audit_adopted_crash_replay_writes_exactly_one_row() {
                 bootstrap_status: "ok".into(),
                 message: String::new(),
             },
-            Some(&insert),
+            Some(&coupling),
         )
         .await
         .expect("mutation commits with its outbox row");
+    assert!(
+        coupling.was_committed(),
+        "the service marks the enqueue committed"
+    );
 
     assert!(audit_rows(&db.pool).await.is_empty(), "no post-hoc row yet");
-    assert_eq!(outbox_rows(&db.pool).await.len(), 1);
+    let pending = outbox_rows(&db.pool).await;
+    assert_eq!(pending.len(), 1);
 
     // The startup dispatcher pass replays the durable row exactly once.
-    let rows = dispatch_one(&db, now).await;
+    // Dispatch at the row's actual (enqueue-stamped) due time.
+    let rows = dispatch_one(&db, pending[0].created_at_ms).await;
     assert_eq!(rows[0].audit_id, "audit-crash-replay");
     assert_eq!(rows[0].action, "ReportBootstrapResult");
     assert_eq!(rows[0].operation_id.as_deref(), Some("op-crash"));
 
     // A second pass is a no-op: still exactly one evidence row.
     let again = dispatcher(&db.pool)
-        .dispatch_pass(now + 60_000)
+        .dispatch_pass(pending[0].created_at_ms + 60_000)
         .await
         .expect("second pass");
     assert_eq!(again, 0);
@@ -1178,4 +1236,53 @@ async fn server_audit_unadopted_lifecycle_rpc_writes_one_direct_row_and_no_outbo
     assert_eq!(rows[0].action, "StartVm");
     assert_eq!(rows[0].outcome, "success");
     assert_eq!(rows[0].status_code, 200);
+}
+
+#[tokio::test]
+async fn server_audit_post_commit_failure_patches_the_committed_row_exactly_once() {
+    let db = TestDb::new().await;
+    // The service enqueues + commits, then fails. This is not reachable
+    // through the current implementations (enqueue is their last fallible
+    // step); the test pins the composition's defensive contract.
+    let server = EnrollmentServer::new(Arc::new(EnqueueThenFail {
+        pool: db.pool.clone(),
+    }))
+    .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let request = peer_request(
+        proto::ReportBootstrapResultRequest {
+            meta: Some(meta("op-post-commit-failure")),
+            node_id: "node-a".into(),
+            bootstrap_status: "ok".into(),
+            message: String::new(),
+        },
+        "node-a",
+    );
+    let status = server
+        .report_bootstrap_result(request)
+        .await
+        .expect_err("the service failure must be preserved");
+    assert_eq!(status.code(), Code::Internal);
+
+    // The committed row is the only evidence: no direct row was added.
+    assert!(
+        audit_rows(&db.pool).await.is_empty(),
+        "a present outbox row must suppress the direct insert"
+    );
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one outbox row");
+    assert_eq!(rows[0].status, AUDIT_OUTBOX_PENDING);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(
+        payload.outcome, "failed",
+        "the commit-time success prediction is patched"
+    );
+    assert_eq!(payload.status_code, 500);
+    assert_eq!(payload.action, "ReportBootstrapResult");
+
+    // Dispatch replays the patched row once; no second row appears.
+    let dispatched = dispatch_one(&db, rows[0].created_at_ms).await;
+    assert_eq!(dispatched[0].audit_id, rows[0].audit_id);
+    assert_eq!(dispatched[0].outcome, "failed");
+    assert_eq!(dispatched[0].status_code, 500);
 }

@@ -1,6 +1,6 @@
 //! VTEP registry and VNI allocation for overlay networking.
 
-use crate::audit_outbox::{enqueue_on_tx, AuditOutboxInsert};
+use crate::audit_outbox::{enqueue_adopted_row, AuditOutboxInsert};
 use crate::{StoreError, StorePool};
 
 /// Repository for VTEP (Virtual Tunnel Endpoint) registry operations.
@@ -317,7 +317,7 @@ impl VtepRepository {
         // (including a lost fabric-IP race) rolls the enqueue back with the
         // mutation and the retry enqueues again.
         if let Some(audit) = audit {
-            enqueue_on_tx(&mut tx, audit).await?;
+            enqueue_adopted_row(&mut tx, audit).await?;
         }
 
         tx.commit().await?;

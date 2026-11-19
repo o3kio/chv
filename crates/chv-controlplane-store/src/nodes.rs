@@ -1,4 +1,4 @@
-use crate::audit_outbox::{enqueue_on_tx, AuditOutboxInsert};
+use crate::audit_outbox::{enqueue_adopted_row, AuditOutboxInsert};
 use crate::{StoreError, StorePool};
 use chv_controlplane_types::domain::{Generation, NodeId, NodeState};
 
@@ -526,7 +526,7 @@ impl NodeRepository {
             Some(audit) => {
                 let mut tx = self.pool.begin().await?;
                 Self::append_version_on(&mut tx, input).await?;
-                enqueue_on_tx(&mut tx, audit).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
                 tx.commit().await?;
                 Ok(())
             }
@@ -659,7 +659,7 @@ impl NodeRepository {
                     tx.rollback().await?;
                     return Ok(false);
                 }
-                enqueue_on_tx(&mut tx, audit).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
                 tx.commit().await?;
                 Ok(true)
             }
@@ -701,7 +701,7 @@ impl NodeRepository {
             Some(audit) => {
                 let mut tx = self.pool.begin().await?;
                 Self::update_certificate_serial_on(&mut tx, node_id, serial).await?;
-                enqueue_on_tx(&mut tx, audit).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
                 tx.commit().await?;
                 Ok(())
             }
@@ -747,7 +747,7 @@ impl NodeRepository {
             Some(audit) => {
                 let mut tx = self.pool.begin().await?;
                 Self::upsert_bootstrap_result_on(&mut tx, input).await?;
-                enqueue_on_tx(&mut tx, audit).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
                 tx.commit().await?;
                 Ok(())
             }

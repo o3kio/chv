@@ -231,12 +231,16 @@ are never pruned, regardless of age.
   per-request `outbox_id`/`audit_id` (UUIDv4, never from the wire) and
   applies the same check-or-insert in `finish_audited`. A committed
   outbox row suppresses the direct insert; a missing row takes the
-  direct path (denied, rolled back, or unadopted); a failed check after
-  a successful call skips the insert to avoid a duplicate, because the
-  adopted service commits its enqueue with the final mutation
-  transaction. The adoption tests cover one dispatched row per adopted
-  RPC, the failed/denied direct row with no outbox row, crash replay,
-  an unadopted lifecycle RPC, and the oversized-payload rollback.
+  direct path (denied, rolled back, or unadopted); a failed check
+  consults the request's committed flag, set by the service once its
+  final transaction committed the enqueue, and skips the insert rather
+  than risk a duplicate. The adoption tests cover one dispatched row per
+  adopted RPC, a service that enqueues and then fails (exactly one row,
+  `finalize_pending` rewrites its outcome/status — removing the patch
+  fails the test), the failed/denied direct row with no outbox row,
+  crash replay, an unadopted lifecycle RPC, and the oversized-payload
+  rollback. Rows are stamped at enqueue (not request start), so a
+  pending row's timestamp is the commit attempt.
 - **`EnrollNode` multi-commit risk (PR 3a):** the outbox row rides the
   final fail-closed write only. Token consumption is a separate, earlier
   commit; a crash between it and the final write leaves a
@@ -273,9 +277,12 @@ are never pruned, regardless of age.
   commits with the middleware never running (the crash made static) is
   replayed exactly once by the dispatcher, and a commit failure after a
   successful enqueue leaves neither the mutation nor the outbox row. The
-  design's `SIGKILL` end-to-end test (long dispatch interval, kill,
-  restart) is **not implemented yet** and is a follow-up; this runbook
-  does not claim one.
+  gRPC adoption suite does the same for the enrollment RPCs and also
+  pins the post-commit-failure patch path (one row, rewritten
+  outcome/status; removing `finalize_pending` fails it). The design's
+  `SIGKILL` end-to-end test (long dispatch interval, kill, restart) is
+  **not implemented yet** and is a follow-up; this runbook does not claim
+  one.
 - **Migration:** `0071_audit_outbox.sql` is additive (one table, two
   indexes). No backfill, no change to `audit_log`. It runs through the
   normal startup migrator; disk-full remains the only new startup

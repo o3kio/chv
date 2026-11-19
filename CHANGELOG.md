@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outbox_dispatch_interval_secs` (default 1) and
   `outbox_retention_days` (default 7, validated 1..=365).
   The plumbing itself changes no request behavior; adoption lands in
-  PR 2 (BFF, above) and PR 3 (gRPC). See
+  PR 2 (BFF, above) and PR 3a/3b (gRPC). See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 

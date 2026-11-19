@@ -87,6 +87,48 @@ pub(crate) async fn issue_unrevoked_node_certificate(
     )))
 }
 
+/// Handler-side handle to one adopted mutation's audit evidence (#706).
+///
+/// Mirrors the BFF's `AuditOutboxTicket`: [`Self::insert`] is the
+/// pre-minted outbox row the service enqueues inside its final mutation
+/// transaction, and the committed flag is flipped by the service
+/// immediately after that store call returns `Ok` (i.e. the enqueue
+/// committed). The gRPC adapter's check-or-insert reads the flag to tell
+/// "nothing was enqueued" from "the evidence is durable even though the
+/// final check failed", so a check error can never produce a duplicate
+/// row.
+pub struct AdoptedAudit<'a> {
+    insert: &'a AuditOutboxInsert,
+    committed: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<'a> AdoptedAudit<'a> {
+    pub fn new(
+        insert: &'a AuditOutboxInsert,
+        committed: &'a std::sync::atomic::AtomicBool,
+    ) -> Self {
+        Self { insert, committed }
+    }
+
+    /// The row to enqueue in the mutation's final transaction.
+    pub fn insert(&self) -> &AuditOutboxInsert {
+        self.insert
+    }
+
+    /// Record that this request's enqueue committed with its mutation.
+    /// Called right after the adopted store call returns `Ok`; every
+    /// adopted store method enqueues as its last fallible statement, so
+    /// `Ok` there means the evidence is durable.
+    pub fn mark_committed(&self) {
+        self.committed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn was_committed(&self) -> bool {
+        self.committed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 #[async_trait]
 pub trait EnrollmentService: Send + Sync {
     /// `peer_addr` is the transport-level remote address of the gRPC call
@@ -104,7 +146,7 @@ pub trait EnrollmentService: Send + Sync {
         &self,
         request: proto::EnrollmentRequest,
         peer_addr: Option<SocketAddr>,
-        audit: Option<&AuditOutboxInsert>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError>;
 
     /// Rotate a node's certificate.
@@ -128,7 +170,7 @@ pub trait EnrollmentService: Send + Sync {
         request: proto::RotateNodeCertificateRequest,
         presented_serial: Option<String>,
         allow_insecure: bool,
-        audit: Option<&AuditOutboxInsert>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError>;
 
     /// `audit` follows [`Self::enroll_node`]: the outbox row commits with
@@ -136,7 +178,7 @@ pub trait EnrollmentService: Send + Sync {
     async fn report_bootstrap_result(
         &self,
         request: proto::ReportBootstrapResultRequest,
-        audit: Option<&AuditOutboxInsert>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 }
 
@@ -197,7 +239,7 @@ impl EnrollmentService for EnrollmentServiceImplementation {
         &self,
         request: proto::EnrollmentRequest,
         peer_addr: Option<SocketAddr>,
-        audit: Option<&AuditOutboxInsert>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::EnrollmentResponse, ControlPlaneServiceError> {
         match self
             .token_repo
@@ -360,9 +402,12 @@ impl EnrollmentService for EnrollmentServiceImplementation {
                     source: Some(SOURCE_ENROLLMENT.into()),
                     reported_unix_ms: now,
                 },
-                version_audit,
+                version_audit.map(AdoptedAudit::insert),
             )
             .await?;
+        if let Some(audit) = version_audit {
+            audit.mark_committed();
+        }
 
         // Register VTEP for overlay networking
         if !inventory.vtep_ip.is_empty() {
@@ -409,9 +454,12 @@ impl EnrollmentService for EnrollmentServiceImplementation {
                     // compiler surfaces unreachable peers (fail closed)
                     // instead of guessing.
                     peer_addr.map(derive_underlay_endpoint).as_deref(),
-                    fabric_audit,
+                    fabric_audit.map(AdoptedAudit::insert),
                 )
                 .await?;
+            if let Some(audit) = fabric_audit {
+                audit.mark_committed();
+            }
         }
 
         Ok(proto::EnrollmentResponse {
@@ -434,7 +482,7 @@ impl EnrollmentService for EnrollmentServiceImplementation {
         request: proto::RotateNodeCertificateRequest,
         presented_serial: Option<String>,
         allow_insecure: bool,
-        audit: Option<&AuditOutboxInsert>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::RotateNodeCertificateResponse, ControlPlaneServiceError> {
         let node_id = NodeId::new(request.node_id).map_err(|e| {
             ControlPlaneServiceError::InvalidArgument(format!("invalid node_id: {}", e))
@@ -513,11 +561,16 @@ impl EnrollmentService for EnrollmentServiceImplementation {
         // concurrent rotation won the race, do not hand out this key material.
         match stored_serial.as_deref() {
             Some(expected) => {
-                if !self
+                let rotated = self
                     .node_repo
-                    .rotate_certificate_serial(&node_id, expected, &cert.serial, audit)
-                    .await?
-                {
+                    .rotate_certificate_serial(
+                        &node_id,
+                        expected,
+                        &cert.serial,
+                        audit.map(AdoptedAudit::insert),
+                    )
+                    .await?;
+                if !rotated {
                     return Err(ControlPlaneServiceError::Conflict(format!(
                         "certificate rotation for node {node_id} lost a concurrent rotation \
                          race; retry with the current certificate"
@@ -529,9 +582,16 @@ impl EnrollmentService for EnrollmentServiceImplementation {
             // local development/tests keep working.
             None => {
                 self.node_repo
-                    .update_certificate_serial(&node_id, &cert.serial, audit)
+                    .update_certificate_serial(
+                        &node_id,
+                        &cert.serial,
+                        audit.map(AdoptedAudit::insert),
+                    )
                     .await?;
             }
+        }
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         Ok(proto::RotateNodeCertificateResponse {
@@ -551,7 +611,7 @@ impl EnrollmentService for EnrollmentServiceImplementation {
     async fn report_bootstrap_result(
         &self,
         request: proto::ReportBootstrapResultRequest,
-        audit: Option<&AuditOutboxInsert>,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let node_id = NodeId::new(request.node_id).map_err(|e| {
             ControlPlaneServiceError::InvalidArgument(format!("invalid node_id: {}", e))
@@ -580,9 +640,12 @@ impl EnrollmentService for EnrollmentServiceImplementation {
                     started_unix_ms: None,
                     completed_unix_ms: self.now_ms(),
                 },
-                audit,
+                audit.map(AdoptedAudit::insert),
             )
             .await?;
+        if let Some(audit) = audit {
+            audit.mark_committed();
+        }
 
         Ok(proto::AckResponse {
             result: Some(proto::ResultMeta {
@@ -862,6 +925,8 @@ mod audit_coupling_tests {
 
         // > the 16 KiB payload bound enforced by `enqueue_on_tx`.
         let oversized = outbox_insert("ob-oversized", "x".repeat(16 * 1024 + 1));
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        let coupling = AdoptedAudit::new(&oversized, &committed);
         let error = service
             .rotate_node_certificate(
                 proto::RotateNodeCertificateRequest {
@@ -870,7 +935,7 @@ mod audit_coupling_tests {
                 },
                 Some("old-serial".into()),
                 false,
-                Some(&oversized),
+                Some(&coupling),
             )
             .await
             .expect_err("oversized evidence must fail the mutation closed");

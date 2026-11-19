@@ -342,11 +342,29 @@ same composition in `finish_audited`: the adapter mints an
 - **row absent** → denied, failed before commit, rolled back, or the
   service did not adopt. The adapter inserts directly, exactly as the
   unadopted path always has.
-- **check fails after a successful call** → the adopted service commits
-  its enqueue with its final transaction, so the evidence is durable in
-  the outbox even though the check failed; the adapter skips the direct
-  insert (no duplicate) and logs loudly. After a failed call nothing was
-  enqueued, so it falls back to the direct insert.
+- **check fails** → the service records that its enqueue committed in a
+  per-request committed flag; a set flag means the evidence is durable in
+  the outbox even though the check failed, so the adapter skips the
+  direct insert (no duplicate) and logs loudly. Without the flag nothing
+  was enqueued and the adapter falls back to the direct insert. If the RPC
+  also reported failure, the retained row keeps its commit-time `success`
+  prediction, because the patch cannot read a row the check could not —
+  the same disclosed limit as the patch-failure arms of
+  `patch_final_outcome`.
+
+Both transports stamp `occurred_at_ms` (and the outbox row's
+`created_at_ms`, its initial due time) at **enqueue**, not request
+start: the BFF ticket does it when it builds the insert, and the adopted
+`chv-controlplane-store` methods clone the pre-minted row and re-stamp it
+immediately before `enqueue_on_tx`. The unadopted direct path keeps its
+post-handler stamp.
+
+The composition assumes **enqueue is the last fallible operation** of an
+adopted mutation; that is true for every current adopted site. The
+committed flag makes the check-error fallback duplicate-free even if a
+future service ever enqueues and then fails. Patching a committed row's
+final outcome is evidence-preserving either way: the mutation and its
+row stay, only the recorded `outcome`/`status_code` changes.
 
 No path produces two rows for one request, and no adopted success path
 produces zero rows: the outbox row and the mutation are one commit. The
@@ -356,9 +374,11 @@ transaction, crash between commit and middleware return, injected
 post-commit non-2xx, unadopted route, oversized actor, distinct ids) and
 the `server_audit_*` adoption tests in
 `crates/chv-controlplane-service/src/server_audit_tests.rs` (one
-dispatched row per adopted RPC, rollback/denial with no outbox row,
-crash replay, unadopted lifecycle RPC still direct, oversized payload
-rolls back).
+dispatched row per adopted RPC, the post-commit-failure patch path — a
+service that enqueues and then fails keeps exactly one row whose
+outcome/status are patched; removing `finalize_pending` fails that test —
+rollback/denial with no outbox row, crash replay, unadopted lifecycle RPC
+still direct, oversized payload rolls back).
 
 The contract adoption relies on:
 
