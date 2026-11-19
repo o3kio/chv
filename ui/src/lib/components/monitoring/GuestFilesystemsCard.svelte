@@ -74,27 +74,27 @@
 		<HardDrive class="h-4 w-4" aria-hidden="true" />
 	{/snippet}
 
-	<p class="text-[10px] text-[var(--shell-text-muted)] mb-2">
+	<p class="text-[10px] text-(--shell-text-muted) mb-2">
 		Reported by the optional guest monitoring agent — guest-observed, never host-accounted.
 	</p>
 
 	{#if loading}
-		<p class="text-sm text-[var(--shell-text-muted)]">Loading filesystem telemetry…</p>
+		<p class="text-sm text-(--shell-text-muted)">Loading filesystem telemetry…</p>
 	{:else if degraded}
-		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-[0.25rem] bg-[var(--shell-surface-muted)] border border-dashed border-[var(--shell-line)]">
-			<span class="text-xs font-bold text-[var(--shell-text-secondary)]">Monitoring is unavailable</span>
-			<span class="text-[10px] text-[var(--shell-text-muted)] text-center max-w-[40rem]">
+		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-sm bg-(--shell-surface-muted) border border-dashed border-(--shell-line)">
+			<span class="text-xs font-bold text-(--shell-text-secondary)">Monitoring is unavailable</span>
+			<span class="text-[10px] text-(--shell-text-muted) text-center max-w-160">
 				The monitoring subsystem is degraded or disabled on the control plane. This does not
 				indicate a problem with this VM.
 			</span>
 		</div>
 	{:else if error}
-		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-[0.25rem] bg-[var(--shell-surface-muted)] border border-[var(--color-danger)]">
-			<span class="text-xs font-bold text-[var(--color-danger)]">Monitoring request failed</span>
-			<span class="text-[10px] text-[var(--shell-text-muted)] text-center max-w-[40rem]">{error}</span>
+		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-sm bg-(--shell-surface-muted) border border-danger">
+			<span class="text-xs font-bold text-danger">Monitoring request failed</span>
+			<span class="text-[10px] text-(--shell-text-muted) text-center max-w-160">{error}</span>
 		</div>
 	{:else if rows.length === 0}
-		<p class="text-sm text-[var(--shell-text-secondary)]">
+		<p class="text-sm text-(--shell-text-secondary)">
 			No filesystem telemetry for this guest. Filesystem data appears only when the optional
 			guest monitoring agent is installed and its filesystem collector is enabled.
 		</p>
@@ -102,7 +102,7 @@
 		<div class="overflow-x-auto">
 			<table class="w-full text-xs border-collapse">
 				<thead>
-					<tr class="text-left text-[var(--shell-text-muted)] border-b border-[var(--shell-line)]">
+					<tr class="text-left text-(--shell-text-muted) border-b border-(--shell-line)">
 						<th class="py-1.5 pr-3 font-semibold">Mount</th>
 						<th class="py-1.5 pr-3 font-semibold">Type</th>
 						<th class="py-1.5 pr-3 font-semibold">Total</th>
@@ -114,8 +114,8 @@
 				</thead>
 				<tbody>
 					{#each rows as row (row.mountId)}
-						<tr class="border-b border-[var(--shell-line)] last:border-b-0">
-							<td class="py-1.5 pr-3 font-medium text-[var(--shell-text)] whitespace-nowrap">
+						<tr class="border-b border-(--shell-line) last:border-b-0">
+							<td class="py-1.5 pr-3 font-medium text-(--shell-text) whitespace-nowrap">
 								{row.mountpoint}
 								{#if row.readOnly}
 									<Badge>read-only</Badge>
@@ -124,34 +124,34 @@
 									<Badge>stale</Badge>
 								{/if}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)]">{row.fstype || '—'}</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] tabular-nums">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary)">{row.fstype || '—'}</td>
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) tabular-nums">
 								{row.totalBytes !== null ? formatBytes(row.totalBytes) : '—'}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] tabular-nums">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) tabular-nums">
 								{row.usedBytes !== null ? formatBytes(row.usedBytes) : '—'}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] tabular-nums">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) tabular-nums">
 								{row.availableBytes !== null ? formatBytes(row.availableBytes) : '—'}
 							</td>
 							<td class="py-1.5 pr-3 w-40">
 								{#if row.usageRatio !== null}
 									<div class="flex items-center gap-2">
-										<div class="h-1.5 flex-1 rounded-full bg-[var(--shell-line)] overflow-hidden">
+										<div class="h-1.5 flex-1 rounded-full bg-(--shell-line) overflow-hidden">
 											<div
-												class="h-full rounded-full bg-[var(--shell-text-secondary)]"
+												class="h-full rounded-full bg-(--shell-text-secondary)"
 												style:width="{Math.max(0, Math.min(100, Math.round(row.usageRatio * 100)))}%"
 											></div>
 										</div>
-										<span class="tabular-nums text-[var(--shell-text-secondary)] whitespace-nowrap">
+										<span class="tabular-nums text-(--shell-text-secondary) whitespace-nowrap">
 											{formatRatio(row.usageRatio)}
 										</span>
 									</div>
 								{:else}
-									<span class="text-[var(--shell-text-muted)]">—</span>
+									<span class="text-(--shell-text-muted)">—</span>
 								{/if}
 							</td>
-							<td class="py-1.5 text-[var(--shell-text-secondary)] tabular-nums">
+							<td class="py-1.5 text-(--shell-text-secondary) tabular-nums">
 								{row.inodeRatio !== null ? formatRatio(row.inodeRatio) : '—'}
 							</td>
 						</tr>

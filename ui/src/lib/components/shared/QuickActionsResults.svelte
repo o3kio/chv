@@ -44,7 +44,7 @@
           class:bg-blue-50={selectedIndex === globalIndex}
           onclick={() => selectAction(action)}
         >
-          <Icon size={18} class="text-gray-500 flex-shrink-0" />
+          <Icon size={18} class="text-gray-500 shrink-0" />
           <div class="flex-1 min-w-0">
             <div class="text-sm font-medium text-gray-900">{action.title}</div>
             <div class="text-xs text-gray-500">{action.description}</div>
@@ -52,7 +52,7 @@
           {#if action.shortcut}
             <div class="hidden sm:flex items-center gap-1">
               {#each action.shortcut as key}
-                <kbd class="px-1.5 py-0.5 text-xs font-mono bg-gray-100 text-gray-600 rounded border border-gray-200">
+                <kbd class="px-1.5 py-0.5 text-xs font-mono bg-gray-100 text-gray-600 rounded-sm border border-gray-200">
                   {key.toUpperCase()}
                 </kbd>
               {/each}

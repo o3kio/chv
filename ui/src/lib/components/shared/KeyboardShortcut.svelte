@@ -64,7 +64,7 @@
   };
 </script>
 
-<span class="inline-flex items-center font-mono font-medium rounded border {sizeClasses[size]} {variantClasses[variant]}">
+<span class="inline-flex items-center font-mono font-medium rounded-sm border {sizeClasses[size]} {variantClasses[variant]}">
   {#each keys as key, i}
     {#if i > 0}
       <span class="text-gray-400">+</span>

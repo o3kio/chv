@@ -62,7 +62,7 @@
 		</div>
 	</div>
 
-	<div class="rounded bg-chrome p-4 text-xs text-muted">
+	<div class="rounded-sm bg-chrome p-4 text-xs text-muted">
 		<p class="font-medium mb-2">This will create:</p>
 		<ul class="ml-4 list-disc space-y-1">
 			<li>VM with {vcpu} vCPU, {memoryMb} MB RAM</li>

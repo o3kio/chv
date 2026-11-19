@@ -78,7 +78,7 @@
 		{#if loadingData}
 			<div class="text-sm text-muted">Loading images...</div>
 		{:else if images.length === 0}
-			<div class="rounded border border-warning/30 bg-warning/10 px-3 py-2 text-sm text-warning">
+			<div class="rounded-sm border border-warning/30 bg-warning/10 px-3 py-2 text-sm text-warning">
 				No images available.
 				<!-- svelte-ignore a11y_invalid_attribute -->
 				<a href="/images" class="underline" onclick={(e) => { e.preventDefault(); onImageLinkClick?.(); }}>Go to Images</a>
@@ -88,7 +88,7 @@
 			<select
 				id="vm-image"
 				bind:value={imageId}
-				class="h-9 w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
+				class="h-9 w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
 				disabled={submitting}
 			>
 				<option value="">Select an image...</option>
@@ -106,7 +106,7 @@
 			<select
 				id="vm-network"
 				bind:value={networkId}
-				class="h-9 w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
+				class="h-9 w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
 				disabled={submitting}
 			>
 				<option value="default">default (auto-create)</option>
@@ -116,7 +116,7 @@
 			<select
 				id="vm-network"
 				bind:value={networkId}
-				class="h-9 w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
+				class="h-9 w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
 				disabled={submitting}
 			>
 				<option value="">Select a network...</option>
@@ -178,7 +178,7 @@
 		</button>
 
 		{#if advancedOpen}
-			<div class="mt-3 space-y-3 rounded border border-line bg-chrome/40 p-3">
+			<div class="mt-3 space-y-3 rounded-sm border border-line bg-chrome/40 p-3">
 				<p class="text-xs text-muted">Select "Inherit" to use the global setting, or explicitly override for this VM.</p>
 
 				<div class="flex items-center justify-between gap-3 border-b border-line pb-3">
@@ -209,7 +209,7 @@
 									[item.key]: val === '' ? undefined : val === 'true'
 								};
 							}}
-							class="h-8 rounded border border-[#CCCCCC] bg-white px-2 py-1 text-sm"
+							class="h-8 rounded-sm border border-[#CCCCCC] bg-white px-2 py-1 text-sm"
 							disabled={submitting}
 						>
 							<option value="">Inherit global</option>
@@ -234,7 +234,7 @@
 									};
 								}}
 								placeholder="Inherit global"
-								class="h-8 rounded border border-[#CCCCCC] bg-white px-2 py-1 text-sm w-48"
+								class="h-8 rounded-sm border border-[#CCCCCC] bg-white px-2 py-1 text-sm w-48"
 								disabled={submitting}
 							/>
 						</div>

@@ -32,7 +32,7 @@
 			id="vm-ssh-key"
 			bind:value={sshKey}
 			placeholder="ssh-rsa AAAA..."
-			class="w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 font-mono text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+			class="w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 font-mono text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
 			rows={3}
 			disabled={submitting}
 		></textarea>
@@ -42,7 +42,7 @@
 		<textarea
 			id="vm-userdata"
 			bind:value={userData}
-			class="w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 font-mono text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+			class="w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 font-mono text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
 			rows={6}
 			disabled={submitting}
 		></textarea>

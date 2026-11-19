@@ -26,12 +26,12 @@
 
 	const variantClasses = {
 		primary:
-			'bg-gradient-to-br from-[var(--color-primary)] to-[var(--color-primary-active)] text-white shadow-[0_2px_8px_var(--color-primary-glow)] hover:shadow-[0_4px_12px_rgba(var(--color-primary-rgb),0.35)] hover:-translate-y-px active:translate-y-0',
+			'bg-linear-to-br from-primary to-(--color-primary-active) text-white shadow-[0_2px_8px_var(--color-primary-glow)] hover:shadow-[0_4px_12px_rgba(var(--color-primary-rgb),0.35)] hover:-translate-y-px active:translate-y-0',
 		secondary:
-			'bg-[var(--bg-surface)] text-[var(--color-neutral-700)] border border-[var(--color-neutral-300)] hover:bg-[var(--color-neutral-50)] hover:border-[var(--color-neutral-400)]',
+			'bg-(--bg-surface) text-neutral-700 border border-neutral-300 hover:bg-(--color-neutral-50) hover:border-neutral-400',
 		ghost:
-			'bg-transparent text-[var(--color-neutral-600)] hover:bg-[var(--color-neutral-100)] hover:text-[var(--color-neutral-900)]',
-		danger: 'bg-[var(--color-danger)] text-white hover:bg-[var(--color-danger-dark)]'
+			'bg-transparent text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900',
+		danger: 'bg-danger text-white hover:bg-(--color-danger-dark)'
 	};
 
 	const sizeClasses = {
@@ -63,7 +63,7 @@
 <button
 	bind:this={buttonRef}
 	type="button"
-	class="btn inline-flex items-center justify-center gap-2 rounded-sm border-none font-medium text-sm cursor-pointer transition-all duration-150 ease-in-out focus-visible:outline-2 focus-visible:outline-[var(--color-primary)] focus-visible:outline-offset-2 disabled:opacity-50 disabled:cursor-not-allowed {variantClasses[variant]} {sizeClasses[size]} {iconOnlyClasses}"
+	class="btn inline-flex items-center justify-center gap-2 rounded-xs border-none font-medium text-sm cursor-pointer transition-all duration-150 ease-in-out focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-2 disabled:opacity-50 disabled:cursor-not-allowed {variantClasses[variant]} {sizeClasses[size]} {iconOnlyClasses}"
 	disabled={isDisabled}
 	aria-disabled={isDisabled}
 	aria-busy={loading}

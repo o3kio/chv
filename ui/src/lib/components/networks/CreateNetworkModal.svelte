@@ -230,7 +230,7 @@
 <Modal bind:open title={editMode ? 'Edit Network' : 'Create Network'} closeOnBackdrop={!submitting}>
 	<form id="create-network-form" onsubmit={handleSubmit} class="space-y-5">
 		{#if formError}
-			<div class="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
+			<div class="rounded-sm border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
 				{formError}
 			</div>
 		{/if}
@@ -285,7 +285,7 @@
 				type="checkbox"
 				bind:checked={dhcpEnabled}
 				disabled={submitting}
-				class="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+				class="h-4 w-4 rounded-sm border-gray-300 text-primary focus:ring-primary"
 			/>
 		</FormField>
 
@@ -295,7 +295,7 @@
 				type="checkbox"
 				bind:checked={isDefault}
 				disabled={submitting}
-				class="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+				class="h-4 w-4 rounded-sm border-gray-300 text-primary focus:ring-primary"
 			/>
 		</FormField>
 	</form>
@@ -305,7 +305,7 @@
 			type="button"
 			onclick={() => (open = false)}
 			disabled={submitting}
-			class="px-4 py-2 rounded border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+			class="px-4 py-2 rounded-sm border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 		>
 			Cancel
 		</button>
@@ -313,7 +313,7 @@
 			type="submit"
 			form="create-network-form"
 			disabled={!isValid() || submitting}
-			class="px-4 py-2 rounded bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
+			class="px-4 py-2 rounded-sm bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
 		>
 			{#if submitting}
 				<svg

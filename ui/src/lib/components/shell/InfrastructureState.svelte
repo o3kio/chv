@@ -15,19 +15,19 @@
 	);
 </script>
 
-<article class="grid gap-4 relative overflow-hidden border border-[var(--border-subtle)] rounded-[var(--radius-sm)] bg-[var(--bg-surface)] p-8 shadow-[var(--shadow-sm)] state-panel state-panel--{variant}" style="grid-template-columns: auto 1fr;">
-	<div class="grid place-items-center w-12 h-12 rounded-[var(--radius-sm)] bg-[var(--bg-surface-muted)] border border-[var(--border-subtle)] text-[var(--color-neutral-400)] relative z-[1] {variant === 'loading' ? 'text-[var(--color-primary)]' : variant === 'empty' ? 'text-[var(--color-neutral-300)]' : 'text-[var(--color-danger)] border-[var(--color-danger)]'}" aria-hidden="true">
+<article class="grid gap-4 relative overflow-hidden border border-(--border-subtle) rounded-sm bg-(--bg-surface) p-8 shadow-(--shadow-sm) state-panel state-panel--{variant}" style="grid-template-columns: auto 1fr;">
+	<div class="grid place-items-center w-12 h-12 rounded-sm bg-(--bg-surface-muted) border border-(--border-subtle) text-neutral-400 relative z-1 {variant === 'loading' ? 'text-primary' : variant === 'empty' ? 'text-neutral-300' : 'text-danger border-danger'}" aria-hidden="true">
 		<Icon size={18} class={variant === 'loading' ? 'animate-spin' : undefined} />
 	</div>
-	<div class="relative z-[1] flex flex-col justify-center">
-		<div class="text-[length:var(--text-base)] font-bold text-[var(--color-neutral-900)] uppercase tracking-[0.05em]">{title}</div>
-		<p class="mt-2 text-[length:var(--text-sm)] text-[var(--color-neutral-600)] max-w-[400px]">{description}</p>
-		<p class="mt-3 text-[length:var(--text-xs)] text-[var(--color-neutral-400)] italic">{hint}</p>
+	<div class="relative z-1 flex flex-col justify-center">
+		<div class="text-(length:--text-base) font-bold text-neutral-900 uppercase tracking-wider">{title}</div>
+		<p class="mt-2 text-(length:--text-sm) text-neutral-600 max-w-[400px]">{description}</p>
+		<p class="mt-3 text-(length:--text-xs) text-neutral-400 italic">{hint}</p>
 		{#if variant === 'loading'}
 			<div class="grid gap-2 mt-4 w-full max-w-[300px]" aria-hidden="true">
-				<span class="block h-1 rounded-sm bg-[var(--color-neutral-100)] relative overflow-hidden skeleton-bar"></span>
-				<span class="block h-1 rounded-sm bg-[var(--color-neutral-100)] relative overflow-hidden skeleton-bar"></span>
-				<span class="block h-1 rounded-sm bg-[var(--color-neutral-100)] relative overflow-hidden skeleton-bar"></span>
+				<span class="block h-1 rounded-xs bg-neutral-100 relative overflow-hidden skeleton-bar"></span>
+				<span class="block h-1 rounded-xs bg-neutral-100 relative overflow-hidden skeleton-bar"></span>
+				<span class="block h-1 rounded-xs bg-neutral-100 relative overflow-hidden skeleton-bar"></span>
 			</div>
 		{/if}
 	</div>

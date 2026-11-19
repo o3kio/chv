@@ -67,7 +67,7 @@
 		<button
 			type="button"
 			onclick={handleCancel}
-			class="px-4 py-2 rounded border border-line text-ink bg-white hover:bg-chrome transition-colors"
+			class="px-4 py-2 rounded-sm border border-line text-ink bg-white hover:bg-chrome transition-colors"
 		>
 			{cancelText}
 		</button>
@@ -75,7 +75,7 @@
 			bind:this={confirmButtonRef}
 			type="button"
 			onclick={handleConfirm}
-			class="px-4 py-2 rounded font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 {confirmButtonClasses[variant]}"
+			class="px-4 py-2 rounded-sm font-medium transition-colors focus:outline-hidden focus:ring-2 focus:ring-offset-1 {confirmButtonClasses[variant]}"
 		>
 			{confirmText}
 		</button>

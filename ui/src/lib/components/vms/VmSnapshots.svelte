@@ -253,7 +253,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 			></textarea>
 		</div>
 		<label class="flex items-center gap-2 text-sm text-ink cursor-pointer">
-			<input type="checkbox" bind:checked={createIncludesMemory} class="rounded border-line" />
+			<input type="checkbox" bind:checked={createIncludesMemory} class="rounded-sm border-line" />
 			<MemoryStick size={14} />
 			Include memory state
 		</label>

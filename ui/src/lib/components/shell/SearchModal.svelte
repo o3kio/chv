@@ -185,8 +185,8 @@
       case 'vm': return 'text-blue-500';
       case 'image': return 'text-purple-500';
       case 'network': return 'text-green-500';
-      case 'page': return 'text-[var(--shell-text-secondary)]';
-      default: return 'text-[var(--shell-text-secondary)]';
+      case 'page': return 'text-(--shell-text-secondary)';
+      default: return 'text-(--shell-text-secondary)';
     }
   }
   
@@ -223,7 +223,7 @@
       aria-modal="true"
       tabindex="-1"
       aria-label="Global search"
-      class="w-full max-w-2xl mx-4 bg-[var(--bg-surface)] rounded-lg shadow-2xl overflow-hidden transition-all duration-150"
+      class="w-full max-w-2xl mx-4 bg-(--bg-surface) rounded-lg shadow-2xl overflow-hidden transition-all duration-150"
       class:scale-95={!isVisible || isClosing}
       class:scale-100={isVisible && !isClosing}
       class:opacity-0={!isVisible || isClosing}
@@ -231,8 +231,8 @@
       onclick={(e) => e.stopPropagation()}
     >
       <!-- Search Input -->
-      <div class="flex items-center gap-3 px-4 py-3 border-b border-[var(--border-subtle)]">
-        <Search size={20} class="text-[var(--shell-text-muted)] flex-shrink-0" />
+      <div class="flex items-center gap-3 px-4 py-3 border-b border-(--border-subtle)">
+        <Search size={20} class="text-(--shell-text-muted) shrink-0" />
         <input
           bind:this={inputRef}
           type="text"
@@ -240,7 +240,7 @@
           oninput={handleInput}
           onkeydown={handleKeyDown}
           placeholder="Search VMs, images, networks..."
-          class="flex-1 bg-transparent text-base outline-none placeholder:text-[var(--shell-text-muted)]"
+          class="flex-1 bg-transparent text-base outline-hidden placeholder:text-(--shell-text-muted)"
           aria-label="Search"
           aria-autocomplete="list"
           aria-controls="search-results"
@@ -250,13 +250,13 @@
           <button
             type="button"
             onclick={() => { setSearchQuery(''); results = []; inputRef?.focus(); }}
-            class="p-1 rounded hover:bg-[var(--bg-surface-muted)] text-[var(--shell-text-muted)] hover:text-[var(--shell-text-secondary)]"
+            class="p-1 rounded-sm hover:bg-(--bg-surface-muted) text-(--shell-text-muted) hover:text-(--shell-text-secondary)"
             aria-label="Clear search"
           >
             <X size={16} />
           </button>
         {/if}
-        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 text-xs font-mono bg-[var(--bg-surface-muted)] text-[var(--shell-text-secondary)] rounded border border-[var(--border-subtle)]">
+        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 text-xs font-mono bg-(--bg-surface-muted) text-(--shell-text-secondary) rounded-sm border border-(--border-subtle)">
           ESC
         </kbd>
       </div>
@@ -272,14 +272,14 @@
         {#if hasQuery}
           <!-- Search Results -->
           {#if results.length === 0}
-            <div class="px-4 py-8 text-center text-[var(--shell-text-secondary)]">
+            <div class="px-4 py-8 text-center text-(--shell-text-secondary)">
               <p>No results found for "{query}"</p>
-              <p class="text-sm mt-1 text-[var(--shell-text-muted)]">Try a different search term</p>
+              <p class="text-sm mt-1 text-(--shell-text-muted)">Try a different search term</p>
             </div>
           {:else}
             {#each groupedEntries as [type, typeResults]}
               <div class="py-2">
-                <div class="px-4 py-1.5 text-xs font-semibold text-[var(--shell-text-secondary)] uppercase tracking-wider bg-[var(--bg-surface-muted)]">
+                <div class="px-4 py-1.5 text-xs font-semibold text-(--shell-text-secondary) uppercase tracking-wider bg-(--bg-surface-muted)">
                   {typeLabels[type]}
                 </div>
                 {#each typeResults as result, i}
@@ -291,23 +291,23 @@
                     data-index={globalIndex}
                     role="option"
                     aria-selected={selectedIndex === globalIndex}
-                    class="w-full px-4 py-2.5 flex items-center gap-3 text-left hover:bg-[var(--bg-surface-muted)] transition-colors"
+                    class="w-full px-4 py-2.5 flex items-center gap-3 text-left hover:bg-(--bg-surface-muted) transition-colors"
                     class:bg-[var(--color-primary-light)]={selectedIndex === globalIndex}
                     onclick={() => selectItem(result.item)}
                   >
                     <Icon size={18} class={getIconColor(type)} />
                     <div class="flex-1 min-w-0">
-                      <div class="text-sm font-medium text-[var(--shell-text)] truncate">
+                      <div class="text-sm font-medium text-(--shell-text) truncate">
                         {@html highlightMatches(result.item.name, result.matches, 'name')}
                       </div>
                       {#if result.item.description}
-                        <div class="text-xs text-[var(--shell-text-secondary)] truncate">
+                        <div class="text-xs text-(--shell-text-secondary) truncate">
                           {@html highlightMatches(result.item.description, result.matches, 'description')}
                         </div>
                       {/if}
                     </div>
                     {#if result.item.route}
-                      <span class="text-xs text-[var(--shell-text-muted)] hidden sm:block">→</span>
+                      <span class="text-xs text-(--shell-text-muted) hidden sm:block">→</span>
                     {/if}
                   </button>
                 {/each}
@@ -318,11 +318,11 @@
           <!-- Recent Searches -->
           <div class="py-2">
             <div class="px-4 py-1.5 flex items-center justify-between">
-              <span class="text-xs font-semibold text-[var(--shell-text-secondary)] uppercase tracking-wider">Recent</span>
+              <span class="text-xs font-semibold text-(--shell-text-secondary) uppercase tracking-wider">Recent</span>
               <button
                 type="button"
                 onclick={clearRecentSearches}
-                class="text-xs text-[var(--shell-text-muted)] hover:text-[var(--shell-text-secondary)]"
+                class="text-xs text-(--shell-text-muted) hover:text-(--shell-text-secondary)"
               >
                 Clear
               </button>
@@ -335,44 +335,44 @@
                 data-index={i}
                 role="option"
                 aria-selected={selectedIndex === i}
-                class="w-full px-4 py-2.5 flex items-center gap-3 text-left hover:bg-[var(--bg-surface-muted)] transition-colors"
+                class="w-full px-4 py-2.5 flex items-center gap-3 text-left hover:bg-(--bg-surface-muted) transition-colors"
                 class:bg-[var(--color-primary-light)]={selectedIndex === i}
                 onclick={() => selectItem(item)}
               >
-                <Clock size={18} class="text-[var(--shell-text-muted)]" />
+                <Clock size={18} class="text-(--shell-text-muted)" />
                 <Icon size={18} class={getIconColor(item.type)} />
                 <div class="flex-1 min-w-0">
-                  <div class="text-sm font-medium text-[var(--shell-text)] truncate">{item.name}</div>
+                  <div class="text-sm font-medium text-(--shell-text) truncate">{item.name}</div>
                   {#if item.description}
-                    <div class="text-xs text-[var(--shell-text-secondary)] truncate">{item.description}</div>
+                    <div class="text-xs text-(--shell-text-secondary) truncate">{item.description}</div>
                   {/if}
                 </div>
-                <span class="text-xs text-[var(--shell-text-muted)] hidden sm:block">{typeLabels[item.type]}</span>
+                <span class="text-xs text-(--shell-text-muted) hidden sm:block">{typeLabels[item.type]}</span>
               </button>
             {/each}
           </div>
         {:else}
           <!-- Empty state with suggestions -->
           <div class="px-4 py-6">
-            <p class="text-sm text-[var(--shell-text-secondary)] mb-3">Type to search or try:</p>
+            <p class="text-sm text-(--shell-text-secondary) mb-3">Type to search or try:</p>
             <div class="flex flex-wrap gap-2">
-              <kbd class="px-2 py-1 text-xs bg-[var(--bg-surface-muted)] text-[var(--shell-text-secondary)] rounded border border-[var(--border-subtle)]">vm-</kbd>
-              <kbd class="px-2 py-1 text-xs bg-[var(--bg-surface-muted)] text-[var(--shell-text-secondary)] rounded border border-[var(--border-subtle)]">image-</kbd>
-              <kbd class="px-2 py-1 text-xs bg-[var(--bg-surface-muted)] text-[var(--shell-text-secondary)] rounded border border-[var(--border-subtle)]">network-</kbd>
+              <kbd class="px-2 py-1 text-xs bg-(--bg-surface-muted) text-(--shell-text-secondary) rounded-sm border border-(--border-subtle)">vm-</kbd>
+              <kbd class="px-2 py-1 text-xs bg-(--bg-surface-muted) text-(--shell-text-secondary) rounded-sm border border-(--border-subtle)">image-</kbd>
+              <kbd class="px-2 py-1 text-xs bg-(--bg-surface-muted) text-(--shell-text-secondary) rounded-sm border border-(--border-subtle)">network-</kbd>
             </div>
           </div>
         {/if}
       </div>
       
       <!-- Footer -->
-      <div class="px-4 py-2 bg-[var(--bg-surface-muted)] border-t border-[var(--border-subtle)] flex items-center justify-between text-xs text-[var(--shell-text-secondary)]">
+      <div class="px-4 py-2 bg-(--bg-surface-muted) border-t border-(--border-subtle) flex items-center justify-between text-xs text-(--shell-text-secondary)">
         <div class="flex items-center gap-3">
           <span class="flex items-center gap-1">
-            <kbd class="px-1.5 py-0.5 bg-[var(--bg-surface)] rounded border border-[var(--border-subtle)]">↑↓</kbd>
+            <kbd class="px-1.5 py-0.5 bg-(--bg-surface) rounded-sm border border-(--border-subtle)">↑↓</kbd>
             <span>Navigate</span>
           </span>
           <span class="flex items-center gap-1">
-            <kbd class="px-1.5 py-0.5 bg-[var(--bg-surface)] rounded border border-[var(--border-subtle)]">↵</kbd>
+            <kbd class="px-1.5 py-0.5 bg-(--bg-surface) rounded-sm border border-(--border-subtle)">↵</kbd>
             <span>Select</span>
           </span>
         </div>

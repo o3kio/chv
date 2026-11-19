@@ -149,7 +149,7 @@
   <form id="quota-form" class="space-y-5" onsubmit={handleSubmit}>
     {#if formError}
       <div
-        class="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700"
+        class="rounded-sm border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700"
         role="alert"
       >
         {formError}
@@ -161,7 +161,7 @@
         <select
           id="quota-user"
           bind:value={userId}
-          class="h-9 w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm disabled:opacity-50"
+          class="h-9 w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm disabled:opacity-50"
           disabled={submitting}
         >
           <option value="">Select a user...</option>
@@ -171,7 +171,7 @@
         </select>
       </FormField>
     {:else}
-      <div class="rounded bg-slate-50 px-3 py-2 text-sm text-slate-600">
+      <div class="rounded-sm bg-slate-50 px-3 py-2 text-sm text-slate-600">
         Editing quota for: <span class="font-medium">{quota?.user_id}</span>
       </div>
     {/if}
@@ -232,7 +232,7 @@
       />
     </FormField>
 
-    <div class="rounded bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-700">
+    <div class="rounded-sm bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-700">
       <p class="font-medium mb-1">Default Values</p>
       <p class="text-xs">
         VMs: 10, CPU: 20, Memory: 64GB, Storage: 500GB, Networks: 5
@@ -245,7 +245,7 @@
       type="button"
       onclick={handleClose}
       disabled={submitting}
-      class="px-4 py-2 rounded border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+      class="px-4 py-2 rounded-sm border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
     >
       Cancel
     </button>
@@ -253,7 +253,7 @@
       type="submit"
       form="quota-form"
       disabled={submitting}
-      class="px-4 py-2 rounded bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors disabled:bg-blue-400 disabled:cursor-not-allowed flex items-center gap-2"
+      class="px-4 py-2 rounded-sm bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors disabled:bg-blue-400 disabled:cursor-not-allowed flex items-center gap-2"
     >
       {#if submitting}
         <svg

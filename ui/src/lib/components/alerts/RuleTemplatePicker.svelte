@@ -12,24 +12,24 @@
 </script>
 
 <div class="mb-4">
-	<span class="block text-[10px] font-bold uppercase tracking-[0.05em] text-[var(--shell-text-muted)] mb-1">
+	<span class="block text-[10px] font-bold uppercase tracking-wider text-(--shell-text-muted) mb-1">
 		Start from a template
 	</span>
 	<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
 		{#each RULE_TEMPLATES as template (template.id)}
 			<button
 				type="button"
-				class="text-left p-2 rounded-sm border bg-[var(--bg-surface)] cursor-pointer transition-colors {selectedId === template.id
-					? 'border-[var(--color-primary)]'
-					: 'border-[var(--color-neutral-300)] hover:border-[var(--color-neutral-400)]'}"
+				class="text-left p-2 rounded-xs border bg-(--bg-surface) cursor-pointer transition-colors {selectedId === template.id
+					? 'border-primary'
+					: 'border-neutral-300 hover:border-neutral-400'}"
 				onclick={() => onSelect(template)}
 			>
-				<span class="block text-xs font-bold text-[var(--color-neutral-900)]">{template.title}</span>
-				<span class="block text-[10px] text-[var(--color-neutral-600)] mt-0.5">{template.rule_type}</span>
+				<span class="block text-xs font-bold text-neutral-900">{template.title}</span>
+				<span class="block text-[10px] text-neutral-600 mt-0.5">{template.rule_type}</span>
 			</button>
 		{/each}
 	</div>
 	{#if selected}
-		<p class="text-[10px] text-[var(--shell-text-muted)] mt-2">{selected.description}</p>
+		<p class="text-[10px] text-(--shell-text-muted) mt-2">{selected.description}</p>
 	{/if}
 </div>

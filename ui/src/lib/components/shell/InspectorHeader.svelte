@@ -4,8 +4,8 @@
 	import Button from '#lib/components/primitives/Button.svelte';
 </script>
 
-<header class="px-3 py-2 border-b border-[var(--border-subtle)] flex justify-between items-center bg-[var(--bg-surface-muted)]">
-	<div class="flex items-center gap-2 text-[length:var(--text-xs)] font-bold text-[var(--shell-text-secondary)] tracking-[0.06em] uppercase">
+<header class="px-3 py-2 border-b border-(--border-subtle) flex justify-between items-center bg-(--bg-surface-muted)">
+	<div class="flex items-center gap-2 text-(length:--text-xs) font-bold text-(--shell-text-secondary) tracking-[0.06em] uppercase">
 		<Info size={12} />
 		<span>Quick inspector</span>
 	</div>

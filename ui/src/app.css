@@ -1,6 +1,39 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: Roboto, system-ui, sans-serif;
+  --font-mono: Roboto Mono, ui-monospace, SFMono-Regular, monospace;
+
+  --color-chrome: var(--bg-surface-muted, #f5f5f5);
+  --color-line: var(--border-subtle, #d0d0d0);
+  --color-ink: var(--shell-text, #1a1a1a);
+  --color-muted: var(--shell-text-muted, #666666);
+  --color-light: var(--shell-text-secondary, #999999);
+  --color-primary: var(--color-primary, #8f5a2a);
+  --color-success: var(--color-success, #3f6b45);
+  --color-warning: var(--color-warning, #9a6a1f);
+  --color-danger: var(--color-danger, #9b4338);
+  --color-hover: var(--shell-accent-soft, #e8f4fc);
+  --color-selected: var(--color-primary-light, #cce5f9);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
 
 :root {
   /* ==========================================================================

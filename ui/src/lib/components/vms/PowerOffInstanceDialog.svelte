@@ -43,26 +43,26 @@
 <Modal bind:open closeOnBackdrop={true} onClose={handleCancel}>
 	{#snippet header()}
 		<div class="flex items-center gap-3">
-			<AlertCircle class="h-5 w-5 text-[var(--color-warning)]" aria-hidden="true" />
-			<h2 id="modal-title" class="text-base font-semibold text-[var(--shell-text)]">
+			<AlertCircle class="h-5 w-5 text-warning" aria-hidden="true" />
+			<h2 id="modal-title" class="text-base font-semibold text-(--shell-text)">
 				Power off instance "{instanceName}"?
 			</h2>
 		</div>
 	{/snippet}
 
 	<div class="space-y-4">
-		<div class="flex items-start gap-3 p-3 bg-[var(--color-warning-light)] border border-[var(--color-warning)]/20 rounded-lg">
-			<AlertCircle class="h-5 w-5 text-[var(--color-warning-dark)] shrink-0 mt-0.5" aria-hidden="true" />
+		<div class="flex items-start gap-3 p-3 bg-(--color-warning-light) border border-warning/20 rounded-lg">
+			<AlertCircle class="h-5 w-5 text-(--color-warning-dark) shrink-0 mt-0.5" aria-hidden="true" />
 			<div>
-				<p class="text-sm font-medium text-[var(--shell-text)]">Immediate hard stop</p>
-				<p class="text-sm text-[var(--shell-text-secondary)] mt-1">
+				<p class="text-sm font-medium text-(--shell-text)">Immediate hard stop</p>
+				<p class="text-sm text-(--shell-text-secondary) mt-1">
 					This does not gracefully shut down the guest operating system and may cause data loss.
 					Use Shutdown for a graceful stop.
 				</p>
 			</div>
 		</div>
 
-		<p class="text-sm text-[var(--shell-text-secondary)]">
+		<p class="text-sm text-(--shell-text-secondary)">
 			Instance <strong>{instanceName}</strong> will be forcefully stopped.
 		</p>
 	</div>

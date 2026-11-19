@@ -26,17 +26,17 @@
 
 <div class="flex flex-col gap-2">
 	{#if tasks.length === 0}
-		<p class="text-[length:var(--text-xs)] text-[var(--shell-text-muted)] py-2 text-center">{emptyText ?? 'No recent tasks recorded for this resource.'}</p>
+		<p class="text-(length:--text-xs) text-(--shell-text-muted) py-2 text-center">{emptyText ?? 'No recent tasks recorded for this resource.'}</p>
 	{:else}
 		{#each tasks as task (task.task_id)}
 			{@const failure = getTaskFailureCause(task)}
-			<div class="flex justify-between items-center p-2 bg-[var(--shell-surface-muted)] border border-[var(--shell-line)] rounded-[0.25rem] gap-4">
+			<div class="flex justify-between items-center p-2 bg-(--shell-surface-muted) border border-(--shell-line) rounded-sm gap-4">
 				<div class="flex flex-col gap-[0.15rem] min-w-0 flex-1">
 					<div class="flex items-center gap-2 justify-between">
-						<span class="font-semibold text-[length:var(--text-sm)] text-[var(--shell-text)] whitespace-nowrap overflow-hidden text-ellipsis">{task.summary}</span>
+						<span class="font-semibold text-(length:--text-sm) text-(--shell-text) whitespace-nowrap overflow-hidden text-ellipsis">{task.summary}</span>
 						<StatusBadge label={task.status} tone={task.tone} />
 					</div>
-					<div class="flex items-center gap-[0.35rem] text-[length:var(--text-xs)] text-[var(--shell-text-muted)]">
+					<div class="flex items-center gap-[0.35rem] text-(length:--text-xs) text-(--shell-text-muted)">
 						<span>{task.operation}</span>
 						{#if task.started_at}
 							<span class="opacity-50">·</span>
@@ -48,17 +48,17 @@
 						     the code as a chip beside the status badge's vocabulary,
 						     the refusal text verbatim (it IS the diagnostic). Absent
 						     fields stay absent; nothing is fabricated. -->
-						<div class="flex flex-col gap-[0.15rem] pt-1 mt-1 border-t border-[var(--shell-line)]" data-testid="task-failure-cause">
+						<div class="flex flex-col gap-[0.15rem] pt-1 mt-1 border-t border-(--shell-line)" data-testid="task-failure-cause">
 							{#if failure.code}
 								<StatusBadge label={failure.code} tone="failed" />
 							{/if}
 							{#if failure.message}
-								<p class="text-[length:var(--text-xs)] text-[var(--shell-text-muted)] whitespace-pre-wrap break-words m-0">{failure.message}</p>
+								<p class="text-(length:--text-xs) text-(--shell-text-muted) whitespace-pre-wrap wrap-break-word m-0">{failure.message}</p>
 							{/if}
 						</div>
 					{/if}
 				</div>
-				<a href={`/tasks?query=${encodeURIComponent(task.task_id)}`} class="text-[var(--shell-text-muted)] transition-colors duration-150 ease-in-out flex p-1 hover:text-[var(--shell-accent)]" title="View detail">
+				<a href={`/tasks?query=${encodeURIComponent(task.task_id)}`} class="text-(--shell-text-muted) transition-colors duration-150 ease-in-out flex p-1 hover:text-(--shell-accent)" title="View detail">
 					<ExternalLink size={14} />
 				</a>
 			</div>

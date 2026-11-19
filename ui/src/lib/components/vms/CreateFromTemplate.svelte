@@ -176,7 +176,7 @@
       </div>
 
       {#if formError}
-        <div class="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
+        <div class="rounded-sm border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
           {formError}
         </div>
       {/if}
@@ -226,7 +226,7 @@
             <select
               id="cloudinit-template"
               bind:value={cloudInitTemplateId}
-              class="h-9 w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
+              class="h-9 w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm"
               disabled={submitting}
             >
               <option value="">Select a template...</option>
@@ -262,7 +262,7 @@
               id="custom-userdata"
               bind:value={customUserData}
               placeholder="#cloud-config\n"
-              class="w-full rounded border border-[#CCCCCC] bg-white px-3 py-2 font-mono text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+              class="w-full rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 font-mono text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
               rows={8}
               disabled={submitting}
             ></textarea>
@@ -280,7 +280,7 @@
           </button>
 
           {#if showPreview}
-            <div class="mt-2 rounded bg-neutral-900 p-4 overflow-auto max-h-64">
+            <div class="mt-2 rounded-sm bg-neutral-900 p-4 overflow-auto max-h-64">
               <pre class="text-xs text-neutral-300 font-mono whitespace-pre-wrap">{renderedPreview || customUserData || '# No configuration'}</pre>
             </div>
           {/if}
@@ -298,7 +298,7 @@
       type="button"
       onclick={() => open = false}
       disabled={submitting}
-      class="px-4 py-2 rounded border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+      class="px-4 py-2 rounded-sm border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
     >
       Cancel
     </button>
@@ -306,7 +306,7 @@
       type="button"
       onclick={handleSubmit}
       disabled={submitting || !name.trim()}
-      class="px-4 py-2 rounded bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
+      class="px-4 py-2 rounded-sm bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
     >
       {#if submitting}
         <svg class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true">

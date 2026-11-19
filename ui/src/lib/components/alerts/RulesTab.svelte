@@ -177,7 +177,7 @@
 
 	{#if conflictNotice}
 		<div
-			class="flex items-center gap-2 mb-3 p-2 rounded-sm border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 text-xs text-[var(--color-warning-dark)]"
+			class="flex items-center gap-2 mb-3 p-2 rounded-xs border border-warning/30 bg-warning/10 text-xs text-(--color-warning-dark)"
 			role="alert"
 		>
 			<AlertTriangle size={14} />
@@ -188,9 +188,9 @@
 	{#if error}
 		<ErrorState />
 	{:else if loading && rules.length === 0}
-		<p class="text-sm text-[var(--shell-text-muted)]">Loading rules…</p>
+		<p class="text-sm text-(--shell-text-muted)">Loading rules…</p>
 	{:else if rules.length === 0}
-		<p class="text-sm text-[var(--shell-text-secondary)]">
+		<p class="text-sm text-(--shell-text-secondary)">
 			No alert rules yet. Start from one of the seven starter templates — created rules stay
 			disabled until you review and enable them.
 		</p>
@@ -198,7 +198,7 @@
 		<div class="overflow-x-auto">
 			<table class="w-full text-xs border-collapse">
 				<thead>
-					<tr class="text-left text-[var(--shell-text-muted)] border-b border-[var(--shell-line)]">
+					<tr class="text-left text-(--shell-text-muted) border-b border-(--shell-line)">
 						<th class="py-1.5 pr-3 font-semibold">Enabled</th>
 						<th class="py-1.5 pr-3 font-semibold">Name</th>
 						<th class="py-1.5 pr-3 font-semibold">Type</th>
@@ -213,7 +213,7 @@
 				</thead>
 				<tbody>
 					{#each rules as rule (rule.rule_id)}
-						<tr class="border-b border-[var(--shell-line)] last:border-b-0">
+						<tr class="border-b border-(--shell-line) last:border-b-0">
 							<td class="py-1.5 pr-3 whitespace-nowrap">
 								{#if isOperator}
 									<input
@@ -229,10 +229,10 @@
 									</Badge>
 								{/if}
 							</td>
-							<td class="py-1.5 pr-3 font-medium text-[var(--shell-text)]">{rule.name}</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 pr-3 font-medium text-(--shell-text)">{rule.name}</td>
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) whitespace-nowrap">
 								{rule.rule_type}
-								<span class="text-[var(--shell-text-muted)]"> · rev {rule.revision}</span>
+								<span class="text-(--shell-text-muted)"> · rev {rule.revision}</span>
 							</td>
 							<td class="py-1.5 pr-3 whitespace-nowrap">
 								<Badge variant={severityBadgeVariant(rule.severity)}>{rule.severity}</Badge>
@@ -240,15 +240,15 @@
 							<td class="py-1.5 pr-3 whitespace-nowrap">
 								<a
 									href={targetHref(rule.target_kind, rule.target_id)}
-									class="text-[var(--shell-accent)] no-underline hover:underline"
+									class="text-(--shell-accent) no-underline hover:underline"
 								>
 									{rule.target_kind}/{rule.target_id}
 								</a>
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] max-w-[24rem] truncate" title={ruleSpecSummary(rule)}>
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) max-w-[24rem] truncate" title={ruleSpecSummary(rule)}>
 								{ruleSpecSummary(rule)}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) whitespace-nowrap">
 								{formatAlertTimestamp(rule.updated_at_ms)}
 							</td>
 							{#if isOperator}
