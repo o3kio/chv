@@ -36,9 +36,11 @@ pub enum ParseError {
 /// floats, and error shape — rather than reproducing serde_yaml byte for
 /// byte:
 ///
-/// - `strict_booleans` keeps YAML 1.2 semantics: only `true`/`false` are
-///   booleans, so values such as `n`, `yes`, or `on` stay strings. Silently
-///   coercing `name: n` into `false` would be a surprising config regression.
+/// - `strict_booleans` keeps YAML 1.2 core-schema semantics: only the six
+///   spellings `true`/`True`/`TRUE` and `false`/`False`/`FALSE` are booleans,
+///   so values such as `n`, `yes`, `on`, or mixed-case `tRuE` stay strings.
+///   Silently coercing `name: n` into `false` — or a `tRuE` typo into `true`
+///   — would be a surprising config regression.
 /// - `merge_keys: AsOrdinary` keeps `<<` as a literal mapping key. serde_yaml
 ///   did not implement YAML 1.1 merge expansion, so accepting merged documents
 ///   would silently change what the schema validator and `Project.extras` see.
@@ -164,9 +166,12 @@ metadata:
     }
 
     /// YAML 1.2 scalar semantics — the behavior `serde_yaml` had, which this
-    /// crate's configs were written against. Only `true`/`false` are booleans;
-    /// YAML 1.1 spellings such as `n`, `yes`, and `on` must stay strings.
-    /// Coercing `name: n` to `false` would silently corrupt a topology.
+    /// crate's configs were written against. The core schema resolves only the
+    /// spellings `true`/`True`/`TRUE` and `false`/`False`/`FALSE` to booleans;
+    /// arbitrary casing such as `tRuE` and YAML 1.1 spellings such as `n`,
+    /// `yes`, and `on` must stay strings. Coercing `name: n` to `false` would
+    /// silently corrupt a topology, and `tRuE` silently becoming a boolean
+    /// would hide a typo behind a surprising value.
     #[test]
     fn yaml_12_scalars_stay_strings() {
         let raw = parse_value(
@@ -179,6 +184,7 @@ metadata:
             ("yes_val", "yes"),
             ("on_val", "on"),
             ("off_val", "off"),
+            ("true_weird", "tRuE"),
         ] {
             assert_eq!(
                 raw.get(key).and_then(|v| v.as_str()),
@@ -186,7 +192,7 @@ metadata:
                 "{key} must remain the string {expected:?}"
             );
         }
-        for key in ["true_val", "true_mixed", "true_weird"] {
+        for key in ["true_val", "true_mixed"] {
             assert_eq!(raw.get(key), Some(&serde_json::Value::Bool(true)), "{key}");
         }
         for key in ["false_val", "false_upper"] {
@@ -217,6 +223,35 @@ networks:
         assert_eq!(m.networks[0].name, "on");
         let dhcp = m.networks[0].dhcp.as_ref().expect("dhcp present");
         assert!(dhcp.enabled, "`true` must still deserialize as bool");
+    }
+
+    /// The six core-schema spellings work through the typed path too, and a
+    /// mixed-case typo is a typed parse error instead of a silently coerced
+    /// `true` (the failure mode the saphyr 2.1 alignment removes).
+    #[test]
+    fn core_schema_boolean_spellings_are_typed() {
+        for (spelling, expected) in [
+            ("true", true),
+            ("True", true),
+            ("TRUE", true),
+            ("false", false),
+            ("False", false),
+            ("FALSE", false),
+        ] {
+            let doc = format!(
+                "apiVersion: chv.kubedo.io/v1alpha1\nkind: CHVArchitecture\nmetadata:\n  name: x\nnetworks:\n  - name: n\n    type: bridge\n    dhcp:\n      enabled: {spelling}\n"
+            );
+            let m = parse_yaml(&doc)
+                .unwrap_or_else(|e| panic!("`{spelling}` must parse as a boolean, got {e:?}"));
+            let dhcp = m.networks[0].dhcp.as_ref().expect("dhcp present");
+            assert_eq!(dhcp.enabled, expected, "`{spelling}` -> {expected}");
+        }
+
+        let typo = "apiVersion: chv.kubedo.io/v1alpha1\nkind: CHVArchitecture\nmetadata:\n  name: x\nnetworks:\n  - name: n\n    type: bridge\n    dhcp:\n      enabled: tRuE\n";
+        assert!(
+            parse_yaml(typo).is_err(),
+            "`tRuE` is a string under YAML 1.2 and must not coerce to a boolean"
+        );
     }
 
     /// serde_yaml kept `<<` as a literal key (it did not implement YAML 1.1
