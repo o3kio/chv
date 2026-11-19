@@ -2981,28 +2981,31 @@ mod tests {
             DesiredStateRepository::new(pool.clone()),
         );
         DesiredStateRepository::new(pool.clone())
-            .upsert_volume(&chv_controlplane_store::VolumeDesiredStateInput {
-                volume_id: ResourceId::new("vol-clone-src").unwrap(),
-                node_id: Some(NodeId::new("node-att").unwrap()),
-                display_name: "vol-clone-src".into(),
-                capacity_bytes: 1024,
-                volume_kind: Some("disk".into()),
-                storage_class: Some("lvm".into()),
-                owner_id: Some("user-att".into()),
-                desired_generation: Generation::new(1),
-                desired_status: None,
-                requested_by: Some("test-user".into()),
-                updated_by: None,
-                attached_vm_id: None,
-                attachment_mode: None,
-                device_name: None,
-                read_only: false,
-                resize_to_bytes: None,
-                snapshot_op: None,
-                snapshot_name: None,
-                clone_source_volume_id: None,
-                requested_unix_ms: 1000,
-            })
+            .upsert_volume(
+                &chv_controlplane_store::VolumeDesiredStateInput {
+                    volume_id: ResourceId::new("vol-clone-src").unwrap(),
+                    node_id: Some(NodeId::new("node-att").unwrap()),
+                    display_name: "vol-clone-src".into(),
+                    capacity_bytes: 1024,
+                    volume_kind: Some("disk".into()),
+                    storage_class: Some("lvm".into()),
+                    owner_id: Some("user-att".into()),
+                    desired_generation: Generation::new(1),
+                    desired_status: None,
+                    requested_by: Some("test-user".into()),
+                    updated_by: None,
+                    attached_vm_id: None,
+                    attachment_mode: None,
+                    device_name: None,
+                    read_only: false,
+                    resize_to_bytes: None,
+                    snapshot_op: None,
+                    snapshot_name: None,
+                    clone_source_volume_id: None,
+                    requested_unix_ms: 1000,
+                },
+                None,
+            )
             .await
             .unwrap();
         let ack = clone_service

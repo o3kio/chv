@@ -834,6 +834,7 @@ async fn late_fragment_upsert_cannot_resurrect_a_deleted_network() {
                 exposure_policy: None,
                 updated_unix_ms: wall_clock,
             }],
+            None,
         )
         .await
         .expect_err("the fragment upsert must refuse a tombstoned network");

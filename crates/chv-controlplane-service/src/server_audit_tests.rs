@@ -10,13 +10,14 @@ use crate::enrollment::{
 use crate::error::ControlPlaneServiceError;
 use crate::lifecycle::LifecycleService;
 use crate::peer_identity::{InsecurePeer, PeerCertificateSerial, PeerNodeId};
-use crate::reconcile::ReconcileService;
+use crate::reconcile::{ReconcileService, ReconcileServiceImplementation};
 use crate::revocation::RevocationSnapshot;
 use crate::server::{EnrollmentServer, LifecycleServer, ReconcileServer};
 use chv_controlplane_store::{
     test_util::TestDb, AuditLogInsert, AuditLogRepository, AuditLogRow, AuditOutboxInsert,
-    AuditOutboxRepository, AuditOutboxRow, BootstrapTokenRepository, NodeRepository,
-    NodeUpsertInput, StorePool, VtepRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
+    AuditOutboxRepository, AuditOutboxRow, BootstrapTokenRepository, DesiredStateRepository,
+    EventRepository, NodeRepository, NodeUpsertInput, ObservedStateRepository, OperationRepository,
+    StorePool, VtepRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
 };
 use chv_controlplane_types::domain::NodeId;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -228,6 +229,7 @@ impl ReconcileService for MockReconcile {
     async fn apply_node_desired_state(
         &self,
         _request: proto::ApplyNodeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         Ok(ok_ack())
     }
@@ -235,6 +237,7 @@ impl ReconcileService for MockReconcile {
     async fn apply_vm_desired_state(
         &self,
         _request: proto::ApplyVmDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         Ok(ok_ack())
     }
@@ -242,6 +245,7 @@ impl ReconcileService for MockReconcile {
     async fn apply_volume_desired_state(
         &self,
         _request: proto::ApplyVolumeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         Ok(ok_ack())
     }
@@ -249,6 +253,7 @@ impl ReconcileService for MockReconcile {
     async fn apply_network_desired_state(
         &self,
         _request: proto::ApplyNetworkDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         Ok(ok_ack())
     }
@@ -256,6 +261,7 @@ impl ReconcileService for MockReconcile {
     async fn acknowledge_desired_state_version(
         &self,
         _request: proto::AcknowledgeDesiredStateVersionRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         Ok(ok_ack())
     }
@@ -716,6 +722,13 @@ async fn server_audit_reconcile_apply_node_desired_state_writes_row() {
         .await
         .expect("apply node desired state succeeds");
 
+    // `MockReconcile` ignores the ticket the adapter hands it, so this is
+    // the "service did not adopt" shape: the row is absent and today's
+    // direct insert runs unchanged.
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "an unadopted reconcile RPC never touches the outbox"
+    );
     let rows = audit_rows(&db.pool).await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
@@ -754,6 +767,10 @@ async fn server_audit_reconcile_acknowledge_accepts_capitalized_kind() {
         .await
         .expect("acknowledge succeeds");
 
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "an unadopted reconcile RPC never touches the outbox"
+    );
     let rows = audit_rows(&db.pool).await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
@@ -1285,4 +1302,679 @@ async fn server_audit_post_commit_failure_patches_the_committed_row_exactly_once
     assert_eq!(dispatched[0].audit_id, rows[0].audit_id);
     assert_eq!(dispatched[0].outcome, "failed");
     assert_eq!(dispatched[0].status_code, 500);
+}
+
+// ---------------------------------------------------------------------------
+// #706 PR 3b — reconcile RPCs coupled to the transactional audit outbox.
+//
+// These drive the *real* `ReconcileServiceImplementation`, so the outbox
+// row is enqueued inside the desired-state write's transaction exactly as
+// in production. `MockReconcile` above still covers the unadopted shape.
+// ---------------------------------------------------------------------------
+
+fn reconcile_impl(db: &TestDb) -> ReconcileServiceImplementation {
+    ReconcileServiceImplementation::new(
+        NodeRepository::new(db.pool.clone()),
+        DesiredStateRepository::new(db.pool.clone()),
+        EventRepository::new(db.pool.clone()),
+        ObservedStateRepository::new(db.pool.clone()),
+        OperationRepository::new(db.pool.clone()),
+    )
+}
+
+fn adopted_reconcile_server(db: &TestDb) -> ReconcileServer {
+    ReconcileServer::new(Arc::new(reconcile_impl(db)))
+        .with_audit(AuditLogRepository::new(db.pool.clone()))
+}
+
+fn reconcile_meta(node_id: &str, operation_id: &str) -> proto::RequestMeta {
+    proto::RequestMeta {
+        operation_id: operation_id.into(),
+        requested_by: "test-user".into(),
+        target_node_id: node_id.into(),
+        desired_state_version: "1".into(),
+        request_unix_ms: 1_000,
+    }
+}
+
+fn desired_state_fragment(
+    resource_id: &str,
+    kind: &str,
+    generation: &str,
+    spec_json: &str,
+) -> proto::DesiredStateFragment {
+    proto::DesiredStateFragment {
+        id: resource_id.into(),
+        kind: kind.into(),
+        generation: generation.into(),
+        spec_json: spec_json.as_bytes().to_vec(),
+        policy_json: vec![],
+        updated_at: String::new(),
+        updated_by: String::new(),
+    }
+}
+
+async fn seed_operation(
+    pool: &StorePool,
+    operation_id: &str,
+    resource_kind: &str,
+    resource_id: &str,
+) {
+    sqlx::query(
+        "INSERT INTO operations \
+         (operation_id, idempotency_key, resource_kind, resource_id, operation_type, status, requested_at) \
+         VALUES (?, ?, ?, ?, 'Test', 'Pending', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+    )
+    .bind(operation_id)
+    .bind(format!("idem-{operation_id}"))
+    .bind(resource_kind)
+    .bind(resource_id)
+    .execute(pool)
+    .await
+    .expect("seed operation");
+}
+
+async fn assert_single_dispatch(db: &TestDb, action: &str) -> AuditLogRow {
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one outbox row");
+    let row = &rows[0];
+    assert_eq!(row.status, AUDIT_OUTBOX_PENDING);
+    let dispatched = dispatch_one(db, row.created_at_ms).await;
+    assert_eq!(dispatched[0].audit_id, row.audit_id, "audit_id is reused");
+    assert_eq!(dispatched[0].action, action);
+    assert_eq!(dispatched[0].outcome, "success");
+    assert_eq!(dispatched[0].status_code, 200);
+
+    // Replay is a no-op: the full path wrote exactly one evidence row.
+    let again = dispatcher(&db.pool)
+        .dispatch_pass(row.created_at_ms + 60_000)
+        .await
+        .expect("second pass");
+    assert_eq!(again, 0, "a dispatched row is never replayed");
+    assert_eq!(audit_rows(&db.pool).await.len(), 1, "no double write");
+    dispatched[0].clone()
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_apply_node_desired_state_adopts_outbox() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    seed_operation(&db.pool, "op-node-adopted", "node", "node-a").await;
+    let server = adopted_reconcile_server(&db);
+
+    let mut request = peer_request(
+        proto::ApplyNodeDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "op-node-adopted")),
+            node_id: "node-a".into(),
+            fragment: Some(desired_state_fragment(
+                "node-a",
+                "node",
+                "1",
+                r#"{"desired_state":"TenantReady"}"#,
+            )),
+        },
+        "node-a",
+    );
+    request.metadata_mut().insert(
+        chv_common::OPERATION_ID_METADATA_KEY,
+        "op-node-adopted".parse().expect("metadata value"),
+    );
+    server
+        .apply_node_desired_state(request)
+        .await
+        .expect("apply node desired state succeeds");
+
+    // The desired-state write committed and the adapter wrote no direct row.
+    let (state,): (String,) =
+        sqlx::query_as("SELECT desired_state FROM node_desired_state WHERE node_id = 'node-a'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read node desired state");
+    assert_eq!(state, "TenantReady");
+    assert!(audit_rows(&db.pool).await.is_empty(), "no direct insert");
+
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(payload.action, "ApplyNodeDesiredState");
+    assert_eq!(
+        payload.path,
+        "chv.controlplane.node.v1.ReconcileService/ApplyNodeDesiredState"
+    );
+    assert_eq!(payload.actor_id, "node-a");
+    assert_eq!(payload.actor_role, "node");
+    assert_eq!(payload.resource_kind.as_deref(), Some("node"));
+    assert_eq!(payload.resource_id.as_deref(), Some("node-a"));
+    assert_eq!(payload.operation_id.as_deref(), Some("op-node-adopted"));
+    assert_metadata_is_allowlisted(&payload.metadata, "mtls");
+
+    assert_single_dispatch(&db, "ApplyNodeDesiredState").await;
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_apply_vm_desired_state_adopts_outbox() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    seed_operation(&db.pool, "op-vm-adopted", "vm", "vm-1").await;
+    let server = adopted_reconcile_server(&db);
+
+    let request = peer_request(
+        proto::ApplyVmDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "op-vm-adopted")),
+            node_id: "node-a".into(),
+            vm_id: "vm-1".into(),
+            fragment: Some(desired_state_fragment(
+                "vm-1",
+                "vm",
+                "2",
+                r#"{"cpu_count":2,"memory_bytes":4294967296,"image_ref":"ubuntu"}"#,
+            )),
+        },
+        "node-a",
+    );
+    server
+        .apply_vm_desired_state(request)
+        .await
+        .expect("apply vm desired state succeeds");
+
+    let (generation,): (i64,) =
+        sqlx::query_as("SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-1'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read vm desired state");
+    assert_eq!(generation, 2);
+    assert!(audit_rows(&db.pool).await.is_empty(), "no direct insert");
+
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(payload.action, "ApplyVmDesiredState");
+    assert_eq!(payload.resource_kind.as_deref(), Some("vm"));
+    assert_eq!(payload.resource_id.as_deref(), Some("vm-1"));
+    assert_eq!(payload.outcome, "success");
+
+    assert_single_dispatch(&db, "ApplyVmDesiredState").await;
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_apply_volume_desired_state_adopts_outbox() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    seed_operation(&db.pool, "op-vol-adopted", "volume", "vol-1").await;
+    let server = adopted_reconcile_server(&db);
+
+    let request = peer_request(
+        proto::ApplyVolumeDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "op-vol-adopted")),
+            node_id: "node-a".into(),
+            volume_id: "vol-1".into(),
+            fragment: Some(desired_state_fragment(
+                "vol-1",
+                "volume",
+                "3",
+                r#"{"capacity_bytes":1073741824,"volume_kind":"disk"}"#,
+            )),
+        },
+        "node-a",
+    );
+    server
+        .apply_volume_desired_state(request)
+        .await
+        .expect("apply volume desired state succeeds");
+
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT desired_generation FROM volume_desired_state WHERE volume_id = 'vol-1'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read volume desired state");
+    assert_eq!(generation, 3);
+    assert!(audit_rows(&db.pool).await.is_empty(), "no direct insert");
+
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(payload.action, "ApplyVolumeDesiredState");
+    assert_eq!(payload.resource_kind.as_deref(), Some("volume"));
+    assert_eq!(payload.resource_id.as_deref(), Some("vol-1"));
+
+    assert_single_dispatch(&db, "ApplyVolumeDesiredState").await;
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_apply_network_desired_state_adopts_outbox() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    seed_operation(&db.pool, "op-net-adopted", "network", "net-1").await;
+    let server = adopted_reconcile_server(&db);
+
+    let request = peer_request(
+        proto::ApplyNetworkDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "op-net-adopted")),
+            node_id: "node-a".into(),
+            network_id: "net-1".into(),
+            fragment: Some(desired_state_fragment(
+                "net-1",
+                "network",
+                "4",
+                r#"{"network_class":"overlay"}"#,
+            )),
+        },
+        "node-a",
+    );
+    server
+        .apply_network_desired_state(request)
+        .await
+        .expect("apply network desired state succeeds");
+
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT desired_generation FROM network_desired_state WHERE network_id = 'net-1'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read network desired state");
+    assert_eq!(generation, 4);
+    assert!(audit_rows(&db.pool).await.is_empty(), "no direct insert");
+
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(payload.action, "ApplyNetworkDesiredState");
+    assert_eq!(payload.resource_kind.as_deref(), Some("network"));
+    assert_eq!(payload.resource_id.as_deref(), Some("net-1"));
+
+    assert_single_dispatch(&db, "ApplyNetworkDesiredState").await;
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_acknowledge_adopts_outbox() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    sqlx::query(
+        "INSERT INTO node_observed_state (node_id, observed_generation, observed_state) \
+         VALUES ('node-a', 1, 'TenantReady')",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("seed observed state");
+    seed_operation(&db.pool, "op-ack-adopted", "node", "node-a").await;
+    let server = adopted_reconcile_server(&db);
+
+    let request = peer_request(
+        proto::AcknowledgeDesiredStateVersionRequest {
+            meta: Some(reconcile_meta("node-a", "op-ack-adopted")),
+            node_id: "node-a".into(),
+            fragment_kind: "node".into(),
+            fragment_id: "node-a".into(),
+            observed_generation: "5".into(),
+            apply_status: "ok".into(),
+        },
+        "node-a",
+    );
+    server
+        .acknowledge_desired_state_version(request)
+        .await
+        .expect("acknowledge succeeds");
+
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT observed_generation FROM node_observed_state WHERE node_id = 'node-a'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read observed state");
+    assert_eq!(generation, 5);
+    assert!(audit_rows(&db.pool).await.is_empty(), "no direct insert");
+
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(payload.action, "AcknowledgeDesiredStateVersion");
+    assert_eq!(
+        payload.path,
+        "chv.controlplane.node.v1.ReconcileService/AcknowledgeDesiredStateVersion"
+    );
+    assert_eq!(payload.resource_kind.as_deref(), Some("node"));
+    assert_eq!(payload.resource_id.as_deref(), Some("node-a"));
+
+    assert_single_dispatch(&db, "AcknowledgeDesiredStateVersion").await;
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_stale_generation_rolls_back_and_writes_one_failed_row() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    sqlx::query("INSERT INTO vms (vm_id, display_name) VALUES ('vm-stale', 'vm-stale')")
+        .execute(&db.pool)
+        .await
+        .expect("seed vm");
+    sqlx::query(
+        "INSERT INTO vm_desired_state (vm_id, desired_generation, requested_at, updated_at) \
+         VALUES ('vm-stale', 10, strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("seed desired state");
+    let server = adopted_reconcile_server(&db);
+
+    let request = peer_request(
+        proto::ApplyVmDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "")),
+            node_id: "node-a".into(),
+            vm_id: "vm-stale".into(),
+            fragment: Some(desired_state_fragment(
+                "vm-stale",
+                "vm",
+                "1",
+                r#"{"cpu_count":2}"#,
+            )),
+        },
+        "node-a",
+    );
+    let status = server
+        .apply_vm_desired_state(request)
+        .await
+        .expect_err("a stale fragment must be refused");
+    assert_eq!(status.code(), Code::Internal);
+
+    // The stale-generation error rolled the whole transaction back: no
+    // desired-state write, no outbox row. The adapter records the failed
+    // request exactly once on the direct path.
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "a rolled-back mutation enqueues nothing"
+    );
+    let (generation,): (i64,) =
+        sqlx::query_as("SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-stale'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read desired state");
+    assert_eq!(generation, 10, "the stale write must not commit");
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one direct failed row");
+    assert_eq!(rows[0].action, "ApplyVmDesiredState");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 500);
+    assert_eq!(rows[0].resource_id.as_deref(), Some("vm-stale"));
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_acknowledge_missing_observed_row_writes_one_failed_row() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    let server = adopted_reconcile_server(&db);
+
+    let request = peer_request(
+        proto::AcknowledgeDesiredStateVersionRequest {
+            meta: Some(reconcile_meta("node-a", "")),
+            node_id: "node-a".into(),
+            fragment_kind: "node".into(),
+            fragment_id: "node-a".into(),
+            observed_generation: "5".into(),
+            apply_status: "ok".into(),
+        },
+        "node-a",
+    );
+    let status = server
+        .acknowledge_desired_state_version(request)
+        .await
+        .expect_err("no observed-state row means NotFound");
+    assert_eq!(status.code(), Code::NotFound);
+
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "a rejected acknowledgement enqueues nothing"
+    );
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one direct failed row");
+    assert_eq!(rows[0].action, "AcknowledgeDesiredStateVersion");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 404);
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_adopted_crash_replay_writes_exactly_one_row() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    let service = reconcile_impl(&db);
+
+    // Deterministic crash: commit the desired-state write + outbox row,
+    // then never run the adapter's `finish_audited` (the process died).
+    let now = chv_common::now_unix_ms();
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-reconcile-crash".into(),
+        audit_id: "audit-reconcile-crash".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: now,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "ApplyVolumeDesiredState".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.ReconcileService/ApplyVolumeDesiredState".into(),
+            resource_kind: Some("volume".into()),
+            resource_id: Some("vol-crash".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: Some("op-reconcile-crash".into()),
+            source_ip: None,
+            metadata: r#"{"transport":"grpc","auth_source":"mtls"}"#.into(),
+        },
+        created_at_ms: now,
+    };
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let coupling = AdoptedAudit::new(&insert, &committed);
+    service
+        .apply_volume_desired_state(
+            proto::ApplyVolumeDesiredStateRequest {
+                meta: Some(reconcile_meta("node-a", "")),
+                node_id: "node-a".into(),
+                volume_id: "vol-crash".into(),
+                fragment: Some(desired_state_fragment(
+                    "vol-crash",
+                    "volume",
+                    "1",
+                    r#"{"capacity_bytes":1024}"#,
+                )),
+            },
+            Some(&coupling),
+        )
+        .await
+        .expect("mutation commits with its outbox row");
+    assert!(
+        coupling.was_committed(),
+        "the service marks the enqueue committed"
+    );
+
+    assert!(audit_rows(&db.pool).await.is_empty(), "no post-hoc row yet");
+    let pending = outbox_rows(&db.pool).await;
+    assert_eq!(pending.len(), 1);
+
+    // The startup dispatcher pass replays the durable row exactly once.
+    let rows = dispatch_one(&db, pending[0].created_at_ms).await;
+    assert_eq!(rows[0].audit_id, "audit-reconcile-crash");
+    assert_eq!(rows[0].action, "ApplyVolumeDesiredState");
+    assert_eq!(rows[0].operation_id.as_deref(), Some("op-reconcile-crash"));
+
+    let again = dispatcher(&db.pool)
+        .dispatch_pass(pending[0].created_at_ms + 60_000)
+        .await
+        .expect("second pass");
+    assert_eq!(again, 0);
+    assert_eq!(audit_rows(&db.pool).await.len(), 1);
+}
+
+/// Reconcile service that enqueues + commits and then fails anyway. Not
+/// reachable through the real implementation (the enqueue is its last
+/// fallible step before the convergence event, which is a *later*
+/// commit); the fixture pins the composition's patch contract.
+struct ReconcileEnqueueThenFail {
+    pool: StorePool,
+}
+
+#[tonic::async_trait]
+impl ReconcileService for ReconcileEnqueueThenFail {
+    async fn apply_node_desired_state(
+        &self,
+        _request: proto::ApplyNodeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn apply_vm_desired_state(
+        &self,
+        _request: proto::ApplyVmDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        let audit = audit.expect("the adapter passes the coupling");
+        let mut tx = self.pool.begin().await.expect("begin adopted tx");
+        chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
+            .await
+            .expect("enqueue evidence");
+        tx.commit().await.expect("commit evidence");
+        audit.mark_committed();
+        Err(ControlPlaneServiceError::Internal(
+            "post-commit failure".into(),
+        ))
+    }
+
+    async fn apply_volume_desired_state(
+        &self,
+        _request: proto::ApplyVolumeDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn apply_network_desired_state(
+        &self,
+        _request: proto::ApplyNetworkDesiredStateRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+
+    async fn acknowledge_desired_state_version(
+        &self,
+        _request: proto::AcknowledgeDesiredStateVersionRequest,
+        _audit: Option<&AdoptedAudit<'_>>,
+    ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+        unreachable!("only apply_vm_desired_state is exercised")
+    }
+}
+
+#[tokio::test]
+async fn server_audit_reconcile_post_commit_failure_patches_the_committed_row() {
+    let db = TestDb::new().await;
+    let server = ReconcileServer::new(Arc::new(ReconcileEnqueueThenFail {
+        pool: db.pool.clone(),
+    }))
+    .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let request = peer_request(
+        proto::ApplyVmDesiredStateRequest {
+            meta: Some(reconcile_meta("node-a", "")),
+            node_id: "node-a".into(),
+            vm_id: "vm-post-commit".into(),
+            fragment: Some(desired_state_fragment("vm-post-commit", "vm", "1", "{}")),
+        },
+        "node-a",
+    );
+    let status = server
+        .apply_vm_desired_state(request)
+        .await
+        .expect_err("the service failure must be preserved");
+    assert_eq!(status.code(), Code::Internal);
+
+    // The committed row is the only evidence: no direct row was added.
+    assert!(
+        audit_rows(&db.pool).await.is_empty(),
+        "a present outbox row suppresses the direct insert"
+    );
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one outbox row");
+    assert_eq!(rows[0].status, AUDIT_OUTBOX_PENDING);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(
+        payload.outcome, "failed",
+        "the commit-time success prediction is patched"
+    );
+    assert_eq!(payload.status_code, 500);
+    assert_eq!(payload.action, "ApplyVmDesiredState");
+
+    let dispatched = dispatch_one(&db, rows[0].created_at_ms).await;
+    assert_eq!(dispatched[0].audit_id, rows[0].audit_id);
+    assert_eq!(dispatched[0].outcome, "failed");
+    assert_eq!(dispatched[0].status_code, 500);
+}
+
+/// An adopted reconcile write whose audit payload exceeds the store's
+/// 16 KiB bound must fail closed: neither the desired-state row nor the
+/// outbox row survives.
+#[tokio::test]
+async fn server_audit_reconcile_oversized_payload_rolls_back_the_adopted_write() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    let service = reconcile_impl(&db);
+
+    let now = chv_common::now_unix_ms();
+    let oversized = AuditOutboxInsert {
+        outbox_id: "ob-reconcile-oversized".into(),
+        audit_id: "audit-reconcile-oversized".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: now,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "ApplyVmDesiredState".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.ReconcileService/ApplyVmDesiredState".into(),
+            resource_kind: Some("vm".into()),
+            resource_id: Some("vm-oversized".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            // > the 16 KiB payload bound enforced by `enqueue_on_tx`.
+            metadata: "x".repeat(16 * 1024 + 1),
+        },
+        created_at_ms: now,
+    };
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let coupling = AdoptedAudit::new(&oversized, &committed);
+    let error = service
+        .apply_vm_desired_state(
+            proto::ApplyVmDesiredStateRequest {
+                meta: Some(reconcile_meta("node-a", "")),
+                node_id: "node-a".into(),
+                vm_id: "vm-oversized".into(),
+                fragment: Some(desired_state_fragment("vm-oversized", "vm", "1", "{}")),
+            },
+            Some(&coupling),
+        )
+        .await
+        .expect_err("oversized evidence must fail the mutation closed");
+    assert!(
+        matches!(
+            &error,
+            ControlPlaneServiceError::Internal(message)
+                if message.contains("audit outbox payload")
+        ),
+        "expected the store's payload validation error, got {error:?}"
+    );
+
+    let (vms,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM vm_desired_state WHERE vm_id = 'vm-oversized'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count desired state");
+    assert_eq!(vms, 0, "the desired-state write must roll back");
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "no outbox row survives the rollback"
+    );
+    assert!(!coupling.was_committed());
 }

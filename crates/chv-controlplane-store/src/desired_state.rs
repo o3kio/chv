@@ -1,3 +1,4 @@
+use crate::audit_outbox::{enqueue_adopted_row, AuditOutboxInsert};
 use crate::{NetworkExposureInput, StoreError, StorePool};
 use chv_controlplane_types::domain::{Generation, NodeId, ResourceId};
 
@@ -533,7 +534,18 @@ impl DesiredStateRepository {
         &self.pool
     }
 
-    pub async fn upsert_vm(&self, input: &VmDesiredStateInput) -> Result<(), StoreError> {
+    /// Persist a VM desired-state fragment.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). The
+    /// desired-state transaction is opened either way; when a row is
+    /// present it is enqueued as the transaction's last fallible
+    /// statement, so the evidence commits with the fragment or not at
+    /// all (a stale generation rolls both back).
+    pub async fn upsert_vm(
+        &self,
+        input: &VmDesiredStateInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let generation = generation_to_i64(input.desired_generation)?;
 
@@ -572,6 +584,9 @@ impl DesiredStateRepository {
             });
         }
 
+        if let Some(audit) = audit {
+            enqueue_adopted_row(&mut tx, audit).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -654,7 +669,16 @@ impl DesiredStateRepository {
         Ok(())
     }
 
-    pub async fn upsert_volume(&self, input: &VolumeDesiredStateInput) -> Result<(), StoreError> {
+    /// Persist a volume desired-state fragment.
+    ///
+    /// `audit` follows [`Self::upsert_vm`]: when present the row is
+    /// enqueued inside the desired-state transaction, so a stale
+    /// generation commits neither the fragment nor its evidence.
+    pub async fn upsert_volume(
+        &self,
+        input: &VolumeDesiredStateInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let generation = generation_to_i64(input.desired_generation)?;
 
@@ -701,6 +725,9 @@ impl DesiredStateRepository {
             });
         }
 
+        if let Some(audit) = audit {
+            enqueue_adopted_row(&mut tx, audit).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1122,10 +1149,17 @@ impl DesiredStateRepository {
         Ok(())
     }
 
+    /// Persist a network desired-state fragment plus its exposure rows.
+    ///
+    /// `audit` follows [`Self::upsert_vm`]: when present the row is
+    /// enqueued inside the desired-state transaction, so a blocked
+    /// tombstone or a stale generation commits neither the fragment,
+    /// the exposures, nor the evidence.
     pub async fn upsert_network_with_exposures(
         &self,
         input: &NetworkDesiredStateInput,
         exposures: &[NetworkExposureInput],
+        audit: Option<&AuditOutboxInsert>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let generation = generation_to_i64(input.desired_generation)?;
@@ -1194,6 +1228,9 @@ impl DesiredStateRepository {
                 })?;
         }
 
+        if let Some(audit) = audit {
+            enqueue_adopted_row(&mut tx, audit).await?;
+        }
         tx.commit().await?;
         Ok(())
     }

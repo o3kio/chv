@@ -2118,7 +2118,7 @@ async fn test_apply_vm_desired_state_persistence() {
         }),
     };
 
-    let result = service.apply_vm_desired_state(request).await;
+    let result = service.apply_vm_desired_state(request, None).await;
     assert!(result.is_ok(), "Expected success, got {:?}", result);
 
     // Verify persistence in vm_desired_state
@@ -2178,7 +2178,7 @@ async fn test_apply_network_desired_state_with_exposures() {
         }),
     };
 
-    let result = service.apply_network_desired_state(request).await;
+    let result = service.apply_network_desired_state(request, None).await;
     assert!(result.is_ok(), "Expected success, got {:?}", result);
 
     // Verify persistence in network_exposures
@@ -2235,7 +2235,7 @@ async fn test_apply_rejects_non_numeric_generation() {
         }),
     };
 
-    let result = service.apply_vm_desired_state(request).await;
+    let result = service.apply_vm_desired_state(request, None).await;
     match result {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
             assert!(
@@ -2291,7 +2291,7 @@ async fn test_apply_node_desired_state_persistence() {
         }),
     };
 
-    let resp = service.apply_node_desired_state(req).await.unwrap();
+    let resp = service.apply_node_desired_state(req, None).await.unwrap();
     assert_eq!(resp.result.unwrap().status, "ok");
 }
 
@@ -2331,7 +2331,7 @@ async fn test_apply_rejects_invalid_spec_json() {
         }),
     };
 
-    let result = service.apply_vm_desired_state(req).await;
+    let result = service.apply_vm_desired_state(req, None).await;
     match result {
         Err(ControlPlaneServiceError::InvalidArgument(_)) => { /* correct */ }
         other => panic!(
@@ -3286,7 +3286,7 @@ async fn test_apply_vm_rejects_wrong_target_node() {
         }),
     };
 
-    match service.apply_vm_desired_state(req).await {
+    match service.apply_vm_desired_state(req, None).await {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
             assert!(msg.contains("target_node_id mismatch"), "msg: {}", msg);
         }
@@ -3342,7 +3342,7 @@ async fn test_apply_vm_rejects_wrong_fragment_id() {
         }),
     };
 
-    match service.apply_vm_desired_state(req).await {
+    match service.apply_vm_desired_state(req, None).await {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
             assert!(msg.contains("fragment.id mismatch"), "msg: {}", msg);
         }
@@ -3398,7 +3398,7 @@ async fn test_apply_vm_rejects_wrong_fragment_kind() {
         }),
     };
 
-    match service.apply_vm_desired_state(req).await {
+    match service.apply_vm_desired_state(req, None).await {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
             assert!(msg.contains("fragment.kind mismatch"), "msg: {}", msg);
         }
@@ -3457,7 +3457,7 @@ async fn test_acknowledge_desired_state_version_persists_observed_generation() {
     };
 
     let resp = service
-        .acknowledge_desired_state_version(req)
+        .acknowledge_desired_state_version(req, None)
         .await
         .unwrap();
     assert_eq!(resp.result.unwrap().node_observed_generation, "5");
@@ -3517,7 +3517,7 @@ async fn test_acknowledge_advances_operation_to_succeeded() {
     };
 
     service
-        .acknowledge_desired_state_version(req)
+        .acknowledge_desired_state_version(req, None)
         .await
         .unwrap();
 
@@ -3580,7 +3580,7 @@ async fn test_acknowledge_preserves_existing_vm_runtime_status() {
     };
 
     service
-        .acknowledge_desired_state_version(req)
+        .acknowledge_desired_state_version(req, None)
         .await
         .unwrap();
 
@@ -3636,7 +3636,7 @@ async fn test_acknowledge_rejects_unknown_fragment_kind() {
         apply_status: "".into(),
     };
 
-    match service.acknowledge_desired_state_version(req).await {
+    match service.acknowledge_desired_state_version(req, None).await {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
             assert!(msg.contains("invalid fragment_kind"), "msg: {}", msg);
         }
@@ -3685,7 +3685,7 @@ async fn test_acknowledge_rejects_unknown_apply_status() {
         apply_status: "mystery-status".into(),
     };
 
-    match service.acknowledge_desired_state_version(req).await {
+    match service.acknowledge_desired_state_version(req, None).await {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
             assert!(msg.contains("invalid apply_status"), "msg: {}", msg);
         }
@@ -5477,31 +5477,34 @@ async fn clone_volume_creates_target_volume_row() {
     // Seed the source volume (node + 10 GiB, local class) the way the
     // volume-fragment reconcile would.
     DesiredStateRepository::new(pool.clone())
-        .upsert_volume(&VolumeDesiredStateInput {
-            volume_id: ResourceId::new("vol-src-1").unwrap(),
-            node_id: Some(NodeId::new("node-clone-1").unwrap()),
-            display_name: "vol-src-1".into(),
-            capacity_bytes: 10_737_418_240,
-            volume_kind: Some("disk".into()),
-            storage_class: Some("local".into()),
-            // #381 review: the source carries an owner (BFF-created volumes
-            // do); the clone target must inherit it or the BFF's
-            // require_volume_owner makes the clone admin-only.
-            owner_id: Some("user-clone-owner".into()),
-            desired_generation: Generation::new(1),
-            desired_status: None,
-            requested_by: Some("test-user".into()),
-            updated_by: None,
-            attached_vm_id: None,
-            attachment_mode: None,
-            device_name: None,
-            read_only: false,
-            resize_to_bytes: None,
-            snapshot_op: None,
-            snapshot_name: None,
-            clone_source_volume_id: None,
-            requested_unix_ms: 1000,
-        })
+        .upsert_volume(
+            &VolumeDesiredStateInput {
+                volume_id: ResourceId::new("vol-src-1").unwrap(),
+                node_id: Some(NodeId::new("node-clone-1").unwrap()),
+                display_name: "vol-src-1".into(),
+                capacity_bytes: 10_737_418_240,
+                volume_kind: Some("disk".into()),
+                storage_class: Some("local".into()),
+                // #381 review: the source carries an owner (BFF-created volumes
+                // do); the clone target must inherit it or the BFF's
+                // require_volume_owner makes the clone admin-only.
+                owner_id: Some("user-clone-owner".into()),
+                desired_generation: Generation::new(1),
+                desired_status: None,
+                requested_by: Some("test-user".into()),
+                updated_by: None,
+                attached_vm_id: None,
+                attachment_mode: None,
+                device_name: None,
+                read_only: false,
+                resize_to_bytes: None,
+                snapshot_op: None,
+                snapshot_name: None,
+                clone_source_volume_id: None,
+                requested_unix_ms: 1000,
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -5542,28 +5545,31 @@ async fn clone_volume_creates_target_volume_row() {
     // A later owner-unaware re-upsert (the volume-fragment reconcile
     // shape: owner_id = NULL) must NOT strip the inherited owner.
     DesiredStateRepository::new(pool.clone())
-        .upsert_volume(&VolumeDesiredStateInput {
-            volume_id: ResourceId::new("vol-dst-1").unwrap(),
-            node_id: Some(NodeId::new("node-clone-1").unwrap()),
-            display_name: "vol-dst-1".into(),
-            capacity_bytes: 10_737_418_240,
-            volume_kind: Some("disk".into()),
-            storage_class: Some("local".into()),
-            owner_id: None,
-            desired_generation: Generation::new(2),
-            desired_status: None,
-            requested_by: Some("fragment-reconcile".into()),
-            updated_by: None,
-            attached_vm_id: None,
-            attachment_mode: None,
-            device_name: None,
-            read_only: false,
-            resize_to_bytes: None,
-            snapshot_op: None,
-            snapshot_name: None,
-            clone_source_volume_id: None,
-            requested_unix_ms: 2000,
-        })
+        .upsert_volume(
+            &VolumeDesiredStateInput {
+                volume_id: ResourceId::new("vol-dst-1").unwrap(),
+                node_id: Some(NodeId::new("node-clone-1").unwrap()),
+                display_name: "vol-dst-1".into(),
+                capacity_bytes: 10_737_418_240,
+                volume_kind: Some("disk".into()),
+                storage_class: Some("local".into()),
+                owner_id: None,
+                desired_generation: Generation::new(2),
+                desired_status: None,
+                requested_by: Some("fragment-reconcile".into()),
+                updated_by: None,
+                attached_vm_id: None,
+                attachment_mode: None,
+                device_name: None,
+                read_only: false,
+                resize_to_bytes: None,
+                snapshot_op: None,
+                snapshot_name: None,
+                clone_source_volume_id: None,
+                requested_unix_ms: 2000,
+            },
+            None,
+        )
         .await
         .unwrap();
     let preserved_owner: Option<String> =
@@ -5592,28 +5598,31 @@ async fn clone_volume_rejects_existing_target() {
 
     for id in ["vol-src-1", "vol-dst-1"] {
         DesiredStateRepository::new(pool.clone())
-            .upsert_volume(&VolumeDesiredStateInput {
-                volume_id: ResourceId::new(id).unwrap(),
-                node_id: Some(NodeId::new("node-clone-1").unwrap()),
-                display_name: id.into(),
-                capacity_bytes: 1024,
-                volume_kind: None,
-                storage_class: None,
-                owner_id: None,
-                desired_generation: Generation::new(1),
-                desired_status: None,
-                requested_by: None,
-                updated_by: None,
-                attached_vm_id: None,
-                attachment_mode: None,
-                device_name: None,
-                read_only: false,
-                resize_to_bytes: None,
-                snapshot_op: None,
-                snapshot_name: None,
-                clone_source_volume_id: None,
-                requested_unix_ms: 1000,
-            })
+            .upsert_volume(
+                &VolumeDesiredStateInput {
+                    volume_id: ResourceId::new(id).unwrap(),
+                    node_id: Some(NodeId::new("node-clone-1").unwrap()),
+                    display_name: id.into(),
+                    capacity_bytes: 1024,
+                    volume_kind: None,
+                    storage_class: None,
+                    owner_id: None,
+                    desired_generation: Generation::new(1),
+                    desired_status: None,
+                    requested_by: None,
+                    updated_by: None,
+                    attached_vm_id: None,
+                    attachment_mode: None,
+                    device_name: None,
+                    read_only: false,
+                    resize_to_bytes: None,
+                    snapshot_op: None,
+                    snapshot_name: None,
+                    clone_source_volume_id: None,
+                    requested_unix_ms: 1000,
+                },
+                None,
+            )
             .await
             .unwrap();
     }
@@ -5711,28 +5720,31 @@ async fn clone_race_test_service() -> (
 /// Seed the clone source the way the volume-fragment reconcile would.
 async fn seed_clone_source(pool: &StorePool, volume_id: &str, capacity_bytes: i64) {
     DesiredStateRepository::new(pool.clone())
-        .upsert_volume(&VolumeDesiredStateInput {
-            volume_id: ResourceId::new(volume_id).unwrap(),
-            node_id: Some(NodeId::new("node-clone-1").unwrap()),
-            display_name: volume_id.into(),
-            capacity_bytes,
-            volume_kind: Some("disk".into()),
-            storage_class: Some("local".into()),
-            owner_id: Some("user-clone-owner".into()),
-            desired_generation: Generation::new(1),
-            desired_status: None,
-            requested_by: Some("test-user".into()),
-            updated_by: None,
-            attached_vm_id: None,
-            attachment_mode: None,
-            device_name: None,
-            read_only: false,
-            resize_to_bytes: None,
-            snapshot_op: None,
-            snapshot_name: None,
-            clone_source_volume_id: None,
-            requested_unix_ms: 1000,
-        })
+        .upsert_volume(
+            &VolumeDesiredStateInput {
+                volume_id: ResourceId::new(volume_id).unwrap(),
+                node_id: Some(NodeId::new("node-clone-1").unwrap()),
+                display_name: volume_id.into(),
+                capacity_bytes,
+                volume_kind: Some("disk".into()),
+                storage_class: Some("local".into()),
+                owner_id: Some("user-clone-owner".into()),
+                desired_generation: Generation::new(1),
+                desired_status: None,
+                requested_by: Some("test-user".into()),
+                updated_by: None,
+                attached_vm_id: None,
+                attachment_mode: None,
+                device_name: None,
+                read_only: false,
+                resize_to_bytes: None,
+                snapshot_op: None,
+                snapshot_name: None,
+                clone_source_volume_id: None,
+                requested_unix_ms: 1000,
+            },
+            None,
+        )
         .await
         .unwrap();
 }
@@ -5963,28 +5975,31 @@ async fn seed_volume_without_node(pool: &StorePool, volume_id: &str) {
 
 async fn seed_volume(pool: &StorePool, volume_id: &str, node_id: Option<&str>) {
     DesiredStateRepository::new(pool.clone())
-        .upsert_volume(&VolumeDesiredStateInput {
-            volume_id: ResourceId::new(volume_id).unwrap(),
-            node_id: node_id.map(|n| NodeId::new(n).unwrap()),
-            display_name: volume_id.into(),
-            capacity_bytes: 1024,
-            volume_kind: None,
-            storage_class: None,
-            owner_id: None,
-            desired_generation: Generation::new(1),
-            desired_status: None,
-            requested_by: None,
-            updated_by: None,
-            attached_vm_id: None,
-            attachment_mode: None,
-            device_name: None,
-            read_only: false,
-            resize_to_bytes: None,
-            snapshot_op: None,
-            snapshot_name: None,
-            clone_source_volume_id: None,
-            requested_unix_ms: 1000,
-        })
+        .upsert_volume(
+            &VolumeDesiredStateInput {
+                volume_id: ResourceId::new(volume_id).unwrap(),
+                node_id: node_id.map(|n| NodeId::new(n).unwrap()),
+                display_name: volume_id.into(),
+                capacity_bytes: 1024,
+                volume_kind: None,
+                storage_class: None,
+                owner_id: None,
+                desired_generation: Generation::new(1),
+                desired_status: None,
+                requested_by: None,
+                updated_by: None,
+                attached_vm_id: None,
+                attachment_mode: None,
+                device_name: None,
+                read_only: false,
+                resize_to_bytes: None,
+                snapshot_op: None,
+                snapshot_name: None,
+                clone_source_volume_id: None,
+                requested_unix_ms: 1000,
+            },
+            None,
+        )
         .await
         .unwrap();
 }
@@ -6380,28 +6395,31 @@ async fn seed_volume_with_class(
     storage_class: Option<&str>,
 ) {
     DesiredStateRepository::new(pool.clone())
-        .upsert_volume(&VolumeDesiredStateInput {
-            volume_id: ResourceId::new(volume_id).unwrap(),
-            node_id: node_id.map(|n| NodeId::new(n).unwrap()),
-            display_name: volume_id.into(),
-            capacity_bytes: 1024,
-            volume_kind: None,
-            storage_class: storage_class.map(str::to_string),
-            owner_id: None,
-            desired_generation: Generation::new(1),
-            desired_status: None,
-            requested_by: None,
-            updated_by: None,
-            attached_vm_id: None,
-            attachment_mode: None,
-            device_name: None,
-            read_only: false,
-            resize_to_bytes: None,
-            snapshot_op: None,
-            snapshot_name: None,
-            clone_source_volume_id: None,
-            requested_unix_ms: 1000,
-        })
+        .upsert_volume(
+            &VolumeDesiredStateInput {
+                volume_id: ResourceId::new(volume_id).unwrap(),
+                node_id: node_id.map(|n| NodeId::new(n).unwrap()),
+                display_name: volume_id.into(),
+                capacity_bytes: 1024,
+                volume_kind: None,
+                storage_class: storage_class.map(str::to_string),
+                owner_id: None,
+                desired_generation: Generation::new(1),
+                desired_status: None,
+                requested_by: None,
+                updated_by: None,
+                attached_vm_id: None,
+                attachment_mode: None,
+                device_name: None,
+                read_only: false,
+                resize_to_bytes: None,
+                snapshot_op: None,
+                snapshot_name: None,
+                clone_source_volume_id: None,
+                requested_unix_ms: 1000,
+            },
+            None,
+        )
         .await
         .unwrap();
 }
@@ -7003,7 +7021,7 @@ async fn late_network_fragment_cannot_resurrect_a_deleted_network() {
         }),
     };
 
-    let result = service.apply_network_desired_state(request).await;
+    let result = service.apply_network_desired_state(request, None).await;
     assert!(
         result.is_err(),
         "a fragment for a tombstoned network must be dropped, got: {:?}",

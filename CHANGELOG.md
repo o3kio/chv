@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **gRPC reconcile mutations adopt the audit outbox (#706 half 1, PR 3b).**
+  The five `ReconcileService` RPCs now commit their audit row with the
+  desired-state write: the adapter mints a server-side
+  `outbox_id`/`audit_id` ticket and `finish_audited` performs the same
+  check-or-insert as every other adopted path. `ApplyNodeDesiredState`
+  couples `set_state_preserving_policy`, the three
+  `Apply{Vm,Volume,Network}DesiredState` RPCs couple their existing
+  desired-state upsert transaction (a stale generation or a `Deleting`
+  tombstone rolls both back), and `AcknowledgeDesiredStateVersion`
+  couples the observed-state acknowledgement (a missing observed-state
+  row enqueues neither). The store methods take an optional outbox row;
+  the upserts already held a transaction, while the node state patch and
+  the four observed-state acknowledgements gain a one-statement
+  transaction on the adopted path. **Residual window (per-write, not
+  per-RPC):** the convergence event append that follows each apply
+  (and, for the acknowledgement, the operation-status update) is a
+  separate commit — a crash in between keeps the state change and its
+  evidence but loses the journal row, and a late journal failure patches
+  the already-durable audit row to `failed`. The reconcile surface has
+  no read-shaped or agent-fan-out RPC, so all five RPCs are adopted; the
+  gRPC lifecycle surface stays post-hoc. Verification is deterministic
+  (one dispatched row per adopted RPC with a no-op second pass, stale
+  generation and missing observed-state rollbacks with one direct failed
+  row and no outbox row, crash replay, the post-commit patch path,
+  unadopted shape, oversized-payload rollback) plus a store-level
+  upsert/enqueue atomicity test; no `SIGKILL` end-to-end test is
+  claimed. See `docs/specs/component/audit-log.md` and
+  `docs/runbooks/audit-outbox.md`.
 - **gRPC enrollment mutations adopt the audit outbox (#706 half 1, PR 3a).**
   `EnrollNode`, `RotateNodeCertificate`, and `ReportBootstrapResult` now
   commit their audit row inside the mutation's transaction: the adapter
@@ -24,8 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-statement: its one-time token consumption plus the node/inventory
   rows commit earlier, so a crash mid-sequence can still leave a
   partially applied enrollment with no outbox row — a disclosed residual
-  risk, not a covered case. The gRPC lifecycle and reconcile surfaces
-  keep the direct post-hoc path. Verification is deterministic (one
+  risk, not a covered case. The gRPC lifecycle surface keeps the direct
+  post-hoc path (reconcile adoption lands in PR 3b, above). Verification
+  is deterministic (one
   dispatched row per adopted RPC, failed/denied direct row with no outbox
   row, crash replay, unadopted lifecycle RPC, oversized-payload rollback);
   no `SIGKILL` end-to-end test is claimed. See

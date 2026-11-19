@@ -487,6 +487,51 @@ macro_rules! audited_lifecycle_call {
     };
 }
 
+/// Same peer-pinned shape as [`audited_service_call`], but for a reconcile
+/// RPC whose service enqueues the audit row inside its desired-state
+/// transaction (#706 PR 3b).
+///
+/// The adapter mints the ticket, hands the coupling to the service, and
+/// then runs the same check-or-insert as every other adopted path.
+macro_rules! audited_reconcile_call {
+    ($self:ident, $request:ident, $action:literal, $span:literal, $method:ident, $kind:expr, $resource_id:expr) => {{
+        let context = GrpcAuditContext::new(
+            &$request,
+            $action,
+            RECONCILE_SERVICE_PATH,
+            $kind,
+            $resource_id,
+            None,
+        );
+        // #706: mint this request's audit ticket before the call so the
+        // service can commit its outbox row with the desired-state write.
+        let ticket = $self.audit.as_ref().map(|_| GrpcAuditTicket::mint());
+        let outbox_insert = ticket.as_ref().map(|ticket| ticket.outbox_insert(&context));
+        let coupling = adopted_coupling(ticket.as_ref(), outbox_insert.as_ref());
+        let op_id = extract_op_id(&$request).unwrap_or_default();
+        let result = async {
+            enforce_peer_node_id(&$request, &$request.get_ref().node_id, $span)?;
+            let _span = tracing::info_span!($span, %op_id);
+            let resp = $self
+                .service
+                .$method($request.into_inner(), coupling.as_ref())
+                .instrument(_span)
+                .await
+                .map_err(tonic::Status::from)?;
+            Ok(Response::new(resp))
+        }
+        .await;
+        finish_audited(
+            $self.audit.as_ref(),
+            &context,
+            ticket.as_ref(),
+            coupling.as_ref(),
+            result,
+        )
+        .await
+    }};
+}
+
 /// Pin the wire-asserted `node_id` to the peer's mTLS-derived identity.
 ///
 /// Used by every agent-side handler that accepts a `node_id` from an
@@ -1745,11 +1790,10 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         &self,
         request: Request<proto::ApplyNodeDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_service_call!(
+        audited_reconcile_call!(
             self,
             request,
             "ApplyNodeDesiredState",
-            RECONCILE_SERVICE_PATH,
             "apply_node_desired_state",
             apply_node_desired_state,
             Some("node"),
@@ -1761,11 +1805,10 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         &self,
         request: Request<proto::ApplyVmDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_service_call!(
+        audited_reconcile_call!(
             self,
             request,
             "ApplyVmDesiredState",
-            RECONCILE_SERVICE_PATH,
             "apply_vm_desired_state",
             apply_vm_desired_state,
             Some("vm"),
@@ -1777,11 +1820,10 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         &self,
         request: Request<proto::ApplyVolumeDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_service_call!(
+        audited_reconcile_call!(
             self,
             request,
             "ApplyVolumeDesiredState",
-            RECONCILE_SERVICE_PATH,
             "apply_volume_desired_state",
             apply_volume_desired_state,
             Some("volume"),
@@ -1793,11 +1835,10 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
         &self,
         request: Request<proto::ApplyNetworkDesiredStateRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_service_call!(
+        audited_reconcile_call!(
             self,
             request,
             "ApplyNetworkDesiredState",
-            RECONCILE_SERVICE_PATH,
             "apply_network_desired_state",
             apply_network_desired_state,
             Some("network"),
@@ -1819,16 +1860,45 @@ impl proto::reconcile_service_server::ReconcileService for ReconcileServer {
             .ok()
             .map(ResourceKind::as_str);
         let resource_id = non_empty(&fragment.fragment_id).or_else(|| non_empty(&fragment.node_id));
-        audited_service_call!(
-            self,
-            request,
+        let context = GrpcAuditContext::new(
+            &request,
             "AcknowledgeDesiredStateVersion",
             RECONCILE_SERVICE_PATH,
-            "acknowledge_desired_state_version",
-            acknowledge_desired_state_version,
             kind,
-            resource_id
+            resource_id,
+            None,
+        );
+        // #706: the outbox row commits with the observed-state
+        // acknowledgement; the operation-status update and the
+        // convergence event that follow are separate commits.
+        let ticket = self.audit.as_ref().map(|_| GrpcAuditTicket::mint());
+        let outbox_insert = ticket.as_ref().map(|ticket| ticket.outbox_insert(&context));
+        let coupling = adopted_coupling(ticket.as_ref(), outbox_insert.as_ref());
+        let op_id = extract_op_id(&request).unwrap_or_default();
+        let result = async {
+            enforce_peer_node_id(
+                &request,
+                &request.get_ref().node_id,
+                "acknowledge_desired_state_version",
+            )?;
+            let _span = tracing::info_span!("acknowledge_desired_state_version", %op_id);
+            let resp = self
+                .service
+                .acknowledge_desired_state_version(request.into_inner(), coupling.as_ref())
+                .instrument(_span)
+                .await
+                .map_err(tonic::Status::from)?;
+            Ok(Response::new(resp))
+        }
+        .await;
+        finish_audited(
+            self.audit.as_ref(),
+            &context,
+            ticket.as_ref(),
+            coupling.as_ref(),
+            result,
         )
+        .await
     }
 }
 
