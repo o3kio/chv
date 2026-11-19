@@ -18,22 +18,40 @@ pub struct ResourcePressure {
 pub fn check_host_resources() -> ResourcePressure {
     use sysinfo::{Disks, System};
 
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let memory_total = sys.total_memory();
-    let memory_used = sys.used_memory();
+    // sysinfo 0.40 made these constructors fallible. Resource pressure is a
+    // health signal, not a data path: keep the agent infallible by degrading
+    // to "no pressure" (with a log line). On Linux the constructors currently
+    // cannot fail (`SystemInner`/`DisksInner::new()` return `Ok`); refresh
+    // failures still surface as zero/stale values, as they did on 0.39.
+    let mut memory_total = 0;
+    let mut memory_used = 0;
+    match System::new() {
+        Ok(mut sys) => {
+            sys.refresh_memory();
+            memory_total = sys.total_memory();
+            memory_used = sys.used_memory();
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "sysinfo System initialisation failed; memory pressure unknown");
+        }
+    }
     let memory_pct = if memory_total > 0 {
         (memory_used as f64 / memory_total as f64) * 100.0
     } else {
         0.0
     };
 
-    let disks = Disks::new_with_refreshed_list();
-    let disk_available = disks
-        .iter()
-        .find(|d| d.mount_point() == std::path::Path::new("/"))
-        .map(|d| d.available_space())
-        .unwrap_or(u64::MAX);
+    let disk_available = match Disks::new_with_refreshed_list() {
+        Ok(disks) => disks
+            .iter()
+            .find(|d| d.mount_point() == std::path::Path::new("/"))
+            .map(|d| d.available_space())
+            .unwrap_or(u64::MAX),
+        Err(err) => {
+            tracing::warn!(error = %err, "sysinfo disk listing failed; disk pressure unknown");
+            u64::MAX
+        }
+    };
 
     let disk_pressure = disk_available < MIN_DISK_AVAILABLE_BYTES;
     let memory_pressure = memory_pct > MAX_MEMORY_USAGE_PERCENT;

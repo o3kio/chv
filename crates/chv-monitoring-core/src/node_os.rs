@@ -34,6 +34,12 @@ use sysinfo::{Disks, System};
 /// cycle — never zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NodeOsSnapshot {
+    /// Whether sysinfo initialised successfully for this cycle. When
+    /// false, the `memory_*` / `swap_*` values below are placeholders and
+    /// must be emitted as unavailable, not as real zero observations.
+    /// (The load averages and disk listing are independent of sysinfo's
+    /// `System` and stay valid.)
+    pub sysinfo_available: bool,
     /// When the non-CPU fields were observed (Unix ms).
     pub observed_at_ms: u64,
     /// Busy fraction of all logical CPUs over the measurement interval
@@ -63,7 +69,21 @@ pub struct NodeOsSnapshot {
 /// is the CPU-interval fix. Not `Clone`: cloning would fork the retained
 /// CPU baseline and reintroduce the fresh-system defect.
 pub struct NodeOsCollector {
-    sys: System,
+    /// `None` while sysinfo initialisation keeps failing. sysinfo 0.40 made
+    /// `System::new()` fallible, and this collector stays infallible so the
+    /// API change cannot take the agent metrics listener down. On Linux the
+    /// constructor currently cannot fail (`SystemInner::new()` returns `Ok`
+    /// unconditionally); per-refresh `/proc` failures remain silent zero or
+    /// stale values, as they were on 0.39. A snapshot taken while degraded
+    /// reports zeroed memory/swap with `sysinfo_available: false`, no CPU
+    /// ratio, and `(None, None)` for the root filesystem, and every snapshot
+    /// retries initialisation.
+    sys: Option<System>,
+    /// Whether a snapshot may retry a failed `System` initialisation.
+    /// Always true in production; the test-only `degraded()` constructor
+    /// clears it so the degraded snapshot shape is deterministic on Linux,
+    /// where `System::new()` succeeds.
+    init_enabled: bool,
     last_cpu_refresh: Option<Instant>,
     last_cpu_ratio: Option<f64>,
     last_cpu_observed_ms: u64,
@@ -74,7 +94,15 @@ impl NodeOsCollector {
     /// reports `cpu_capacity_ratio: None`.
     pub fn new() -> Self {
         NodeOsCollector {
-            sys: System::new(),
+            sys: System::new()
+                .inspect_err(|err| {
+                    tracing::warn!(
+                        error = %err,
+                        "sysinfo System initialisation failed; metrics degraded"
+                    )
+                })
+                .ok(),
+            init_enabled: true,
             last_cpu_refresh: None,
             last_cpu_ratio: None,
             last_cpu_observed_ms: 0,
@@ -87,47 +115,70 @@ impl NodeOsCollector {
     pub fn snapshot(&mut self) -> NodeOsSnapshot {
         let now_ms = unix_now_ms();
 
-        // CPU: refresh only when sysinfo's minimum interval has elapsed
-        // since the last refresh — refreshing inside the interval would
-        // reset the baseline and make the next "interval" shorter than
-        // claimed. When not eligible, retain the last valid reading
-        // (with its own timestamp).
-        let eligible = self
-            .last_cpu_refresh
-            .map(|t| t.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
-            .unwrap_or(true);
-        if eligible {
-            self.sys.refresh_cpu_usage();
-            // A fresh System's first refresh is the since-boot average;
-            // only a refresh on a System that already saw a previous
-            // refresh measures the elapsed interval.
-            let measured_interval = self.last_cpu_refresh.is_some();
-            let usage = self.sys.global_cpu_usage();
-            if measured_interval && usage.is_finite() && usage >= 0.0 {
-                self.last_cpu_ratio = Some((usage as f64 / 100.0).clamp(0.0, 1.0));
-                self.last_cpu_observed_ms = now_ms;
-            }
-            self.last_cpu_refresh = Some(Instant::now());
+        // Retry while degraded: an init failure is treated as transient and
+        // must not disable host metrics for the agent's whole lifetime.
+        if self.sys.is_none() && self.init_enabled {
+            self.sys = System::new()
+                .inspect_err(
+                    |err| tracing::debug!(error = %err, "sysinfo System re-initialisation failed"),
+                )
+                .ok();
         }
+        let sysinfo_available = self.sys.is_some();
 
-        self.sys.refresh_memory();
-        let memory_total_bytes = self.sys.total_memory();
-        let memory_available_bytes = self.sys.available_memory();
-        let swap_used_bytes = self.sys.used_swap();
+        let mut memory_total_bytes = 0;
+        let mut memory_available_bytes = 0;
+        let mut swap_used_bytes = 0;
+        if let Some(sys) = self.sys.as_mut() {
+            // CPU: refresh only when sysinfo's minimum interval has elapsed
+            // since the last refresh — refreshing inside the interval would
+            // reset the baseline and make the next "interval" shorter than
+            // claimed. When not eligible, retain the last valid reading
+            // (with its own timestamp).
+            let eligible = self
+                .last_cpu_refresh
+                .map(|t| t.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
+                .unwrap_or(true);
+            if eligible {
+                sys.refresh_cpu_usage();
+                // A fresh System's first refresh is the since-boot average;
+                // only a refresh on a System that already saw a previous
+                // refresh measures the elapsed interval.
+                let measured_interval = self.last_cpu_refresh.is_some();
+                let usage = sys.global_cpu_usage();
+                if measured_interval && usage.is_finite() && usage >= 0.0 {
+                    self.last_cpu_ratio = Some((usage as f64 / 100.0).clamp(0.0, 1.0));
+                    self.last_cpu_observed_ms = now_ms;
+                }
+                self.last_cpu_refresh = Some(Instant::now());
+            }
+
+            sys.refresh_memory();
+            memory_total_bytes = sys.total_memory();
+            memory_available_bytes = sys.available_memory();
+            swap_used_bytes = sys.used_swap();
+        }
 
         // Disks carry no interval semantics; a refreshed list per cycle is
         // the documented per-scrape precedent. The root mount is the
         // filesystem the pressure checks and dashboards reason about.
-        let disks = Disks::new_with_refreshed_list();
-        let (root_fs_total_bytes, root_fs_available_bytes) = disks
-            .iter()
-            .find(|d| d.mount_point() == Path::new("/"))
-            .map(|d| (Some(d.total_space()), Some(d.available_space())))
-            .unwrap_or((None, None));
+        let (root_fs_total_bytes, root_fs_available_bytes) = match Disks::new_with_refreshed_list()
+        {
+            Ok(disks) => disks
+                .iter()
+                .find(|d| d.mount_point() == Path::new("/"))
+                .map(|d| (Some(d.total_space()), Some(d.available_space())))
+                .unwrap_or((None, None)),
+            Err(err) => {
+                tracing::debug!(error = %err, "sysinfo disk listing failed");
+                (None, None)
+            }
+        };
 
         let (load1, load5, load15) = read_loadavg();
 
         NodeOsSnapshot {
+            sysinfo_available,
             observed_at_ms: now_ms,
             cpu_capacity_ratio: self.last_cpu_ratio,
             cpu_observed_at_ms: self.last_cpu_observed_ms,
@@ -146,6 +197,20 @@ impl NodeOsCollector {
     /// checks by consumers holding a snapshot).
     pub fn retained_cpu(&self) -> (Option<f64>, u64) {
         (self.last_cpu_ratio, self.last_cpu_observed_ms)
+    }
+
+    /// Test-only: a collector whose sysinfo `System` is unavailable and must
+    /// not retry, so the degraded snapshot shape can be asserted even though
+    /// `System::new()` succeeds on Linux.
+    #[cfg(test)]
+    fn degraded() -> Self {
+        NodeOsCollector {
+            sys: None,
+            init_enabled: false,
+            last_cpu_refresh: None,
+            last_cpu_ratio: None,
+            last_cpu_observed_ms: 0,
+        }
     }
 }
 
@@ -217,6 +282,20 @@ mod tests {
         // fabricate a new interval: it retains the same reading.
         let immediate = c.snapshot();
         assert_eq!(immediate.cpu_capacity_ratio, measured);
+    }
+
+    #[test]
+    fn degraded_snapshot_flags_memory_as_unavailable() {
+        let mut c = NodeOsCollector::degraded();
+        let s = c.snapshot();
+        assert!(!s.sysinfo_available, "degraded snapshot must say so");
+        assert_eq!(s.cpu_capacity_ratio, None, "no system, no CPU ratio");
+        // Placeholder values are zero but consumers must gate on the flag.
+        assert_eq!(s.memory_total_bytes, 0);
+        assert_eq!(s.memory_available_bytes, 0);
+        assert_eq!(s.swap_used_bytes, 0);
+        // Load averages read /proc directly and stay valid.
+        assert!(s.load1.is_some());
     }
 
     #[test]

@@ -95,7 +95,7 @@ pub fn read_proc_stat(proc_root: &Path, pid: u32) -> Result<ProcStat, ProbeError
 
 /// Read the process's resident set size in bytes from
 /// `/proc/<pid>/status` (`VmRSS`, kB). The kernel-parsed line avoids the
-/// page-size dependency of `statm` (which sysinfo 0.39 no longer
+/// page-size dependency of `statm` (which sysinfo no longer
 /// exposes). This is the **host-accounted** memory of the process —
 /// explicitly not the guest working set (see the native monitoring
 /// spec's memory split).
