@@ -47,7 +47,7 @@
 
 	.banner-title {
 		font-weight: 700;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		margin-bottom: 0.15rem;
 		color: rgb(120, 75, 0);
 	}

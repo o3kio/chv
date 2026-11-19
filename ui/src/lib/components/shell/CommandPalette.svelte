@@ -76,36 +76,36 @@
 {#if open}
 	<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 	<div class="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] bg-black/50 transition-opacity duration-150" class:opacity-0={!isVisible||isClosing} class:opacity-100={isVisible&&!isClosing} onclick={handleBackdropClick} aria-hidden="true">
-		<div role="dialog" aria-modal="true" tabindex="-1" aria-label="Command palette" class="w-full max-w-xl mx-4 overflow-hidden rounded-[var(--radius-md)] bg-[var(--shell-surface)] shadow-[0_4px_16px_rgba(0,0,0,0.15)] transition-all duration-150" class:scale-95={!isVisible||isClosing} class:scale-100={isVisible&&!isClosing} class:opacity-0={!isVisible||isClosing} class:opacity-100={isVisible&&!isClosing} onclick={(e)=>e.stopPropagation()}>
+		<div role="dialog" aria-modal="true" tabindex="-1" aria-label="Command palette" class="w-full max-w-xl mx-4 overflow-hidden rounded-md bg-(--shell-surface) shadow-[0_4px_16px_rgba(0,0,0,0.15)] transition-all duration-150" class:scale-95={!isVisible||isClosing} class:scale-100={isVisible&&!isClosing} class:opacity-0={!isVisible||isClosing} class:opacity-100={isVisible&&!isClosing} onclick={(e)=>e.stopPropagation()}>
 			<!-- Input -->
-			<div class="flex items-center gap-3 px-4 py-3 border-b border-[var(--border-subtle)]">
-				<Search size={18} class="shrink-0 text-[var(--shell-text-muted)]" />
-				<input bind:this={inputRef} type="text" value={query} oninput={handleInput} placeholder="Type a command or search..." class="flex-1 bg-transparent text-[length:var(--text-base)] text-[var(--shell-text)] placeholder:text-[var(--shell-text-muted)] outline-none" aria-label="Command search" aria-autocomplete="list" aria-controls="command-results" aria-activedescendant={filtered.length>0?`cmd-item-${selectedIndex}`:undefined} />
-				<kbd class="hidden sm:inline-flex items-center px-2 py-1 text-[length:var(--text-xs)] font-mono text-[var(--shell-text-muted)] bg-[var(--shell-surface-muted)] rounded-[var(--radius-xs)] border border-[var(--border-subtle)]">ESC</kbd>
+			<div class="flex items-center gap-3 px-4 py-3 border-b border-(--border-subtle)">
+				<Search size={18} class="shrink-0 text-(--shell-text-muted)" />
+				<input bind:this={inputRef} type="text" value={query} oninput={handleInput} placeholder="Type a command or search..." class="flex-1 bg-transparent text-(length:--chv-text-base) text-(--shell-text) placeholder:text-(--shell-text-muted) outline-hidden" aria-label="Command search" aria-autocomplete="list" aria-controls="command-results" aria-activedescendant={filtered.length>0?`cmd-item-${selectedIndex}`:undefined} />
+				<kbd class="hidden sm:inline-flex items-center px-2 py-1 text-(length:--chv-text-xs) font-mono text-(--shell-text-muted) bg-(--shell-surface-muted) rounded-xs border border-(--border-subtle)">ESC</kbd>
 			</div>
 			<!-- Results -->
 			<div bind:this={resultsRef} id="command-results" class="max-h-[50vh] overflow-y-auto" role="listbox" aria-label="Commands">
 				{#if filtered.length === 0}
-					<div class="px-4 py-8 text-center text-[var(--shell-text-muted)]"><p class="text-[length:var(--text-sm)]">No commands found</p></div>
+					<div class="px-4 py-8 text-center text-(--shell-text-muted)"><p class="text-(length:--chv-text-sm)">No commands found</p></div>
 				{:else}
 					{#each grouped as [category, cmds]}
-						<div class="px-3 py-1.5 text-[length:var(--text-xs)] font-bold uppercase tracking-wider text-[var(--shell-text-muted)] bg-[var(--shell-surface-muted)]">{category}</div>
+						<div class="px-3 py-1.5 text-(length:--chv-text-xs) font-bold uppercase tracking-wider text-(--shell-text-muted) bg-(--shell-surface-muted)">{category}</div>
 						{#each cmds as cmd, i}
 							{@const globalIndex = getGlobalIndex(category, i)}
 							{@const Icon = cmd.icon}
 							<button type="button" id="cmd-item-{globalIndex}" data-index={globalIndex} role="option" aria-selected={selectedIndex===globalIndex} class="w-full px-4 py-2.5 flex items-center gap-3 text-left transition-colors duration-100" class:bg-[var(--shell-accent-soft)]={selectedIndex===globalIndex} onclick={()=>execute(cmd)}>
-								<Icon size={16} class="shrink-0 text-[var(--shell-text-muted)]" />
-								<span class="flex-1 text-[length:var(--text-sm)] font-medium text-[var(--shell-text)]">{cmd.title}</span>
+								<Icon size={16} class="shrink-0 text-(--shell-text-muted)" />
+								<span class="flex-1 text-(length:--chv-text-sm) font-medium text-(--shell-text)">{cmd.title}</span>
 							</button>
 						{/each}
 					{/each}
 				{/if}
 			</div>
 			<!-- Footer -->
-			<div class="px-4 py-2 bg-[var(--shell-surface-muted)] border-t border-[var(--border-subtle)] flex items-center justify-between text-[length:var(--text-xs)] text-[var(--shell-text-muted)]">
+			<div class="px-4 py-2 bg-(--shell-surface-muted) border-t border-(--border-subtle) flex items-center justify-between text-(length:--chv-text-xs) text-(--shell-text-muted)">
 				<div class="flex items-center gap-3">
-					<span class="flex items-center gap-1"><kbd class="px-1.5 py-0.5 bg-[var(--shell-surface)] rounded-[var(--radius-xs)] border border-[var(--border-subtle)]">↑↓</kbd><span>Navigate</span></span>
-					<span class="flex items-center gap-1"><kbd class="px-1.5 py-0.5 bg-[var(--shell-surface)] rounded-[var(--radius-xs)] border border-[var(--border-subtle)]">↵</kbd><span>Select</span></span>
+					<span class="flex items-center gap-1"><kbd class="px-1.5 py-0.5 bg-(--shell-surface) rounded-xs border border-(--border-subtle)">↑↓</kbd><span>Navigate</span></span>
+					<span class="flex items-center gap-1"><kbd class="px-1.5 py-0.5 bg-(--shell-surface) rounded-xs border border-(--border-subtle)">↵</kbd><span>Select</span></span>
 				</div>
 				<div><span>{filtered.length} command{filtered.length!==1?'s':''}</span></div>
 			</div>

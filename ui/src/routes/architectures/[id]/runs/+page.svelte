@@ -125,8 +125,8 @@
 		background: none;
 		border: none;
 		padding: 0;
-		font-size: var(--text-xs);
-		color: var(--color-neutral-500);
+		font-size: var(--chv-text-xs);
+		color: var(--chv-color-neutral-500);
 		cursor: pointer;
 		align-self: flex-start;
 	}
@@ -134,35 +134,35 @@
 		color: var(--color-primary);
 		outline: none;
 	}
-	.page-title { font-size: var(--text-lg); font-weight: 700; margin: 0; }
-	.page-subtitle { margin: 0; font-size: var(--text-sm); color: var(--color-neutral-600); }
+	.page-title { font-size: var(--chv-text-lg); font-weight: 700; margin: 0; }
+	.page-subtitle { margin: 0; font-size: var(--chv-text-sm); color: var(--chv-color-neutral-600); }
 	.empty {
 		padding: 2rem;
-		border: 1px dashed var(--color-neutral-300);
+		border: 1px dashed var(--chv-color-neutral-300);
 		border-radius: var(--radius-sm);
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 		text-align: center;
 	}
-	.et { margin: 0; font-size: var(--text-sm); font-weight: 600; color: var(--color-neutral-700); }
-	.ex { margin: 0.25rem 0 0 0; font-size: 12px; color: var(--color-neutral-500); }
+	.et { margin: 0; font-size: var(--chv-text-sm); font-weight: 600; color: var(--chv-color-neutral-700); }
+	.ex { margin: 0.25rem 0 0 0; font-size: 12px; color: var(--chv-color-neutral-500); }
 	.table-wrap {
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 		overflow-x: auto;
 	}
-	.runs { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+	.runs { width: 100%; border-collapse: collapse; font-size: var(--chv-text-sm); }
 	.runs th, .runs td {
 		padding: 0.5rem 0.75rem;
 		text-align: left;
-		border-bottom: 1px solid var(--color-neutral-200);
+		border-bottom: 1px solid var(--chv-color-neutral-200);
 	}
 	.runs thead th {
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 		font-size: 12px;
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 	.runs tbody tr:last-child td { border-bottom: none; }
 	.row-link {
@@ -180,7 +180,7 @@
 		border: 1px solid rgba(220, 38, 38, 0.4);
 		border-radius: var(--radius-xs);
 		color: rgb(153, 27, 27);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 	.sr-only {
 		position: absolute;

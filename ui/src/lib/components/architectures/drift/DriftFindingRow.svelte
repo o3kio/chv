@@ -76,7 +76,7 @@
 		gap: 0.25rem;
 		padding: 0.6rem 0.75rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
 	}
 
@@ -97,14 +97,14 @@
 	}
 
 	.row-ref {
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 12px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.row-message {
-		font-size: var(--text-sm);
-		color: var(--color-neutral-800);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-800);
 		line-height: 1.4;
 	}
 
@@ -112,11 +112,11 @@
 		display: flex;
 		gap: 0.5rem;
 		font-size: 11px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.row-path {
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 	}
 
 	.diff {
@@ -125,21 +125,21 @@
 		align-items: center;
 		gap: 0.35rem;
 		padding: 0.3rem 0.5rem;
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px dashed var(--color-neutral-200);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px dashed var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 11px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.diff-field {
 		font-weight: 700;
-		color: var(--color-neutral-800);
+		color: var(--chv-color-neutral-800);
 	}
 
 	.diff-arrow {
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
 
 	.diff-expected {

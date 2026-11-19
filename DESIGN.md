@@ -43,13 +43,13 @@ No gradients, no decorative illustrations. Visual hierarchy comes from:
 **Scale:**
 | Token | Size | Pixels | Usage |
 |-------|------|--------|-------|
-| `--text-xs` | 0.6875rem | ~11px | Labels, timestamps, metadata |
-| `--text-sm` | 0.8125rem | ~13px | Secondary text, captions |
-| `--text-base` | 0.875rem | 14px | Primary body text, table data |
-| `--text-lg` | 1rem | 16px | h4, section subheadings |
-| `--text-xl` | 1.125rem | 18px | h3, card titles |
-| `--text-2xl` | 1.5rem | 24px | h2, section headers |
-| `--text-3xl` | 1.75rem | 28px | h1, page titles |
+| `--chv-text-xs` | 0.6875rem | ~11px | Labels, timestamps, metadata |
+| `--chv-text-sm` | 0.8125rem | ~13px | Secondary text, captions |
+| `--chv-text-base` | 0.875rem | 14px | Primary body text, table data |
+| `--chv-text-lg` | 1rem | 16px | h4, section subheadings |
+| `--chv-text-xl` | 1.125rem | 18px | h3, card titles |
+| `--chv-text-2xl` | 1.5rem | 24px | h2, section headers |
+| `--chv-text-3xl` | 1.75rem | 28px | h1, page titles |
 
 **Weight usage:** 400 regular, 500 medium, 600 semibold, 700 bold (headings use 600)
 
@@ -93,16 +93,16 @@ No gradients, no decorative illustrations. Visual hierarchy comes from:
 
 | Token | Hex | Usage |
 |-------|-----|-------|
-| `--color-neutral-50` | #f7f3ec | Page background, lightest surface |
-| `--color-neutral-100` | #efe9df | Sidebar background, alternate rows |
-| `--color-neutral-200` | #ddd5c8 | Borders, dividers |
-| `--color-neutral-300` | #c7bcac | Muted borders, disabled states |
-| `--color-neutral-400` | #9d917f | Placeholder text, scrollbar |
-| `--color-neutral-500` | #75695b | Secondary text, labels |
-| `--color-neutral-600` | #5e5449 | Muted text |
-| `--color-neutral-700` | #423b33 | Secondary headings |
-| `--color-neutral-800` | #29241f | Primary text |
-| `--color-neutral-900` | #191612 | Headings, highest contrast text |
+| `--chv-color-neutral-50` | #f7f3ec | Page background, lightest surface |
+| `--chv-color-neutral-100` | #efe9df | Sidebar background, alternate rows |
+| `--chv-color-neutral-200` | #ddd5c8 | Borders, dividers |
+| `--chv-color-neutral-300` | #c7bcac | Muted borders, disabled states |
+| `--chv-color-neutral-400` | #9d917f | Placeholder text, scrollbar |
+| `--chv-color-neutral-500` | #75695b | Secondary text, labels |
+| `--chv-color-neutral-600` | #5e5449 | Muted text |
+| `--chv-color-neutral-700` | #423b33 | Secondary headings |
+| `--chv-color-neutral-800` | #29241f | Primary text |
+| `--chv-color-neutral-900` | #191612 | Headings, highest contrast text |
 
 ### Shell / Chrome Tokens
 
@@ -150,16 +150,16 @@ Dark mode is implemented via `[data-theme="dark"]` CSS override. Strategy: inver
 
 | Token | Light | Dark |
 |-------|-------|------|
-| `--color-neutral-50` | #f7f3ec | #1a1816 |
-| `--color-neutral-100` | #efe9df | #222019 |
-| `--color-neutral-200` | #ddd5c8 | #2e2b24 |
-| `--color-neutral-300` | #c7bcac | #3d3930 |
-| `--color-neutral-400` | #9d917f | #6b6050 |
-| `--color-neutral-500` | #75695b | #9a8e7c |
-| `--color-neutral-600` | #5e5449 | #b5a998 |
-| `--color-neutral-700` | #423b33 | #d0c8ba |
-| `--color-neutral-800` | #29241f | #e8e2d8 |
-| `--color-neutral-900` | #191612 | #f5f2ec |
+| `--chv-color-neutral-50` | #f7f3ec | #1a1816 |
+| `--chv-color-neutral-100` | #efe9df | #222019 |
+| `--chv-color-neutral-200` | #ddd5c8 | #2e2b24 |
+| `--chv-color-neutral-300` | #c7bcac | #3d3930 |
+| `--chv-color-neutral-400` | #9d917f | #6b6050 |
+| `--chv-color-neutral-500` | #75695b | #9a8e7c |
+| `--chv-color-neutral-600` | #5e5449 | #b5a998 |
+| `--chv-color-neutral-700` | #423b33 | #d0c8ba |
+| `--chv-color-neutral-800` | #29241f | #e8e2d8 |
+| `--chv-color-neutral-900` | #191612 | #f5f2ec |
 
 **Dark shell tokens:**
 
@@ -251,15 +251,15 @@ Dark mode is implemented via `[data-theme="dark"]` CSS override. Strategy: inver
 **Danger:** Use `--color-danger` (#9b4338) for destructive actions
 
 **Sizes:**
-- Default: 0.4rem 0.75rem padding, `--text-sm` font size
-- Small (`.btn-sm`): 0.25rem 0.5rem padding, `--text-xs` font size
+- Default: 0.4rem 0.75rem padding, `--chv-text-sm` font size
+- Small (`.btn-sm`): 0.25rem 0.5rem padding, `--chv-text-xs` font size
 
 **Transition:** `--duration-fast` (150ms) with `--ease-default`
 
 ### Data Tables
 
-- Header: `--color-neutral-100` (#efe9df) background, uppercase labels
-- Rows: `--shell-surface` / `--color-neutral-50` alternating
+- Header: `--chv-color-neutral-100` (#efe9df) background, uppercase labels
+- Rows: `--shell-surface` / `--chv-color-neutral-50` alternating
 - Hover: `--shell-surface-muted`
 - Selected: `--color-primary-light` (#f5eadc)
 - Status column: Icon + text (not just colored text)
@@ -269,9 +269,9 @@ Dark mode is implemented via `[data-theme="dark"]` CSS override. Strategy: inver
 
 - Labels above inputs (not inline)
 - Section grouping with fieldsets
-- Input borders: `--shell-line` / `--color-neutral-200`
+- Input borders: `--shell-line` / `--chv-color-neutral-200`
 - Focus state: `--color-primary` (#8f5a2a) border, `--radius-sm`
-- Font: inherits `--font-sans`; size `--text-sm`
+- Font: inherits `--chv-font-sans`; size `--chv-text-sm`
 
 ### Status Indicators
 
@@ -363,7 +363,7 @@ Use in order for multi-series charts. Each color has a 12% opacity fill variant 
 ### Chart Grid and Axes
 
 - Grid lines: `var(--shell-line)` (rgba(128, 112, 93, 0.18))
-- Axis labels: `var(--shell-text-secondary)` (#4b5865), `--text-xs` size
+- Axis labels: `var(--shell-text-secondary)` (#4b5865), `--chv-text-xs` size
 - Tooltip background: `var(--shell-surface)` with `--shadow-md`
 - Tooltip border: `var(--shell-line-strong)`
 
@@ -404,7 +404,7 @@ theme: uses console tokens above
 - Button size: 28px square, `--radius-sm` border radius
 - Button hover: rgba(255, 255, 255, 0.08) overlay
 - Status dot: 8px diameter circle
-- Font size: `--text-sm` (13px)
+- Font size: `--chv-text-sm` (13px)
 
 ---
 
@@ -428,7 +428,7 @@ Toast notifications use the design system's semantic colors, not hardcoded value
 - Border-left: 4px solid
 - Shadow: `--shadow-lg`
 - Border radius: `--radius-md` (8px)
-- Text: `--text-sm` (13px), `var(--shell-text)`
+- Text: `--chv-text-sm` (13px), `var(--shell-text)`
 - Dismiss button: 16px icon, hover `rgba(0,0,0,0.05)` overlay
 - Position: top-right, 16px from viewport edges
 - Auto-dismiss: 5s for success/info, manual dismiss for error/warning
@@ -456,7 +456,7 @@ CHV has three roles: `viewer` (read-only), `operator` (read+write), `admin` (rea
 
 - **Hidden approach (default):** Don't render the button/action at all. Viewers see a clean read-only interface, not a field of disabled buttons.
 - **Disabled approach (when context helps):** Show the element at 50% opacity with `cursor: not-allowed` and a tooltip: "Requires operator or admin role". Use this only when hiding the element would make the interface confusing (e.g., a settings form where some fields are editable and some aren't).
-- **Role badge:** Show current role in the user menu. Format: pill badge using `--radius-full`, `--text-xs`, uppercase. Colors: viewer=`--color-neutral-400`, operator=`--color-info`, admin=`--color-primary`.
+- **Role badge:** Show current role in the user menu. Format: pill badge using `--radius-full`, `--chv-text-xs`, uppercase. Colors: viewer=`--chv-color-neutral-400`, operator=`--color-info`, admin=`--color-primary`.
 
 ### Server-Side Enforcement
 
@@ -487,8 +487,8 @@ Components that shipped after the original design system was written. Document t
 
 - Grid layout: 3 columns on desktop, 1 on mobile
 - Capacity bar: full width, `--radius-sm`, height 8px
-- Bar colors: `--color-success` (used), `--color-neutral-200` (free), `--color-danger` when >90% used
-- Pool name: `--text-lg`, `font-weight: 600`
+- Bar colors: `--color-success` (used), `--chv-color-neutral-200` (free), `--color-danger` when >90% used
+- Pool name: `--chv-text-lg`, `font-weight: 600`
 - Stats: `--font-mono` for sizes (GiB, TiB)
 
 ### User Management Table

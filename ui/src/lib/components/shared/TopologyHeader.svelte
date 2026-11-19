@@ -43,19 +43,19 @@
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.header-left .title {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 	}
 
 	.header-left .context {
-		font-size: var(--text-xs);
-		color: var(--color-neutral-400);
+		font-size: var(--chv-text-xs);
+		color: var(--chv-color-neutral-400);
 	}
 
 	.zoom-controls {
@@ -77,6 +77,6 @@
 	}
 
 	.btn-zoom:hover {
-		background: var(--color-neutral-50);
+		background: var(--chv-color-neutral-50);
 	}
 </style>

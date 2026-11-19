@@ -181,7 +181,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		font-size: 10px;
 		font-weight: 800;
 		text-transform: uppercase;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		letter-spacing: 0.05em;
 		margin-bottom: 0.75rem;
 	}
@@ -211,7 +211,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		gap: 0.5rem;
 		font-size: 11px;
 		font-weight: 700;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.governance-alert {
@@ -227,13 +227,13 @@ import Button from '#lib/components/primitives/Button.svelte';
 		display: block;
 		font-size: 11px;
 		font-weight: 800;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		margin-bottom: 0.125rem;
 	}
 
 	.alert-desc {
 		font-size: 10px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		margin: 0;
 	}
 
@@ -261,7 +261,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		display: flex;
 		justify-content: space-between;
 		font-size: 10px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		padding: 0.35rem 0.5rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);

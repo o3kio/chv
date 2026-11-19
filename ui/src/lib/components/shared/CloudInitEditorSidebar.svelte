@@ -37,7 +37,7 @@
           <button
             type="button"
             onclick={() => insertVariable(varName)}
-            class="text-xs bg-white px-2 py-1 rounded border border-line text-primary hover:border-primary transition-colors"
+            class="text-xs bg-white px-2 py-1 rounded-sm border border-line text-primary hover:border-primary transition-colors"
             title="Insert variable"
           >
             {'{{.' + varName + '}}'}
@@ -60,7 +60,7 @@
                   previewVariables = { ...previewVariables, [varName]: e.currentTarget.value };
                 }}
                 placeholder={`Enter ${varName}...`}
-                class="w-full h-7 rounded border border-[#CCCCCC] bg-white px-2 py-1 text-sm"
+                class="w-full h-7 rounded-sm border border-[#CCCCCC] bg-white px-2 py-1 text-sm"
               />
             </div>
           {/each}
@@ -91,7 +91,7 @@
         <button
           type="button"
           onclick={() => insertSnippet(snippet.snippet)}
-          class="w-full text-left text-xs px-3 py-2 rounded border border-line hover:border-primary hover:bg-white transition-colors"
+          class="w-full text-left text-xs px-3 py-2 rounded-sm border border-line hover:border-primary hover:bg-white transition-colors"
         >
           {snippet.name}
         </button>
@@ -114,7 +114,7 @@
           <EyeOff size={12} />
         </button>
       </div>
-      <div class="rounded bg-neutral-900 overflow-auto max-h-64">
+      <div class="rounded-sm bg-neutral-900 overflow-auto max-h-64">
         <pre class="p-3 text-xs font-mono whitespace-pre-wrap"><code>{@html highlightYAML(renderedPreview)}</code></pre>
       </div>
     </div>

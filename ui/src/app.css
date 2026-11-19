@@ -1,6 +1,39 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: Roboto, system-ui, sans-serif;
+  --font-mono: Roboto Mono, ui-monospace, SFMono-Regular, monospace;
+
+  --color-chrome: var(--bg-surface-muted, #f5f5f5);
+  --color-line: var(--border-subtle, #d0d0d0);
+  --color-ink: var(--shell-text, #1a1a1a);
+  --color-muted: var(--shell-text-muted, #666666);
+  --color-light: var(--shell-text-secondary, #999999);
+  --color-primary: var(--color-primary, #8f5a2a);
+  --color-success: var(--color-success, #3f6b45);
+  --color-warning: var(--color-warning, #9a6a1f);
+  --color-danger: var(--color-danger, #9b4338);
+  --color-hover: var(--shell-accent-soft, #e8f4fc);
+  --color-selected: var(--color-primary-light, #cce5f9);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
 
 :root {
   /* ==========================================================================
@@ -52,39 +85,44 @@
   --color-info-rgb: 73, 98, 125;
   
   /* Neutral Scale (Technical Grays) */
-  --color-neutral-50: #f4f1ea;
-  --color-neutral-100: #e0ddd5;
-  --color-neutral-200: #c7c4bc;
-  --color-neutral-300: #aead9f;
-  --color-neutral-400: #8d8d81;
-  --color-neutral-500: #6f6f61;
-  --color-neutral-600: #525252;
-  --color-neutral-700: #393939;
-  --color-neutral-800: #262626;
-  --color-neutral-900: #161616;
+  --chv-color-neutral-50: #f4f1ea;
+  --chv-color-neutral-100: #e0ddd5;
+  --chv-color-neutral-200: #c7c4bc;
+  --chv-color-neutral-300: #aead9f;
+  --chv-color-neutral-400: #8d8d81;
+  --chv-color-neutral-500: #6f6f61;
+  --chv-color-neutral-600: #525252;
+  --chv-color-neutral-700: #393939;
+  --chv-color-neutral-800: #262626;
+  --chv-color-neutral-900: #161616;
 
   /* Component token aliases (names consumed by components, mapped to the
      themed tokens above; resolved per active theme) */
-  --color-ink: var(--color-neutral-900);
-  --color-muted: var(--color-neutral-500);
+  --color-ink: var(--chv-color-neutral-900);
+  --color-muted: var(--chv-color-neutral-500);
   --color-line: var(--border-subtle);
   --color-border: var(--border-subtle);
   
   /* Typography */
-  /* System font stack — no external CDN required. IBM Plex fonts are used
+  /* The CHV design tokens are prefixed `--chv-` where their names would
+     otherwise collide with a Tailwind v4 theme namespace (`--text-*`,
+     `--font-*`, `--shadow-*`, and the warm `neutral` palette). Tailwind
+     utilities keep their v3 values; the design system keeps backing raw
+     CSS and explicit arbitrary utilities such as `text-(--chv-text-sm)`.
+     System font stack — no external CDN required. IBM Plex fonts are used
      if the user has them installed locally; otherwise the OS-native stack
      provides a consistent, high-quality fallback. */
-  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
-  --font-mono: 'IBM Plex Mono', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', 'Courier New', monospace;
+  --chv-font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
+  --chv-font-mono: 'IBM Plex Mono', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', 'Courier New', monospace;
   
   /* Type scale */
-  --text-xs: 0.6875rem;   /* 11px */
-  --text-sm: 0.8125rem;   /* 13px */
-  --text-base: 0.875rem;  /* 14px */
-  --text-lg: 1rem;        /* 16px */
-  --text-xl: 1.125rem;    /* 18px */
-  --text-2xl: 1.5rem;     /* 24px */
-  --text-3xl: 1.75rem;    /* 28px */
+  --chv-text-xs: 0.6875rem;   /* 11px */
+  --chv-text-sm: 0.8125rem;   /* 13px */
+  --chv-text-base: 0.875rem;  /* 14px */
+  --chv-text-lg: 1rem;        /* 16px */
+  --chv-text-xl: 1.125rem;    /* 18px */
+  --chv-text-2xl: 1.5rem;     /* 24px */
+  --chv-text-3xl: 1.75rem;    /* 28px */
   
   /* Spacing (4px base) */
   --space-1: 0.25rem;
@@ -95,9 +133,9 @@
   --space-6: 1.5rem;
   
   /* Shadows (Technical/Flat) */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
-  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.08);
-  --shadow-lg: 0 8px 16px rgba(0, 0, 0, 0.1);
+  --chv-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --chv-shadow-md: 0 2px 4px rgba(0, 0, 0, 0.08);
+  --chv-shadow-lg: 0 8px 16px rgba(0, 0, 0, 0.1);
   --shadow-glow-primary: 0 0 14px rgba(143, 90, 42, 0.1);
   --shadow-glow-success: 0 0 14px rgba(63, 107, 69, 0.1);
 
@@ -124,9 +162,9 @@
   --shell-surface-muted: var(--bg-surface-muted);
   --shell-line: var(--border-subtle);
   --shell-line-strong: var(--border-strong);
-  --shell-text: var(--color-neutral-900);
-  --shell-text-secondary: var(--color-neutral-600);
-  --shell-text-muted: var(--color-neutral-500);
+  --shell-text: var(--chv-color-neutral-900);
+  --shell-text-secondary: var(--chv-color-neutral-600);
+  --shell-text-muted: var(--chv-color-neutral-500);
   --shell-accent: var(--color-primary);
   --shell-accent-soft: var(--color-primary-light);
 
@@ -190,9 +228,9 @@
   --color-accent: #c4922e;
   --color-accent-soft: #2d2410;
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 8px 16px rgba(0, 0, 0, 0.5);
+  --chv-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --chv-shadow-md: 0 2px 4px rgba(0, 0, 0, 0.4);
+  --chv-shadow-lg: 0 8px 16px rgba(0, 0, 0, 0.5);
   --shadow-glow-primary: 0 0 14px rgba(196, 133, 78, 0.15);
   --shadow-glow-success: 0 0 14px rgba(90, 158, 98, 0.15);
 
@@ -201,16 +239,16 @@
 
   --dot-grid: rgba(255, 255, 255, 0.04);
 
-  --color-neutral-50: #1a1816;
-  --color-neutral-100: #222019;
-  --color-neutral-200: #2e2b24;
-  --color-neutral-300: #3d3930;
-  --color-neutral-400: #6b6050;
-  --color-neutral-500: #9a8e7c;
-  --color-neutral-600: #b5a998;
-  --color-neutral-700: #d0c8ba;
-  --color-neutral-800: #e8e2d8;
-  --color-neutral-900: #f5f2ec;
+  --chv-color-neutral-50: #1a1816;
+  --chv-color-neutral-100: #222019;
+  --chv-color-neutral-200: #2e2b24;
+  --chv-color-neutral-300: #3d3930;
+  --chv-color-neutral-400: #6b6050;
+  --chv-color-neutral-500: #9a8e7c;
+  --chv-color-neutral-600: #b5a998;
+  --chv-color-neutral-700: #d0c8ba;
+  --chv-color-neutral-800: #e8e2d8;
+  --chv-color-neutral-900: #f5f2ec;
 
   --color-sidebar-bg: #1e1c18;
   --color-sidebar-dark: #161410;
@@ -261,8 +299,8 @@ html, body {
 }
 
 body {
-  font-family: var(--font-sans);
-  font-size: var(--text-base);
+  font-family: var(--chv-font-sans);
+  font-size: var(--chv-text-base);
   color: var(--shell-text);
   background-color: var(--shell-bg);
   -webkit-font-smoothing: antialiased;
@@ -272,7 +310,7 @@ body {
 
 /* Monospace for technical data */
 code, pre {
-  font-family: var(--font-mono);
+  font-family: var(--chv-font-mono);
   font-size: 0.875em;
 }
 
@@ -284,7 +322,7 @@ input,
 textarea,
 select {
   font-family: inherit;
-  font-size: var(--text-sm);
+  font-size: var(--chv-text-sm);
 }
 
 input:focus,
@@ -311,7 +349,7 @@ select:focus {
 /* Selection color */
 ::selection {
   background: rgba(143, 90, 42, 0.2);
-  color: var(--color-neutral-900);
+  color: var(--chv-color-neutral-900);
 }
 
 /* Reduced motion */
@@ -348,10 +386,10 @@ select:focus {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--color-neutral-400);
+  background: var(--chv-color-neutral-400);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-neutral-500);
+  background: var(--chv-color-neutral-500);
 }

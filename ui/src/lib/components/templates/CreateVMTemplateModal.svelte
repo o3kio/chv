@@ -63,7 +63,7 @@
             type="text"
             bind:value={newTemplateName}
             placeholder="e.g., Ubuntu Web Server"
-            class="w-full h-9 rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+            class="w-full h-9 rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
           />
         </div>
 
@@ -76,7 +76,7 @@
             type="text"
             bind:value={newTemplateDescription}
             placeholder="Brief description of this template"
-            class="w-full h-9 rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+            class="w-full h-9 rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
           />
         </div>
 
@@ -87,7 +87,7 @@
           <select
             id="source-vm"
             bind:value={selectedVMId}
-            class="w-full h-9 rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+            class="w-full h-9 rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
           >
             <option value="">Select a VM...</option>
             {#each vms as vm}
@@ -106,7 +106,7 @@
           <select
             id="cloud-init-template"
             bind:value={selectedCloudInitId}
-            class="w-full h-9 rounded border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+            class="w-full h-9 rounded-sm border border-[#CCCCCC] bg-white px-3 py-2 text-sm focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20"
           >
             <option value="">None</option>
             {#each cloudInitTemplates as cit}
@@ -124,7 +124,7 @@
           type="button"
           onclick={() => open = false}
           disabled={creatingTemplate}
-          class="px-4 py-2 rounded border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50"
+          class="px-4 py-2 rounded-sm border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50"
         >
           Cancel
         </button>
@@ -132,7 +132,7 @@
           type="button"
           onclick={handleCreateVMTemplate}
           disabled={creatingTemplate || !newTemplateName.trim() || !selectedVMId}
-          class="px-4 py-2 rounded bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
+          class="px-4 py-2 rounded-sm bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
         >
           {#if creatingTemplate}
             <svg class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">

@@ -170,7 +170,7 @@
   .field-control .label {
     font-size: 10px;
     font-weight: 800;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
   }
 
   .field-control input, .field-control select {
@@ -179,8 +179,8 @@
     border-radius: var(--radius-xs);
     padding: 0.4rem 0.625rem;
     font-size: 11px;
-    font-family: var(--font-mono);
-    color: var(--color-neutral-900);
+    font-family: var(--chv-font-mono);
+    color: var(--chv-color-neutral-900);
     width: 100%;
   }
 
@@ -215,7 +215,7 @@
   }
 
   .field label {
-    font-size: var(--text-xs);
+    font-size: var(--chv-text-xs);
     font-weight: 600;
     color: var(--shell-text-muted);
     text-transform: uppercase;
@@ -229,7 +229,7 @@
     border-radius: 0.25rem;
     background: var(--shell-surface);
     color: var(--shell-text);
-    font-size: var(--text-sm);
+    font-size: var(--chv-text-sm);
     outline: none;
     transition: border-color 0.15s;
   }
@@ -250,6 +250,6 @@
     border: 1px solid var(--status-failed-border);
     border-radius: 0.25rem;
     color: var(--status-failed-text);
-    font-size: var(--text-sm);
+    font-size: var(--chv-text-sm);
   }
 </style>

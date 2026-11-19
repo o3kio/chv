@@ -264,13 +264,13 @@
 	.form-heading { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
 	.form-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 700;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}
-	.form-hint { font-size: 12px; color: var(--color-neutral-500); }
+	.form-hint { font-size: 12px; color: var(--chv-color-neutral-500); }
 	.field {
 		display: flex;
 		flex-direction: column;
@@ -278,19 +278,19 @@
 		max-width: 480px;
 	}
 	.field-inline { flex-direction: row; align-items: center; gap: 0.5rem; }
-	.field-label { font-size: 12px; font-weight: 600; color: var(--color-neutral-700); }
+	.field-label { font-size: 12px; font-weight: 600; color: var(--chv-color-neutral-700); }
 	.field-input {
 		padding: 0.4rem 0.6rem;
-		font-size: var(--text-sm);
-		border: 1px solid var(--color-neutral-300);
+		font-size: var(--chv-text-sm);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		background: var(--bg-surface);
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		width: 100%;
 		box-sizing: border-box;
 	}
 	.field-input:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 1px; }
-	.field-help { font-size: 11px; color: var(--color-neutral-500); line-height: 1.4; }
+	.field-help { font-size: 11px; color: var(--chv-color-neutral-500); line-height: 1.4; }
 	.form-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
-	.form-version { font-size: 11px; color: var(--color-neutral-400); }
+	.form-version { font-size: 11px; color: var(--chv-color-neutral-400); }
 </style>

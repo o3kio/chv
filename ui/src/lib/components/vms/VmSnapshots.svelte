@@ -253,7 +253,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 			></textarea>
 		</div>
 		<label class="flex items-center gap-2 text-sm text-ink cursor-pointer">
-			<input type="checkbox" bind:checked={createIncludesMemory} class="rounded border-line" />
+			<input type="checkbox" bind:checked={createIncludesMemory} class="rounded-sm border-line" />
 			<MemoryStick size={14} />
 			Include memory state
 		</label>
@@ -340,7 +340,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.form-label {
 		display: block;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 500;
 		color: var(--shell-text);
 	}
@@ -348,7 +348,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.form-input {
 		width: 100%;
 		padding: 0.5rem 0.75rem;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--shell-text);
 		background: white;
 		border: 1px solid var(--shell-line);
@@ -400,15 +400,11 @@ import Button from '#lib/components/primitives/Button.svelte';
 	}
 
 	.text-sm {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 
 	.text-ink {
 		color: var(--shell-text);
-	}
-
-	.rounded {
-		border-radius: 0.25rem;
 	}
 
 	.border-line {
@@ -419,7 +415,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		display: flex;
 		align-items: center;
 		gap: 0.4rem;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		padding: 0.35rem 0.5rem;
 		margin-bottom: 0.5rem;

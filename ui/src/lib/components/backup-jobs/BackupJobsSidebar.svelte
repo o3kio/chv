@@ -61,13 +61,13 @@
     justify-content: space-between;
     font-size: 9px;
     font-weight: 800;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     padding: 0.35rem 0.5rem;
     background: var(--bg-surface-muted);
     border-radius: var(--radius-xs);
   }
 
-  .vital-row span:last-child { color: var(--color-neutral-900); }
+  .vital-row span:last-child { color: var(--chv-color-neutral-900); }
 
   .micro-trace-list {
     display: flex;
@@ -84,8 +84,8 @@
     gap: 2px;
   }
 
-  .trace-vm { font-size: 10px; font-weight: 800; color: var(--color-neutral-900); }
-  .trace-meta { font-size: 9px; font-weight: 700; color: var(--color-neutral-400); text-transform: uppercase; }
+  .trace-vm { font-size: 10px; font-weight: 800; color: var(--chv-color-neutral-900); }
+  .trace-meta { font-size: 9px; font-weight: 700; color: var(--chv-color-neutral-400); text-transform: uppercase; }
 
-  .empty-hint { font-size: 10px; font-weight: 700; color: var(--color-neutral-400); text-align: center; padding: 1rem; }
+  .empty-hint { font-size: 10px; font-weight: 700; color: var(--chv-color-neutral-400); text-align: center; padding: 1rem; }
 </style>

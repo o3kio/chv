@@ -14,35 +14,35 @@
 	> = {
 		running: {
 			label: 'RUNNING',
-			toneClass: 'text-[var(--status-healthy-text)]',
-			dotClass: 'bg-[var(--color-success)]'
+			toneClass: 'text-(--status-healthy-text)',
+			dotClass: 'bg-success'
 		},
 		stopped: {
 			label: 'STOPPED',
-			toneClass: 'text-[var(--color-neutral-500)]',
-			dotClass: 'bg-[var(--color-neutral-500)]'
+			toneClass: 'text-(--chv-color-neutral-500)',
+			dotClass: 'bg-(--chv-color-neutral-500)'
 		},
 		error: {
 			label: 'ERROR',
-			toneClass: 'text-[var(--status-failed-text)]',
-			dotClass: 'bg-[var(--color-danger)]'
+			toneClass: 'text-(--status-failed-text)',
+			dotClass: 'bg-danger'
 		},
 		paused: {
 			label: 'PAUSED',
-			toneClass: 'text-[var(--status-warning-text)]',
-			dotClass: 'bg-[var(--color-warning)]'
+			toneClass: 'text-(--status-warning-text)',
+			dotClass: 'bg-warning'
 		},
 		unknown: {
 			label: 'UNKNOWN',
-			toneClass: 'text-[var(--status-unknown-text)]',
-			dotClass: 'bg-[var(--color-neutral-400)]'
+			toneClass: 'text-(--status-unknown-text)',
+			dotClass: 'bg-(--chv-color-neutral-400)'
 		}
 	};
 
 	const c = $derived(config[status] ?? config.unknown);
 </script>
 
-<span class="inline-flex items-center gap-1.5 text-[length:var(--text-xs)] font-medium {c.toneClass}" aria-label="Status: {c.label}">
+<span class="inline-flex items-center gap-1.5 text-(length:--chv-text-xs) font-medium {c.toneClass}" aria-label="Status: {c.label}">
 	<span class="w-[6px] h-[6px] rounded-full {c.dotClass}" aria-hidden="true"></span>
 	{#if showText}
 		<span>{c.label}</span>

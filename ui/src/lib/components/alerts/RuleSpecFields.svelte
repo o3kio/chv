@@ -45,9 +45,9 @@
 	}: Props = $props();
 
 	const inputClass =
-		'w-full px-2.5 py-1.5 text-sm border border-[var(--color-neutral-300)] rounded-sm bg-[var(--bg-surface)] text-[var(--color-neutral-900)]';
+		'w-full px-2.5 py-1.5 text-sm border border-(--chv-color-neutral-300) rounded-xs bg-(--bg-surface) text-(--chv-color-neutral-900)';
 	const labelClass =
-		'block text-[10px] font-bold uppercase tracking-[0.05em] text-[var(--shell-text-muted)] mb-1';
+		'block text-[10px] font-bold uppercase tracking-wider text-(--shell-text-muted) mb-1';
 </script>
 
 {#if ruleType === 'threshold' || ruleType === 'rate' || ruleType === 'availability'}
@@ -88,7 +88,7 @@
 		<input class={inputClass} type="text" bind:value={dimensionValue} placeholder="ext4:/" oninput={onDimensionEdit} />
 	</label>
 	{#if dimensionNote}
-		<p class="sm:col-span-2 m-0 text-xs text-[var(--color-warning-dark)]">{dimensionNote}</p>
+		<p class="sm:col-span-2 m-0 text-xs text-(--color-warning-dark)">{dimensionNote}</p>
 	{/if}
 {:else if ruleType === 'check_status'}
 	<label class="block">
@@ -106,6 +106,6 @@
 {:else if ruleType === 'group'}
 	<div class="sm:col-span-2">
 		<span class={labelClass}>Spec (group rules round-trip unchanged)</span>
-		<p class="text-xs text-[var(--shell-text-secondary)] m-0">{groupSummary}</p>
+		<p class="text-xs text-(--shell-text-secondary) m-0">{groupSummary}</p>
 	</div>
 {/if}

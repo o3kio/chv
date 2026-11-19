@@ -48,7 +48,7 @@
 		background: var(--shell-surface);
 		color: var(--shell-text-secondary);
 		text-decoration: none;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 600;
 		line-height: 1;
 	}

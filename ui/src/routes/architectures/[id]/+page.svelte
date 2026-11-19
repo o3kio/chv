@@ -608,7 +608,7 @@
 	}
 
 	.runs-link {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--color-primary);
 		text-decoration: none;
 		padding: 0.25rem 0.5rem;
@@ -626,8 +626,8 @@
 		background: none;
 		border: none;
 		padding: 0;
-		font-size: var(--text-xs);
-		color: var(--color-neutral-500);
+		font-size: var(--chv-text-xs);
+		color: var(--chv-color-neutral-500);
 		cursor: pointer;
 		align-self: flex-start;
 	}
@@ -639,21 +639,21 @@
 	}
 
 	.page-title {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		font-weight: 700;
 		margin: 0;
 	}
 
 	.page-subtitle {
 		margin: 0;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-600);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.tablist {
 		display: flex;
 		gap: 0.25rem;
-		border-bottom: 1px solid var(--color-neutral-200);
+		border-bottom: 1px solid var(--chv-color-neutral-200);
 	}
 
 	.tab {
@@ -661,15 +661,15 @@
 		background: none;
 		border: none;
 		padding: 0.5rem 0.85rem;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-600);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-600);
 		cursor: pointer;
 		border-bottom: 2px solid transparent;
 		margin-bottom: -1px;
 	}
 
 	.tab:hover {
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.tab:focus-visible {
@@ -688,8 +688,8 @@
 		flex-direction: column;
 		gap: 0.5rem;
 		padding: 2rem;
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px dashed var(--color-neutral-300);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px dashed var(--chv-color-neutral-300);
 		border-radius: var(--radius-sm);
 		text-align: center;
 	}
@@ -706,8 +706,8 @@
 		align-items: center;
 		gap: 0.5rem;
 		padding: 0.5rem 0.75rem;
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px solid var(--color-neutral-200);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
 	}
 
@@ -715,8 +715,8 @@
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
-		font-size: var(--text-xs);
-		color: var(--color-neutral-600);
+		font-size: var(--chv-text-xs);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.toolbar-actions {
@@ -740,16 +740,16 @@
 	}
 
 	.placeholder-title {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.placeholder-text {
 		margin: 0 auto;
 		max-width: 520px;
 		font-size: 12px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		line-height: 1.5;
 	}
 
@@ -762,6 +762,6 @@
 		border: 1px solid rgba(220, 38, 38, 0.4);
 		border-radius: var(--radius-xs);
 		color: rgb(153, 27, 27);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 </style>

@@ -128,7 +128,7 @@ sudo systemctl enable --now chv-agent
     <div class="space-y-6">
       <div class="bg-green-50 border border-green-200 rounded-lg p-4">
         <div class="flex items-start gap-3">
-          <div class="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center flex-shrink-0">
+          <div class="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center shrink-0">
             <Server class="text-green-600" size={20} />
           </div>
           <div>

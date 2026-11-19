@@ -25,19 +25,19 @@
 	}
 
 	const baseClasses =
-		'h-9 w-full rounded border px-3 py-2 text-sm font-sans transition-colors duration-150';
+		'h-9 w-full rounded-sm border px-3 py-2 text-sm font-sans transition-colors duration-150';
 
 	const stateClasses = $derived(() => {
 		if (disabled) {
-			return 'border-[var(--border-subtle)] bg-[var(--bg-surface-muted)] text-muted cursor-not-allowed';
+			return 'border-(--border-subtle) bg-(--bg-surface-muted) text-muted cursor-not-allowed';
 		}
 		if (error) {
-			return 'border-danger bg-[var(--bg-surface)] text-ink focus:border-danger focus:outline-none focus:ring-2 focus:ring-danger/20';
+			return 'border-danger bg-(--bg-surface) text-ink focus:border-danger focus:outline-hidden focus:ring-2 focus:ring-danger/20';
 		}
 		if (isFocused) {
-			return 'border-primary bg-[var(--bg-surface)] text-ink focus:outline-none focus:ring-2 focus:ring-primary/20';
+			return 'border-primary bg-(--bg-surface) text-ink focus:outline-hidden focus:ring-2 focus:ring-primary/20';
 		}
-		return 'border-[var(--border-subtle)] bg-[var(--bg-surface)] text-ink hover:border-muted focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20';
+		return 'border-(--border-subtle) bg-(--bg-surface) text-ink hover:border-muted focus:border-primary focus:outline-hidden focus:ring-2 focus:ring-primary/20';
 	});
 </script>
 

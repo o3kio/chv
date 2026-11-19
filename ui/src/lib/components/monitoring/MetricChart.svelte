@@ -118,11 +118,11 @@
 					scales: {
 						x: {
 							grid: { display: false },
-							ticks: { font: { size: 9, family: 'var(--font-mono)' }, maxTicksLimit: 8 }
+							ticks: { font: { size: 9, family: 'var(--chv-font-mono)' }, maxTicksLimit: 8 }
 						},
 						y: {
 							grid: { color: 'rgba(0,0,0,0.05)' },
-							ticks: { font: { size: 9, family: 'var(--font-mono)' } },
+							ticks: { font: { size: 9, family: 'var(--chv-font-mono)' } },
 							beginAtZero: series.kind !== 'gauge' || series.unit === 'bytes'
 						}
 					}
@@ -169,17 +169,17 @@
 	.title-text {
 		font-size: 12px;
 		font-weight: 700;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.unit-badge {
 		font-size: 9px;
-		font-family: var(--font-mono);
+		font-family: var(--chv-font-mono);
 		font-weight: 700;
 		padding: 1px 5px;
 		border-radius: 2px;
 		background: var(--bg-surface-muted);
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.chart-meta {
@@ -190,8 +190,8 @@
 
 	.meta-item {
 		font-size: 9px;
-		font-family: var(--font-mono);
-		color: var(--color-neutral-500);
+		font-family: var(--chv-font-mono);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.chart-body {
@@ -213,11 +213,11 @@
 	.empty-title {
 		font-size: 11px;
 		font-weight: 700;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.empty-hint {
 		font-size: 10px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
 </style>

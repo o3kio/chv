@@ -96,7 +96,7 @@
 		align-items: center;
 		gap: 0.75rem;
 		padding: 0.75rem 1rem;
-		color: var(--color-neutral-300);
+		color: var(--chv-color-neutral-300);
 		text-decoration: none;
 		font-size: 0.875rem;
 		transition: all 0.15s ease;
@@ -105,7 +105,7 @@
 
 	.nav-item:hover {
 		background: rgba(255, 255, 255, 0.05);
-		color: var(--color-neutral-50);
+		color: var(--chv-color-neutral-50);
 	}
 
 	.nav-item.active {
@@ -142,7 +142,7 @@
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
 
 	.status-indicator {

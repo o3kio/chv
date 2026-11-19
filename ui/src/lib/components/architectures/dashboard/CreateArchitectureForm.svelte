@@ -122,15 +122,15 @@
 	}
 
 	.form-heading {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		font-weight: 700;
 		margin: 0;
 	}
 
 	.form-subheading {
 		margin: 0 0 0.5rem 0;
-		color: var(--color-neutral-600);
-		font-size: var(--text-sm);
+		color: var(--chv-color-neutral-600);
+		font-size: var(--chv-text-sm);
 	}
 
 	.field {
@@ -140,20 +140,20 @@
 	}
 
 	.field label {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.field input,
 	.field textarea,
 	.field select {
 		padding: 0.5rem 0.65rem;
-		font-size: var(--text-sm);
-		border: 1px solid var(--color-neutral-300);
+		font-size: var(--chv-text-sm);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		background: var(--bg-surface);
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 		font-family: inherit;
 	}
 
@@ -172,7 +172,7 @@
 	.field-hint {
 		margin: 0;
 		font-size: 11px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.field-error {

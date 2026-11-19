@@ -124,7 +124,7 @@
 <Modal bind:open title="Allocate Block" closeOnBackdrop={!submitting}>
 	<form id="create-volume-form" onsubmit={handleSubmit} class="space-y-5">
 		{#if formError}
-			<div class="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
+			<div class="rounded-sm border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger" role="alert">
 				{formError}
 			</div>
 		{/if}
@@ -207,7 +207,7 @@
 			type="button"
 			onclick={() => (open = false)}
 			disabled={submitting}
-			class="px-4 py-2 rounded border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+			class="px-4 py-2 rounded-sm border border-line text-ink bg-white hover:bg-chrome transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 		>
 			Cancel
 		</button>
@@ -215,7 +215,7 @@
 			type="submit"
 			form="create-volume-form"
 			disabled={!isValid() || submitting}
-			class="px-4 py-2 rounded bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
+			class="px-4 py-2 rounded-sm bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:bg-primary/30 disabled:cursor-not-allowed flex items-center gap-2"
 		>
 			{#if submitting}
 				<svg

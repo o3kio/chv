@@ -15,6 +15,6 @@
 	}[tone]);
 </script>
 
-<div class="w-full h-1 bg-[var(--shell-line)] rounded-full overflow-hidden">
+<div class="w-full h-1 bg-(--shell-line) rounded-full overflow-hidden">
 	<div class="h-full transition-[width] duration-300 ease-out" style="width: {progress}%; background: {color}"></div>
 </div>

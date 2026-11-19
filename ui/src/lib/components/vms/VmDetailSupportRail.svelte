@@ -126,7 +126,7 @@
 		border-radius: var(--radius-sm);
 		background: var(--color-success-light);
 		color: var(--color-success-dark);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 600;
 	}
 

@@ -82,7 +82,7 @@
 <style>
   .blueprint-name {
     font-weight: 700;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .row-ops {
@@ -96,7 +96,7 @@
     display: grid;
     place-items: center;
     border-radius: 4px;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     transition: all 0.1s ease;
   }
 

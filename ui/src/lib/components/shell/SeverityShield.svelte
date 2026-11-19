@@ -15,7 +15,7 @@
 	}[severity]);
 </script>
 
-<div class="inline-flex items-center gap-[0.35rem] px-[0.4rem] py-[0.15rem] rounded-full font-bold text-[10px] uppercase tracking-[0.05em] {severity === 'critical' ? 'border border-[var(--color-danger)] shadow-[0_0_4px_rgba(239,68,68,0.2)]' : severity === 'warning' ? 'border border-[var(--color-warning-dark)]' : 'border border-transparent'}" style="background: {config.bg}; color: {config.color};">
+<div class="inline-flex items-center gap-[0.35rem] px-[0.4rem] py-[0.15rem] rounded-full font-bold text-[10px] uppercase tracking-wider {severity === 'critical' ? 'border border-danger shadow-[0_0_4px_rgba(239,68,68,0.2)]' : severity === 'warning' ? 'border border-(--color-warning-dark)' : 'border border-transparent'}" style="background: {config.bg}; color: {config.color};">
 	<config.icon size={14} />
 	{#if showLabel}
 		<span>{config.label}</span>

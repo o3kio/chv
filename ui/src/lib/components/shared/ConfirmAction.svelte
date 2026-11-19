@@ -150,7 +150,7 @@
         </p>
         <div class="max-h-32 overflow-y-auto space-y-1">
           {#each items as item}
-            <div class="flex items-center gap-2 text-sm text-ink py-1 px-2 bg-white rounded border border-line">
+            <div class="flex items-center gap-2 text-sm text-ink py-1 px-2 bg-white rounded-sm border border-line">
               <config.icon size={14} class="text-muted" />
               <span class="truncate">{item}</span>
             </div>
@@ -165,7 +165,7 @@
         <p class="text-xs font-medium text-muted uppercase tracking-wider">Impact Summary</p>
         <div class="grid grid-cols-2 gap-2">
           {#each impact as item}
-            <div class="flex items-center justify-between p-2 bg-chrome rounded border border-line">
+            <div class="flex items-center justify-between p-2 bg-chrome rounded-sm border border-line">
               <span class="text-xs text-muted">{item.label}</span>
               <Badge variant={getImpactVariant(item.type)}>{item.value}</Badge>
             </div>
@@ -178,13 +178,13 @@
     {#if requireTypeConfirmation}
       <div class="space-y-2 pt-2 border-t border-line">
         <p class="text-sm text-muted">
-          To confirm, type <code class="bg-chrome px-1.5 py-0.5 rounded text-xs font-mono">{typeConfirmationText}</code> below:
+          To confirm, type <code class="bg-chrome px-1.5 py-0.5 rounded-sm text-xs font-mono">{typeConfirmationText}</code> below:
         </p>
         <input
           type="text"
           bind:value={typedConfirmation}
           placeholder={`Type "${typeConfirmationText}" to confirm`}
-          class="w-full px-3 py-2 text-sm border border-line rounded focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
+          class="w-full px-3 py-2 text-sm border border-line rounded-sm focus:outline-hidden focus:ring-2 focus:ring-primary/30 focus:border-primary"
         />
       </div>
     {/if}
@@ -194,7 +194,7 @@
     <button
       type="button"
       onclick={handleCancel}
-      class="px-4 py-2 rounded border border-line text-ink bg-white hover:bg-chrome transition-colors text-sm font-medium"
+      class="px-4 py-2 rounded-sm border border-line text-ink bg-white hover:bg-chrome transition-colors text-sm font-medium"
     >
       {cancelText}
     </button>
@@ -203,7 +203,7 @@
       type="button"
       onclick={handleConfirm}
       disabled={!canConfirm}
-      class="px-4 py-2 rounded font-medium transition-all text-sm focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:opacity-50 disabled:cursor-not-allowed {config.buttonClass}"
+      class="px-4 py-2 rounded-sm font-medium transition-all text-sm focus:outline-hidden focus:ring-2 focus:ring-offset-1 disabled:opacity-50 disabled:cursor-not-allowed {config.buttonClass}"
     >
       {finalConfirmText}
     </button>

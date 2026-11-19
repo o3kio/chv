@@ -97,7 +97,7 @@
               </div>
             {/if}
             {#if lastActionResult.warnings.length > 0}
-              <div class="rounded border border-warning bg-yellow-50 px-3 py-2">
+              <div class="rounded-sm border border-warning bg-yellow-50 px-3 py-2">
                 <span class="text-warning font-medium">Warnings:</span>
                 <ul class="mt-1 list-disc pl-5 text-warning">
                   {#each lastActionResult.warnings as warning}
@@ -107,7 +107,7 @@
               </div>
             {/if}
             {#if lastActionResult.errors.length > 0}
-              <div class="rounded border border-danger bg-red-50 px-3 py-2">
+              <div class="rounded-sm border border-danger bg-red-50 px-3 py-2">
                 <span class="text-danger font-medium">Errors:</span>
                 <ul class="mt-1 list-disc pl-5 text-danger">
                   {#each lastActionResult.errors as err}

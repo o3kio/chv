@@ -116,7 +116,7 @@
 				aria-labelledby={titleId}
 				aria-describedby={descId}
 				tabindex="-1"
-				class="{widthClasses[width]} max-h-[80vh] overflow-hidden rounded-lg bg-[var(--bg-surface)] shadow-[0_4px_16px_rgba(0,0,0,0.15)] transition-all duration-200 ease-out mx-4"
+				class="{widthClasses[width]} max-h-[80vh] overflow-hidden rounded-lg bg-(--bg-surface) shadow-[0_4px_16px_rgba(0,0,0,0.15)] transition-all duration-200 ease-out mx-4"
 				class:scale-95={!isVisible || isClosing}
 				class:scale-100={isVisible && !isClosing}
 				class:opacity-0={!isVisible || isClosing}
@@ -139,7 +139,7 @@
 					<button
 						bind:this={closeButtonRef}
 						onclick={handleClose}
-						class="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-black/5 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+						class="flex h-8 w-8 shrink-0 items-center justify-center rounded-sm text-muted transition-colors hover:bg-black/5 hover:text-ink focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
 						aria-label="Close modal"
 						type="button"
 					>

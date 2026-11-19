@@ -42,10 +42,10 @@
 <style>
 	.ttl {
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		padding: 0.1rem 0.5rem;
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px solid var(--color-neutral-200);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
 	}
 	.ttl-exp {

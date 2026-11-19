@@ -19,12 +19,12 @@
 </script>
 
 <SectionCard title="Recent deliveries" icon={Send}>
-	<p class="text-[10px] text-[var(--shell-text-muted)] mb-2">
+	<p class="text-[10px] text-(--shell-text-muted) mb-2">
 		Notification outbox audit — webhook and Slack deliveries for firing, resolved and
 		acknowledged events.
 	</p>
 	{#if deliveries.length === 0}
-		<p class="text-sm text-[var(--shell-text-secondary)]">
+		<p class="text-sm text-(--shell-text-secondary)">
 			No notification events yet. Deliveries appear once a rule fires and a destination is
 			configured.
 		</p>
@@ -32,7 +32,7 @@
 		<div class="overflow-x-auto">
 			<table class="w-full text-xs border-collapse">
 				<thead>
-					<tr class="text-left text-[var(--shell-text-muted)] border-b border-[var(--shell-line)]">
+					<tr class="text-left text-(--shell-text-muted) border-b border-(--shell-line)">
 						<th class="py-1.5 pr-3 font-semibold">Event</th>
 						<th class="py-1.5 pr-3 font-semibold">Channel</th>
 						<th class="py-1.5 pr-3 font-semibold">Status</th>
@@ -42,14 +42,14 @@
 				</thead>
 				<tbody>
 					{#each deliveries as delivery (delivery.event_id)}
-						<tr class="border-b border-[var(--shell-line)] last:border-b-0">
+						<tr class="border-b border-(--shell-line) last:border-b-0">
 							<td class="py-1.5 pr-3 whitespace-nowrap">
-								<span class="font-medium text-[var(--shell-text)]">{delivery.event_type}</span>
+								<span class="font-medium text-(--shell-text)">{delivery.event_type}</span>
 								{#if delivery.attempts > 1}
-									<span class="text-[var(--shell-text-muted)]"> · {delivery.attempts} attempts</span>
+									<span class="text-(--shell-text-muted)"> · {delivery.attempts} attempts</span>
 								{/if}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) whitespace-nowrap">
 								{delivery.channel}
 							</td>
 							<td class="py-1.5 pr-3 whitespace-nowrap">
@@ -57,15 +57,15 @@
 									{delivery.status}
 								</Badge>
 								{#if delivery.last_response}
-									<span class="block text-[10px] text-[var(--shell-text-muted)] mt-0.5">
+									<span class="block text-[10px] text-(--shell-text-muted) mt-0.5">
 										{delivery.last_response}
 									</span>
 								{/if}
 							</td>
 							<!-- Summaries are operator-configured or redacted server-side;
 							     still plain text interpolation only, never {@html}. -->
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)]">{delivery.summary}</td>
-							<td class="py-1.5 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary)">{delivery.summary}</td>
+							<td class="py-1.5 text-(--shell-text-secondary) whitespace-nowrap">
 								{formatAlertTimestamp(delivery.occurred_at_ms)}
 							</td>
 						</tr>

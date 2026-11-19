@@ -227,12 +227,12 @@ import Button from '#lib/components/primitives/Button.svelte';
 	}
 
 	.audit-info .label {
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.audit-info .val {
-		color: var(--color-neutral-900);
-		font-family: var(--font-mono);
+		color: var(--chv-color-neutral-900);
+		font-family: var(--chv-font-mono);
 	}
 
 	.audit-bar-track {
@@ -267,8 +267,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 		border-radius: var(--radius-xs);
 	}
 
-	.w-stat .val { font-size: 18px; font-weight: 800; color: var(--color-neutral-900); }
-	.w-stat .lbl { font-size: 9px; font-weight: 800; color: var(--color-neutral-500); text-transform: uppercase; letter-spacing: 0.05em; }
+	.w-stat .val { font-size: 18px; font-weight: 800; color: var(--chv-color-neutral-900); }
+	.w-stat .lbl { font-size: 9px; font-weight: 800; color: var(--chv-color-neutral-500); text-transform: uppercase; letter-spacing: 0.05em; }
 
 	.mini-activity {
 		display: flex;
@@ -278,7 +278,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.mini-activity p {
 		font-size: 11px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		margin: 0;
 	}
 
@@ -311,7 +311,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.rule-item {
 		font-size: 10px;
 		font-weight: 700;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		padding: 0.25rem 0.5rem;
 		background: var(--bg-surface-muted);
 		border-radius: 2px;
@@ -319,7 +319,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.empty-hint {
 		font-size: 11px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		padding: 1rem 0;
 		text-align: center;
 	}
@@ -345,7 +345,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		border-radius: 0.35rem;
 	}
 
-	.w-stat .val { font-size: var(--text-lg); font-weight: 700; }
+	.w-stat .val { font-size: var(--chv-text-lg); font-weight: 700; }
 	.w-stat .lbl { font-size: 10px; color: var(--shell-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 
 	.mini-activity {
@@ -355,7 +355,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	}
 
 	.mini-activity p {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-secondary);
 		margin: 0;
 	}
@@ -369,7 +369,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	}
 
 	.empty-hint {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		text-align: center;
 		padding: 1rem 0;

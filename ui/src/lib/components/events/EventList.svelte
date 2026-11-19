@@ -142,7 +142,7 @@
           <select
             value={currentFilter || ''}
             onchange={(e) => setFilter((e.target as HTMLSelectElement).value || null)}
-            class="appearance-none bg-white border border-slate-200 text-slate-700 text-sm rounded-lg px-3 py-2 pr-8 focus:outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500"
+            class="appearance-none bg-white border border-slate-200 text-slate-700 text-sm rounded-lg px-3 py-2 pr-8 focus:outline-hidden focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500"
             aria-label="Filter by resource type"
           >
             <option value="">All Types</option>
@@ -226,7 +226,7 @@
             aria-controls="event-content-{event.id}"
           >
             <div class="flex items-center gap-3 min-w-0 flex-1">
-              <div class="p-1.5 bg-slate-100 rounded-md flex-shrink-0">
+              <div class="p-1.5 bg-slate-100 rounded-md shrink-0">
                 <ResourceIcon size={14} class="text-slate-500" />
               </div>
               <StateBadge label={event.status} />
@@ -240,7 +240,7 @@
                 {/if}
               </span>
             </div>
-            <div class="flex items-center gap-2 flex-shrink-0">
+            <div class="flex items-center gap-2 shrink-0">
               <span class="text-xs text-slate-500 whitespace-nowrap" title={formatFullTime(event.timestamp)}>
                 {formatRelativeTime(event.timestamp)}
               </span>
@@ -280,7 +280,7 @@
                   {#if event.details}
                     <div class="col-span-2">
                       <span class="text-slate-400">Details:</span>
-                      <pre class="mt-1 p-2 bg-slate-100 rounded text-slate-600 overflow-x-auto">{JSON.stringify(event.details, null, 2)}</pre>
+                      <pre class="mt-1 p-2 bg-slate-100 rounded-sm text-slate-600 overflow-x-auto">{JSON.stringify(event.details, null, 2)}</pre>
                     </div>
                   {/if}
                 </div>
@@ -326,7 +326,7 @@
   }
 
   .event-list:hover {
-    box-shadow: var(--shadow-md);
+    box-shadow: var(--chv-shadow-md);
   }
 
   .event-item {

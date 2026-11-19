@@ -70,7 +70,7 @@
 				{node.vmCount} workloads
 			</text>
 			<circle cx={node.x + 55} cy={node.y - 20} r="4" class="status-indicator" style:fill={getStatusColor(node.status)} />
-			<MoreHorizontal x={node.x + 46} y={node.y + 10} size={16} color="var(--color-neutral-500)" />
+			<MoreHorizontal x={node.x + 46} y={node.y + 10} size={16} color="var(--chv-color-neutral-500)" />
 		</g>
 	{/each}
 
@@ -114,7 +114,7 @@
 	}
 
 	.connection-line {
-		stroke: var(--status-color, var(--color-neutral-200));
+		stroke: var(--status-color, var(--chv-color-neutral-200));
 		stroke-width: 1.25;
 		fill: none;
 		opacity: 0.48;
@@ -170,14 +170,14 @@
 	.node-label {
 		font-size: 12px;
 		font-weight: 600;
-		fill: var(--color-neutral-800);
+		fill: var(--chv-color-neutral-800);
 	}
 
 	.node-meta,
 	.vm-meta {
 		font-size: 9px;
 		font-weight: 500;
-		fill: var(--color-neutral-500);
+		fill: var(--chv-color-neutral-500);
 	}
 
 	.vm-box {
@@ -208,7 +208,7 @@
 	.vm-label {
 		font-size: 10px;
 		font-weight: 600;
-		fill: var(--color-neutral-700);
+		fill: var(--chv-color-neutral-700);
 	}
 
 	.status-indicator {

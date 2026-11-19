@@ -138,20 +138,20 @@
 	}
 
 	.status-dot.muted {
-		background: var(--color-neutral-400, #a3a3a3);
+		background: var(--chv-color-neutral-400, #a3a3a3);
 	}
 
 	.status-label {
 		font-size: 11px;
 		font-weight: 700;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.health-row {
 		display: flex;
 		justify-content: space-between;
 		font-size: 10px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		padding: 0.3rem 0.4rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);
@@ -159,7 +159,7 @@
 
 	.health-row strong {
 		font-weight: 700;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.health-row.warn strong {
@@ -169,7 +169,7 @@
 	.degraded-note {
 		font-size: 10px;
 		line-height: 1.5;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 		padding: 0.4rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);

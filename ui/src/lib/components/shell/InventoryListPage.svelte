@@ -82,7 +82,7 @@
 		{/each}
 	</div>
 
-	<div class="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-[var(--radius-xs)] overflow-hidden">
+	<div class="bg-(--bg-surface) border border-(--border-subtle) rounded-xs overflow-hidden">
 		<FilterBar
 			{filters}
 			{activeFilters}
@@ -91,7 +91,7 @@
 		/>
 	</div>
 
-	<main class="grid gap-4 items-start grid-cols-[1fr_300px] max-[1100px]:!grid-cols-1">
+	<main class="grid gap-4 items-start grid-cols-[1fr_300px] max-[1100px]:grid-cols-1!">
 		<section>
 			{#if state === 'error'}
 				<ErrorState />

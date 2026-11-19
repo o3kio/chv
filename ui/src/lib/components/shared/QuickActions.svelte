@@ -251,20 +251,20 @@
           oninput={handleInput}
           onkeydown={handleKeyDown}
           placeholder="What would you like to do?"
-          class="flex-1 bg-transparent text-base outline-none placeholder:text-gray-400"
+          class="flex-1 bg-transparent text-base outline-hidden placeholder:text-gray-400"
           aria-label="Quick action search"
         />
         {#if query}
           <button
             type="button"
             onclick={() => { query = ''; inputRef?.focus(); }}
-            class="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600"
+            class="p-1 rounded-sm hover:bg-gray-100 text-gray-400 hover:text-gray-600"
             aria-label="Clear search"
           >
             <X size={16} />
           </button>
         {/if}
-        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 text-xs font-mono bg-gray-100 text-gray-500 rounded border border-gray-200">
+        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 text-xs font-mono bg-gray-100 text-gray-500 rounded-sm border border-gray-200">
           ESC
         </kbd>
       </div>

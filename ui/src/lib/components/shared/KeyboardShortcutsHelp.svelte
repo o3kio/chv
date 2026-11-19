@@ -143,7 +143,7 @@
         <button
           type="button"
           onclick={handleClose}
-          class="p-2 rounded hover:bg-gray-100 text-gray-500 hover:text-gray-700 transition-colors"
+          class="p-2 rounded-sm hover:bg-gray-100 text-gray-500 hover:text-gray-700 transition-colors"
           aria-label="Close"
         >
           <X size={18} />
@@ -160,7 +160,7 @@
             bind:value={searchQuery}
             onkeydown={handleKeyDown}
             placeholder="Search shortcuts..."
-            class="w-full pl-9 pr-4 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            class="w-full pl-9 pr-4 py-2 text-sm border border-gray-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-transparent"
           />
         </div>
       </div>
@@ -211,16 +211,16 @@
         <div class="mt-8 p-4 bg-blue-50 rounded-lg border border-blue-100">
           <h4 class="text-sm font-semibold text-blue-900 mb-2">Pro Tips</h4>
           <ul class="text-sm text-blue-800 space-y-1 list-disc list-inside">
-            <li>Press <kbd class="px-1.5 py-0.5 bg-white rounded border border-blue-200 font-mono text-xs">?</kbd> from anywhere to open this help</li>
-            <li>Use <kbd class="px-1.5 py-0.5 bg-white rounded border border-blue-200 font-mono text-xs">{getModifierKey()}</kbd> + <kbd class="px-1.5 py-0.5 bg-white rounded border border-blue-200 font-mono text-xs">K</kbd> for quick search</li>
-            <li>Navigation shortcuts like <kbd class="px-1.5 py-0.5 bg-white rounded border border-blue-200 font-mono text-xs">G</kbd> then <kbd class="px-1.5 py-0.5 bg-white rounded border border-blue-200 font-mono text-xs">V</kbd> work anywhere</li>
+            <li>Press <kbd class="px-1.5 py-0.5 bg-white rounded-sm border border-blue-200 font-mono text-xs">?</kbd> from anywhere to open this help</li>
+            <li>Use <kbd class="px-1.5 py-0.5 bg-white rounded-sm border border-blue-200 font-mono text-xs">{getModifierKey()}</kbd> + <kbd class="px-1.5 py-0.5 bg-white rounded-sm border border-blue-200 font-mono text-xs">K</kbd> for quick search</li>
+            <li>Navigation shortcuts like <kbd class="px-1.5 py-0.5 bg-white rounded-sm border border-blue-200 font-mono text-xs">G</kbd> then <kbd class="px-1.5 py-0.5 bg-white rounded-sm border border-blue-200 font-mono text-xs">V</kbd> work anywhere</li>
           </ul>
         </div>
       </div>
       
       <!-- Footer -->
       <div class="px-6 py-3 bg-gray-50 border-t border-gray-200 flex items-center justify-between text-xs text-gray-500">
-        <span>Press <kbd class="px-1.5 py-0.5 bg-white rounded border border-gray-200 font-mono">?</kbd> anytime to show this dialog</span>
+        <span>Press <kbd class="px-1.5 py-0.5 bg-white rounded-sm border border-gray-200 font-mono">?</kbd> anytime to show this dialog</span>
         <span>{filteredGroups.reduce((acc, g) => acc + g.shortcuts.length, 0)} shortcuts</span>
       </div>
     </div>

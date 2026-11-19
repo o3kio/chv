@@ -105,7 +105,7 @@
 
 <SectionCard title="Incidents" badgeLabel={String(total)}>
 	{#snippet actions()}
-		<label class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.05em] text-[var(--shell-text-muted)] cursor-pointer m-0">
+		<label class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-(--shell-text-muted) cursor-pointer m-0">
 			<input type="checkbox" checked={includeResolved} onchange={toggleResolved} />
 			Show resolved
 		</label>
@@ -114,9 +114,9 @@
 	{#if error}
 		<ErrorState />
 	{:else if loading && incidents.length === 0}
-		<p class="text-sm text-[var(--shell-text-muted)]">Loading incidents…</p>
+		<p class="text-sm text-(--shell-text-muted)">Loading incidents…</p>
 	{:else if incidents.length === 0}
-		<p class="text-sm text-[var(--shell-text-secondary)]">
+		<p class="text-sm text-(--shell-text-secondary)">
 			No {includeResolved ? '' : 'active '}incidents. Rules evaluate every few seconds;
 			pending incidents appear here before any notification is sent.
 		</p>
@@ -124,7 +124,7 @@
 		<div class="overflow-x-auto">
 			<table class="w-full text-xs border-collapse">
 				<thead>
-					<tr class="text-left text-[var(--shell-text-muted)] border-b border-[var(--shell-line)]">
+					<tr class="text-left text-(--shell-text-muted) border-b border-(--shell-line)">
 						<th class="py-1.5 pr-3 font-semibold">State</th>
 						<th class="py-1.5 pr-3 font-semibold">Severity</th>
 						<th class="py-1.5 pr-3 font-semibold">Target</th>
@@ -142,7 +142,7 @@
 						{@const silenced =
 							incident.silenced_until_ms !== null && incident.silenced_until_ms > Date.now()}
 						<tr
-							class="border-b border-[var(--shell-line)] last:border-b-0 cursor-pointer hover:bg-[var(--shell-surface-muted)]"
+							class="border-b border-(--shell-line) last:border-b-0 cursor-pointer hover:bg-(--shell-surface-muted)"
 							onclick={() => (selectedAlertId = incident.alert_id)}
 						>
 							<td class="py-1.5 pr-3 whitespace-nowrap">
@@ -162,20 +162,20 @@
 							<td class="py-1.5 pr-3 whitespace-nowrap">
 								<a
 									href={targetHref(incident.target_kind, incident.target_id)}
-									class="text-[var(--shell-accent)] no-underline hover:underline"
+									class="text-(--shell-accent) no-underline hover:underline"
 									onclick={(event) => event.stopPropagation()}
 								>
 									{incident.target_kind}/{incident.target_id}
 								</a>
 							</td>
 							<!-- The message is the evaluator's rendered summary; plain text only. -->
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] max-w-[22rem] truncate">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) max-w-88 truncate">
 								{incident.message}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) whitespace-nowrap">
 								{incident.last_observed ?? '—'}
 							</td>
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary) whitespace-nowrap">
 								{formatAlertTimestamp(incident.opened_at)}
 							</td>
 							{#if isOperator && incident.status !== 'resolved'}
@@ -195,18 +195,18 @@
 									</Button>
 									<details class="relative">
 										<summary
-											class="list-none cursor-pointer inline-flex items-center gap-1 px-2 h-8 rounded-sm text-[var(--color-neutral-600)] hover:bg-[var(--color-neutral-100)] hover:text-[var(--color-neutral-900)] text-sm font-medium"
+											class="list-none cursor-pointer inline-flex items-center gap-1 px-2 h-8 rounded-xs text-(--chv-color-neutral-600) hover:bg-(--chv-color-neutral-100) hover:text-(--chv-color-neutral-900) text-sm font-medium"
 											title="Silence"
 											onclick={(event) => event.stopPropagation()}
 										>
 											<BellOff size={13} />
 											<ChevronRight size={11} />
 										</summary>
-										<div class="absolute right-0 z-10 mt-1 flex flex-col gap-1 p-1 bg-[var(--bg-surface)] border border-[var(--color-neutral-300)] rounded-sm shadow-lg min-w-[5rem]">
+										<div class="absolute right-0 z-10 mt-1 flex flex-col gap-1 p-1 bg-(--bg-surface) border border-(--chv-color-neutral-300) rounded-xs shadow-lg min-w-20">
 											{#each SILENCE_PICKS as pick (pick.minutes)}
 												<button
 													type="button"
-													class="text-xs text-left px-2 py-1 rounded-sm bg-transparent border-none cursor-pointer text-[var(--color-neutral-700)] hover:bg-[var(--color-neutral-100)]"
+													class="text-xs text-left px-2 py-1 rounded-xs bg-transparent border-none cursor-pointer text-(--chv-color-neutral-700) hover:bg-(--chv-color-neutral-100)"
 													disabled={busyAlertId === incident.alert_id}
 													onclick={(event) => {
 														event.stopPropagation();
@@ -220,7 +220,7 @@
 									</details>
 								</td>
 							{:else if isOperator}
-								<td class="py-1.5 text-right text-[var(--shell-text-muted)]">—</td>
+								<td class="py-1.5 text-right text-(--shell-text-muted)">—</td>
 							{/if}
 						</tr>
 					{/each}

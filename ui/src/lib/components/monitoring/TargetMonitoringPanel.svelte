@@ -137,7 +137,7 @@
 
 	.source-note {
 		font-size: 10px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 
 	.charts-grid {
@@ -158,7 +158,7 @@
 	}
 
 	.state-degraded {
-		border: 1px dashed var(--color-neutral-300, #d4d4d4);
+		border: 1px dashed var(--chv-color-neutral-300, #d4d4d4);
 	}
 
 	.state-error {
@@ -168,7 +168,7 @@
 	.state-title {
 		font-size: 12px;
 		font-weight: 700;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.state-error .state-title {
@@ -177,7 +177,7 @@
 
 	.state-hint {
 		font-size: 10px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		text-align: center;
 		max-width: 40rem;
 	}

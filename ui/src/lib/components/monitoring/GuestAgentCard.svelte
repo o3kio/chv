@@ -125,19 +125,19 @@
 	{/snippet}
 
 	{#if loading}
-		<p class="text-sm text-[var(--shell-text-muted)]">Loading agent status…</p>
+		<p class="text-sm text-(--shell-text-muted)">Loading agent status…</p>
 	{:else if disabled}
-		<p class="text-sm text-[var(--shell-text-secondary)]">
+		<p class="text-sm text-(--shell-text-secondary)">
 			Guest ingestion is not enabled on this manager. VMs are fully usable without it — enabling it
 			is a deployment decision (see ADR-026).
 		</p>
 	{:else if error}
-		<p class="text-sm text-[var(--color-danger)]">{error}</p>
+		<p class="text-sm text-danger">{error}</p>
 	{:else if !agent || agent.state === 'revoked'}
 		<div class="flex items-start justify-between gap-4">
 			<div>
-				<p class="text-sm text-[var(--shell-text)]">{stateView.label}</p>
-				<p class="text-sm text-[var(--shell-text-secondary)]">{stateView.description}</p>
+				<p class="text-sm text-(--shell-text)">{stateView.label}</p>
+				<p class="text-sm text-(--shell-text-secondary)">{stateView.description}</p>
 			</div>
 			{#if onEnroll && actions.includes('enroll')}
 				<Button variant="primary" size="sm" onclick={onEnroll}>Enroll agent</Button>
@@ -146,9 +146,9 @@
 	{:else if agent.state === 'enrolling'}
 		<div class="flex items-start justify-between gap-4">
 			<div>
-				<p class="text-sm text-[var(--shell-text)]">{stateView.label}</p>
-				<p class="text-sm text-[var(--shell-text-secondary)]">{stateView.description}</p>
-				<p class="text-xs text-[var(--shell-text-muted)] mt-1">
+				<p class="text-sm text-(--shell-text)">{stateView.label}</p>
+				<p class="text-sm text-(--shell-text-secondary)">{stateView.description}</p>
+				<p class="text-xs text-(--shell-text-muted) mt-1">
 					Claim expires in
 					{agent.claim_expires_at_ms ? guestAgentCredentialRemaining(agent.claim_expires_at_ms) : '—'}
 					{#if agent.claim_issued_by}· issued by {agent.claim_issued_by}{/if}
@@ -161,25 +161,25 @@
 	{:else}
 		<div class="flex items-start justify-between gap-4">
 			<div class="space-y-1 min-w-0">
-				<p class="text-sm font-medium text-[var(--shell-text)]">
+				<p class="text-sm font-medium text-(--shell-text)">
 					{stateView.label}
 					{#if agent.os.name}
-						<span class="font-normal text-[var(--shell-text-secondary)]">
+						<span class="font-normal text-(--shell-text-secondary)">
 							· {agent.os.name}{agent.os.version ? ` ${agent.os.version}` : ''}
 						</span>
 					{/if}
 				</p>
-				<p class="text-xs text-[var(--shell-text-secondary)]">{stateView.description}</p>
-				<dl class="grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-[var(--shell-text-muted)] mt-2">
+				<p class="text-xs text-(--shell-text-secondary)">{stateView.description}</p>
+				<dl class="grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-(--shell-text-muted) mt-2">
 					<div>
 						<dt class="inline">Last report: </dt>
-						<dd class="inline text-[var(--shell-text-secondary)]">
+						<dd class="inline text-(--shell-text-secondary)">
 							{guestAgentLastSeen(agent.last_seen_age_seconds, agent.state)}
 						</dd>
 					</div>
 					<div>
 						<dt class="inline">Credential: </dt>
-						<dd class="inline text-[var(--shell-text-secondary)]">
+						<dd class="inline text-(--shell-text-secondary)">
 							epoch {agent.credential_epoch ?? '—'}, expires in
 							{agent.credential_expires_at_ms
 								? guestAgentCredentialRemaining(agent.credential_expires_at_ms)
@@ -188,13 +188,13 @@
 					</div>
 					<div>
 						<dt class="inline">OS kernel: </dt>
-						<dd class="inline text-[var(--shell-text-secondary)]">
+						<dd class="inline text-(--shell-text-secondary)">
 							{agent.os.kernel_release ?? 'unknown'}
 						</dd>
 					</div>
 					<div>
 						<dt class="inline">VM: </dt>
-						<dd class="inline text-[var(--shell-text-secondary)]">{vmName ?? vmId}</dd>
+						<dd class="inline text-(--shell-text-secondary)">{vmName ?? vmId}</dd>
 					</div>
 				</dl>
 			</div>

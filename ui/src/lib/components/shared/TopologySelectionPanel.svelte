@@ -45,7 +45,7 @@
 		border: 1px solid var(--shell-line-strong);
 		border-radius: var(--radius-sm);
 		background: color-mix(in srgb, var(--shell-surface) 94%, transparent);
-		box-shadow: var(--shadow-sm);
+		box-shadow: var(--chv-shadow-sm);
 	}
 
 	.selection-panel__eyebrow,
@@ -64,13 +64,13 @@
 
 	.selection-panel h3 {
 		margin-top: 0.15rem;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--shell-text);
 	}
 
 	.selection-panel p {
 		margin-top: 0.2rem;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 	}
 
@@ -78,7 +78,7 @@
 		display: flex;
 		align-items: center;
 		gap: 0.35rem;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text);
 	}
 
@@ -100,7 +100,7 @@
 		border: 1px solid var(--shell-line);
 		border-radius: var(--radius-xs);
 		color: var(--shell-text);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		text-decoration: none;
 		background: var(--shell-surface-muted);
 	}

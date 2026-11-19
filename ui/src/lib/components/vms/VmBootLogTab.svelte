@@ -20,17 +20,17 @@
 
 <style>
 	.empty-hint {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		text-align: center;
 		padding: 1rem 0;
 	}
 
 	.boot-log {
-		font-family: var(--font-mono);
-		font-size: var(--text-xs);
+		font-family: var(--chv-font-mono);
+		font-size: var(--chv-text-xs);
 		line-height: 1.5;
-		background: var(--color-neutral-50);
+		background: var(--chv-color-neutral-50);
 		border: 1px solid var(--shell-line);
 		border-radius: var(--radius-md);
 		padding: var(--space-4);

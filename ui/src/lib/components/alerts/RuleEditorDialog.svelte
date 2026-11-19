@@ -223,9 +223,9 @@
 	}
 
 	const inputClass =
-		'w-full px-2.5 py-1.5 text-sm border border-[var(--color-neutral-300)] rounded-sm bg-[var(--bg-surface)] text-[var(--color-neutral-900)]';
+		'w-full px-2.5 py-1.5 text-sm border border-(--chv-color-neutral-300) rounded-xs bg-(--bg-surface) text-(--chv-color-neutral-900)';
 	const labelClass =
-		'block text-[10px] font-bold uppercase tracking-[0.05em] text-[var(--shell-text-muted)] mb-1';
+		'block text-[10px] font-bold uppercase tracking-wider text-(--shell-text-muted) mb-1';
 </script>
 
 <Modal bind:open title={isEdit ? 'Edit alert rule' : 'New alert rule'} width="wide">
@@ -290,7 +290,7 @@
 			bind:dimensionValue
 		/>
 
-		<label class="flex items-center gap-2 text-sm text-[var(--color-neutral-700)] sm:col-span-2 mt-1 cursor-pointer">
+		<label class="flex items-center gap-2 text-sm text-(--chv-color-neutral-700) sm:col-span-2 mt-1 cursor-pointer">
 			<input type="checkbox" bind:checked={enabled} />
 			Enabled
 			{#if !isEdit}
@@ -300,7 +300,7 @@
 	</div>
 
 	{#if validationError}
-		<p class="text-xs text-[var(--color-danger)] mt-3 mb-0" role="alert">{validationError}</p>
+		<p class="text-xs text-danger mt-3 mb-0" role="alert">{validationError}</p>
 	{/if}
 
 	{#snippet footer()}

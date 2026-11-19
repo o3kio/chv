@@ -225,22 +225,22 @@
 <nav class="flex flex-col h-full gap-4 select-none" aria-label="Primary">
 	<!-- Header -->
 	<div class="flex items-center gap-3 py-2 px-1">
-		<div class="grid place-items-center w-8 h-8 rounded-[var(--radius-sm)] bg-[var(--color-primary)] text-[var(--color-sidebar-text-active,#ffffff)]">
+		<div class="grid place-items-center w-8 h-8 rounded-sm bg-primary text-(--color-sidebar-text-active,#ffffff)">
 			<Database size={16} />
 		</div>
 		<div class="flex flex-col">
-			<div class="text-[0.875rem] font-bold text-[var(--color-sidebar-text-active,#ffffff)]">CellHV</div>
-			<div class="text-[0.625rem] text-[var(--color-neutral-500)] uppercase tracking-[0.05em]">Control Plane</div>
+			<div class="text-[0.875rem] font-bold text-(--color-sidebar-text-active,#ffffff)">CellHV</div>
+			<div class="text-[0.625rem] text-(--chv-color-neutral-500) uppercase tracking-wider">Control Plane</div>
 		</div>
 	</div>
 
 	<!-- Search -->
-	<div class="mx-1 flex min-h-8 items-center gap-2 rounded-[var(--radius-xs)] border border-[var(--color-neutral-700)] bg-[var(--color-neutral-800)] px-[0.625rem] text-[var(--color-neutral-400)] transition-colors duration-[120ms] ease-in-out focus-within:border-[var(--color-primary)] focus-within:text-[var(--color-sidebar-text-active,#ffffff)]">
+	<div class="mx-1 flex min-h-8 items-center gap-2 rounded-xs border border-(--chv-color-neutral-700) bg-(--chv-color-neutral-800) px-2.5 text-(--chv-color-neutral-400) transition-colors duration-120 ease-in-out focus-within:border-primary focus-within:text-(--color-sidebar-text-active,#ffffff)">
 		<Search size={12} class="shrink-0" />
 		<input
 			type="search"
 			placeholder="Search resources..."
-			class="min-w-0 flex-1 border-0 bg-transparent py-[0.35rem] px-0 text-[length:var(--text-xs)] text-[var(--color-sidebar-text-active,#ffffff)] placeholder:text-[var(--color-neutral-500)]"
+			class="min-w-0 flex-1 border-0 bg-transparent py-[0.35rem] px-0 text-(length:--chv-text-xs) text-(--color-sidebar-text-active,#ffffff) placeholder:text-(--chv-color-neutral-500)"
 			bind:value={searchQuery}
 			aria-label="Search fleet resources"
 		/>
@@ -252,7 +252,7 @@
 		<div class="flex flex-col gap-1" data-testid="nav-design-group">
 			<button
 				type="button"
-				class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-[var(--color-neutral-500)] bg-transparent border-none cursor-pointer rounded-[var(--radius-xs)] px-2 py-1 hover:text-[var(--color-sidebar-text-active,#ffffff)]"
+				class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-(--chv-color-neutral-500) bg-transparent border-none cursor-pointer rounded-xs px-2 py-1 hover:text-(--color-sidebar-text-active,#ffffff)"
 				aria-expanded={openGroups['design']}
 				aria-controls="group-design"
 				onclick={() => toggleGroup('design')}
@@ -266,7 +266,7 @@
 					<a
 						href="/architectures/new"
 						data-testid="nav-architecture-designer"
-						class="flex items-center gap-[0.625rem] py-[0.35rem] px-2 text-[length:var(--text-sm)] text-[var(--color-neutral-300)] no-underline rounded-[var(--radius-xs)] transition-all duration-[120ms] ease-in-out hover:bg-[var(--color-neutral-800)] hover:text-[var(--color-sidebar-text-active,#ffffff)] {isActive('/architectures/new', page.url.pathname) ? 'bg-[var(--color-primary)] text-[var(--color-sidebar-text-active,#ffffff)]' : ''}"
+						class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-(--chv-color-neutral-300) no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff) {isActive('/architectures/new', page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 						aria-current={isActive('/architectures/new', page.url.pathname) ? 'page' : undefined}
 					>
 						<Compass size={14} />
@@ -275,7 +275,7 @@
 					<a
 						href="/architectures"
 						data-testid="nav-saved-topologies"
-						class="flex items-center gap-[0.625rem] py-[0.35rem] px-2 text-[length:var(--text-sm)] text-[var(--color-neutral-300)] no-underline rounded-[var(--radius-xs)] transition-all duration-[120ms] ease-in-out hover:bg-[var(--color-neutral-800)] hover:text-[var(--color-sidebar-text-active,#ffffff)] {page.url.pathname === '/architectures' || (page.url.pathname.startsWith('/architectures/') && !page.url.pathname.startsWith('/architectures/new')) ? 'bg-[var(--color-primary)] text-[var(--color-sidebar-text-active,#ffffff)]' : ''}"
+						class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-(--chv-color-neutral-300) no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff) {page.url.pathname === '/architectures' || (page.url.pathname.startsWith('/architectures/') && !page.url.pathname.startsWith('/architectures/new')) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 						aria-current={page.url.pathname === '/architectures' || (page.url.pathname.startsWith('/architectures/') && !page.url.pathname.startsWith('/architectures/new')) ? 'page' : undefined}
 					>
 						<LayoutGrid size={14} />
@@ -289,7 +289,7 @@
 		<div class="flex flex-col gap-1">
 			<a
 				href="/"
-				class="flex items-center gap-[0.625rem] py-[0.35rem] px-2 text-[length:var(--text-sm)] text-[var(--color-neutral-300)] no-underline rounded-[var(--radius-xs)] transition-all duration-[120ms] ease-in-out hover:bg-[var(--color-neutral-800)] hover:text-[var(--color-sidebar-text-active,#ffffff)] {isActive('/', page.url.pathname) ? 'bg-[var(--color-primary)] text-[var(--color-sidebar-text-active,#ffffff)]' : ''}"
+				class="flex items-center gap-2.5 py-[0.35rem] px-2 text-(length:--chv-text-sm) text-(--chv-color-neutral-300) no-underline rounded-xs transition-all duration-120 ease-in-out hover:bg-(--chv-color-neutral-800) hover:text-(--color-sidebar-text-active,#ffffff) {isActive('/', page.url.pathname) ? 'bg-primary text-(--color-sidebar-text-active,#ffffff)' : ''}"
 				aria-current={isActive('/', page.url.pathname) ? 'page' : undefined}
 			>
 				<House size={14} />
@@ -329,13 +329,13 @@
 		gap: 0.35rem;
 		padding: 0.25rem 0.75rem;
 		font-size: 0.7rem;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 	.status-dot {
 		width: 6px;
 		height: 6px;
 		border-radius: 50%;
-		background: var(--color-neutral-400);
+		background: var(--chv-color-neutral-400);
 	}
 	.status-dot.connected {
 		background: var(--color-success);

@@ -88,7 +88,7 @@
 		align-items: center;
 		justify-content: center;
 		border-radius: 8px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		background: transparent;
 		border: none;
 		cursor: pointer;
@@ -97,7 +97,7 @@
 
 	.menu-button:hover {
 		background: rgba(255, 255, 255, 0.1);
-		color: var(--color-neutral-50);
+		color: var(--chv-color-neutral-50);
 	}
 
 	.menu-button:focus-visible {

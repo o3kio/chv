@@ -70,20 +70,20 @@
 <Modal bind:open closeOnBackdrop={false} onClose={close}>
 	{#snippet header()}
 		<div class="flex items-center gap-3">
-			<KeyRound class="h-5 w-5 text-[var(--color-info)]" aria-hidden="true" />
-			<h2 id="modal-title" class="text-base font-semibold text-[var(--shell-text)]">
+			<KeyRound class="h-5 w-5 text-(--color-info)" aria-hidden="true" />
+			<h2 id="modal-title" class="text-base font-semibold text-(--shell-text)">
 				Enroll guest monitoring agent
 			</h2>
 		</div>
 	{/snippet}
 
 	{#if issuing}
-		<p class="text-sm text-[var(--shell-text-secondary)]">Issuing a one-time claim…</p>
+		<p class="text-sm text-(--shell-text-secondary)">Issuing a one-time claim…</p>
 	{:else if error}
-		<p class="text-sm text-[var(--color-danger)]">{error}</p>
+		<p class="text-sm text-danger">{error}</p>
 	{:else if claim}
 		<div class="space-y-4">
-			<p class="text-sm text-[var(--shell-text-secondary)]">
+			<p class="text-sm text-(--shell-text-secondary)">
 				Install <code class="text-xs">chv-monitor-agent</code> in
 				{vmName ?? vmId}, place the claim token at
 				<code class="text-xs">/var/lib/chv-monitor/claim</code> (owner
@@ -91,23 +91,23 @@
 				enrolls over mutual TLS on its next run.
 			</p>
 			<div
-				class="bg-[var(--shell-surface-muted)] rounded-lg p-3 border border-[var(--shell-line)]"
+				class="bg-(--shell-surface-muted) rounded-lg p-3 border border-(--shell-line)"
 			>
 				<p
-					class="text-xs font-medium text-[var(--shell-text-muted)] uppercase tracking-wider mb-2"
+					class="text-xs font-medium text-(--shell-text-muted) uppercase tracking-wider mb-2"
 				>
 					Claim token — shown once, never again
 				</p>
-				<p class="font-mono text-xs break-all text-[var(--shell-text)]">
+				<p class="font-mono text-xs break-all text-(--shell-text)">
 					{claim.claim_token}
 				</p>
 				{#if claim.server_url}
-					<p class="text-xs text-[var(--shell-text-muted)] mt-2">
+					<p class="text-xs text-(--shell-text-muted) mt-2">
 						Manager: {claim.server_url}
 					</p>
 				{/if}
 			</div>
-			<p class="text-xs text-[var(--shell-text-muted)]">
+			<p class="text-xs text-(--shell-text-muted)">
 				The token expires
 				{new Date(claim.expires_at_ms).toLocaleString()} and is single-use. If it is lost or
 				expires unused, simply issue a new one.

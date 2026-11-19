@@ -137,9 +137,9 @@
 		font-size: 11px;
 		font-weight: 600;
 		border-radius: var(--radius-xs);
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px solid var(--color-neutral-200);
-		color: var(--color-neutral-600);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px solid var(--chv-color-neutral-200);
+		color: var(--chv-color-neutral-600);
 	}
 	.chip-zero { opacity: 0.7; }
 	.chip-conflict {
@@ -148,7 +148,7 @@
 		color: rgb(120, 53, 15);
 	}
 	.chip-count { font-variant-numeric: tabular-nums; font-weight: 700; }
-	.meta { margin: 0; font-size: 12px; color: var(--color-neutral-500); }
+	.meta { margin: 0; font-size: 12px; color: var(--chv-color-neutral-500); }
 	.conflict-banner {
 		display: flex;
 		flex-direction: column;
@@ -158,22 +158,22 @@
 		background: rgba(180, 83, 9, 0.1);
 		border: 1px solid rgba(180, 83, 9, 0.4);
 		color: rgb(120, 53, 15);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 	.empty {
 		padding: 1rem;
-		border: 1px dashed var(--color-neutral-300);
+		border: 1px dashed var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		text-align: center;
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 	}
 	.empty-title {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
-	.empty-text { margin: 0.25rem 0 0 0; font-size: 12px; color: var(--color-neutral-600); }
+	.empty-text { margin: 0.25rem 0 0 0; font-size: 12px; color: var(--chv-color-neutral-600); }
 	.entries { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
 	.entry {
 		display: flex;
@@ -181,7 +181,7 @@
 		gap: 0.25rem;
 		padding: 0.6rem 0.75rem;
 		background: var(--bg-surface);
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
 	}
 	.entry-conflict {
@@ -208,28 +208,28 @@
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 	.entry-name {
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 12px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 	.entry-natural-key {
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 11px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
-	.entry-reason { font-size: var(--text-sm); color: var(--color-neutral-800); line-height: 1.4; }
+	.entry-reason { font-size: var(--chv-text-sm); color: var(--chv-color-neutral-800); line-height: 1.4; }
 	.ownership-cue { font-size: 12px; font-weight: 600; color: rgb(120, 53, 15); }
 	.changes { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
 	.change {
 		padding: 0.2rem 0.5rem;
-		background: var(--color-neutral-50, #f8fafc);
-		border: 1px dashed var(--color-neutral-200);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		border: 1px dashed var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 11px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 </style>

@@ -239,7 +239,7 @@
 		display: flex;
 		align-items: center;
 		gap: 0.35rem;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 	}
 
@@ -254,7 +254,7 @@
 		border-radius: 9999px;
 		background: var(--status-failed-bg);
 		color: var(--status-failed-text);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 600;
 		letter-spacing: 0.08em;
 		text-transform: uppercase;
@@ -264,7 +264,7 @@
 	.failure-message {
 		display: block;
 		margin-top: 0.25rem;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		overflow: hidden;
 		text-overflow: ellipsis;

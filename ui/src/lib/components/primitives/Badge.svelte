@@ -13,19 +13,19 @@
 	}: Props & { children?: import('svelte').Snippet } = $props();
 
 	const variantClasses = {
-		default: 'bg-[var(--color-neutral-100)] text-[var(--color-neutral-600)] border-[var(--color-neutral-200)]',
-		success: 'bg-[var(--color-success)]/15 text-[var(--color-success-dark)] border-[var(--color-success)]/20',
-		warning: 'bg-[var(--color-warning)]/15 text-[var(--color-warning-dark)] border-[var(--color-warning)]/20',
-		danger: 'bg-[var(--color-danger)]/15 text-[var(--color-danger-dark)] border-[var(--color-danger)]/20',
-		info: 'bg-[var(--color-info)]/15 text-[var(--color-info-dark)] border-[var(--color-info)]/20'
+		default: 'bg-(--chv-color-neutral-100) text-(--chv-color-neutral-600) border-(--chv-color-neutral-200)',
+		success: 'bg-success/15 text-(--color-success-dark) border-success/20',
+		warning: 'bg-warning/15 text-(--color-warning-dark) border-warning/20',
+		danger: 'bg-danger/15 text-(--color-danger-dark) border-danger/20',
+		info: 'bg-(--color-info)/15 text-(--color-info-dark) border-(--color-info)/20'
 	};
 
 	const dotClasses = {
-		default: 'bg-[var(--color-neutral-400)]',
-		success: 'bg-[var(--color-success)] shadow-[var(--shadow-glow-success)]',
-		warning: 'bg-[var(--color-warning)]',
-		danger: 'bg-[var(--color-danger)]',
-		info: 'bg-[var(--color-info)]'
+		default: 'bg-(--chv-color-neutral-400)',
+		success: 'bg-success shadow-(--shadow-glow-success)',
+		warning: 'bg-warning',
+		danger: 'bg-danger',
+		info: 'bg-(--color-info)'
 	};
 </script>
 

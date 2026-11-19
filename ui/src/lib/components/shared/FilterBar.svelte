@@ -168,7 +168,7 @@
 <style>
 	.filter-bar {
 		background: white;
-		border-bottom: 1px solid var(--color-neutral-200);
+		border-bottom: 1px solid var(--chv-color-neutral-200);
 	}
 
 	.filter-toggle {
@@ -179,14 +179,14 @@
 		padding: 0.75rem 1rem;
 		background: transparent;
 		border: none;
-		color: var(--color-neutral-700);
-		font-size: var(--text-sm);
+		color: var(--chv-color-neutral-700);
+		font-size: var(--chv-text-sm);
 		font-weight: 500;
 		cursor: pointer;
 	}
 
 	.filter-toggle:hover {
-		background: var(--color-neutral-50);
+		background: var(--chv-color-neutral-50);
 	}
 
 	.filter-badge {
@@ -198,7 +198,7 @@
 		padding: 0 0.375rem;
 		background: var(--color-primary);
 		color: white;
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 600;
 		border-radius: 9999px;
 	}
@@ -227,7 +227,7 @@
 		gap: 0.5rem;
 		margin-bottom: 1rem;
 		padding-bottom: 1rem;
-		border-bottom: 1px solid var(--color-neutral-100);
+		border-bottom: 1px solid var(--chv-color-neutral-100);
 	}
 
 	.filter-chip {
@@ -238,7 +238,7 @@
 		background: var(--color-primary-light);
 		border: 1px solid rgba(229, 112, 53, 0.2);
 		border-radius: var(--radius-sm);
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--color-primary-dark);
 	}
 
@@ -270,8 +270,8 @@
 		background: transparent;
 		border: none;
 		border-radius: var(--radius-sm);
-		color: var(--color-neutral-500);
-		font-size: var(--text-xs);
+		color: var(--chv-color-neutral-500);
+		font-size: var(--chv-text-xs);
 		font-weight: 500;
 		cursor: pointer;
 		transition: all var(--duration-fast);
@@ -297,9 +297,9 @@
 	}
 
 	.filter-label {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		font-weight: 500;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 	}
@@ -307,11 +307,11 @@
 	.filter-select,
 	.filter-input {
 		padding: 0.5rem 0.75rem;
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-sm);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		background: white;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		transition: border-color var(--duration-fast);
 	}
 
@@ -336,8 +336,8 @@
 		gap: 0.5rem;
 		padding: 0.5rem 0;
 		cursor: pointer;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-700);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.filter-checkbox input[type='checkbox'] {

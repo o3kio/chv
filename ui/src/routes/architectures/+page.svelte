@@ -113,15 +113,15 @@
 	}
 
 	.page-title {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		font-weight: 700;
 		margin: 0;
 	}
 
 	.page-subtitle {
 		margin: 0;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-600);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.grid {
@@ -139,6 +139,6 @@
 		border: 1px solid rgba(220, 38, 38, 0.4);
 		border-radius: var(--radius-xs);
 		color: rgb(153, 27, 27);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 </style>

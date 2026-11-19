@@ -22,10 +22,10 @@
 	});
 </script>
 
-<a href={config.href} class="inline-flex items-center gap-[0.35rem] no-underline text-[var(--shell-text)] font-medium transition-colors duration-150 ease-in-out hover:text-[var(--shell-accent)] {compact ? '' : ''}">
-	<config.icon size={12} class="text-[var(--shell-text-muted)]" />
+<a href={config.href} class="inline-flex items-center gap-[0.35rem] no-underline text-(--shell-text) font-medium transition-colors duration-150 ease-in-out hover:text-(--shell-accent) {compact ? '' : ''}">
+	<config.icon size={12} class="text-(--shell-text-muted)" />
 	{#if !compact}
-		<span class="text-[10px] uppercase font-bold text-[var(--shell-text-muted)] tracking-[0.05em]">{config.label}</span>
+		<span class="text-[10px] uppercase font-bold text-(--shell-text-muted) tracking-wider">{config.label}</span>
 	{/if}
-	<span class="text-[length:var(--text-sm)] whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px] {compact ? 'text-[length:var(--text-xs)]' : ''}">{label}</span>
+	<span class="text-(length:--chv-text-sm) whitespace-nowrap overflow-hidden text-ellipsis max-w-[200px] {compact ? 'text-(length:--chv-text-xs)' : ''}">{label}</span>
 </a>

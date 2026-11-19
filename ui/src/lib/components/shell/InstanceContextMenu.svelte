@@ -103,26 +103,26 @@
 {#if menuOpen}
 	<div
 		bind:this={menuElement}
-		class="fixed z-50 min-w-[12rem] rounded-md border border-[var(--shell-line)] bg-[var(--bg-sidebar)] shadow-lg py-1"
+		class="fixed z-50 min-w-48 rounded-md border border-(--shell-line) bg-(--bg-sidebar) shadow-lg py-1"
 		style="left: {menuPos.x}px; top: {menuPos.y}px;"
 		role="menu"
 		aria-label="Actions for instance {instanceName}"
 	>
 		{#each actions as action, i (action.id)}
 			{#if action.dangerous && i > 0 && !actions[i - 1].dangerous}
-				<div class="my-1 border-t border-[var(--shell-line)]" role="separator"></div>
+				<div class="my-1 border-t border-(--shell-line)" role="separator"></div>
 			{/if}
 			{@const Icon = iconMap[action.id] ?? ExternalLink}
 			<button
 				type="button"
 				role="menuitem"
 				disabled={!action.enabled}
-				class="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[length:var(--text-sm)] transition-colors
+				class="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-(length:--chv-text-sm) transition-colors
 					{action.enabled
 						? action.dangerous
-							? 'text-[var(--color-danger)] hover:bg-[var(--color-danger-light)]'
-							: 'text-[var(--color-sidebar-text)] hover:bg-[var(--color-neutral-800)]'
-						: 'text-[var(--color-neutral-600)] cursor-not-allowed'}
+							? 'text-danger hover:bg-(--color-danger-light)'
+							: 'text-(--color-sidebar-text) hover:bg-(--chv-color-neutral-800)'
+						: 'text-(--chv-color-neutral-600) cursor-not-allowed'}
 				"
 				onclick={() => handleActionClick(action.id)}
 				title={action.disabledReason ?? action.label}
@@ -131,7 +131,7 @@
 				<Icon size={14} aria-hidden="true" />
 				<span class="flex-1">{action.label}</span>
 				{#if !action.enabled && action.disabledReason}
-					<span class="text-[length:var(--text-xs)] text-[var(--color-neutral-600)] truncate max-w-[6rem]">
+					<span class="text-(length:--chv-text-xs) text-(--chv-color-neutral-600) truncate max-w-24">
 						{action.disabledReason}
 					</span>
 				{/if}

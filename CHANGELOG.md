@@ -41,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HER-shrink path uses a device-filtered `bridge fdb show` parse so stale
   flood entries are actually removed (v0.1.6). Plan and journal formats
   are unchanged — no persisted-state migration.
+- **WebUI build stack moved to Tailwind CSS 4.** The PostCSS plugin is
+  replaced by `@tailwindcss/vite`, the three `@tailwind` directives become
+  a single `@import 'tailwindcss'`, and the JS config's theme moved into
+  an `@theme` block in `ui/src/app.css` (v4 removed `tailwind.config.cjs`
+  auto-detection). Utilities keep their v3 values: the app's own design
+  tokens that collide with a v4 theme namespace (`--text-*`, `--font-*`,
+  `--shadow-sm|md|lg`, the warm `neutral` palette) are now prefixed
+  `--chv-`, while `--color-*` stays intentionally wired to the utilities
+  from the old config, and neutral arbitrary values that the codemod
+  rewrote into named utilities were restored to the CHV palette. The
+  upgrade codemod rewrote arbitrary-value utilities (`bg-[var(--x)]` →
+  `bg-(--x)`, size hints) and the renumbered radius/shadow scales; a
+  base-layer border-color override preserves v3's gray default. Two
+  intentional visual deltas: opacity modifiers that were dead in v3
+  (`bg-primary/15`, …) now render, and v4 raises the browser floor to
+  cascade-layers/`oklch` capability. Also drops the unused `postcss`
+  devDependency and deletes 17 stray captured `svelte-check` logs that
+  v4's automatic source detection would otherwise scan.
 
 ## [0.4.0-rc.8] - 2026-11-06
 

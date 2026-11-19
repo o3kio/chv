@@ -62,19 +62,19 @@
 		flex-direction: column;
 		gap: 0.25rem;
 		padding: 1rem;
-		background: var(--color-neutral-50, #f9fafb);
+		background: var(--chv-color-neutral-50, #f9fafb);
 		border: 1px solid var(--shell-line);
 		border-radius: var(--radius-md);
 	}
 
 	.metric-label {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		font-weight: 600;
 	}
 
 	.metric-value {
-		font-size: var(--text-lg, 1.125rem);
+		font-size: var(--chv-text-lg, 1.125rem);
 		font-weight: 800;
 		color: var(--shell-text);
 	}

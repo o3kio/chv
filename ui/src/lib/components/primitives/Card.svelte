@@ -22,11 +22,11 @@
 </script>
 
 <div
-	class="bg-[var(--bg-surface)] border border-[var(--color-neutral-200)] rounded-md shadow-sm overflow-hidden transition-all duration-300 ease-in-out {interactive ? 'cursor-pointer hover:shadow-lg hover:border-[var(--color-primary)]/30 hover:-translate-y-0.5' : ''}"
+	class="bg-(--bg-surface) border border-(--chv-color-neutral-200) rounded-md shadow-xs overflow-hidden transition-all duration-300 ease-in-out {interactive ? 'cursor-pointer hover:shadow-lg hover:border-primary/30 hover:-translate-y-0.5' : ''}"
 	role="article"
 >
 	{#if header}
-		<div class="border-b border-[var(--color-neutral-100)] bg-[var(--color-neutral-50)] {paddingClasses[padding]}">
+		<div class="border-b border-(--chv-color-neutral-100) bg-(--chv-color-neutral-50) {paddingClasses[padding]}">
 			{@render header()}
 		</div>
 	{/if}
@@ -34,7 +34,7 @@
 		{@render children?.()}
 	</div>
 	{#if footer}
-		<div class="border-t border-[var(--color-neutral-100)] bg-[var(--color-neutral-50)] {paddingClasses[padding]}">
+		<div class="border-t border-(--chv-color-neutral-100) bg-(--chv-color-neutral-50) {paddingClasses[padding]}">
 			{@render footer()}
 		</div>
 	{/if}

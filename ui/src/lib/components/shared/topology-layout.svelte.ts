@@ -74,6 +74,6 @@ export function getStatusColor(status: string) {
 		case 'healthy': return 'var(--color-success)';
 		case 'warning': return 'var(--color-warning)';
 		case 'danger': return 'var(--color-danger)';
-		default: return 'var(--color-neutral-400)';
+		default: return 'var(--chv-color-neutral-400)';
 	}
 }

@@ -176,13 +176,13 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.dispatch-cue p {
 		margin: 0;
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		line-height: 1.45;
 		color: var(--shell-text);
 	}
 
 	.dispatch-cue span {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		line-height: 1.5;
 		color: var(--shell-text-muted);
 	}

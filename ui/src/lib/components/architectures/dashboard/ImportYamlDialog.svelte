@@ -232,7 +232,7 @@
 	.hint {
 		margin: 0;
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.field {
@@ -246,19 +246,19 @@
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.yaml-textarea {
 		width: 100%;
-		font-family: var(--font-mono, ui-monospace, monospace);
+		font-family: var(--chv-font-mono, ui-monospace, monospace);
 		font-size: 12px;
 		line-height: 1.5;
 		padding: 0.6rem;
-		border: 1px solid var(--color-neutral-300);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
-		background: var(--color-neutral-50, #f8fafc);
-		color: var(--color-neutral-900);
+		background: var(--chv-color-neutral-50, #f8fafc);
+		color: var(--chv-color-neutral-900);
 		resize: vertical;
 	}
 
@@ -281,7 +281,7 @@
 		align-items: center;
 		gap: 0.4rem;
 		font-size: 12px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		cursor: pointer;
 	}
 
@@ -294,7 +294,7 @@
 		align-items: center;
 		gap: 0.4rem;
 		font-size: 12px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		cursor: pointer;
 	}
 
@@ -313,9 +313,9 @@
 		flex-direction: column;
 		gap: 0.4rem;
 		padding: 0.75rem;
-		border: 1px solid var(--color-neutral-200);
+		border: 1px solid var(--chv-color-neutral-200);
 		border-radius: var(--radius-xs);
-		background: var(--color-neutral-50, #f8fafc);
+		background: var(--chv-color-neutral-50, #f8fafc);
 	}
 
 	.preview-head {
@@ -349,7 +349,7 @@
 
 	.counts {
 		font-size: 12px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 	}
 
 	.preview-list {

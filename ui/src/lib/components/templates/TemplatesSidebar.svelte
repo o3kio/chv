@@ -39,7 +39,7 @@
     display: flex;
     justify-content: space-between;
     font-size: 10px;
-    color: var(--color-neutral-600);
+    color: var(--chv-color-neutral-600);
     padding: 0.35rem 0.5rem;
     background: var(--bg-surface-muted);
     border-radius: var(--radius-xs);
@@ -47,12 +47,12 @@
 
   .summary-row span:last-child {
     font-weight: 700;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
   }
 
   .empty-hint {
     font-size: 11px;
-    color: var(--color-neutral-400);
+    color: var(--chv-color-neutral-400);
     padding: 1rem;
     text-align: center;
   }

@@ -123,7 +123,7 @@
 		height: 100%;
 		width: 100%;
 		background: var(--bg-surface, #fff);
-		border: 1px solid var(--color-neutral-200, #ddd5c8);
+		border: 1px solid var(--chv-color-neutral-200, #ddd5c8);
 		border-radius: var(--radius-md, 0.5rem);
 		overflow: hidden;
 	}

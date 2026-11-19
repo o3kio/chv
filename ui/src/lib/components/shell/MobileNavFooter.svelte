@@ -75,7 +75,7 @@
 
 	.user-email {
 		font-size: 0.75rem;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -88,7 +88,7 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		background: transparent;
 		border: none;
 		cursor: pointer;

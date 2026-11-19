@@ -155,8 +155,8 @@
 
 	.lead {
 		margin: 0;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-700);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.confirm {
@@ -166,17 +166,17 @@
 	}
 
 	.cl {
-		font-size: var(--text-sm);
-		color: var(--color-neutral-700);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.ci {
 		padding: 0.4rem 0.6rem;
-		font-size: var(--text-sm);
-		border: 1px solid var(--color-neutral-300);
+		font-size: var(--chv-text-sm);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		background: var(--bg-surface);
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.ci:focus-visible {
@@ -191,6 +191,6 @@
 	.ch {
 		margin: 0;
 		font-size: 12px;
-		color: var(--color-neutral-500);
+		color: var(--chv-color-neutral-500);
 	}
 </style>

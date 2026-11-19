@@ -39,20 +39,20 @@
 	}
 
 	.empty-state-icon {
-		color: var(--color-neutral-300);
+		color: var(--chv-color-neutral-300);
 		margin-bottom: 1rem;
 	}
 
 	.empty-state-title {
-		font-size: var(--text-lg);
+		font-size: var(--chv-text-lg);
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 		margin: 0 0 0.5rem 0;
 	}
 
 	.empty-state-description {
-		font-size: var(--text-sm);
-		color: var(--color-neutral-500);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-500);
 		max-width: 480px;
 		margin: 0 0 1.5rem 0;
 		line-height: 1.5;

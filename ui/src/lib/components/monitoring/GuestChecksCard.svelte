@@ -83,32 +83,32 @@
 		<ClipboardCheck class="h-4 w-4" aria-hidden="true" />
 	{/snippet}
 
-	<p class="text-[10px] text-[var(--shell-text-muted)] mb-2">
+	<p class="text-[10px] text-(--shell-text-muted) mb-2">
 		Reported by the optional guest monitoring agent — guest-observed, never host-accounted.
 	</p>
 
 	{#if loading}
-		<p class="text-sm text-[var(--shell-text-muted)]">Loading guest checks…</p>
+		<p class="text-sm text-(--shell-text-muted)">Loading guest checks…</p>
 	{:else if degraded}
-		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-[0.25rem] bg-[var(--shell-surface-muted)] border border-dashed border-[var(--shell-line)]">
-			<span class="text-xs font-bold text-[var(--shell-text-secondary)]">Monitoring is unavailable</span>
-			<span class="text-[10px] text-[var(--shell-text-muted)] text-center max-w-[40rem]">
+		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-sm bg-(--shell-surface-muted) border border-dashed border-(--shell-line)">
+			<span class="text-xs font-bold text-(--shell-text-secondary)">Monitoring is unavailable</span>
+			<span class="text-[10px] text-(--shell-text-muted) text-center max-w-160">
 				The monitoring subsystem is degraded or disabled on the control plane. This does not
 				indicate a problem with this VM.
 			</span>
 		</div>
 	{:else if error}
-		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-[0.25rem] bg-[var(--shell-surface-muted)] border border-[var(--color-danger)]">
-			<span class="text-xs font-bold text-[var(--color-danger)]">Monitoring request failed</span>
-			<span class="text-[10px] text-[var(--shell-text-muted)] text-center max-w-[40rem]">{error}</span>
+		<div class="flex flex-col items-center gap-1 py-8 px-4 rounded-sm bg-(--shell-surface-muted) border border-danger">
+			<span class="text-xs font-bold text-danger">Monitoring request failed</span>
+			<span class="text-[10px] text-(--shell-text-muted) text-center max-w-160">{error}</span>
 		</div>
 	{:else if checks.length === 0}
-		<p class="text-sm text-[var(--shell-text-secondary)]">No checks configured for this guest.</p>
+		<p class="text-sm text-(--shell-text-secondary)">No checks configured for this guest.</p>
 	{:else}
 		<div class="overflow-x-auto">
 			<table class="w-full text-xs border-collapse">
 				<thead>
-					<tr class="text-left text-[var(--shell-text-muted)] border-b border-[var(--shell-line)]">
+					<tr class="text-left text-(--shell-text-muted) border-b border-(--shell-line)">
 						<th class="py-1.5 pr-3 font-semibold">Check</th>
 						<th class="py-1.5 pr-3 font-semibold">Status</th>
 						<th class="py-1.5 pr-3 font-semibold">Summary</th>
@@ -119,9 +119,9 @@
 					{#each checks as check (check.check_id)}
 						{@const parts = parseCheckId(check.check_id)}
 						{@const view = checkStatusView(check.status)}
-						<tr class="border-b border-[var(--shell-line)] last:border-b-0">
-							<td class="py-1.5 pr-3 text-[var(--shell-text)] whitespace-nowrap">
-								<span class="text-[var(--shell-text-muted)]">{parts.kindLabel}</span>
+						<tr class="border-b border-(--shell-line) last:border-b-0">
+							<td class="py-1.5 pr-3 text-(--shell-text) whitespace-nowrap">
+								<span class="text-(--shell-text-muted)">{parts.kindLabel}</span>
 								<span class="mx-1" aria-hidden="true">·</span>
 								<span class="font-medium">{parts.name}</span>
 							</td>
@@ -133,10 +133,10 @@
 							</td>
 							<!-- Summaries are untrusted guest-side strings: plain text
 							     interpolation only, never {@html}. -->
-							<td class="py-1.5 pr-3 text-[var(--shell-text-secondary)]">
+							<td class="py-1.5 pr-3 text-(--shell-text-secondary)">
 								{check.summary ?? '—'}
 							</td>
-							<td class="py-1.5 text-[var(--shell-text-secondary)] whitespace-nowrap">
+							<td class="py-1.5 text-(--shell-text-secondary) whitespace-nowrap">
 								{checkAgeLabel(check.observed_at_ms, nowMs)}
 							</td>
 						</tr>

@@ -110,14 +110,14 @@
 
 .briefing-value {
 	margin: 0.45rem 0 0;
-	font-size: var(--text-lg);
+	font-size: var(--chv-text-lg);
 	font-weight: 700;
 	color: var(--shell-text);
 }
 
 .briefing-note {
 	margin: 0.3rem 0 0;
-	font-size: var(--text-xs);
+	font-size: var(--chv-text-xs);
 	line-height: 1.5;
 	color: var(--shell-text-secondary);
 }
@@ -185,14 +185,14 @@
 
 .attention-item p {
 	margin: 0;
-	font-size: var(--text-sm);
+	font-size: var(--chv-text-sm);
 	line-height: 1.45;
 	color: var(--shell-text);
 }
 
 .attention-scope,
 .attention-item span {
-	font-size: var(--text-xs);
+	font-size: var(--chv-text-xs);
 	color: var(--shell-text-muted);
 }
 
@@ -220,13 +220,13 @@
 	justify-content: space-between;
 	font-size: 9px;
 	font-weight: 600;
-	color: var(--color-neutral-500);
+	color: var(--chv-color-neutral-500);
 	text-transform: uppercase;
 }
 
 .cap-bar {
 	height: 4px;
-	background: var(--color-neutral-100);
+	background: var(--chv-color-neutral-100);
 	border-radius: 999px;
 	overflow: hidden;
 }

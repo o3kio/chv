@@ -233,7 +233,7 @@
 <Modal bind:open title="Create VM - Step {step} of 3" closeOnBackdrop={!submitting} width="wide">
 	{#if formError}
 		<div
-			class="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger mb-4"
+			class="rounded-sm border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger mb-4"
 			role="alert"
 		>
 			{formError}

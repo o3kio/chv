@@ -96,10 +96,10 @@
     gap: 2px;
   }
 
-  .p-name { font-weight: 800; color: var(--color-neutral-900); font-size: 11px; }
-  .p-id { font-size: 9px; font-weight: 700; color: var(--color-neutral-400); font-family: var(--font-mono); }
+  .p-name { font-weight: 800; color: var(--chv-color-neutral-900); font-size: 11px; }
+  .p-id { font-size: 9px; font-weight: 700; color: var(--chv-color-neutral-400); font-family: var(--chv-font-mono); }
 
-  .cell-text { font-size: 11px; color: var(--color-neutral-600); }
+  .cell-text { font-size: 11px; color: var(--chv-color-neutral-600); }
 
   .op-cluster {
     display: flex;
@@ -114,7 +114,7 @@
     background: var(--bg-surface-muted);
     border: 1px solid var(--border-subtle);
     border-radius: 2px;
-    color: var(--color-neutral-500);
+    color: var(--chv-color-neutral-500);
     cursor: pointer;
   }
 
@@ -131,11 +131,11 @@
     gap: 0.75rem;
   }
 
-  .timestamp { font-size: 10px; font-family: var(--font-mono); color: var(--color-neutral-500); }
+  .timestamp { font-size: 10px; font-family: var(--chv-font-mono); color: var(--chv-color-neutral-500); }
   .trace-dl {
      background: transparent;
      border: none;
-     color: var(--color-neutral-400);
+     color: var(--chv-color-neutral-400);
      cursor: pointer;
   }
   .trace-dl:hover { color: var(--color-primary); }
@@ -145,7 +145,7 @@
     text-align: center;
     font-size: 10px;
     font-weight: 800;
-    color: var(--color-neutral-400);
+    color: var(--chv-color-neutral-400);
     letter-spacing: 0.1em;
   }
 </style>

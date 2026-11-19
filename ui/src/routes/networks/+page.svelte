@@ -259,7 +259,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.fabric-name {
 		font-weight: 700;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.fabric-tag {
@@ -273,7 +273,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.empty-hint {
 		font-size: 11px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		padding: 1rem;
 		text-align: center;
 	}
@@ -294,7 +294,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		padding: 0.5rem 0.75rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);
-		color: var(--color-neutral-800);
+		color: var(--chv-color-neutral-800);
 	}
 
 	.attention-card__main {
@@ -334,7 +334,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.task-label {
 		font-weight: 600;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 
 	.task-time {

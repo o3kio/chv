@@ -40,7 +40,7 @@
 		border: 1px solid var(--shell-line-strong);
 		border-radius: var(--radius-xs);
 		background: color-mix(in srgb, var(--shell-surface) 92%, transparent);
-		box-shadow: var(--shadow-sm);
+		box-shadow: var(--chv-shadow-sm);
 		cursor: crosshair;
 		overflow: hidden;
 	}

@@ -36,7 +36,7 @@
 		gap: 0.15rem;
 		padding: 0.6rem 0.85rem;
 		border-radius: var(--radius-xs);
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 	}
 	.banner-error {
 		background: rgba(220, 38, 38, 0.08);

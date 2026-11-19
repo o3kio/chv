@@ -104,14 +104,14 @@
 		min-height: 80px;
 		padding: 0.625rem 0.75rem;
 		border-radius: var(--radius-md, 0.5rem);
-		background: var(--color-neutral-50, #f7f3ec);
-		border: 1px solid var(--color-neutral-300, #c7bcac);
+		background: var(--chv-color-neutral-50, #f7f3ec);
+		border: 1px solid var(--chv-color-neutral-300, #c7bcac);
 		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 		display: flex;
 		flex-direction: column;
 		justify-content: center;
-		font-family: var(--font-sans, 'IBM Plex Sans', system-ui, sans-serif);
-		color: var(--color-neutral-800, #29241f);
+		font-family: var(--chv-font-sans, 'IBM Plex Sans', system-ui, sans-serif);
+		color: var(--chv-color-neutral-800, #29241f);
 	}
 
 	.chv-node.selected {
@@ -145,7 +145,7 @@
 	}
 
 	.name {
-		font-size: var(--text-sm, 0.8125rem);
+		font-size: var(--chv-text-sm, 0.8125rem);
 		font-weight: 600;
 		line-height: 1.2;
 		overflow: hidden;
@@ -154,8 +154,8 @@
 	}
 
 	.kind {
-		font-size: var(--text-xs, 0.6875rem);
-		color: var(--color-neutral-500, #75695b);
+		font-size: var(--chv-text-xs, 0.6875rem);
+		color: var(--chv-color-neutral-500, #75695b);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}

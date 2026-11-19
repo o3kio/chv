@@ -169,13 +169,13 @@
 
 		<div class="grid grid-cols-2 gap-4">
 			<FormField label="OS Family">
-				<select bind:value={osFamily} class="w-full border border-line rounded px-3 py-2 text-sm">
+				<select bind:value={osFamily} class="w-full border border-line rounded-sm px-3 py-2 text-sm">
 					<option value="linux">Linux</option>
 				</select>
 			</FormField>
 
 			<FormField label="Architecture">
-				<select bind:value={architecture} class="w-full border border-line rounded px-3 py-2 text-sm">
+				<select bind:value={architecture} class="w-full border border-line rounded-sm px-3 py-2 text-sm">
 					<option value="x86_64">x86_64</option>
 					<option value="aarch64">aarch64</option>
 				</select>
@@ -190,8 +190,8 @@
 	</form>
 
 	{#snippet footer()}
-		<button type="button" onclick={() => (open = false)} class="button-secondary px-4 py-2 rounded text-sm">Cancel</button>
-		<button type="button" onclick={handleSubmit} disabled={submitting} class="button-primary px-4 py-2 rounded text-sm">
+		<button type="button" onclick={() => (open = false)} class="button-secondary px-4 py-2 rounded-sm text-sm">Cancel</button>
+		<button type="button" onclick={handleSubmit} disabled={submitting} class="button-primary px-4 py-2 rounded-sm text-sm">
 			{submitting ? 'Processing...' : (activeTab === 'remote' ? 'Start Import' : 'Upload Image')}
 		</button>
 	{/snippet}

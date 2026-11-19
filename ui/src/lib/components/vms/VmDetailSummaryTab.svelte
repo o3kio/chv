@@ -152,7 +152,7 @@
 	}
 
 	.empty-hint {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 		text-align: center;
 		padding: 1rem 0;

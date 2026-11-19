@@ -233,12 +233,12 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.window-title {
 		font-size: 11px;
 		font-weight: 800;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
 	}
 
 	.window-meta {
 		font-size: 9px;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
     font-weight: 700;
 	}
 
@@ -269,21 +269,21 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.node-name {
 		font-size: 11px;
 		font-weight: 800;
-    color: var(--color-neutral-900);
+    color: var(--chv-color-neutral-900);
 	}
 
 	.node-status {
 		font-size: 9px;
 		text-transform: uppercase;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		font-weight: 700;
 	}
 
 	.progress-pct {
-		font-family: var(--font-mono);
+		font-family: var(--chv-font-mono);
 		font-size: 10px;
 		font-weight: 800;
-    color: var(--color-neutral-600);
+    color: var(--chv-color-neutral-600);
 	}
 
 	.upgrade-dispatch {
@@ -318,7 +318,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.upgrade-text span { 
     font-size: 9px; 
     font-weight: 600;
-    color: var(--color-neutral-500); 
+    color: var(--chv-color-neutral-500); 
   }
 
 	.posture-nominal {
@@ -352,7 +352,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	.action-desc {
 		font-size: 10px;
 		font-weight: 700;
-    color: var(--color-neutral-800);
+    color: var(--chv-color-neutral-800);
 	}
 
 	.audit-summary {
@@ -365,7 +365,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		display: flex;
 		justify-content: space-between;
 		font-size: 10px;
-		color: var(--color-neutral-600);
+		color: var(--chv-color-neutral-600);
 		padding: 0.35rem 0.5rem;
 		background: var(--bg-surface-muted);
 		border-radius: var(--radius-xs);
@@ -373,13 +373,13 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	.summary-row span:last-child {
 		font-weight: 800;
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 
 	.empty-hint {
 		font-size: 10px;
 		font-weight: 700;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 		padding: 1.5rem;
 		text-align: center;
     text-transform: uppercase;

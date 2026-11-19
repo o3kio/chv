@@ -105,7 +105,7 @@
 		border: 1px solid var(--shell-line-strong);
 		border-radius: var(--radius-sm);
 		background: var(--shell-surface);
-		box-shadow: var(--shadow-lg);
+		box-shadow: var(--chv-shadow-lg);
 		overflow: hidden;
 	}
 
@@ -119,12 +119,12 @@
 	}
 
 	.topology-menu__header strong {
-		font-size: var(--text-sm);
+		font-size: var(--chv-text-sm);
 		color: var(--shell-text);
 	}
 
 	.topology-menu__header span {
-		font-size: var(--text-xs);
+		font-size: var(--chv-text-xs);
 		color: var(--shell-text-muted);
 	}
 
@@ -155,7 +155,7 @@
 
 	.topology-menu__items button:disabled {
 		cursor: not-allowed;
-		color: var(--color-neutral-400);
+		color: var(--chv-color-neutral-400);
 	}
 
 	.topology-menu__items small {

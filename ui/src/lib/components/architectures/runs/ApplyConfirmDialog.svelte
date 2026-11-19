@@ -176,7 +176,7 @@
 
 <style>
 	.body { display: flex; flex-direction: column; gap: 0.85rem; }
-	.lead { margin: 0; font-size: var(--text-sm); color: var(--color-neutral-700); }
+	.lead { margin: 0; font-size: var(--chv-text-sm); color: var(--chv-color-neutral-700); }
 	.warns {
 		display: flex;
 		flex-direction: column;
@@ -192,32 +192,32 @@
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 	.wl {
 		margin: 0;
 		padding-left: 1.1rem;
 		font-size: 12px;
-		color: var(--color-neutral-700);
+		color: var(--chv-color-neutral-700);
 	}
 	.ack {
 		display: flex;
 		gap: 0.4rem;
-		font-size: var(--text-sm);
-		color: var(--color-neutral-700);
+		font-size: var(--chv-text-sm);
+		color: var(--chv-color-neutral-700);
 		cursor: pointer;
 	}
 	.confirm { display: flex; flex-direction: column; gap: 0.3rem; }
-	.cl { font-size: var(--text-sm); color: var(--color-neutral-700); }
+	.cl { font-size: var(--chv-text-sm); color: var(--chv-color-neutral-700); }
 	.ci {
 		padding: 0.4rem 0.6rem;
-		font-size: var(--text-sm);
-		border: 1px solid var(--color-neutral-300);
+		font-size: var(--chv-text-sm);
+		border: 1px solid var(--chv-color-neutral-300);
 		border-radius: var(--radius-xs);
 		background: var(--bg-surface);
-		color: var(--color-neutral-900);
+		color: var(--chv-color-neutral-900);
 	}
 	.ci:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 1px; }
 	.ci[aria-invalid='true'] { border-color: var(--color-danger, #b91c1c); }
-	.ch { margin: 0; font-size: 12px; color: var(--color-neutral-500); }
+	.ch { margin: 0; font-size: 12px; color: var(--chv-color-neutral-500); }
 </style>
