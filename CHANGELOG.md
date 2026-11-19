@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **RustSec advisories cleared from the dependency graph.** `rusqlite`
+  0.32→0.41 and `sqlx` 0.8→0.9.1 now share a single
+  `libsqlite3-sys` 0.39.1 (bundled SQLite 3.54.1), removing
+  RUSTSEC-2026-0459 (CVE-2026-119375). `quinn-proto` 0.11.18→0.11.19
+  clears RUSTSEC-2026-0523/-0524, `quinn-udp` 0.5.14→0.5.16 clears
+  RUSTSEC-2026-0538, and `rustix` 1.1.4→1.1.6 clears
+  RUSTSEC-2026-0486 (xattr). The sqlx 0.9 migration required the
+  removed `runtime-tokio-rustls` feature to be split into
+  `runtime-tokio` + `tls-rustls-ring`, dynamic SQL call sites to be
+  wrapped in `sqlx::AssertSqlSafe` (the new injection-audit gate), and
+  the monitoring migrator to adopt `Migrator::with_migrations` /
+  `SqlSafeStr`. The two remaining upstream-unmaintained crates
+  (`chrono`, `humantime`) are acknowledged in `.cargo/audit.toml` with
+  rationale and tracking issues #755/#756; the stale `rsa` ignore is
+  removed because `sqlx-mysql` 0.9 made its `rsa` dependency
+  feature-gated, so `rsa` left the lockfile (the crate itself is still
+  pulled, just without that dependency).
+
 ## [0.4.0-rc.8] - 2026-11-06
 
 > **Final release candidate for `v0.4.0` and the base for the stable tag.**

@@ -27,7 +27,7 @@ tracing = { workspace = true }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["sqlite", "runtime-tokio-rustls"] }
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio", "tls-rustls-ring"] }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
