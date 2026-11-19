@@ -20,11 +20,11 @@ recovery path we cannot honour.
 > the mutation **committed** and its evidence row is waiting for the
 > dispatcher. The response was normally 2xx, but a committed mutation
 > whose final response was later patched to a non-2xx (e.g. a downstream
-> middleware failure) keeps its pending row too — with `outcome`/`status`
-> rewritten to match; see the patch note below. The gRPC surface and
-> every unadopted BFF route still use the direct post-hoc insert; their
-> rows never appear in this table, and their narrow crash window remains
-> open (tracked under #706).
+> middleware failure) keeps its pending row too — with `outcome` and
+> `status_code` rewritten to match; see the patch note below. The gRPC
+> surface and every unadopted BFF route still use the direct post-hoc
+> insert; their rows never appear in this table, and their narrow crash
+> window remains open (tracked under #706).
 >
 > Adopted routes: `POST /v1/users/create`, `/v1/users/update`,
 > `/v1/users/delete`, `/v1/tokens/create`, `/v1/tokens/revoke`,
@@ -205,10 +205,12 @@ are never pruned, regardless of age.
   crash-before-middleware, injected post-commit 500, unadopted routes,
   and the oversized-actor fail-closed case.
 - **Lock scope (PR 2):** `users`/`tokens` mutations that were autocommit
-  single statements are now wrapped in `begin()` so the mutation and the
-  outbox INSERT commit together. The write lock is held for one extra
-  INSERT; no new lock ordering is introduced. `networks` and
-  `vms/import` already held a transaction, so only the INSERT is new.
+  single statements are now wrapped in
+  `begin_with("BEGIN IMMEDIATE;")` so the mutation and the outbox INSERT
+  commit together. The write lock is held for one extra INSERT; no new
+  lock ordering is introduced. `networks` already held a transaction, so
+  only the INSERT is new there; `vms/import` likewise keeps its existing
+  transaction.
 - **Oversized actor (PR 2, NIT 5):** adopted sites fail closed. A payload
   over the store's 16 KiB bound is not truncated; enqueue fails, the
   mutation transaction rolls back (the caller sees a 500 and no state

@@ -310,9 +310,9 @@ checks the outbox by primary key:
 No path produces two rows for one request, and no adopted success path
 produces zero rows: the outbox row and the mutation are one commit. The
 verification evidence is `crates/chv-webui-bff/tests/audit_log.rs`
-(adopted success, rollback after `begin()`, crash between commit and
-middleware return, injected post-commit non-2xx, unadopted route,
-oversized actor, distinct ids).
+(adopted success, rollback after the `BEGIN IMMEDIATE` mutation
+transaction, crash between commit and middleware return, injected
+post-commit non-2xx, unadopted route, oversized actor, distinct ids).
 
 The contract adoption relies on:
 

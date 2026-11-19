@@ -887,8 +887,16 @@ async fn username_at_the_256_char_cap_is_accepted_and_one_over_is_rejected() {
     );
     let rows = rows_for_path(&state, "/v1/users/create").await;
     assert_eq!(rows.len(), 2, "accepted row + direct rejection row");
-    assert_eq!(rows[0].outcome, "failed");
-    assert_eq!(rows[0].status_code, 400);
+    // Select by content, not position: `occurred_at_ms` can tie across
+    // both rows and the `audit_id` tiebreaker is random, so `rows[0]`
+    // is not a stable identity. Exactly one row of each outcome must
+    // exist for this path.
+    let rejected: Vec<_> = rows.iter().filter(|row| row.outcome == "failed").collect();
+    assert_eq!(rejected.len(), 1, "exactly one rejected attempt");
+    assert_eq!(rejected[0].status_code, 400);
+    let accepted: Vec<_> = rows.iter().filter(|row| row.outcome == "success").collect();
+    assert_eq!(accepted.len(), 1, "exactly one accepted attempt");
+    assert_eq!(accepted[0].status_code, 200);
 }
 
 #[tokio::test]
