@@ -175,7 +175,7 @@ impl CertificateRevocationRepository {
         certificate_serial: &str,
     ) -> Result<Option<NodeCertificateRevocation>, StoreError> {
         let sql = format!("{SELECT_REVOCATION_SQL} WHERE certificate_serial = ?");
-        let row = sqlx::query_as::<_, NodeCertificateRevocation>(&sql)
+        let row = sqlx::query_as::<_, NodeCertificateRevocation>(sqlx::AssertSqlSafe(sql))
             .bind(certificate_serial)
             .fetch_optional(&self.pool)
             .await?;
@@ -188,7 +188,7 @@ impl CertificateRevocationRepository {
     /// A caller that cannot read it MUST fail closed in production mode.
     pub async fn list_all(&self) -> Result<Vec<NodeCertificateRevocation>, StoreError> {
         let sql = format!("{SELECT_REVOCATION_SQL} ORDER BY revoked_at, certificate_serial");
-        let rows = sqlx::query_as::<_, NodeCertificateRevocation>(&sql)
+        let rows = sqlx::query_as::<_, NodeCertificateRevocation>(sqlx::AssertSqlSafe(sql))
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
@@ -200,7 +200,7 @@ impl CertificateRevocationRepository {
         node_id: &str,
     ) -> Result<Vec<NodeCertificateRevocation>, StoreError> {
         let sql = format!("{SELECT_REVOCATION_SQL} WHERE node_id = ? ORDER BY revoked_at DESC");
-        let rows = sqlx::query_as::<_, NodeCertificateRevocation>(&sql)
+        let rows = sqlx::query_as::<_, NodeCertificateRevocation>(sqlx::AssertSqlSafe(sql))
             .bind(node_id)
             .fetch_all(&self.pool)
             .await?;

@@ -267,10 +267,11 @@ async fn assert_create_journaled_nothing(state: &AppState) {
         ("volume_desired_state", "volume desired state"),
         ("operations", "operations"),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0, "a rejected create must not journal {label}");
     }
 }

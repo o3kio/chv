@@ -93,7 +93,7 @@ pub async fn list_tasks(
                  "SELECT COUNT(*)")
         .replace(" ORDER BY requested_at DESC LIMIT ? OFFSET ?", "");
 
-    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+    let mut count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql.as_str()));
     for b in &bindings {
         count_query = count_query.bind(b.clone());
     }
@@ -102,7 +102,7 @@ pub async fn list_tasks(
         .await
         .map_err(|e| BffError::Internal(format!("failed to count tasks: {}", e)))?;
 
-    let mut query = sqlx::query_as::<_, TaskRow>(&query_sql);
+    let mut query = sqlx::query_as::<_, TaskRow>(sqlx::AssertSqlSafe(query_sql.as_str()));
     for b in bindings {
         query = query.bind(b);
     }
@@ -287,7 +287,7 @@ pub async fn stream_tasks(
 
             sql.push_str(" ORDER BY requested_at DESC LIMIT 100");
 
-            let mut query = sqlx::query_as::<_, TaskStreamRow>(&sql);
+            let mut query = sqlx::query_as::<_, TaskStreamRow>(sqlx::AssertSqlSafe(sql.as_str()));
             for id in &ids {
                 query = query.bind(id);
             }

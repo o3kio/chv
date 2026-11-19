@@ -21,19 +21,36 @@
 #   RUSTSEC-2024-0370 (proc-macro-error 1.x) — crate left the graph entirely
 #     when tabled moved off it; superseded state (proc-macro-error2) also gone.
 ignore = [
-    # RUSTSEC-2023-0071 — `rsa` Marvin Attack (no upstream patch).
-    #   (a) Non-applicable: `rsa` enters Cargo.lock only via `sqlx-mysql`
-    #       (sqlx 0.8 lists sqlx-mysql unconditionally in its top-level
-    #       Cargo.toml). CHV enables only the `sqlite` feature, so none of
-    #       that code is compiled into CHV binaries — cargo-deny's
-    #       feature-aware graph walk confirms `rsa` is unreachable, which is
-    #       why this advisory needs no ignore in deny.toml. cargo-audit has
-    #       no reachability filtering, hence this entry.
-    #   (b) Upstream: https://github.com/RustCrypto/RSA/issues/19 (no patch).
-    #       sqlx side: https://github.com/launchbadge/sqlx/issues/2911
-    #   (c) Remove when sqlx makes sqlx-mysql/-postgres optional, or `rsa`
-    #       ships a constant-time implementation.
-    "RUSTSEC-2023-0071",
+    # --- Unmaintained (informational; no vulnerability) -------------------
+    # Policy (deny.toml, security.yml): unmaintained stays visible as a
+    # cargo-deny warning so we keep time to migrate; cargo-audit treats
+    # `unmaintained` as fatal, so the two currently-unfixable entries are
+    # acknowledged here to keep the vulnerability gate meaningful. Neither
+    # advisory describes a defect — both record upstream maintenance status.
+
+    # RUSTSEC-2026-0543 — `chrono` is unmaintained (all versions).
+    #   (a) Non-applicable as a vulnerability: chrono is used for UTC
+    #       timestamps only (RFC 3339 text in SQLite, per
+    #       docs/specs/cellhv-core-local-store.md). No advisory-specific
+    #       exploit exists; the gate exists to force a migration.
+    #   (b) Upstream: https://github.com/chronotope/chrono/issues/1768
+    #       (`object_store 0.14.2` and `cron 0.17` also require chrono, so
+    #       rewriting the 9 direct workspace crates would not remove it).
+    #   (c) Remove when object_store drops its unconditional chrono
+    #       dependency and cron/the direct users migrate to jiff/time.
+    #       Tracking: #755.
+    "RUSTSEC-2026-0543",
+
+    # RUSTSEC-2026-0542 — `humantime` is unmaintained (transitively via
+    # `object_store`'s duration parser; CHV has no direct use).
+    #   (a) Non-applicable as a vulnerability: maintenance status only; no
+    #       CHV code path calls humantime directly.
+    #   (b) Upstream: https://github.com/chronotope/chrono/issues/1768
+    #       (object_store 0.14.2 is the latest release and depends on
+    #       humantime 2.1 unconditionally).
+    #   (c) Remove when object_store stops depending on humantime.
+    #       Tracking: #756.
+    "RUSTSEC-2026-0542",
 
     # Removed 2026-10-08 (#235 PR 2 — rustls-pemfile fully retired):
     # RUSTSEC-2025-0134 no longer requires an ignore — chv-stord-core's

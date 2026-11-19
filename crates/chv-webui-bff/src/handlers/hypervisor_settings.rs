@@ -316,7 +316,7 @@ pub async fn update_settings(
             "UPDATE hypervisor_settings SET {} WHERE id = 1",
             sets.join(", ")
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for p in params {
             query = query.bind(p);
         }

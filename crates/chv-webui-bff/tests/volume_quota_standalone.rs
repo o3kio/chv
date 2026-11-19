@@ -377,10 +377,11 @@ async fn standalone_creates_cannot_stack_past_the_aggregate_limit() {
         ("volume_desired_state", "volume desired state"),
         ("operations", "operations"),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "the rejected create must not journal {label}");
     }
 }
