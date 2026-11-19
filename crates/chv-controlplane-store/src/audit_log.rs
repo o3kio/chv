@@ -169,7 +169,7 @@ impl AuditLogRepository {
             "SELECT * FROM audit_log {FILTER_WHERE} \
              ORDER BY occurred_at_ms DESC, audit_id DESC LIMIT $8 OFFSET $9"
         );
-        let rows: Vec<AuditLogRow> = sqlx::query_as(&sql)
+        let rows: Vec<AuditLogRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(&filter.actor)
             .bind(&filter.resource_kind)
             .bind(&filter.resource_id)
@@ -183,7 +183,7 @@ impl AuditLogRepository {
             .await?;
 
         let count_sql = format!("SELECT COUNT(*) FROM audit_log {FILTER_WHERE}");
-        let total: (i64,) = sqlx::query_as(&count_sql)
+        let total: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(count_sql))
             .bind(&filter.actor)
             .bind(&filter.resource_kind)
             .bind(&filter.resource_id)
@@ -208,7 +208,7 @@ impl AuditLogRepository {
             "SELECT * FROM audit_log {FILTER_WHERE} \
              ORDER BY occurred_at_ms ASC, audit_id ASC LIMIT $8"
         );
-        let rows: Vec<AuditLogRow> = sqlx::query_as(&sql)
+        let rows: Vec<AuditLogRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(&filter.actor)
             .bind(&filter.resource_kind)
             .bind(&filter.resource_id)

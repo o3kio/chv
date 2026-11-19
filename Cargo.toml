@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["full"] }
 # (`tls-native-roots` / `tls-webpki-roots`, neither needed — every CHV
 # TLS consumer loads its CA/cert material explicitly from PEM files).
 # `tls-ring` keeps the ring provider the rest of the rustls stack uses
-# (sqlx runtime-tokio-rustls, the stord migration mTLS listener).
+# (sqlx tls-rustls-ring, the stord migration mTLS listener).
 #
 # Feature set: transport + server + channel (hyper-based serving and
 # clients), codegen (generated service traits; also what tonic-health
@@ -102,10 +102,10 @@ tower-http = { version = "0.7", features = ["cors", "fs"] }
 hyper-util = { version = "0.1", features = ["client", "server", "tokio"] }
 metrics-exporter-prometheus = "0.18"
 jsonwebtoken = "9"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 axum = "0.7"
 bcrypt = "0.19"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "derive", "json", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "migrate", "derive", "json", "uuid", "chrono"] }
 nix = { version = "0.31", features = ["term", "ioctl", "process", "fs"] }
 crc32fast = "1"
 moka = { version = "0.12", features = ["future"] }

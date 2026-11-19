@@ -2038,7 +2038,7 @@ pub async fn update_migration_progress(
         completed_at_clause
     );
 
-    let result = sqlx::query(&sql)
+    let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(phase_str)
         .bind(bytes_transferred as i64)
         .bind(total_bytes as i64)

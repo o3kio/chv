@@ -1,7 +1,7 @@
 use crate::config::MonitoringStoreConfig;
 use crate::error::MonitoringStoreError;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqlSafeStr, SqlitePool};
 use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
@@ -53,17 +53,14 @@ fn embedded_migrator() -> Result<sqlx::migrate::Migrator, MonitoringStoreError> 
             version,
             Cow::Owned(description),
             migration_type,
-            Cow::Borrowed(sql),
+            (*sql).into_sql_str(),
             false,
         ));
     }
-    migrations.sort_by_key(|m| m.version);
-    Ok(sqlx::migrate::Migrator {
-        migrations: Cow::Owned(migrations),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    })
+    // `with_migrations` sorts by version and applies the same defaults the
+    // previous struct literal set explicitly (ignore_missing=false,
+    // locking=true, no_tx=false).
+    Ok(sqlx::migrate::Migrator::with_migrations(migrations))
 }
 
 /// The monitoring store's own pool. Deliberately separate from the

@@ -287,7 +287,7 @@ async fn seed_schedule(state: &AppState, schedule_id: &str, vm_id: &str) {
 
 async fn count(state: &AppState, table: &str) -> i64 {
     // `table` is a test-owned literal, never user input.
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(&state.pool)
         .await
         .expect("count rows")

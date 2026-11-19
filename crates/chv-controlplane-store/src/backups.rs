@@ -722,7 +722,7 @@ impl BackupRepository {
         }
         let placeholders = job_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!("DELETE FROM backup_jobs WHERE job_id IN ({})", placeholders);
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for id in job_ids {
             query = query.bind(id);
         }
