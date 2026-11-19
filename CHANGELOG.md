@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pulled, just without that dependency).
 
 ### Changed
+- **YAML boolean parsing follows the YAML 1.2 core schema exactly**
+  (`serde-saphyr` 2.1). Only `true`/`True`/`TRUE` and `false`/`False`/
+  `FALSE` are booleans; a mixed-case typo such as `enabled: tRuE` is now a
+  validation error instead of being silently coerced to `true`. YAML 1.1
+  spellings (`n`, `yes`, `on`) stay strings, as before.
 - **Fabric provider crates bumped to v0.2.0.** `fabric-plan`,
   `fabric-linux`, and `fabric-conformance` move together from the v0.1.5
   tag to v0.2.0 (the coordinated bump replaces the per-crate Dependabot
