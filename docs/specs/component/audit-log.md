@@ -249,12 +249,68 @@ The insert happens **after** the handler returns. If the insert fails:
 Residual risk: the mutation has already happened when the insert is
 attempted. A 500 `AUDIT_LOG_WRITE_FAILED` therefore does not roll the
 mutation back; it tells the caller the audit trail is incomplete.
-There is no retry queue and no transactional coupling to handler
-transactions, so a process crash in the narrow window after the
-handler commits but before the audit insert commits yields an
-unrecorded mutation. Closing that window would require every mutation
-to share a transaction with its audit insert, which the current
-handler/store boundary does not provide.
+
+### Transactional outbox (plumbing landed, not yet adopted)
+
+The control plane ships an `audit_outbox` table (migration `0071`) and a
+bounded dispatcher for it, but **no request path enqueues into it yet**
+(#706 half 1). The table is created empty, the dispatcher runs once per
+second and finds nothing, and every current behavior above is unchanged
+byte-for-byte, including the crash window.
+
+The contract the plumbing provides, and what adoption changes:
+
+- **Enqueue is transactional.** An adopted mutation calls
+  `enqueue_on_tx` inside the transaction it already holds, so the
+  `audit_outbox` row commits with the mutation or not at all. The row
+  carries a pre-minted `audit_id` and the already-redacted
+  `AuditLogInsert` as JSON; the dispatcher never re-derives content.
+- **Enqueue is at-least-once; dispatch is exactly-once.** The emitter
+  mints one `outbox_id` per request. A duplicate enqueue is a loud
+  store error (there is no `INSERT OR IGNORE` against the outbox key),
+  while a replayed *dispatch* is safe: `complete` inserts the
+  `audit_log` row and flips the outbox row to `dispatched` in one
+  transaction, reusing the pre-minted `audit_id`. There is no dedupe
+  scan and no duplicate evidence row.
+- **No dead-letter and no attempt ceiling.** Audit evidence is never
+  droppable, so failed dispatches retry forever with 1 s → 60 s capped
+  exponential backoff (±20 % jitter). The claim lease is 60 s; a
+  dispatcher crash simply lets the lease expire and the rows return.
+- **Bounded staleness.** Once a path is adopted, its row becomes
+  visible to the admin API at most one dispatch interval plus one
+  backoff step after commit (default ≈ 2 s), including a replay pass
+  immediately after restart. Until adoption, latency is unchanged.
+- **Adopted success paths fail closed at commit.** If the enqueue
+  itself fails, the mutation transaction fails, so the awkward
+  post-hoc 500 for those paths disappears. Denied/failed/unadopted
+  paths keep the direct post-hoc insert above.
+- **The crash window closes only where mutation and outbox share a
+  commit.** Multi-statement mutations (notably `EnrollNode`, whose
+  token consumption and node upsert are separate commits) couple only
+  the final transaction; a crash between commits remains a
+  half-applied mutation with no outbox row. Folding enrollment into one
+  transaction is follow-up work.
+
+**Adoption constraint — payload cap.** Enqueue rejects a serialized
+`AuditLogInsert` larger than 16 KiB, while the current direct-insert
+path has no explicit bound on actor fields. Before adopting a site,
+PR 2/3 must either validate/cap the actor fields so the row fits, or
+explicitly disclose that an oversized row fails **enqueue** — which,
+for an adopted path, rolls back the mutation transaction itself
+(fail-closed: no mutation without its evidence). Silent truncation is
+not permitted.
+
+Dispatched outbox rows are kept for 7 days (`[audit]
+outbox_retention_days`, validated 1..=365) and pruned in bounded
+batches; pending rows are never pruned. This cleanup is plumbing, not
+evidence deletion — `audit_log` retention is separate.
+
+A stuck outbox (dispatcher wedged, database errors) delays evidence
+rather than losing it; see
+[`docs/runbooks/audit-outbox.md`](../../runbooks/audit-outbox.md) for
+the metrics and triage. The interceptor-denial writer (#762) inserts
+directly into `audit_log` and is unaffected: denial events have no
+mutation transaction to couple to.
 
 ## Denials and anonymous actors
 
@@ -368,5 +424,8 @@ flood or raise the cap.
 
 Configuration validation rejects `retention_days = 0`,
 `retention_days > 36500` (overflow guard on the millisecond cutoff),
-`sweep_interval_secs < 60`, `max_rows < 1000`, and
-`max_rows > 1000000000000`.
+`sweep_interval_secs < 60`, `max_rows < 1000`,
+`max_rows > 1000000000000`, `outbox_dispatch_interval_secs < 1`, and
+`outbox_retention_days` outside `1..=365`. Outbox retention applies only
+to **dispatched** plumbing rows; pending rows are never pruned and the
+evidence table's own retention above is unchanged.

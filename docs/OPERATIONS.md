@@ -53,6 +53,27 @@ chv_operations_completed_total{status="succeeded"}
 chv_operations_latency_seconds_bucket
 ```
 
+#### Audit Outbox
+
+The transactional audit outbox (#706 half 1) delays evidence rather than
+losing it. Pending rows are not yet visible in the admin audit API.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `chv_audit_outbox_pending` | gauge | rows currently `pending` |
+| `chv_audit_outbox_oldest_pending_ms` | gauge | age of the oldest pending row |
+| `chv_audit_outbox_dispatched_total` | counter | rows converted into `audit_log` rows |
+| `chv_audit_outbox_dispatch_failures_total` | counter | failed dispatch attempts (retried forever) |
+
+Alert condition: page if `chv_audit_outbox_pending > 0` for 10 minutes,
+or `chv_audit_outbox_oldest_pending_ms > 600000` (10 minutes). Pending
+rows are delayed evidence, never lost evidence, but a security
+investigation must not wait on them. Triage in the
+[audit outbox runbook](runbooks/audit-outbox.md).
+
+The BFF/gRPC `chv_*_audit_write_failures_total` counters still cover the
+direct post-hoc insert fallback and are unchanged.
+
 #### Circuit Breaker Behavior
 
 Node communication from the control plane is protected by a circuit breaker (`Closed` → `Open` → `HalfOpen`). When open, RPCs to that node are rejected immediately with `BackendUnavailable` without attempting the call. The breaker probes with single requests every 30s (default) in `HalfOpen` state and closes after 3 consecutive successes.

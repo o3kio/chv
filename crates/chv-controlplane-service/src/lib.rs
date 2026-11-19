@@ -34,6 +34,7 @@ pub mod monitoring_ingest;
 pub mod monitoring_validate;
 
 pub mod alert_evaluator;
+pub mod audit_outbox_dispatcher;
 pub mod monitoring_exporter;
 pub mod notification_dispatcher;
 

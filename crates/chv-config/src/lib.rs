@@ -1147,6 +1147,20 @@ pub struct AuditConfig {
     /// cannot grow the SQLite database without bound (#658 review M2).
     #[serde(default = "default_audit_max_rows")]
     pub max_rows: u64,
+    /// Transactional audit outbox dispatch cadence (#706 half 1).
+    /// Default **1 second** — the bound on how long a committed
+    /// mutation's row can stay invisible to the admin audit API once a
+    /// path is adopted. Rejected below 1 s (a zero interval would busy
+    /// loop). The worker itself is always mounted; with no adopted path
+    /// the outbox stays empty and this setting changes nothing.
+    #[serde(default = "default_audit_outbox_dispatch_interval_secs")]
+    pub outbox_dispatch_interval_secs: u64,
+    /// How long **dispatched** audit-outbox rows are kept for operator
+    /// inspection before pruning (default **7 days**, validated
+    /// 1..=365). Pending rows are never pruned; `audit_log` retention
+    /// is separate and unchanged.
+    #[serde(default = "default_audit_outbox_retention_days")]
+    pub outbox_retention_days: u64,
 }
 
 impl Default for AuditConfig {
@@ -1155,6 +1169,8 @@ impl Default for AuditConfig {
             retention_days: default_audit_retention_days(),
             sweep_interval_secs: default_audit_sweep_interval_secs(),
             max_rows: default_audit_max_rows(),
+            outbox_dispatch_interval_secs: default_audit_outbox_dispatch_interval_secs(),
+            outbox_retention_days: default_audit_outbox_retention_days(),
         }
     }
 }
@@ -1181,6 +1197,15 @@ impl AuditConfig {
         if self.max_rows > 1_000_000_000_000 {
             return Err("audit.max_rows must not exceed 1000000000000".to_string());
         }
+        if self.outbox_dispatch_interval_secs < 1 {
+            return Err("audit.outbox_dispatch_interval_secs must be at least 1".to_string());
+        }
+        if self.outbox_retention_days == 0 {
+            return Err("audit.outbox_retention_days must be at least 1".to_string());
+        }
+        if self.outbox_retention_days > 365 {
+            return Err("audit.outbox_retention_days must not exceed 365".to_string());
+        }
         Ok(())
     }
 }
@@ -1195,6 +1220,14 @@ fn default_audit_sweep_interval_secs() -> u64 {
 
 fn default_audit_max_rows() -> u64 {
     1_000_000
+}
+
+fn default_audit_outbox_dispatch_interval_secs() -> u64 {
+    1
+}
+
+fn default_audit_outbox_retention_days() -> u64 {
+    7
 }
 
 /// Native monitoring history configuration (`[monitoring]`, ADR-027,
@@ -2319,6 +2352,41 @@ impl ControlPlaneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_outbox_defaults_are_inert_and_validation_rejects_zero() {
+        let cfg = AuditConfig::default();
+        assert_eq!(cfg.outbox_dispatch_interval_secs, 1);
+        assert_eq!(cfg.outbox_retention_days, 7);
+        assert!(cfg.validate().is_ok());
+
+        let zero_interval = AuditConfig {
+            outbox_dispatch_interval_secs: 0,
+            ..Default::default()
+        };
+        assert!(
+            zero_interval.validate().is_err(),
+            "a zero dispatch interval would busy-loop"
+        );
+
+        let zero_retention = AuditConfig {
+            outbox_retention_days: 0,
+            ..Default::default()
+        };
+        assert!(zero_retention.validate().is_err());
+
+        let long_retention = AuditConfig {
+            outbox_retention_days: 366,
+            ..Default::default()
+        };
+        assert!(long_retention.validate().is_err());
+
+        let max_retention = AuditConfig {
+            outbox_retention_days: 365,
+            ..Default::default()
+        };
+        assert!(max_retention.validate().is_ok());
+    }
 
     #[test]
     fn alerting_and_notifications_default_to_no_op() {

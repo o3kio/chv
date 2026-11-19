@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Transactional audit-outbox plumbing (#706 half 1).** Migration `0071`
+  adds an `audit_outbox` table, `chv-controlplane-store` gains
+  `enqueue_on_tx` plus `AuditOutboxRepository` (claim-with-lease, atomic
+  insert-and-mark `complete`, infinite retry, bounded pruning), and
+  `chv-controlplane` mounts a bounded dispatcher (128 rows/pass, 1 s
+  default cadence, 60 s lease, 1 s→60 s backoff, metrics
+  `chv_audit_outbox_pending`, `_oldest_pending_ms`, `_dispatched_total`,
+  `_dispatch_failures_total`). `[audit]` gains
+  `outbox_dispatch_interval_secs` (default 1) and
+  `outbox_retention_days` (default 7, validated 1..=365).
+  **No behavior change yet:** no request path enqueues into the outbox,
+  so it ships empty, the dispatcher finds nothing, and every mutation
+  keeps today's direct post-hoc insert (including its crash window).
+  Adoption follows in PR 2 (BFF) and PR 3 (gRPC). See
+  `docs/specs/component/audit-log.md` and
+  `docs/runbooks/audit-outbox.md`.
+
 ### Security
 - **mTLS interceptor denials are now durably audited (#706).** A
   missing/unparseable client certificate, an unusable certificate serial, or

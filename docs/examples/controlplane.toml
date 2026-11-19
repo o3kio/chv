@@ -250,7 +250,15 @@ dir = "/usr/share/chv/ui"
 # arrive faster than they age out — e.g. an anonymous-denial flood,
 # which is always recorded. Hitting the cap logs a warning: evidence
 # is being discarded ahead of schedule.
+#
+# outbox_dispatch_interval_secs bounds how long a committed mutation's
+# audit row can stay pending once a path adopts the transactional
+# outbox (#706). outbox_retention_days keeps DISPATCHED plumbing rows
+# for operator inspection; pending rows are never pruned. Both are
+# inert until adoption: the outbox ships empty in this release.
 [audit]
 retention_days = 365
 sweep_interval_secs = 86400
 max_rows = 1000000
+outbox_dispatch_interval_secs = 1
+outbox_retention_days = 7
