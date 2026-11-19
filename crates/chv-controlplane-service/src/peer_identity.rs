@@ -45,6 +45,7 @@
 //!
 //! See ADR-008 (error handling) and ADR-014 (mTLS / certificate trust boundary).
 
+use crate::denial_audit::{DenialAuditSink, DenialEvent, DenialReason};
 use crate::error::ControlPlaneServiceError;
 use crate::revocation::RevocationSnapshot;
 use chv_controlplane_types::domain::NodeId;
@@ -117,6 +118,13 @@ pub struct PeerIdentityInterceptor {
     allow_insecure: bool,
     revocation: RevocationSnapshot,
     revocation_policy: RevocationPolicy,
+    /// Fully-qualified gRPC service this interceptor guards. Server-side tonic
+    /// does not expose the RPC method (`GrpcMethod` is client-only), so denial
+    /// audit rows record the service as their `path`.
+    service: &'static str,
+    /// Optional durable audit sink. `None` in insecure mode and in contexts
+    /// that intentionally do not emit denial rows.
+    denials: Option<DenialAuditSink>,
 }
 
 impl PeerIdentityInterceptor {
@@ -176,7 +184,44 @@ impl PeerIdentityInterceptor {
             allow_insecure,
             revocation,
             revocation_policy,
+            service: "unknown",
+            denials: None,
         })
+    }
+
+    /// Label this interceptor with the fully-qualified gRPC service it guards.
+    ///
+    /// The label becomes the `path` of any durable denial row; tonic does not
+    /// expose the RPC method on the server side.
+    pub fn with_service(mut self, service: &'static str) -> Self {
+        self.service = service;
+        self
+    }
+
+    /// Attach a durable denial-audit sink. Interceptor rejections are then
+    /// recorded as anonymous `interceptor_denied` rows (#706).
+    pub fn with_denial_audit(mut self, sink: DenialAuditSink) -> Self {
+        self.denials = Some(sink);
+        self
+    }
+
+    /// Best-effort, non-blocking denial emission. Never affects the request
+    /// outcome; an absent sink (insecure mode / enrollment admission) is a
+    /// no-op.
+    fn emit_denial(
+        &self,
+        reason: DenialReason,
+        source_ip: Option<String>,
+        certificate_serial: Option<String>,
+    ) {
+        if let Some(sink) = &self.denials {
+            sink.emit(DenialEvent {
+                service: self.service,
+                reason,
+                source_ip,
+                certificate_serial,
+            });
+        }
     }
 
     /// Check a serial against the denylist using the current snapshot.
@@ -201,6 +246,8 @@ impl PeerIdentityInterceptor {
             return Ok(request);
         }
 
+        let source_ip = request.remote_addr().map(|addr| addr.ip().to_string());
+
         // Parse the leaf certificate once and derive both the node identity
         // and serial from that single X.509 parse (L2 review finding).
         let (peer_node_id, peer_serial) = match extract_peer_identity_from_extensions(
@@ -208,6 +255,7 @@ impl PeerIdentityInterceptor {
         ) {
             Ok(identity) => identity,
             Err(err) => {
+                self.emit_denial(DenialReason::MissingCertificate, source_ip, None);
                 tracing::warn!(error = %err, "rejecting request: peer identity extraction failed");
                 return Err(tonic::Status::unauthenticated(
                     "peer mTLS certificate required",
@@ -258,9 +306,11 @@ impl PeerIdentityInterceptor {
         // usable production credential: fail closed instead of admitting an
         // unrevokable peer. CHV-issued certificates always carry an 8-char
         // ASCII serial, so this only affects foreign/binary-serial certs.
+        let source_ip = request.remote_addr().map(|addr| addr.ip().to_string());
         let serial = match peer_serial.as_deref() {
             Some(serial) if !serial.is_empty() => serial,
             _ => {
+                self.emit_denial(DenialReason::UnusableSerial, source_ip, peer_serial.clone());
                 tracing::warn!(
                     peer_node_id = %peer_node_id,
                     "rejecting request: peer certificate has no usable serial for revocation check"
@@ -273,6 +323,11 @@ impl PeerIdentityInterceptor {
 
         if self.revocation.is_revoked(Some(serial)) {
             metrics::counter!("chv_revoked_peer_rejected_total").increment(1);
+            self.emit_denial(
+                DenialReason::RevokedSerial,
+                source_ip,
+                Some(serial.to_string()),
+            );
             tracing::warn!(
                 peer_node_id = %peer_node_id,
                 certificate_serial = %serial,
@@ -892,5 +947,134 @@ mod tests {
     fn validate_security_mode_allows_insecure_with_dev_feature() {
         // Only valid when the crate is compiled with the `dev` feature.
         assert!(validate_security_mode(true).is_ok());
+    }
+
+    // ----- #706: interceptor denial audit ---------------------------------
+
+    fn interceptor_with_sink(
+        interceptor: PeerIdentityInterceptor,
+        service: &'static str,
+    ) -> (
+        PeerIdentityInterceptor,
+        tokio::sync::mpsc::Receiver<DenialEvent>,
+    ) {
+        let (sink, rx) = DenialAuditSink::channel();
+        (
+            interceptor.with_service(service).with_denial_audit(sink),
+            rx,
+        )
+    }
+
+    #[test]
+    fn revoked_serial_emits_revoked_denial_event() {
+        let (interceptor, mut rx) = interceptor_with_sink(
+            PeerIdentityInterceptor::new(
+                false,
+                RevocationSnapshot::from_serials(["revoked-serial"]),
+            )
+            .unwrap(),
+            "chv.controlplane.node.v1.LifecycleService",
+        );
+
+        interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                Some("revoked-serial".into()),
+            )
+            .expect_err("revoked peer must be rejected");
+
+        let event = rx.try_recv().expect("one denial event is queued");
+        assert_eq!(event.service, "chv.controlplane.node.v1.LifecycleService");
+        assert_eq!(event.reason, DenialReason::RevokedSerial);
+        assert_eq!(event.certificate_serial.as_deref(), Some("revoked-serial"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a single rejection emits exactly one event"
+        );
+    }
+
+    #[test]
+    fn unusable_serial_emits_unusable_denial_event() {
+        let (interceptor, mut rx) = interceptor_with_sink(
+            PeerIdentityInterceptor::new(false, RevocationSnapshot::from_serials(["anything"]))
+                .unwrap(),
+            "chv.controlplane.node.v1.ReconcileService",
+        );
+
+        interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                None,
+            )
+            .expect_err("peer without a usable serial must be rejected");
+
+        let event = rx.try_recv().expect("one denial event is queued");
+        assert_eq!(event.service, "chv.controlplane.node.v1.ReconcileService");
+        assert_eq!(event.reason, DenialReason::UnusableSerial);
+        assert_eq!(event.certificate_serial, None);
+    }
+
+    #[test]
+    fn missing_certificate_through_intercept_emits_denial_event() {
+        let (interceptor, mut rx) = interceptor_with_sink(
+            PeerIdentityInterceptor::new(false, RevocationSnapshot::empty()).unwrap(),
+            "chv.controlplane.node.v1.InventoryService",
+        );
+
+        interceptor
+            .intercept(tonic::Request::new(()))
+            .expect_err("cert-less request must be rejected");
+
+        let event = rx.try_recv().expect("one denial event is queued");
+        assert_eq!(event.service, "chv.controlplane.node.v1.InventoryService");
+        assert_eq!(event.reason, DenialReason::MissingCertificate);
+        assert_eq!(event.certificate_serial, None);
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn insecure_mode_emits_no_denial_event() {
+        let (interceptor, mut rx) = interceptor_with_sink(
+            PeerIdentityInterceptor::new(
+                true,
+                RevocationSnapshot::from_serials(["revoked-serial"]),
+            )
+            .unwrap(),
+            "chv.controlplane.node.v1.LifecycleService",
+        );
+
+        interceptor
+            .intercept(tonic::Request::new(()))
+            .expect("insecure mode passes through");
+        assert!(
+            rx.try_recv().is_err(),
+            "insecure passthrough must never emit denial rows"
+        );
+    }
+
+    #[test]
+    fn enrollment_recovery_admission_emits_no_denial_event() {
+        let (interceptor, mut rx) = interceptor_with_sink(
+            PeerIdentityInterceptor::for_enrollment(
+                false,
+                RevocationSnapshot::from_serials(["revoked-serial"]),
+            )
+            .unwrap(),
+            "chv.controlplane.node.v1.EnrollmentService",
+        );
+
+        interceptor
+            .authorize_peer(
+                tonic::Request::new(()),
+                NodeId::new("node-a").unwrap(),
+                Some("revoked-serial".into()),
+            )
+            .expect("enrollment recovery path admits revoked certificate");
+        assert!(
+            rx.try_recv().is_err(),
+            "enrollment admission is not a denial and must not emit"
+        );
     }
 }

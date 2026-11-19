@@ -6,6 +6,7 @@ pub mod circuit_breaker;
 pub mod compat;
 mod container;
 pub mod convergence_metrics;
+mod denial_audit;
 mod enrollment;
 mod error;
 mod fabric_planner;

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **mTLS interceptor denials are now durably audited (#706).** A
+  missing/unparseable client certificate, an unusable certificate serial, or
+  a revoked serial rejected by the steady-state `PeerIdentityInterceptor`
+  now writes an anonymous `audit_log` row (`action=interceptor_denied`,
+  `method=gRPC`, `path=<gRPC service>`, `outcome=denied`, `status=401`, with
+  the reason in `metadata` — plus the certificate serial for revoked-serial
+  rows only, never certificate material).
+  Rejections move through a bounded channel to an off-path writer; a full or
+  closed channel (and backlog beyond the 64-event shutdown drain) increments
+  `chv_grpc_denial_audit_dropped_total`, and identical
+  `(service, reason, peer)` rows are deduped for 60 seconds into
+  `chv_grpc_denial_audit_suppressed_total`. Server-side tonic does not expose
+  the RPC method, so rows carry the service as `path`; method-level fidelity
+  and the crash window (mutation commits before its audit row) remain open
+  under #706.
 - **RustSec advisories cleared from the dependency graph.** `rusqlite`
   0.32→0.41 and `sqlx` 0.8→0.9.1 now share a single
   `libsqlite3-sys` 0.39.1 (bundled SQLite 3.54.1), removing

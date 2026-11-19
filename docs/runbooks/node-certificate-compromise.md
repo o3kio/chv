@@ -164,6 +164,14 @@ per-serial, not fleet-wide.
 - Control-plane logs contain
   `rejecting request: peer certificate serial is revoked` with the node id and
   serial.
+- The first rejection per 60s window per `(service, reason, peer)` now
+  writes a durable `audit_log` row: `action=interceptor_denied`,
+  `outcome=denied`, `status=401`, `path=<gRPC service>`, with the reason
+  (and serial) in `metadata`. The peer key is the certificate serial when
+  usable, otherwise the source IP (so the service is part of the dedupe
+  key). Repeated attempts within the window are suppressed into
+  `chv_grpc_denial_audit_suppressed_total`, while still incrementing
+  `chv_revoked_peer_rejected_total`.
 
 ### 2.4 Confirm rotation is burned
 

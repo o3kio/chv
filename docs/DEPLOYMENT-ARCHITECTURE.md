@@ -600,8 +600,12 @@ found it.
   loudly logged, but it is retained for compatibility).
 - **#706 — audit crash window.** The audit insert happens after the mutation's
   handler returns, so a crash between commit and insert can leave a mutation
-  unrecorded. The mTLS-interceptor denials (missing, unparseable, or revoked
-  certificate) write no audit row at all. Tracked in #706.
+  unrecorded. This crash window remains open. mTLS-interceptor denials
+  (missing, unparseable, or revoked certificate) now write a durable anonymous
+  `audit_log` row (`action=interceptor_denied`, `outcome=denied`,
+  `status=401`, `path=<gRPC service>`, 60s
+  per-`(service, reason, peer)` dedupe) instead of only metrics/logs.
+  Tracked in #706 for the remaining outbox work.
 - **#709 — fixed in the rc.2 build.** In the `e82d49a1` candidate the
   first-enrollment `ReportBootstrapResult` was sent on the pre-enrollment
   certificate and rejected by the peer-node-id check, so a fresh install did

@@ -1,7 +1,7 @@
 # Privileged-mutation audit log (#658)
 
 The control plane keeps one durable, append-only record of every
-privileged mutation, written to `audit_log` by two emitters:
+privileged mutation, written to `audit_log` by two mutation emitters:
 
 1. **HTTP (BFF)** — centralized in middleware wrapped around the whole
    HTTP surface; handlers do not call an audit function.
@@ -9,7 +9,13 @@ privileged mutation, written to `audit_log` by two emitters:
    `crates/chv-controlplane-service/src/server.rs`; handlers do not call
    an audit function. Coverage and its explicit exclusions are below.
 
-The two emitters share the schema, retention, and admin read surface,
+A third emitter,
+`crates/chv-controlplane-service/src/denial_audit.rs`, appends anonymous
+interceptor-rejection rows (`interceptor_denied`); those are denial
+evidence, not privileged mutations, and are scoped separately in the
+denial boundary below.
+
+All three emitters share the schema, retention, and admin read surface,
 but use different `action`/`method`/`path` vocabularies (documented in
 the Row contract).
 
@@ -79,20 +85,54 @@ Excluded:
   metric ingest on the same listener, high-rate and not a privileged
   mutation.
 
-**Denial boundary (honest limit).** The steady-state mTLS interceptor
-rejects requests *before* the handler runs: a revoked serial increments
-`chv_revoked_peer_rejected_total` and emits a `warn` log; a
-missing/unparseable certificate (or a certificate with no comparable
-serial) emits only a `warn` log. Neither produces an `audit_log` row.
-Handler-level denials (peer/node mismatch, revoked peer on
-`RotateNodeCertificate` and `ReportBootstrapResult`) are inside the
-audited block and are recorded. Post-revocation attempts against the
-lifecycle surface are therefore visible only in metrics/logs, and
-certificate-less probes only in logs; an investigator must check both.
-Denial rows for interceptor rejections would require emitting from the
-interceptor (which lacks the gRPC method name) or moving revocation into
-each audited handler; both are follow-up work, not claims of this
-emitter.
+Those services remain excluded at the **handler** level only:
+interceptor-level rejections on `InventoryService`, `TelemetryService`,
+and `MonitoringService` still write durable denial rows (see the denial
+boundary below).
+
+**Denial boundary.** The steady-state mTLS interceptor rejects requests
+*before* the handler runs. Those rejections now produce a durable
+`audit_log` row with the anonymous actor: `action=interceptor_denied`,
+`method=gRPC`, `path=<fully-qualified gRPC service>`, `outcome=denied`,
+`status_code=401`. `metadata` records `reason` (`missing_certificate`,
+`unusable_serial`, or `revoked_serial`) and, when present, the
+certificate serial (never the certificate itself, tokens, or bodies).
+`source_ip` is recorded when the transport exposes it. A revoked serial
+still increments `chv_revoked_peer_rejected_total`.
+
+**Method-level fidelity limit.** Server-side tonic does not expose the
+RPC method: `tonic::extensions::GrpcMethod` is inserted only by generated
+client code, and `tonic::Request` drops the HTTP URI. Interceptor rows
+therefore record the gRPC **service** as `path`; method-level path
+fidelity is a follow-up. Handler-level denials continue to carry
+`<service>/<RpcName>` and are inside the audited block, so peer/node
+mismatch and revoked-peer rejections on `RotateNodeCertificate` and
+`ReportBootstrapResult` are recorded as before.
+
+**Flood control.** Rejections are queued on a bounded (1024) channel and
+written off the request path. A full or closed channel increments
+`chv_grpc_denial_audit_dropped_total{cause="full"|"closed"}`; it never
+blocks or changes request handling. Identical `(service, reason, peer)`
+rejections are recorded at most once per 60 seconds (peer = certificate
+serial when usable, else source IP, else the literal `unknown`), and
+suppressed duplicates increment
+`chv_grpc_denial_audit_suppressed_total{reason="..."}` while still
+incrementing the rejection metrics — a quiet audit trail is not proof of
+a quiet boundary. The window is an operational default and may be tuned
+later. Successful and failed writes are counted by
+`chv_grpc_denial_audit_written_total{reason="..."}` and
+`chv_grpc_denial_audit_write_failures_total{reason="..."}`.
+
+At shutdown the writer flushes at most 64 already-queued events; anything
+still queued is counted in
+`chv_grpc_denial_audit_dropped_total{cause="shutdown"}`. A hard process
+kill loses whatever is still queued — the same crash-window family as the
+still-open half of #706. If the listener fails or the 5s drain budget is
+exceeded, the writer is aborted and queued events are lost **uncounted**
+(the same crash-window family), bounded at ≤1024 events.
+
+The crash window (a mutation commits before its audit row is written)
+remains open and is tracked under #706.
 
 ## Mounting
 
@@ -131,15 +171,15 @@ Layer order (outermost first) and why:
 | `audit_id` | Server-minted 128-bit id (primary key). |
 | `occurred_at_ms` | Epoch-millisecond completion timestamp. |
 | `actor_id`, `actor_username`, `actor_role` | Verified claims, or the explicit anonymous marker. |
-| `action` | Stable action. HTTP: dotted, derived from method/path, e.g. `vm.create`. gRPC: the protobuf RPC name, e.g. `StartVm`. |
-| `method`, `path` | Request shape; never the query string. HTTP: verb + matched route. gRPC: `gRPC` + `<fully-qualified service>/<RpcName>`. |
+| `action` | Stable action. HTTP: dotted, derived from method/path, e.g. `vm.create`. gRPC: the protobuf RPC name, e.g. `StartVm`; interceptor rejections use the fixed literal `interceptor_denied` (not an RPC name). |
+| `method`, `path` | Request shape; never the query string. HTTP: verb + matched route. gRPC: `gRPC` + `<fully-qualified service>/<RpcName>`. The only gRPC rows without an RPC suffix are interceptor rejections, whose `path` is `<fully-qualified gRPC service>`: server-side tonic does not expose `GrpcMethod` (it is inserted only by generated client code) and `tonic::Request` drops the HTTP URI. |
 | `resource_kind`, `resource_id` | Best-effort resource. HTTP: path-derived; bodies are intentionally not read. gRPC: request fields (capped), with `EnrollNode` using the issued node id on success. |
 | `outcome` | `success` (2xx/3xx), `denied` (401/403), `failed` (other 4xx/5xx). gRPC status codes are mapped to the HTTP equivalents (200/400/401/403/404/409/412/429/499/500/501/503/504). |
 | `status_code` | Final HTTP status, or the gRPC code's HTTP equivalent. |
 | `correlation_id` | Correlation id assigned by the correlation middleware (HTTP), capped at 128 chars. gRPC rows leave it NULL; `operation_id` is the join key for agent traffic. |
 | `operation_id` | Inbound `x-operation-id` when supplied (HTTP or gRPC metadata), capped at 128 chars. |
 | `source_ip` | Transport peer address (see below), or a validated forwarding hop. On gRPC this is always the direct TCP peer, never a metadata header. |
-| `metadata` | Allowlisted redacted JSON object. HTTP: `auth_source`. gRPC: `transport: "grpc"` and `auth_source` ∈ `mtls` \| `insecure` \| `bootstrap_token`. |
+| `metadata` | Allowlisted redacted JSON object. HTTP: `auth_source`. gRPC: `transport: "grpc"` and `auth_source` ∈ `mtls` \| `insecure` \| `bootstrap_token`. Interceptor denials use `auth_source: "mtls_rejected"`, `reason` ∈ `missing_certificate` \| `unusable_serial` \| `revoked_serial`, and — only when the serial matched the operator-controlled revocation denylist, so the value is bounded by operator data rather than arbitrary client bytes — `certificate_serial` (capped at 256 chars). |
 
 Client-controlled identifier strings (`operation_id`,
 `correlation_id`) are capped at 128 characters so a hostile or buggy
@@ -232,8 +272,11 @@ certificate-authenticated, so it forces the anonymous actor and labels
 `auth_source: "bootstrap_token"`. When the interceptor ran in insecure
 dev mode (`CHV_ALLOW_INSECURE=1`), the handler sees `InsecurePeer`, the
 row is anonymous, and `auth_source` is `insecure`. Interceptor-level
-certificate rejections are outside the handler and therefore have no
-row (see the denial boundary above).
+certificate rejections **do** write a durable anonymous row, even though
+they happen outside the handler: `action=interceptor_denied`,
+`method=gRPC`, `path=<fully-qualified gRPC service>`, `outcome=denied`,
+`status=401`, with the reason and serial in `metadata` (see the denial
+boundary above).
 
 ## Redaction contract
 
@@ -245,14 +288,18 @@ The audit row never stores:
 - request bodies or query strings;
 - arbitrary handler payloads.
 
-`metadata` is constructed from an explicit allowlist — `auth_source`
-on the HTTP emitter (`crates/chv-webui-bff/src/audit.rs`) and
-`transport` + `auth_source` on the gRPC emitter
-(`crates/chv-controlplane-service/src/server.rs`). A future field must
-be added deliberately to the relevant allowlist and must be safe to
-retain for the full retention period. Neither repository path exposes
-free-form metadata from request data. The gRPC emitter also caps every
-request-derived string before insert and never records a bootstrap
+`metadata` is constructed from an explicit allowlist:
+
+| Emitter | Allowlisted `metadata` keys |
+|---|---|
+| HTTP (`crates/chv-webui-bff/src/audit.rs`) | `auth_source` |
+| gRPC handlers (`crates/chv-controlplane-service/src/server.rs`) | `transport`, `auth_source` |
+| gRPC interceptor denials (`crates/chv-controlplane-service/src/denial_audit.rs`) | `transport`, `auth_source`, `reason`, optional `certificate_serial` |
+
+A future field must be added deliberately to the relevant allowlist and
+must be safe to retain for the full retention period. No repository path
+exposes free-form metadata from request data. The gRPC emitters also cap
+every request-derived string before insert and never record a bootstrap
 token, certificate, or handler error detail.
 
 ## Admin API
