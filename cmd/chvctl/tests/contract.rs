@@ -1231,10 +1231,11 @@ async fn vm_create_storage_class_rejection_row() {
         "volume_desired_state",
         "operations",
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0, "a rejected create must not journal {table}");
     }
 }
@@ -2212,10 +2213,11 @@ async fn volume_create_storage_class_rejection_row() {
     // A rejected create journals nothing (every table the create tx
     // writes — the `volume_create_route.rs` discipline).
     for table in ["volumes", "volume_desired_state", "operations"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0, "a rejected create must not journal {table}");
     }
 }
@@ -2252,10 +2254,11 @@ async fn volume_create_requires_node_row() {
 
     // The 400 fires before the transaction — nothing is journaled.
     for table in ["volumes", "volume_desired_state", "operations"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0, "a rejected create must not journal {table}");
     }
 }

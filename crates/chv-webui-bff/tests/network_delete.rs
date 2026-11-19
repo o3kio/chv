@@ -667,9 +667,9 @@ async fn network_delete_tombstone_lands_and_reads_exclude_it() {
         ("vni_allocations", "vni allocations"),
         ("vm_nic_desired_state", "nic rows"),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE network_id = ?"
-        ))
+        )))
         .bind(&net_id)
         .fetch_one(&state.pool)
         .await

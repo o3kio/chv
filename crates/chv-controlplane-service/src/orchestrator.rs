@@ -1982,7 +1982,9 @@ impl Orchestrator {
                 "SELECT network_id, cidr, gateway, firewall_rules_json FROM network_desired_state WHERE network_id IN ({})",
                 placeholders
             );
-            let mut query = sqlx::query_as::<_, NetworkDesiredStateWithIdRow>(&query_str);
+            let mut query = sqlx::query_as::<_, NetworkDesiredStateWithIdRow>(sqlx::AssertSqlSafe(
+                query_str.as_str(),
+            ));
             for id in &unique_network_ids {
                 query = query.bind(id);
             }
