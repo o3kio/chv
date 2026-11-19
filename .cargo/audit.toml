@@ -46,8 +46,9 @@ ignore = [
     #   (a) Non-applicable as a vulnerability: maintenance status only; no
     #       CHV code path calls humantime directly.
     #   (b) Upstream: https://github.com/chronotope/chrono/issues/1768
-    #       (object_store 0.14.2 is the latest release and depends on
-    #       humantime 2.1 unconditionally).
+    #       (the advisory's own url field points at the chrono issue because
+    #       in this timeline humantime wraps chrono; object_store 0.14.2 is
+    #       the latest release and depends on humantime 2.1 unconditionally).
     #   (c) Remove when object_store stops depending on humantime.
     #       Tracking: #756.
     "RUSTSEC-2026-0542",

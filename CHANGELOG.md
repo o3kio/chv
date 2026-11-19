@@ -21,8 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the monitoring migrator to adopt `Migrator::with_migrations` /
   `SqlSafeStr`. The two remaining upstream-unmaintained crates
   (`chrono`, `humantime`) are acknowledged in `.cargo/audit.toml` with
-  rationale and tracking issues #755/#756; the stale `rsa` ignore left
-  when sqlx 0.9 dropped `sqlx-mysql` from the lockfile is removed.
+  rationale and tracking issues #755/#756; the stale `rsa` ignore is
+  removed because `sqlx-mysql` 0.9 made its `rsa` dependency
+  feature-gated, so `rsa` left the lockfile (the crate itself is still
+  pulled, just without that dependency).
 
 ## [0.4.0-rc.8] - 2026-11-06
 

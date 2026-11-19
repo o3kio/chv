@@ -46,10 +46,11 @@ unused-ignored-advisory = "deny"
 # `advisory-not-detected`, and `unused-ignored-advisory = "deny"` above
 # turns that into a gate failure). Note the companion `.cargo/audit.toml`
 # (consumed by the real `cargo audit` CI job) walks the raw lockfile with
-# NO reachability filtering, so its ignore set is intentionally a superset
-# of this one (e.g. RUSTSEC-2023-0071): a crate can be unreachable in the
-# build graph (no deny.toml entry needed) yet still present in Cargo.lock
-# (audit.toml entry needed). Reconcile each file against its own tool.
+# NO reachability filtering, so its ignore set can be a superset of this
+# one: a crate can be unreachable in the build graph (no deny.toml entry
+# needed) yet still present in Cargo.lock (audit.toml entry needed).
+# Reconcile each file against its own tool; both are empty-clean of the
+# rsa entry since sqlx-mysql 0.9 dropped its `rsa` dependency (2026-11-19).
 #
 # Removed 2026-09-29 (prompt 03 reconciliation, issue #230):
 #   RUSTSEC-2023-0071 (rsa) — `rsa` is unreachable in the build graph
