@@ -132,7 +132,9 @@ exceeded, the writer is aborted and queued events are lost **uncounted**
 (the same crash-window family), bounded at ≤1024 events.
 
 The crash window (a mutation commits before its audit row is written)
-remains open and is tracked under #706.
+remains open for the denial writer and for every mutation site not
+coupled to the audit outbox; the BFF adoption below closes it for the
+listed routes and tracks the rest under #706.
 
 ## Mounting
 
@@ -169,7 +171,7 @@ Layer order (outermost first) and why:
 | Column | Meaning |
 |---|---|
 | `audit_id` | Server-minted 128-bit id (primary key). |
-| `occurred_at_ms` | Epoch-millisecond completion timestamp. |
+| `occurred_at_ms` | Epoch-millisecond completion timestamp; for an adopted HTTP mutation it is stamped at enqueue (the commit attempt) and replayed verbatim by the dispatcher. |
 | `actor_id`, `actor_username`, `actor_role` | Verified claims, or the explicit anonymous marker. |
 | `action` | Stable action. HTTP: dotted, derived from method/path, e.g. `vm.create`. gRPC: the protobuf RPC name, e.g. `StartVm`; interceptor rejections use the fixed literal `interceptor_denied` (not an RPC name). |
 | `method`, `path` | Request shape; never the query string. HTTP: verb + matched route. gRPC: `gRPC` + `<fully-qualified service>/<RpcName>`. The only gRPC rows without an RPC suffix are interceptor rejections, whose `path` is `<fully-qualified gRPC service>`: server-side tonic does not expose `GrpcMethod` (it is inserted only by generated client code) and `tonic::Request` drops the HTTP URI. |
@@ -212,9 +214,14 @@ that user's privileged actions.
 
 A request is classified once, executed once, and then the middleware
 attempts one insert. Under a healthy database this is exactly one row
-per mutating request, including failed and denied attempts.
+per mutating request, including failed and denied attempts. Adopted BFF
+routes keep the same exactly-one-row guarantee through a different
+emitter: the handler commits the row into `audit_outbox` with the
+mutation and the middleware's check-or-insert skips the direct insert
+(see the transactional-outbox section below).
 
-The insert happens **after** the handler returns. If the insert fails:
+For the direct (post-hoc) path, the insert happens **after** the handler
+returns. If the insert fails:
 
 - the `chv_bff_audit_write_failures_total` counter is incremented — a
   systemic audit-store outage is visible on dashboards, not only in
@@ -250,15 +257,64 @@ Residual risk: the mutation has already happened when the insert is
 attempted. A 500 `AUDIT_LOG_WRITE_FAILED` therefore does not roll the
 mutation back; it tells the caller the audit trail is incomplete.
 
-### Transactional outbox (plumbing landed, not yet adopted)
+### Transactional outbox (BFF adopted; gRPC not yet)
 
 The control plane ships an `audit_outbox` table (migration `0071`) and a
-bounded dispatcher for it, but **no request path enqueues into it yet**
-(#706 half 1). The table is created empty, the dispatcher runs once per
-second and finds nothing, and every current behavior above is unchanged
-byte-for-byte, including the crash window.
+bounded dispatcher for it (#706 half 1). Mutation sites are adopted
+incrementally; the contract below holds for every adopted site, and
+everything else keeps the post-hoc insert above byte-for-byte, including
+its crash window.
 
-The contract the plumbing provides, and what adoption changes:
+**Adopted in PR 2 (HTTP/BFF).** These are pure-database,
+single-transaction mutations:
+
+| Route | Action | Shape |
+|---|---|---|
+| `POST /v1/users/create` | `user.create` | INSERT + outbox row in one transaction (was autocommit) |
+| `POST /v1/users/update` | `user.update` | UPDATE + outbox row in one transaction |
+| `POST /v1/users/delete` | `user.delete` | DELETE + outbox row in one transaction |
+| `POST /v1/tokens/create` | `api_token.create` | INSERT + outbox row in one transaction (was autocommit) |
+| `POST /v1/tokens/revoke` | `api_token.revoke` | DELETE + outbox row in one transaction |
+| `POST /v1/networks/create` | `network.create` | the existing transaction now also enqueues |
+| `POST /v1/networks/update` | `network.update` | the existing transaction now also enqueues |
+| `POST /v1/networks/delete` | `network.delete` | the existing transaction now also enqueues |
+| `POST /v1/vms/import` | `vm.import` | the **final** transaction couples the VM/volume/operation rows; the filesystem work happens before it |
+
+**Not adopted (still post-hoc).** Every other audited route — notably
+`vm.delete`, `volume.delete`, snapshot/clone/restore mutations, anything
+that performs filesystem or agent RPC work inside the handler, the
+guest-agent browser routes, and the whole gRPC surface (PR 3). They keep
+today's direct insert and its narrow crash window. Denied and failed
+requests also stay post-hoc: there is no state change to lose.
+
+**Check-or-insert.** For every classified HTTP mutation the middleware
+mints (server-side, UUIDv4, never read from a request header or body) an
+`outbox_id` and a pre-minted `audit_id`, and puts them on the request as
+an `AuditOutboxTicket`. An adopted handler passes its mutation
+transaction to `commit_adopted_mutation`, which calls `enqueue_on_tx`
+immediately before the commit. After the handler returns the middleware
+checks the outbox by primary key:
+
+- **row present** → the evidence row is durable; no second row is
+  written. If the final status is not 2xx/3xx, `finalize_pending` patches
+  the pending row's outcome/status. If the dispatcher already won the
+  race, the mismatch is logged with the `outbox_id` and the row keeps its
+  commit-time `success` prediction.
+- **row absent** → denied, failed before commit, rolled back, or
+  unadopted. The middleware inserts directly, exactly as before.
+- **check fails** → never a double write: when the ticket was committed
+  (the handler enqueued and committed), the middleware trusts the
+  durable outbox row and skips the direct insert; otherwise it falls back
+  to the direct insert.
+
+No path produces two rows for one request, and no adopted success path
+produces zero rows: the outbox row and the mutation are one commit. The
+verification evidence is `crates/chv-webui-bff/tests/audit_log.rs`
+(adopted success, rollback after the `BEGIN IMMEDIATE` mutation
+transaction, crash between commit and middleware return, injected
+post-commit non-2xx, unadopted route, oversized actor, distinct ids).
+
+The contract adoption relies on:
 
 - **Enqueue is transactional.** An adopted mutation calls
   `enqueue_on_tx` inside the transaction it already holds, so the
@@ -276,34 +332,73 @@ The contract the plumbing provides, and what adoption changes:
   droppable, so failed dispatches retry forever with 1 s → 60 s capped
   exponential backoff (±20 % jitter). The claim lease is 60 s; a
   dispatcher crash simply lets the lease expire and the rows return.
-- **Bounded staleness.** Once a path is adopted, its row becomes
-  visible to the admin API at most one dispatch interval plus one
-  backoff step after commit (default ≈ 2 s), including a replay pass
-  immediately after restart. Until adoption, latency is unchanged.
+- **Bounded staleness.** An adopted path's row becomes visible to the
+  admin API at most one dispatch interval plus one backoff step after
+  commit (default ≈ 2 s), including a replay pass immediately after
+  restart. Unadopted routes keep the immediate visibility above.
 - **Adopted success paths fail closed at commit.** If the enqueue
-  itself fails, the mutation transaction fails, so the awkward
-  post-hoc 500 for those paths disappears. Denied/failed/unadopted
-  paths keep the direct post-hoc insert above.
+  itself fails, the mutation transaction fails, so the post-hoc 500
+  `AUDIT_LOG_WRITE_FAILED` cannot happen for an adopted route. The
+  caller instead gets a 500 saying the mutation was not performed, and
+  the middleware records that failed request once on the direct path.
+  Denied/failed/unadopted paths keep the direct post-hoc insert above.
 - **The crash window closes only where mutation and outbox share a
   commit.** Multi-statement mutations (notably `EnrollNode`, whose
   token consumption and node upsert are separate commits) couple only
   the final transaction; a crash between commits remains a
-  half-applied mutation with no outbox row. Folding enrollment into one
-  transaction is follow-up work.
+  half-applied mutation with no outbox row. `vms/import` has the same
+  shape: its temporary-directory setup and file move precede the final
+  transaction. Folding enrollment into one transaction is follow-up
+  work.
 
-**Adoption constraint — payload cap.** Enqueue rejects a serialized
-`AuditLogInsert` larger than 16 KiB, while the current direct-insert
-path has no explicit bound on actor fields. Before adopting a site,
-PR 2/3 must either validate/cap the actor fields so the row fits, or
-explicitly disclose that an oversized row fails **enqueue** — which,
-for an adopted path, rolls back the mutation transaction itself
-(fail-closed: no mutation without its evidence). Silent truncation is
-not permitted.
+**Lock scope.** Wrapping the formerly autocommit `users`/`tokens`
+statements in a transaction extends the SQLite write lock by one INSERT
+(the outbox row) per adopted mutation; it introduces no new lock
+ordering. Those transactions, and `networks/create`, use
+`BEGIN IMMEDIATE` — the repo's write-serializing discipline — because
+their first statement is a write; a deferred `BEGIN` would only defer
+the same lock and risk a `SQLITE_BUSY` at the outbox INSERT instead of
+at `BEGIN`. `networks/update`, `networks/delete`, and `vms/import`
+already held a transaction, so only the extra INSERT is new there.
+
+**Actor-field cap (NIT 5 decision).** The store caps the serialized
+payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
+`actor_username` / `actor_role`. Adopted sites **fail closed**: the row
+is never silently truncated. An oversized payload makes enqueue fail, the
+mutation transaction rolls back (no mutation without durable evidence),
+and the middleware records the failed request once on the direct path
+(which does not truncate the actor either). Covered by
+`oversized_actor_fails_closed_and_rolls_back` in the BFF audit tests.
+
+**Username bound (review S2).** To keep that fail-closed path
+unreachable for API-created users, `POST /v1/users/create` rejects a
+`username` longer than 256 characters with the existing validation shape
+(400 `BAD_REQUEST`, no truncation). `users/update` has no rename field,
+so there is nothing else to bound. Residual risk, stated honestly: the
+bound is enforced only on this creation path. A username longer than 256
+characters that already exists in the database (created before this
+change, written out-of-band, or seeded/managed outside the BFF) still
+works for login and still yields an oversized `actor_username`; that
+user's adopted mutations would fail closed until the row is corrected.
+The login/JWT path itself performs no username-length validation beyond
+the request body limit — it does not need one to be correct, but it does
+not close the legacy-row case.
 
 Dispatched outbox rows are kept for 7 days (`[audit]
 outbox_retention_days`, validated 1..=365) and pruned in bounded
 batches; pending rows are never pruned. This cleanup is plumbing, not
 evidence deletion — `audit_log` retention is separate.
+
+**Verification scope.** The crash window and the tx coupling are proven
+deterministically by `crates/chv-webui-bff/tests/audit_log.rs` (the
+`SIGKILL` end-to-end test from the design is a follow-up, not
+implemented): an adopted handler that commits with the middleware never
+running is replayed exactly once by the dispatcher, and a **commit
+failure after a successful enqueue** (the
+`commit_failure_after_a_successful_enqueue_rolls_back_mutation_and_outbox`
+test, using a deferred foreign key that SQLite only checks at `COMMIT`)
+leaves neither the mutation nor the outbox row — which a pool/autocommit
+enqueue could not satisfy.
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see

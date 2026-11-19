@@ -1,6 +1,7 @@
 use axum::{extract::State, response::Json};
 use serde_json::{json, Value};
 
+use crate::audit::{commit_adopted_mutation, AuditTicket};
 use crate::auth::BearerToken;
 use crate::router::AppState;
 use crate::BffError;
@@ -237,6 +238,7 @@ pub async fn get_network(
 pub async fn create_network(
     crate::auth::BearerToken(claims): crate::auth::BearerToken,
     State(state): State<AppState>,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
@@ -308,7 +310,7 @@ pub async fn create_network(
 
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE;")
         .await
         .map_err(|e| BffError::Internal(format!("failed to begin transaction: {}", e)))?;
 
@@ -350,9 +352,9 @@ pub async fn create_network(
     .await
     .map_err(|e| BffError::Internal(format!("failed to insert network_desired_state: {}", e)))?;
 
-    tx.commit()
-        .await
-        .map_err(|e| BffError::Internal(format!("failed to commit transaction: {}", e)))?;
+    // Mutation and audit evidence commit together (#706). This handler
+    // already held a transaction; the outbox INSERT rides inside it.
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
 
     state.cache.invalidate("networks:").await;
     state.cache.invalidate("overview").await;
@@ -367,6 +369,7 @@ pub async fn create_network(
 pub async fn delete_network(
     crate::auth::BearerToken(claims): crate::auth::BearerToken,
     State(state): State<AppState>,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
@@ -556,9 +559,9 @@ pub async fn delete_network(
     .await
     .map_err(|e| BffError::Internal(format!("failed to tombstone network: {}", e)))?;
 
-    tx.commit()
-        .await
-        .map_err(|e| BffError::Internal(format!("failed to commit transaction: {}", e)))?;
+    // Mutation and audit evidence commit together (#706). This handler
+    // already held a transaction; the outbox INSERT rides inside it.
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
 
     state.cache.invalidate("networks:").await;
     state.cache.invalidate("overview").await;
@@ -573,6 +576,7 @@ pub async fn delete_network(
 pub async fn update_network(
     crate::auth::BearerToken(claims): crate::auth::BearerToken,
     State(state): State<AppState>,
+    ticket: AuditTicket,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<Json<Value>, BffError> {
     crate::auth::require_operator_or_admin(&claims)?;
@@ -783,9 +787,9 @@ pub async fn update_network(
         };
     }
 
-    tx.commit()
-        .await
-        .map_err(|e| BffError::Internal(format!("failed to commit transaction: {}", e)))?;
+    // Mutation and audit evidence commit together (#706). This handler
+    // already held a transaction; the outbox INSERT rides inside it.
+    commit_adopted_mutation(tx, ticket.as_ref()).await?;
 
     state.cache.invalidate("networks:").await;
     state.cache.invalidate("overview").await;

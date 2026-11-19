@@ -621,6 +621,29 @@ async fn production_router_audits_all_privileged_surfaces_exactly_once() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // `/v1/users/create` is an outbox-adopted mutation (#706 PR 2): the
+    // handler commits its row into `audit_outbox` with the mutation and
+    // the middleware's check-or-insert skips the direct insert. Until the
+    // dispatcher runs, `audit_log` is (correctly) still empty.
+    assert!(
+        rows_for(&pool, "/v1/users/create").await.is_empty(),
+        "the adopted row must not be written directly by the middleware"
+    );
+    let outbox = chv_controlplane_store::AuditOutboxRepository::new(pool.clone());
+    let (pending, _) = outbox
+        .pending_stats(chv_common::now_unix_ms())
+        .await
+        .expect("outbox stats");
+    assert_eq!(pending, 1, "exactly one pending outbox row for the request");
+    // One real dispatcher pass (the same worker mounted in production).
+    let dispatcher =
+        crate::audit_outbox_dispatcher::AuditOutboxDispatcher::new(outbox, 7 * 86_400_000);
+    let dispatched = dispatcher
+        .dispatch_pass(chv_common::now_unix_ms() + 1)
+        .await
+        .expect("dispatch pass");
+    assert_eq!(dispatched, 1);
+
     let rows = rows_for(&pool, "/v1/users/create").await;
     assert_eq!(
         rows.len(),
