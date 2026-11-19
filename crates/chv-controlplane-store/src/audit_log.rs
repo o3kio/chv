@@ -8,6 +8,7 @@
 //! caller constructs the already-redacted JSON object from an allowlist.
 
 use crate::{StoreError, StorePool};
+use serde::{Deserialize, Serialize};
 
 /// Outcome vocabulary. The BFF derives these from the HTTP status:
 /// 2xx/3xx = success, 401/403 = denied, everything else = failed.
@@ -76,7 +77,11 @@ pub struct AuditLogRow {
 /// Fields required to append one audit row. `metadata` must already be
 /// the allowlisted, redacted JSON object produced by the BFF or the
 /// node-facing gRPC audit boundary.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` are additive (#706 half 1): the transactional
+/// outbox persists this already-redacted row as JSON and the dispatcher
+/// replays it verbatim, never re-deriving attribution or redaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditLogInsert {
     pub occurred_at_ms: i64,
     pub actor_id: String,
@@ -107,6 +112,39 @@ pub struct AuditLogFilter {
     pub outcome: Option<String>,
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,
+}
+
+/// Insert one row with a caller-supplied `audit_id` on an open
+/// transaction. Used only by the audit outbox dispatcher (#706 half 1):
+/// the id is minted at enqueue so replay is deterministic, and the
+/// insert must share a transaction with the outbox row's
+/// `status = 'dispatched'` update. The bind order mirrors
+/// `INSERT_SQL` and [`AuditLogRepository::insert`] exactly.
+pub(crate) async fn insert_row_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit_id: &str,
+    input: &AuditLogInsert,
+) -> Result<(), StoreError> {
+    sqlx::query(INSERT_SQL)
+        .bind(audit_id)
+        .bind(input.occurred_at_ms)
+        .bind(&input.actor_id)
+        .bind(&input.actor_username)
+        .bind(&input.actor_role)
+        .bind(&input.action)
+        .bind(&input.method)
+        .bind(&input.path)
+        .bind(&input.resource_kind)
+        .bind(&input.resource_id)
+        .bind(&input.outcome)
+        .bind(input.status_code)
+        .bind(&input.correlation_id)
+        .bind(&input.operation_id)
+        .bind(&input.source_ip)
+        .bind(&input.metadata)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Rows deleted per retention/prune statement. Bounded so a sweep of

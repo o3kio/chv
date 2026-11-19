@@ -3,6 +3,7 @@ mod instance_lock;
 use chv_config::{ControlPlaneConfig, ControlPlaneTlsConfig};
 use chv_controlplane_service::{
     alert_evaluator::{AlertEvaluatorWorker, EvaluatorChannels},
+    audit_outbox_dispatcher::AuditOutboxDispatcher,
     compat::{CompatibilityMatrix, Component},
     monitoring_exporter::{MonitoringExporter, ReqwestExportTransport},
     notification_dispatcher::{DispatcherSettings, NotificationDispatcher},
@@ -14,9 +15,9 @@ use chv_controlplane_service::{
 };
 use chv_controlplane_store::{
     connect_pool, run_migrations, AlertRepository, AlertRuleRepository, AuditLogRepository,
-    BackupRepository, BootstrapTokenRepository, ControlPlaneStoreConfig, DesiredStateRepository,
-    EventRepository, NodeRepository, NotificationOutboxRepository, ObservedStateRepository,
-    OperationRepository, VtepRepository,
+    AuditOutboxRepository, BackupRepository, BootstrapTokenRepository, ControlPlaneStoreConfig,
+    DesiredStateRepository, EventRepository, NodeRepository, NotificationOutboxRepository,
+    ObservedStateRepository, OperationRepository, VtepRepository,
 };
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -1215,6 +1216,25 @@ pub async fn build_service(
         }
     });
 
+    // Transactional audit outbox dispatcher (#706 half 1). Plumbing
+    // only: it is always mounted but no request path enqueues yet, so
+    // it drains an empty table and changes no request behavior. Tokio's
+    // interval fires immediately, giving the post-crash replay pass on
+    // startup. Failures are logged and rows stay pending; evidence is
+    // delayed, never dropped (there is no dead-letter).
+    let audit_outbox_dispatcher = AuditOutboxDispatcher::new(
+        AuditOutboxRepository::new(pool.clone()),
+        (config.audit.outbox_retention_days as i64).saturating_mul(86_400_000),
+    );
+    let audit_outbox_interval =
+        std::time::Duration::from_secs(config.audit.outbox_dispatch_interval_secs);
+    let audit_outbox_shutdown = shutdown_rx.clone();
+    let audit_outbox_handle = tokio::spawn(async move {
+        audit_outbox_dispatcher
+            .run(audit_outbox_interval, audit_outbox_shutdown)
+            .await
+    });
+
     let reaper_handle = tokio::spawn(migration_reaper.run(shutdown_rx));
 
     Ok(ControlPlaneService::new(
@@ -1239,6 +1259,7 @@ pub async fn build_service(
             notification_dispatcher_handle,
             monitoring_exporter_handle,
             audit_retention_handle,
+            audit_outbox_handle,
         ],
     ))
 }
