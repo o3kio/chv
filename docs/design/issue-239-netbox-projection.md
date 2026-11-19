@@ -12,7 +12,8 @@ plan, runner, client, ownership), migration `0059_netbox_projection.sql`, the
 post-apply worker (`crates/chv-controlplane-service/src/netbox_projection_worker.rs`),
 the BFF `/v1/architectures/netbox/*` routes, the UI `NetboxPanel`, and the
 end-to-end evidence in `docs/evidence/netbox-projection-e2e.md`. Issue #239 is
-closed; this document remains the design of record. The full documentation set
+closed by the change that lands this status update; this document remains the
+design of record. The full documentation set
 for #239 (design → ADR → spec → contracts → plan) is:
 
 | Document | Path | Status |

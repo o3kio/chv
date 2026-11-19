@@ -1,7 +1,8 @@
 # Specification: Architecture Designer — NetBox Projection
 
 > **Status:** Implemented (2026-10; status reconciled 2026-11-19) with `docs/design/issue-239-netbox-projection.md` and
-> [ADR-023](../adr/023-netbox-projection.md). Issue: kubedoio/chv#239 (closed).
+> [ADR-023](../adr/023-netbox-projection.md). Issue: kubedoio/chv#239
+> (closed by the change that lands this status update).
 > Test doubles: [ADR-024](../adr/024-netbox-test-doubles-and-demo-gate.md)
 > (issue kubedoio/chv#586).
 > Contracts: [`contracts/netbox-mapping-contract.md`](../architecture-designer/contracts/netbox-mapping-contract.md),
