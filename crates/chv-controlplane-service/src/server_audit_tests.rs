@@ -253,9 +253,12 @@ impl EnrollmentService for EnqueueThenFail {
         audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let audit = audit.expect("the adapter passes the coupling");
-        // Same tx mode as the adopted write paths (#706): the first
-        // statement is a write, so a deferred BEGIN would only move the
-        // lock upgrade to that statement.
+        // The enqueue commits in its own transaction before the failure,
+        // which is all this mock needs: the adapter sees a durable outbox
+        // row and a failed status. `BEGIN IMMEDIATE` is used here because
+        // the row must be durable before the simulated failure; the
+        // production enrollment path (`upsert_bootstrap_result`) still
+        // opens a deferred `begin()`.
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE;")

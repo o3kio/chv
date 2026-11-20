@@ -370,8 +370,11 @@ are never pruned, regardless of age.
   single statements are now wrapped in
   `begin_with("BEGIN IMMEDIATE;")` so the mutation and the outbox INSERT
   commit together. The write lock is held for one extra INSERT; no new
-  lock ordering is introduced. `networks` already held a transaction, so
-  only the INSERT is new there; `vms/import` likewise keeps its existing
+  lock ordering is introduced. `networks/update` and `networks/delete`
+  already held a transaction, so only the INSERT is new there;
+  `networks/create`'s transaction pre-existed but its mode was converted
+  from a deferred `begin()` to `BEGIN IMMEDIATE` in PR 2, so it now takes
+  the write lock at `BEGIN`; `vms/import` likewise keeps its existing
   transaction.
 - **Oversized actor (PR 2, NIT 5):** adopted sites fail closed. A payload
   over the store's 16 KiB bound is not truncated; enqueue fails, the
