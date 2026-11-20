@@ -323,13 +323,16 @@ are never pruned, regardless of age.
   acknowledgements gain a transaction around the mutation statement plus
   the outbox INSERT on the adopted path. The transaction never spans the
   convergence event append or the operation-status update.
-- **Lock scope (PR 3c):** `set_scheduling_paused`, `set_drain_intent`,
-  and `set_state_preserving_policy` take an optional outbox row. With a
-  row they wrap the single intent statement plus the outbox INSERT in
-  `begin_with("BEGIN IMMEDIATE;")`; without one they keep the original
-  autocommit statement byte-for-byte. The lock is held for one extra
-  INSERT and never across the operation-status update or any transport
-  work.
+- **Lock scope (PR 3c):** `set_scheduling_paused` and `set_drain_intent`
+  take an optional outbox row. `set_state_preserving_policy` already took
+  one in PR 3b (it also serves `ApplyNodeDesiredState`); PR 3c changed
+  only that adopted branch's transaction mode, from a deferred `begin()`
+  to `BEGIN IMMEDIATE`, so the reconcile RPC gets the same mode. With a
+  row these methods wrap the single intent statement plus the outbox
+  INSERT in `begin_with("BEGIN IMMEDIATE;")`; without one they keep the
+  original autocommit statement byte-for-byte. The lock is held for one
+  extra INSERT and never across the operation-status update or any
+  transport work.
 - **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
   service (VM power, volumes, networks, migrate, overlay, ARP, resolve
   inspect) and every unadopted BFF route still insert after the handler

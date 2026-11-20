@@ -257,15 +257,16 @@ returns. If the insert fails:
 **Adopted gRPC RPCs.** The three enrollment RPCs, the five reconcile
 RPCs, and the five node-lifecycle transitions commit their evidence row
 with the mutation's transaction (see the transactional-outbox section),
-so the post-hoc insert above is skipped on success. The failure modes are narrower but not gone: an enqueue
-failure fails the mutation transaction (the adapter then records the
-failed request once on the direct path), and a crash before the coupled
-transaction commits is not covered for any earlier writes the RPC makes.
-The `EnrollNode` token caveat stands — the token is consumed in an
-earlier commit, so a rolled-back enrollment still burns it and the
-operator must issue a new one. The reconcile residual is smaller: only
-the convergence-event append (and, for `AcknowledgeDesiredStateVersion`,
-the operation-status update) follows the coupled write.
+so the post-hoc insert above is skipped on success. The failure modes
+are narrower but not gone: an enqueue failure fails the mutation
+transaction (the adapter then records the failed request once on the
+direct path), and a crash before the coupled transaction commits is not
+covered for any earlier writes the RPC makes. The `EnrollNode` token
+caveat stands — the token is consumed in an earlier commit, so a
+rolled-back enrollment still burns it and the operator must issue a new
+one. The reconcile residual is smaller: only the convergence-event
+append (and, for `AcknowledgeDesiredStateVersion`, the operation-status
+update) follows the coupled write.
 
 Residual risk: the mutation has already happened when the insert is
 attempted. A 500 `AUDIT_LOG_WRITE_FAILED` therefore does not roll the
@@ -531,9 +532,10 @@ statements in a transaction extends the SQLite write lock by one INSERT
 ordering. Those transactions, and `networks/create`, use
 `BEGIN IMMEDIATE` — the repo's write-serializing discipline — because
 their first statement is a write; a deferred `BEGIN` would only defer
-the same lock and risk a `SQLITE_BUSY` at the outbox INSERT instead of
-at `BEGIN`. `networks/update`, `networks/delete`, and `vms/import`
-already held a transaction, so only the extra INSERT is new there.
+the same lock and risk a `SQLITE_BUSY` at that first write statement
+(the mutation) instead of at `BEGIN`. `networks/update`,
+`networks/delete`, and `vms/import` already held a transaction, so only
+the extra INSERT is new there.
 
 On gRPC the adopted store methods take an optional outbox row and open a
 transaction only when one is present (otherwise they keep the original
@@ -550,10 +552,15 @@ the outbox INSERT on the adopted path. For the PR 3c node transitions
 `set_scheduling_paused`, `set_drain_intent`, and
 `set_state_preserving_policy` wrap the single intent statement plus the
 outbox INSERT in `BEGIN IMMEDIATE` when a row is present (the `None`
-branch keeps the original autocommit statement). Every transaction is
-held for the store call only — never across certificate minting, the
-convergence event append, the operation-status update, or transport work
-— so no new lock ordering is introduced.
+branch keeps the original autocommit statement). Because
+`set_state_preserving_policy` is shared with `ApplyNodeDesiredState`
+(PR 3b), that adopted branch's move from a deferred `begin()` to
+`BEGIN IMMEDIATE` applies to that reconcile RPC too: it stays a
+single-statement mutation in one transaction under WAL with the 5s
+`busy_timeout`, with identical atomicity and no lock-ordering change.
+Every transaction is held for the store call only — never across
+certificate minting, the convergence event append, the operation-status
+update, or transport work — so no new lock ordering is introduced.
 
 **Actor-field cap (NIT 5 decision).** The store caps the serialized
 payload at 16 KiB; the direct path has no explicit bound on `actor_id` /

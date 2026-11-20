@@ -140,7 +140,7 @@ pub async fn create_user(
     // BEGIN IMMEDIATE (the repo's write-serializing discipline) takes the
     // write lock up front: the first statement here is a write, so a
     // deferred BEGIN would only defer the same lock and risk a busy error
-    // at the outbox INSERT instead.
+    // at that first write statement (the INSERT) instead.
     let mut tx = state
         .pool
         .begin_with("BEGIN IMMEDIATE;")

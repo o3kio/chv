@@ -35,8 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass, intent-failure journal preservation, crash replay, the
   post-commit patch path, oversized-payload rollback) plus store-level
   intent/enqueue atomicity and deferred-FK commit-failure tests; no
-  `SIGKILL` end-to-end test is claimed. See
-  `docs/specs/component/audit-log.md` and
+  `SIGKILL` end-to-end test is claimed. The shared
+  `set_state_preserving_policy` adopted branch also moved from a deferred
+  `begin()` to `BEGIN IMMEDIATE`, so `ApplyNodeDesiredState` (PR 3b) now
+  runs its single-statement mutation plus the outbox INSERT in
+  `BEGIN IMMEDIATE` too — identical atomicity and no lock-ordering
+  change. See `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 - **gRPC reconcile mutations adopt the audit outbox (#706 half 1, PR 3b).**
   The five `ReconcileService` RPCs now commit their audit row with the
@@ -58,13 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence but loses the journal row, and a late journal failure patches
   the already-durable audit row to `failed`. The reconcile surface has
   no read-shaped or agent-fan-out RPC, so all five RPCs are adopted; the
-  rest of the gRPC lifecycle surface stayed post-hoc until PR 3c (above). Verification is deterministic
-  (one dispatched row per adopted RPC with a no-op second pass, stale
-  generation and missing observed-state rollbacks with one direct failed
-  row and no outbox row, crash replay, the post-commit patch path,
-  unadopted shape, oversized-payload rollback) plus a store-level
-  upsert/enqueue atomicity test; no `SIGKILL` end-to-end test is
-  claimed. See `docs/specs/component/audit-log.md` and
+  rest of the gRPC lifecycle surface stayed post-hoc until PR 3c
+  (above). Verification is deterministic (one dispatched row per adopted
+  RPC with a no-op second pass, stale generation and missing
+  observed-state rollbacks with one direct failed row and no outbox row,
+  crash replay, the post-commit patch path, unadopted shape,
+  oversized-payload rollback) plus a store-level upsert/enqueue atomicity
+  test; no `SIGKILL` end-to-end test is claimed. See
+  `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 - **gRPC enrollment mutations adopt the audit outbox (#706 half 1, PR 3a).**
   `EnrollNode`, `RotateNodeCertificate`, and `ReportBootstrapResult` now
