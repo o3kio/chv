@@ -254,10 +254,10 @@ returns. If the insert fails:
   re-enroll. This is the deliberate fail-closed tradeoff, not automatic
   recovery.
 
-**Adopted gRPC RPCs.** The three enrollment RPCs and the five reconcile
-RPCs commit their evidence row with the mutation's transaction (see the
-transactional-outbox section), so the post-hoc insert above is skipped
-on success. The failure modes are narrower but not gone: an enqueue
+**Adopted gRPC RPCs.** The three enrollment RPCs, the five reconcile
+RPCs, and the five node-lifecycle transitions commit their evidence row
+with the mutation's transaction (see the transactional-outbox section),
+so the post-hoc insert above is skipped on success. The failure modes are narrower but not gone: an enqueue
 failure fails the mutation transaction (the adapter then records the
 failed request once on the direct path), and a crash before the coupled
 transaction commits is not covered for any earlier writes the RPC makes.
@@ -316,15 +316,72 @@ transaction:
 | `ApplyNetworkDesiredState` | `ApplyNetworkDesiredState` | as above, including the exposure rows; a `Deleting` tombstone or stale generation rolls everything back |
 | `AcknowledgeDesiredStateVersion` | `AcknowledgeDesiredStateVersion` | the observed-state acknowledgement and the outbox row are one transaction (the single mutation statement plus the outbox INSERT on the adopted path); a missing observed-state row enqueues neither |
 
+**Adopted in PR 3c (gRPC lifecycle — node transitions).** Same adapter
+shape, but the coupling is **intent-anchored**: the privileged state
+change and its outbox row share one commit, and nothing else is folded
+in. The operation row and its `OperationStarted` event are earlier,
+separate commits (residual below).
+
+| RPC | Action | Coupled intent write |
+|---|---|---|
+| `PauseNodeScheduling` | `PauseNodeScheduling` | `set_scheduling_paused` (`scheduling_paused = true`) and the outbox row are one transaction |
+| `ResumeNodeScheduling` | `ResumeNodeScheduling` | `set_scheduling_paused` (`scheduling_paused = false`) and the outbox row are one transaction |
+| `DrainNode` | `DrainNode` | `set_drain_intent` (upsert `desired_state = Draining`) and the outbox row are one transaction |
+| `EnterMaintenance` | `EnterMaintenance` | `set_state_preserving_policy` (upsert `desired_state = Maintenance` plus `state_reason`) and the outbox row are one transaction |
+| `ExitMaintenance` | `ExitMaintenance` | `set_state_preserving_policy` (upsert `desired_state = TenantReady`) and the outbox row are one transaction |
+
+Journal-anchoring these five (putting the outbox row in the operation
+INSERT) was **rejected** for this slice: that row commits before the
+intent, so a crash in between would leave a `success` audit row for a
+scheduling change that never happened — false evidence, which is worse
+for incident response than missing evidence. The cost of the chosen
+shape is that the operation journal is not covered by the same commit;
+see the residual paragraph below. An intent failure (for pause/resume, a
+missing `node_desired_state` row) still runs the existing `Failed`
+operation journal and `OperationFailed` event and writes exactly one
+direct failed audit row; no outbox row exists because the intent
+transaction rolled back.
+
+**Residual window (lifecycle node transitions, PR 3c).** The coupled
+unit is exactly one statement pair: the intent write plus the outbox
+INSERT. Everything else in these five handlers is outside it, by design:
+
+- The `operations` INSERT and the `OperationStarted` event are **earlier,
+  separate commits**. A crash between them and the intent commit leaves
+  **no state change and no audit row** — the pre-existing window,
+  unchanged by this PR, not a covered case.
+- A crash after the intent + outbox commit but before the operation's
+  `Accepted` status update leaves the **applied state plus a `success`
+  audit row** (the commit-time prediction) and a possibly **stale
+  operation status** (`Pending`, which neither the dispatcher nor the
+  reaper claims today). The audit evidence is correct; the journal is
+  incomplete.
+- An **intent failure** keeps the existing `Failed` operation journal and
+  `OperationFailed` event and produces **exactly one direct failed audit
+  row**; the intent transaction (including the enqueue) rolled back, so
+  no outbox row exists.
+- A **non-crash failure of the later `Accepted` status update** returns an
+  error and patches the already-committed row to `failed`/500; the state
+  change and its evidence stay (evidence is not retracted).
+- Adoption is **per-RPC**. The other lifecycle RPCs (including `StartVm`)
+  remain post-hoc with their original crash window. This PR makes **no
+  claim that the lifecycle surface is globally closed**; the remaining
+  groups are follow-up slices under #706.
+
 **Not adopted (still post-hoc).** Every other audited route — notably
-the whole gRPC `LifecycleService` surface (agent-ack fan-out and
-filesystem work inside the handlers), the `Unimplemented` shims,
-`vm.delete`, `volume.delete`, snapshot/clone/restore mutations, anything
-that performs filesystem or agent RPC work inside the handler, and the
+the rest of the gRPC `LifecycleService` surface (agent-ack fan-out and
+filesystem work inside the handlers) including `StartVm`, `StopVm`,
+`RebootVm`, `DeleteVm`, `ResizeVm`, `PauseVm`, `ResumeVm`,
+`PowerButtonVm`, the volume attach/resize/snapshot/clone RPCs, the
+network lifecycle RPCs, `MigrateVm`, `UpdateOverlay`,
+`SendGratuitousArp`, `ResolveInspectRequiredOperation`, the
+`Unimplemented` shims, `vm.delete`, `volume.delete`, anything that
+performs filesystem or agent RPC work inside the handler, and the
 guest-agent browser routes. They keep today's direct insert and its
 narrow crash window. Denied and failed requests also stay post-hoc:
 there is no state change to lose. The reconcile surface has no
-read-shaped or agent-fan-out RPC, so all five of its RPCs are adopted.
+read-shaped or agent-fan-out RPC, so all five of its RPCs are adopted;
+the lifecycle surface is adopted per-RPC, not as a whole.
 
 **Check-or-insert (HTTP).** For every classified HTTP mutation the
 middleware mints (server-side, UUIDv4, never read from a request header
@@ -347,7 +404,8 @@ checks the outbox by primary key:
   to the direct insert.
 
 **Check-or-insert (gRPC).** The adopted gRPC RPCs (the three enrollment
-RPCs and the five reconcile RPCs) use the same composition in
+RPCs, the five reconcile RPCs, and the five node-lifecycle transitions)
+use the same composition in
 `finish_audited`: the adapter mints an `outbox_id`/`audit_id` pair
 (UUIDv4, never from the wire), hands the `AuditOutboxInsert` to the
 service, and after the RPC returns:
@@ -454,6 +512,16 @@ The contract adoption relies on:
   - `AcknowledgeDesiredStateVersion` couples the observed-state
     acknowledgement; the operation-status update and the convergence
     event that follow are separate commits with the same residual shape.
+  - the five node-lifecycle transitions (`PauseNodeScheduling`,
+    `ResumeNodeScheduling`, `DrainNode`, `EnterMaintenance`,
+    `ExitMaintenance`) couple the **intent** write only. Their operation
+    row and `OperationStarted` event are earlier commits, so a crash
+    between journal and intent leaves no state change and no audit row
+    (the pre-existing window); a crash after the intent commit leaves the
+    applied state and its `success` row with a possibly stale operation
+    status. Coupling the journal instead was rejected: it would record a
+    `success` audit row for a scheduling change a later crash prevented
+    (false evidence), not merely missing evidence.
   - `RotateNodeCertificate`, `ReportBootstrapResult`, and the reconcile
     RPCs have no earlier mutation commit on their adopted path.
 
@@ -478,10 +546,14 @@ path. On the reconcile path
 already opened a transaction, so only the INSERT is new;
 `set_state_preserving_policy` and the four observed-state
 acknowledgements gain a transaction around the mutation statement plus
-the outbox INSERT on the adopted path. Every transaction is held for the
-store call only — never across certificate minting, the convergence
-event append, the operation-status update, or transport work — so no new
-lock ordering is introduced.
+the outbox INSERT on the adopted path. For the PR 3c node transitions
+`set_scheduling_paused`, `set_drain_intent`, and
+`set_state_preserving_policy` wrap the single intent statement plus the
+outbox INSERT in `BEGIN IMMEDIATE` when a row is present (the `None`
+branch keeps the original autocommit statement). Every transaction is
+held for the store call only — never across certificate minting, the
+convergence event append, the operation-status update, or transport work
+— so no new lock ordering is introduced.
 
 **Actor-field cap (NIT 5 decision).** The store caps the serialized
 payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
@@ -540,6 +612,13 @@ ignores the ticket writes one direct row and no outbox row); and both
 check-error branches of the gRPC composition (a committed enqueue whose
 lookup fails must not direct-insert and is replayed from the durable
 row; an uncommitted one falls back to exactly one direct failed row).
+The PR 3c lifecycle slice adds, per adopted RPC, the same one-dispatched-
+row proof (pre-minted `audit_id` reused, second pass a no-op), an intent
+failure (missing `node_desired_state` row: no outbox row, the `Failed`
+operation journal and `OperationFailed` event intact, exactly one direct
+404 row), crash replay, the `EnqueueThenFail` patch path on
+`PauseNodeScheduling`, and an oversized payload that rolls the intent
+back (state unchanged, zero outbox rows).
 The store suite pins the rotation transaction's atomicity directly
 (`test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap`:
 a lost compare-and-swap commits neither the serial nor the outbox row)
@@ -549,7 +628,12 @@ generation commits neither the fragment nor the outbox row, an accepted
 one commits both with the pre-minted ids;
 `test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write`:
 a successful enqueue whose COMMIT fails rolls the desired-state write
-back too).
+back too, and the PR 3c
+`test_set_scheduling_paused_audit_commit_failure_rolls_back_the_intent`:
+the same deferred-FK construction rolls the node scheduling intent back
+with the outbox row, while
+`test_set_scheduling_paused_audit_is_atomic_with_the_intent` pins the
+committed pair and the `NotFound` rollback).
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see

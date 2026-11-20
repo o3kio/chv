@@ -566,7 +566,7 @@ impl NodeRepository {
                 Self::set_state_preserving_policy_on(&mut conn, input).await
             }
             Some(audit) => {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE;").await?;
                 Self::set_state_preserving_policy_on(&mut tx, input).await?;
                 enqueue_adopted_row(&mut tx, audit).await?;
                 tx.commit().await?;
@@ -592,8 +592,35 @@ impl NodeRepository {
         Ok(())
     }
 
+    /// Pause or resume a node's scheduling.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the patch and the outbox enqueue share one transaction,
+    /// so the evidence commits with the scheduling change or not at all.
+    /// Every other caller passes `None` and keeps the original autocommit
+    /// statement.
     pub async fn set_scheduling_paused(
         &self,
+        input: &NodeSchedulingPatchInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::set_scheduling_paused_on(&mut conn, input).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE;").await?;
+                Self::set_scheduling_paused_on(&mut tx, input).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn set_scheduling_paused_on(
+        conn: &mut sqlx::SqliteConnection,
         input: &NodeSchedulingPatchInput,
     ) -> Result<(), StoreError> {
         let result = sqlx::query(PATCH_NODE_SCHEDULING_SQL)
@@ -603,7 +630,7 @@ impl NodeRepository {
             .bind(&input.updated_by)
             .bind(input.scheduling_paused)
             .bind(input.requested_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
 
         if result.rows_affected() == 0 {
@@ -616,7 +643,35 @@ impl NodeRepository {
         Ok(())
     }
 
-    pub async fn set_drain_intent(&self, input: &NodeDrainIntentInput) -> Result<(), StoreError> {
+    /// Record a node's drain intent.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the patch and the outbox enqueue share one transaction,
+    /// so the evidence commits with the drain intent or not at all.
+    pub async fn set_drain_intent(
+        &self,
+        input: &NodeDrainIntentInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::set_drain_intent_on(&mut conn, input).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE;").await?;
+                Self::set_drain_intent_on(&mut tx, input).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn set_drain_intent_on(
+        conn: &mut sqlx::SqliteConnection,
+        input: &NodeDrainIntentInput,
+    ) -> Result<(), StoreError> {
         sqlx::query(PATCH_NODE_DRAIN_INTENT_SQL)
             .bind(input.node_id.as_str())
             .bind(generation_to_i64(input.desired_generation)?)
@@ -624,7 +679,7 @@ impl NodeRepository {
             .bind(&input.updated_by)
             .bind(input.allow_workload_stop)
             .bind(input.requested_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         Ok(())
     }

@@ -487,6 +487,51 @@ macro_rules! audited_lifecycle_call {
     };
 }
 
+/// Same peer-pinned shape as [`audited_lifecycle_call`], but for a
+/// lifecycle RPC whose service enqueues the audit row inside its intent
+/// transaction (#706 PR 3c).
+///
+/// The adapter mints the ticket, hands the coupling to the service, and
+/// then runs the same check-or-insert as every other adopted path.
+macro_rules! audited_adopted_lifecycle_call {
+    ($self:ident, $request:ident, $action:literal, $span:literal, $method:ident, $kind:expr, $resource_id:expr) => {{
+        let context = GrpcAuditContext::new(
+            &$request,
+            $action,
+            LIFECYCLE_SERVICE_PATH,
+            $kind,
+            $resource_id,
+            None,
+        );
+        // #706: mint this request's audit ticket before the call so the
+        // service can commit its outbox row with the intent write.
+        let ticket = $self.audit.as_ref().map(|_| GrpcAuditTicket::mint());
+        let outbox_insert = ticket.as_ref().map(|ticket| ticket.outbox_insert(&context));
+        let coupling = adopted_coupling(ticket.as_ref(), outbox_insert.as_ref());
+        let op_id = extract_op_id(&$request).unwrap_or_default();
+        let result = async {
+            enforce_peer_node_id(&$request, &$request.get_ref().node_id, $span)?;
+            let _span = tracing::info_span!($span, %op_id);
+            let resp = $self
+                .service
+                .$method($request.into_inner(), coupling.as_ref())
+                .instrument(_span)
+                .await
+                .map_err(tonic::Status::from)?;
+            Ok(Response::new(resp))
+        }
+        .await;
+        finish_audited(
+            $self.audit.as_ref(),
+            &context,
+            ticket.as_ref(),
+            coupling.as_ref(),
+            result,
+        )
+        .await
+    }};
+}
+
 /// Same peer-pinned shape as [`audited_service_call`], but for a reconcile
 /// RPC whose service enqueues the audit row inside its desired-state
 /// transaction (#706 PR 3b).
@@ -1387,7 +1432,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::PauseNodeSchedulingRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "PauseNodeScheduling",
@@ -1402,7 +1447,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::ResumeNodeSchedulingRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "ResumeNodeScheduling",
@@ -1417,7 +1462,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::DrainNodeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "DrainNode",
@@ -1432,7 +1477,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::EnterMaintenanceRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "EnterMaintenance",
@@ -1447,7 +1492,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::ExitMaintenanceRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "ExitMaintenance",

@@ -958,8 +958,218 @@ async fn test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write(
     assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
 }
 
-// ── #384: transactional clone target materialization ──────────────────────
-//
+/// #706 PR 3c: a node scheduling transition and its audit-outbox row are
+/// one commit. The `None` branch keeps the original autocommit statement;
+/// the `Some` branch enqueues the pre-minted row last, inside the same
+/// transaction as the intent update.
+#[tokio::test]
+async fn test_set_scheduling_paused_audit_is_atomic_with_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-sched-atomic").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 1, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let input = NodeSchedulingPatchInput {
+        node_id: node_id.clone(),
+        desired_generation: Generation::new(2),
+        scheduling_paused: true,
+        requested_by: Some("test".into()),
+        updated_by: None,
+        requested_unix_ms: 1_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-sched-atomic".into(),
+        audit_id: "audit-ob-sched-atomic".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-sched-atomic".into(),
+            actor_username: "node-sched-atomic".into(),
+            actor_role: "node".into(),
+            action: "PauseNodeScheduling".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/PauseNodeScheduling".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-sched-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    repo.set_scheduling_paused(&input, Some(&insert))
+        .await
+        .expect("the adopted scheduling write commits");
+
+    let (paused,): (i64,) = sqlx::query_as(
+        "SELECT scheduling_paused FROM node_desired_state WHERE node_id = 'node-sched-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paused, 1, "the intent committed");
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-sched-atomic");
+    assert_eq!(audit_id, "audit-ob-sched-atomic");
+
+    // A missing desired-state row is the store's in-tx rejection: neither
+    // the (never applied) patch nor an outbox row may commit.
+    let missing = NodeSchedulingPatchInput {
+        node_id: NodeId::new("node-sched-missing").unwrap(),
+        ..input.clone()
+    };
+    let rejected = repo
+        .set_scheduling_paused(
+            &missing,
+            Some(&AuditOutboxInsert {
+                outbox_id: "ob-sched-missing".into(),
+                audit_id: "audit-ob-sched-missing".into(),
+                ..insert
+            }),
+        )
+        .await;
+    assert!(matches!(rejected, Err(StoreError::NotFound { .. })));
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox_rows, 1,
+        "a rejected intent enqueues nothing (only the accepted row remains)"
+    );
+}
+
+/// #706 PR 3c: an enqueue that succeeds but whose **commit** fails must
+/// roll the intent write back too (the same deferred-FK construction as
+/// the reconcile and BFF atomicity tests).
+#[tokio::test]
+async fn test_set_scheduling_paused_audit_commit_failure_rolls_back_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-sched-commit-fail").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 5, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let input = NodeSchedulingPatchInput {
+        node_id: node_id.clone(),
+        desired_generation: Generation::new(6),
+        scheduling_paused: true,
+        requested_by: Some("test".into()),
+        updated_by: None,
+        requested_unix_ms: 2_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-sched-commit-fail".into(),
+        audit_id: "audit-ob-sched-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-sched-commit-fail".into(),
+            actor_username: "node-sched-commit-fail".into(),
+            actor_role: "node".into(),
+            action: "PauseNodeScheduling".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/PauseNodeScheduling".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-sched-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    let error = repo
+        .set_scheduling_paused(&input, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    let (paused, generation): (i64, i64) = sqlx::query_as(
+        "SELECT scheduling_paused, desired_generation FROM node_desired_state \
+         WHERE node_id = 'node-sched-commit-fail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paused, 0, "the intent must roll back with the evidence");
+    assert_eq!(generation, 5, "the intent must roll back with the evidence");
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
+}
+
+// ── #384: transactional clone target materialization ──────────────────────//
 // `materialize_clone_target` is the clone path's store core: ONE
 // `BEGIN IMMEDIATE` transaction that reads the source row (under the
 // write lock, so a racing resize cannot split the read from the target
