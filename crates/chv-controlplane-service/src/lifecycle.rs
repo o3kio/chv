@@ -746,25 +746,28 @@ impl LifecycleService for LifecycleServiceImplementation {
 
         self.persist_intent_and_accept(&operation_id, || async {
             self.desired_state_repo
-                .upsert_vm(&VmDesiredStateInput {
-                    vm_id: vm_id.clone(),
-                    node_id: Some(node_id.clone()),
-                    display_name: vm_id.as_str().into(),
-                    tenant_id: None,
-                    placement_policy: None,
-                    desired_generation,
-                    desired_status: None,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    target_node_id: Some(node_id.clone()),
-                    cpu_count: spec.cpu_count,
-                    memory_bytes: spec.memory_bytes,
-                    image_ref: spec.image_ref,
-                    boot_mode: spec.boot_mode,
-                    desired_power_state: Some("Created".into()),
-                    vsock_enabled: None,
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .upsert_vm(
+                    &VmDesiredStateInput {
+                        vm_id: vm_id.clone(),
+                        node_id: Some(node_id.clone()),
+                        display_name: vm_id.as_str().into(),
+                        tenant_id: None,
+                        placement_policy: None,
+                        desired_generation,
+                        desired_status: None,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        target_node_id: Some(node_id.clone()),
+                        cpu_count: spec.cpu_count,
+                        memory_bytes: spec.memory_bytes,
+                        image_ref: spec.image_ref,
+                        boot_mode: spec.boot_mode,
+                        desired_power_state: Some("Created".into()),
+                        vsock_enabled: None,
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    None,
+                )
                 .await
         })
         .await?;
@@ -1535,15 +1538,18 @@ impl LifecycleService for LifecycleServiceImplementation {
 
         self.persist_intent_and_accept(&operation_id, || async {
             self.node_repo
-                .set_state_preserving_policy(&NodeStatePatchInput {
-                    node_id: node_id.clone(),
-                    desired_state: NodeState::Maintenance,
-                    desired_generation,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    state_reason: Some(request.reason),
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_state_preserving_policy(
+                    &NodeStatePatchInput {
+                        node_id: node_id.clone(),
+                        desired_state: NodeState::Maintenance,
+                        desired_generation,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        state_reason: Some(request.reason),
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    None,
+                )
                 .await
         })
         .await?;
@@ -1572,15 +1578,18 @@ impl LifecycleService for LifecycleServiceImplementation {
 
         self.persist_intent_and_accept(&operation_id, || async {
             self.node_repo
-                .set_state_preserving_policy(&NodeStatePatchInput {
-                    node_id: node_id.clone(),
-                    desired_state: NodeState::TenantReady,
-                    desired_generation,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    state_reason: None,
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_state_preserving_policy(
+                    &NodeStatePatchInput {
+                        node_id: node_id.clone(),
+                        desired_state: NodeState::TenantReady,
+                        desired_generation,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        state_reason: None,
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    None,
+                )
                 .await
         })
         .await?;

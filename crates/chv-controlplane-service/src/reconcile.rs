@@ -1,3 +1,4 @@
+use crate::enrollment::AdoptedAudit;
 use crate::error::ControlPlaneServiceError;
 use async_trait::async_trait;
 use chv_controlplane_store::{
@@ -17,29 +18,51 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[async_trait]
 pub trait ReconcileService: Send + Sync {
+    /// Persist a node desired-state fragment.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the implementation enqueues it inside the desired-state
+    /// write's transaction, so the evidence commits with the fragment
+    /// or not at all. The convergence event appended afterwards is a
+    /// separate commit (see the residual window documented in
+    /// `docs/specs/component/audit-log.md`).
     async fn apply_node_desired_state(
         &self,
         request: proto::ApplyNodeDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::apply_node_desired_state`].
     async fn apply_vm_desired_state(
         &self,
         request: proto::ApplyVmDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::apply_node_desired_state`].
     async fn apply_volume_desired_state(
         &self,
         request: proto::ApplyVolumeDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::apply_node_desired_state`].
     async fn apply_network_desired_state(
         &self,
         request: proto::ApplyNetworkDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// Acknowledge an observed desired-state generation.
+    ///
+    /// `audit` follows [`Self::apply_node_desired_state`]: the row is
+    /// enqueued with the observed-state acknowledgement. The operation
+    /// status update and convergence event that follow are separate
+    /// commits.
     async fn acknowledge_desired_state_version(
         &self,
         request: proto::AcknowledgeDesiredStateVersionRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 }
 
@@ -199,6 +222,7 @@ impl ReconcileService for ReconcileServiceImplementation {
     async fn apply_node_desired_state(
         &self,
         request: proto::ApplyNodeDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = NodeId::new(request.node_id).map_err(|e| {
@@ -233,19 +257,22 @@ impl ReconcileService for ReconcileServiceImplementation {
 
         if let Err(e) = self
             .node_repo
-            .set_state_preserving_policy(&NodeStatePatchInput {
-                node_id: node_id.clone(),
-                desired_state,
-                desired_generation: generation,
-                requested_by: Self::normalize_requested_by(&meta),
-                updated_by: if fragment.updated_by.is_empty() {
-                    None
-                } else {
-                    Some(fragment.updated_by)
+            .set_state_preserving_policy(
+                &NodeStatePatchInput {
+                    node_id: node_id.clone(),
+                    desired_state,
+                    desired_generation: generation,
+                    requested_by: Self::normalize_requested_by(&meta),
+                    updated_by: if fragment.updated_by.is_empty() {
+                        None
+                    } else {
+                        Some(fragment.updated_by)
+                    },
+                    state_reason: spec.state_reason,
+                    requested_unix_ms: now,
                 },
-                state_reason: spec.state_reason,
-                requested_unix_ms: now,
-            })
+                audit.map(AdoptedAudit::insert),
+            )
             .await
         {
             let op_id = Self::parse_operation_id(&meta)?;
@@ -271,6 +298,12 @@ impl ReconcileService for ReconcileServiceImplementation {
             return Err(ControlPlaneServiceError::Internal(format!(
                 "persistence error: {e}"
             )));
+        }
+        // The desired-state write (and, when adopted, its audit row)
+        // committed. Everything after this point — the convergence event
+        // append — is a separate commit.
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         let op_id = Self::parse_operation_id(&meta)?;
@@ -309,6 +342,7 @@ impl ReconcileService for ReconcileServiceImplementation {
     async fn apply_vm_desired_state(
         &self,
         request: proto::ApplyVmDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = NodeId::new(request.node_id).map_err(|e| {
@@ -336,29 +370,32 @@ impl ReconcileService for ReconcileServiceImplementation {
 
         if let Err(e) = self
             .desired_state_repo
-            .upsert_vm(&VmDesiredStateInput {
-                vm_id: vm_id.clone(),
-                node_id: Some(node_id.clone()),
-                display_name: fragment.id.clone(),
-                tenant_id: None,
-                placement_policy: None,
-                desired_generation: generation,
-                desired_status: None,
-                requested_by: Self::normalize_requested_by(&meta),
-                updated_by: if fragment.updated_by.is_empty() {
-                    None
-                } else {
-                    Some(fragment.updated_by)
+            .upsert_vm(
+                &VmDesiredStateInput {
+                    vm_id: vm_id.clone(),
+                    node_id: Some(node_id.clone()),
+                    display_name: fragment.id.clone(),
+                    tenant_id: None,
+                    placement_policy: None,
+                    desired_generation: generation,
+                    desired_status: None,
+                    requested_by: Self::normalize_requested_by(&meta),
+                    updated_by: if fragment.updated_by.is_empty() {
+                        None
+                    } else {
+                        Some(fragment.updated_by)
+                    },
+                    target_node_id: Some(node_id.clone()),
+                    cpu_count: spec.cpu_count,
+                    memory_bytes: spec.memory_bytes,
+                    image_ref: spec.image_ref,
+                    boot_mode: spec.boot_mode,
+                    desired_power_state: spec.desired_power_state,
+                    vsock_enabled: None,
+                    requested_unix_ms: now,
                 },
-                target_node_id: Some(node_id.clone()),
-                cpu_count: spec.cpu_count,
-                memory_bytes: spec.memory_bytes,
-                image_ref: spec.image_ref,
-                boot_mode: spec.boot_mode,
-                desired_power_state: spec.desired_power_state,
-                vsock_enabled: None,
-                requested_unix_ms: now,
-            })
+                audit.map(AdoptedAudit::insert),
+            )
             .await
         {
             let op_id = Self::parse_operation_id(&meta)?;
@@ -384,6 +421,9 @@ impl ReconcileService for ReconcileServiceImplementation {
             return Err(ControlPlaneServiceError::Internal(format!(
                 "persistence error: {e}"
             )));
+        }
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         let op_id = Self::parse_operation_id(&meta)?;
@@ -422,6 +462,7 @@ impl ReconcileService for ReconcileServiceImplementation {
     async fn apply_volume_desired_state(
         &self,
         request: proto::ApplyVolumeDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = NodeId::new(request.node_id).map_err(|e| {
@@ -470,34 +511,37 @@ impl ReconcileService for ReconcileServiceImplementation {
 
         if let Err(e) = self
             .desired_state_repo
-            .upsert_volume(&VolumeDesiredStateInput {
-                volume_id: volume_id.clone(),
-                node_id: Some(node_id.clone()),
-                display_name: fragment.id.clone(),
-                capacity_bytes: spec.capacity_bytes,
-                volume_kind: spec.volume_kind,
-                storage_class: spec.storage_class,
-                // Fragments do not carry ownership; NULL here preserves the
-                // owner a BFF creation or clone set (COALESCE in the upsert).
-                owner_id: None,
-                desired_generation: generation,
-                desired_status: None,
-                requested_by: Self::normalize_requested_by(&meta),
-                updated_by: if fragment.updated_by.is_empty() {
-                    None
-                } else {
-                    Some(fragment.updated_by)
+            .upsert_volume(
+                &VolumeDesiredStateInput {
+                    volume_id: volume_id.clone(),
+                    node_id: Some(node_id.clone()),
+                    display_name: fragment.id.clone(),
+                    capacity_bytes: spec.capacity_bytes,
+                    volume_kind: spec.volume_kind,
+                    storage_class: spec.storage_class,
+                    // Fragments do not carry ownership; NULL here preserves the
+                    // owner a BFF creation or clone set (COALESCE in the upsert).
+                    owner_id: None,
+                    desired_generation: generation,
+                    desired_status: None,
+                    requested_by: Self::normalize_requested_by(&meta),
+                    updated_by: if fragment.updated_by.is_empty() {
+                        None
+                    } else {
+                        Some(fragment.updated_by)
+                    },
+                    attached_vm_id,
+                    attachment_mode: spec.attachment_mode,
+                    device_name: spec.device_name,
+                    read_only: spec.read_only,
+                    resize_to_bytes: None,
+                    snapshot_op: spec.snapshot_op,
+                    snapshot_name: spec.snapshot_name,
+                    clone_source_volume_id,
+                    requested_unix_ms: now,
                 },
-                attached_vm_id,
-                attachment_mode: spec.attachment_mode,
-                device_name: spec.device_name,
-                read_only: spec.read_only,
-                resize_to_bytes: None,
-                snapshot_op: spec.snapshot_op,
-                snapshot_name: spec.snapshot_name,
-                clone_source_volume_id,
-                requested_unix_ms: now,
-            })
+                audit.map(AdoptedAudit::insert),
+            )
             .await
         {
             let op_id = Self::parse_operation_id(&meta)?;
@@ -523,6 +567,9 @@ impl ReconcileService for ReconcileServiceImplementation {
             return Err(ControlPlaneServiceError::Internal(format!(
                 "persistence error: {e}"
             )));
+        }
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         let op_id = Self::parse_operation_id(&meta)?;
@@ -561,6 +608,7 @@ impl ReconcileService for ReconcileServiceImplementation {
     async fn apply_network_desired_state(
         &self,
         request: proto::ApplyNetworkDesiredStateRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = NodeId::new(request.node_id).map_err(|e| {
@@ -668,6 +716,7 @@ impl ReconcileService for ReconcileServiceImplementation {
                     requested_unix_ms: now,
                 },
                 &exposures,
+                audit.map(AdoptedAudit::insert),
             )
             .await
         {
@@ -694,6 +743,9 @@ impl ReconcileService for ReconcileServiceImplementation {
             return Err(ControlPlaneServiceError::Internal(format!(
                 "persistence error: {e}"
             )));
+        }
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         let op_id = Self::parse_operation_id(&meta)?;
@@ -732,6 +784,7 @@ impl ReconcileService for ReconcileServiceImplementation {
     async fn acknowledge_desired_state_version(
         &self,
         request: proto::AcknowledgeDesiredStateVersionRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = NodeId::new(request.node_id).map_err(|e| {
@@ -762,24 +815,50 @@ impl ReconcileService for ReconcileServiceImplementation {
         match resource_kind {
             ResourceKind::Node => {
                 self.observed_state_repo
-                    .acknowledge_node_generation(&node_id, observed_generation, now)
+                    .acknowledge_node_generation(
+                        &node_id,
+                        observed_generation,
+                        now,
+                        audit.map(AdoptedAudit::insert),
+                    )
                     .await?;
             }
             ResourceKind::Vm => {
                 self.observed_state_repo
-                    .acknowledge_vm_generation(&resource_id, observed_generation, now)
+                    .acknowledge_vm_generation(
+                        &resource_id,
+                        observed_generation,
+                        now,
+                        audit.map(AdoptedAudit::insert),
+                    )
                     .await?;
             }
             ResourceKind::Volume => {
                 self.observed_state_repo
-                    .acknowledge_volume_generation(&resource_id, observed_generation, now)
+                    .acknowledge_volume_generation(
+                        &resource_id,
+                        observed_generation,
+                        now,
+                        audit.map(AdoptedAudit::insert),
+                    )
                     .await?;
             }
             ResourceKind::Network => {
                 self.observed_state_repo
-                    .acknowledge_network_generation(&resource_id, observed_generation, now)
+                    .acknowledge_network_generation(
+                        &resource_id,
+                        observed_generation,
+                        now,
+                        audit.map(AdoptedAudit::insert),
+                    )
                     .await?;
             }
+        }
+        // The acknowledgement (and, when adopted, its audit row)
+        // committed. The operation-status update and the convergence
+        // event below are separate commits.
+        if let Some(audit) = audit {
+            audit.mark_committed();
         }
 
         if let Some(ref operation_id) = op_id {

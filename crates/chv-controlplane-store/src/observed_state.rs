@@ -1,3 +1,4 @@
+use crate::audit_outbox::{enqueue_adopted_row, AuditOutboxInsert};
 use crate::{StoreError, StorePool};
 use chv_controlplane_types::domain::{Generation, NodeId, NodeState, ResourceId};
 
@@ -274,8 +275,47 @@ impl ObservedStateRepository {
         Ok(())
     }
 
+    /// Record a node's acknowledged desired-state generation.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the acknowledgement and the outbox enqueue share one
+    /// transaction, so a missing observed-state row commits neither.
     pub async fn acknowledge_node_generation(
         &self,
+        node_id: &NodeId,
+        observed_generation: Generation,
+        observed_unix_ms: i64,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::acknowledge_node_generation_on(
+                    &mut conn,
+                    node_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::acknowledge_node_generation_on(
+                    &mut tx,
+                    node_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn acknowledge_node_generation_on(
+        conn: &mut sqlx::SqliteConnection,
         node_id: &NodeId,
         observed_generation: Generation,
         observed_unix_ms: i64,
@@ -284,7 +324,7 @@ impl ObservedStateRepository {
             .bind(node_id.as_str())
             .bind(generation_to_i64(observed_generation)?)
             .bind(observed_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
 
         if result.rows_affected() == 0 {
@@ -371,8 +411,60 @@ impl ObservedStateRepository {
         Ok(())
     }
 
+    fn acknowledge_generation_error(
+        error: sqlx::Error,
+        entity: &'static str,
+        id: &str,
+    ) -> StoreError {
+        match &error {
+            sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
+                StoreError::NotFound {
+                    entity,
+                    id: id.to_string(),
+                }
+            }
+            _ => StoreError::from(error),
+        }
+    }
+
+    /// Record a VM's acknowledged desired-state generation (`audit`
+    /// follows [`Self::acknowledge_node_generation`]).
     pub async fn acknowledge_vm_generation(
         &self,
+        vm_id: &ResourceId,
+        observed_generation: Generation,
+        observed_unix_ms: i64,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::acknowledge_vm_generation_on(
+                    &mut conn,
+                    vm_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::acknowledge_vm_generation_on(
+                    &mut tx,
+                    vm_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn acknowledge_vm_generation_on(
+        conn: &mut sqlx::SqliteConnection,
         vm_id: &ResourceId,
         observed_generation: Generation,
         observed_unix_ms: i64,
@@ -381,17 +473,9 @@ impl ObservedStateRepository {
             .bind(vm_id.as_str())
             .bind(generation_to_i64(observed_generation)?)
             .bind(observed_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
-                    StoreError::NotFound {
-                        entity: "vm",
-                        id: vm_id.to_string(),
-                    }
-                }
-                _ => StoreError::from(e),
-            })?;
+            .map_err(|e| Self::acknowledge_generation_error(e, "vm", vm_id.as_str()))?;
         Ok(())
     }
 
@@ -432,8 +516,44 @@ impl ObservedStateRepository {
         Ok(())
     }
 
+    /// Record a volume's acknowledged desired-state generation (`audit`
+    /// follows [`Self::acknowledge_node_generation`]).
     pub async fn acknowledge_volume_generation(
         &self,
+        volume_id: &ResourceId,
+        observed_generation: Generation,
+        observed_unix_ms: i64,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::acknowledge_volume_generation_on(
+                    &mut conn,
+                    volume_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::acknowledge_volume_generation_on(
+                    &mut tx,
+                    volume_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn acknowledge_volume_generation_on(
+        conn: &mut sqlx::SqliteConnection,
         volume_id: &ResourceId,
         observed_generation: Generation,
         observed_unix_ms: i64,
@@ -442,17 +562,9 @@ impl ObservedStateRepository {
             .bind(volume_id.as_str())
             .bind(generation_to_i64(observed_generation)?)
             .bind(observed_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
-                    StoreError::NotFound {
-                        entity: "volume",
-                        id: volume_id.to_string(),
-                    }
-                }
-                _ => StoreError::from(e),
-            })?;
+            .map_err(|e| Self::acknowledge_generation_error(e, "volume", volume_id.as_str()))?;
         Ok(())
     }
 
@@ -498,8 +610,44 @@ impl ObservedStateRepository {
         Ok(())
     }
 
+    /// Record a network's acknowledged desired-state generation (`audit`
+    /// follows [`Self::acknowledge_node_generation`]).
     pub async fn acknowledge_network_generation(
         &self,
+        network_id: &ResourceId,
+        observed_generation: Generation,
+        observed_unix_ms: i64,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::acknowledge_network_generation_on(
+                    &mut conn,
+                    network_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::acknowledge_network_generation_on(
+                    &mut tx,
+                    network_id,
+                    observed_generation,
+                    observed_unix_ms,
+                )
+                .await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn acknowledge_network_generation_on(
+        conn: &mut sqlx::SqliteConnection,
         network_id: &ResourceId,
         observed_generation: Generation,
         observed_unix_ms: i64,
@@ -508,17 +656,9 @@ impl ObservedStateRepository {
             .bind(network_id.as_str())
             .bind(generation_to_i64(observed_generation)?)
             .bind(observed_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
-                    StoreError::NotFound {
-                        entity: "network",
-                        id: network_id.to_string(),
-                    }
-                }
-                _ => StoreError::from(e),
-            })?;
+            .map_err(|e| Self::acknowledge_generation_error(e, "network", network_id.as_str()))?;
         Ok(())
     }
 }

@@ -102,25 +102,28 @@ impl TestCluster {
 
         // Create VM record
         self.desired_state_repo
-            .upsert_vm(&VmDesiredStateInput {
-                vm_id: ResourceId::new(vm_id).unwrap(),
-                node_id: Some(NodeId::new(node_id).unwrap()),
-                display_name: format!("Test VM {vm_id}"),
-                tenant_id: None,
-                placement_policy: None,
-                desired_generation: Generation::new(1),
-                desired_status: Some("running".to_string()),
-                requested_by: Some("test".to_string()),
-                updated_by: Some("test".to_string()),
-                target_node_id: Some(NodeId::new(node_id).unwrap()),
-                cpu_count: Some(2),
-                memory_bytes: Some(memory_bytes),
-                image_ref: Some("test-image:latest".to_string()),
-                boot_mode: None,
-                desired_power_state: Some("Running".to_string()),
-                vsock_enabled: None,
-                requested_unix_ms: 1000,
-            })
+            .upsert_vm(
+                &VmDesiredStateInput {
+                    vm_id: ResourceId::new(vm_id).unwrap(),
+                    node_id: Some(NodeId::new(node_id).unwrap()),
+                    display_name: format!("Test VM {vm_id}"),
+                    tenant_id: None,
+                    placement_policy: None,
+                    desired_generation: Generation::new(1),
+                    desired_status: Some("running".to_string()),
+                    requested_by: Some("test".to_string()),
+                    updated_by: Some("test".to_string()),
+                    target_node_id: Some(NodeId::new(node_id).unwrap()),
+                    cpu_count: Some(2),
+                    memory_bytes: Some(memory_bytes),
+                    image_ref: Some("test-image:latest".to_string()),
+                    boot_mode: None,
+                    desired_power_state: Some("Running".to_string()),
+                    vsock_enabled: None,
+                    requested_unix_ms: 1000,
+                },
+                None,
+            )
             .await
             .expect("failed to create VM desired state");
 

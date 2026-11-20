@@ -70,25 +70,28 @@ impl Fixture {
         // The observed-state row has FKs into vms (desired) and nodes;
         // create both parents first, exactly like the real report path.
         chv_controlplane_store::DesiredStateRepository::new(ops_db.pool.clone())
-            .upsert_vm(&chv_controlplane_store::VmDesiredStateInput {
-                vm_id: vm_id.clone(),
-                node_id: Some(node_id.clone()),
-                display_name: "ingest-test-vm".to_string(),
-                tenant_id: None,
-                placement_policy: None,
-                desired_generation: Generation::new(1),
-                desired_status: None,
-                requested_by: None,
-                updated_by: None,
-                target_node_id: None,
-                cpu_count: None,
-                memory_bytes: None,
-                image_ref: None,
-                boot_mode: None,
-                desired_power_state: None,
-                vsock_enabled: None,
-                requested_unix_ms: 0,
-            })
+            .upsert_vm(
+                &chv_controlplane_store::VmDesiredStateInput {
+                    vm_id: vm_id.clone(),
+                    node_id: Some(node_id.clone()),
+                    display_name: "ingest-test-vm".to_string(),
+                    tenant_id: None,
+                    placement_policy: None,
+                    desired_generation: Generation::new(1),
+                    desired_status: None,
+                    requested_by: None,
+                    updated_by: None,
+                    target_node_id: None,
+                    cpu_count: None,
+                    memory_bytes: None,
+                    image_ref: None,
+                    boot_mode: None,
+                    desired_power_state: None,
+                    vsock_enabled: None,
+                    requested_unix_ms: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
         observed_state_repo

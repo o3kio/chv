@@ -558,7 +558,7 @@ async fn test_ack_node_generation_preserves_observed_state() {
     .await
     .unwrap();
 
-    repo.acknowledge_node_generation(&node_id, Generation::new(5), 2000)
+    repo.acknowledge_node_generation(&node_id, Generation::new(5), 2000, None)
         .await
         .expect("ack should succeed when observed row exists");
 
@@ -599,7 +599,7 @@ async fn test_ack_node_generation_rejects_missing_observed_row() {
     .unwrap();
 
     let result = repo
-        .acknowledge_node_generation(&node_id, Generation::new(5), 2000)
+        .acknowledge_node_generation(&node_id, Generation::new(5), 2000, None)
         .await;
 
     match result {
@@ -649,13 +649,13 @@ async fn test_upsert_vm_rejects_stale_generation() {
         requested_unix_ms: 1000,
     };
 
-    repo.upsert_vm(&input).await.unwrap();
+    repo.upsert_vm(&input, None).await.unwrap();
 
     let mut stale_input = input.clone();
     stale_input.desired_generation = Generation::new(3);
     stale_input.requested_unix_ms = 2000;
 
-    match repo.upsert_vm(&stale_input).await {
+    match repo.upsert_vm(&stale_input, None).await {
         Err(StoreError::StaleGeneration {
             entity,
             id,
@@ -695,13 +695,13 @@ async fn test_upsert_vm_accepts_newer_generation() {
         requested_unix_ms: 1000,
     };
 
-    repo.upsert_vm(&input).await.unwrap();
+    repo.upsert_vm(&input, None).await.unwrap();
 
     let mut newer_input = input.clone();
     newer_input.desired_generation = Generation::new(5);
     newer_input.requested_unix_ms = 2000;
 
-    repo.upsert_vm(&newer_input).await.unwrap();
+    repo.upsert_vm(&newer_input, None).await.unwrap();
 
     let gen: i64 = sqlx::query_scalar(
         "SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-gen-newer'",
@@ -738,8 +738,224 @@ async fn test_upsert_vm_accepts_same_generation_idempotent() {
         requested_unix_ms: 1000,
     };
 
-    repo.upsert_vm(&input).await.unwrap();
-    repo.upsert_vm(&input).await.unwrap();
+    repo.upsert_vm(&input, None).await.unwrap();
+    repo.upsert_vm(&input, None).await.unwrap();
+}
+
+/// #706 PR 3b: the reconcile desired-state upsert and its audit-outbox row
+/// are one commit. A stale-generation refusal (the store's only in-tx
+/// rejection on this path) commits neither; a successful upsert commits
+/// both with the pre-minted ids.
+#[tokio::test]
+async fn test_upsert_vm_audit_is_atomic_with_the_desired_state_write() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = DesiredStateRepository::new(pool.clone());
+
+    let input = VmDesiredStateInput {
+        vm_id: ResourceId::new("vm-audit-atomic").unwrap(),
+        node_id: None,
+        display_name: "audit-atomic".to_string(),
+        tenant_id: None,
+        placement_policy: None,
+        desired_generation: Generation::new(5),
+        desired_status: Some("Running".to_string()),
+        requested_by: Some("test".to_string()),
+        updated_by: Some("test".to_string()),
+        target_node_id: None,
+        cpu_count: Some(2),
+        memory_bytes: Some(1024),
+        image_ref: Some("img".to_string()),
+        boot_mode: None,
+        desired_power_state: Some("on".to_string()),
+        vsock_enabled: None,
+        requested_unix_ms: 1000,
+    };
+    repo.upsert_vm(&input, None).await.unwrap();
+
+    let audit_insert = |outbox_id: &str| AuditOutboxInsert {
+        outbox_id: outbox_id.into(),
+        audit_id: format!("audit-{outbox_id}"),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "ApplyVmDesiredState".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.ReconcileService/ApplyVmDesiredState".into(),
+            resource_kind: Some("vm".into()),
+            resource_id: Some("vm-audit-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    // A stale write rolls the fragment back *and* enqueues nothing.
+    let stale = audit_insert("ob-reconcile-stale");
+    let mut stale_input = input.clone();
+    stale_input.desired_generation = Generation::new(3);
+    stale_input.requested_unix_ms = 2000;
+    assert!(matches!(
+        repo.upsert_vm(&stale_input, Some(&stale)).await,
+        Err(StoreError::StaleGeneration { .. })
+    ));
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-audit-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(generation, 5, "the stale fragment must not commit");
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "a rolled-back write enqueues nothing");
+
+    // A successful write commits both, reusing the pre-minted ids.
+    let accepted = audit_insert("ob-reconcile-accepted");
+    let mut accepted_input = input.clone();
+    accepted_input.desired_generation = Generation::new(6);
+    accepted_input.requested_unix_ms = 3000;
+    repo.upsert_vm(&accepted_input, Some(&accepted))
+        .await
+        .unwrap();
+
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-audit-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(generation, 6);
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-reconcile-accepted");
+    assert_eq!(audit_id, "audit-ob-reconcile-accepted");
+}
+
+/// #706 PR 3b: an enqueue that succeeds but whose **commit** fails must
+/// roll the desired-state mutation back too.
+///
+/// The trigger below writes a child row with a deferred foreign key that
+/// has no parent, so SQLite accepts the outbox INSERT and rejects the
+/// COMMIT. The generation assertion is the discriminator: if the enqueue
+/// were decoupled (a pool/autocommit statement after `tx.commit()`), the
+/// desired-state write would already be durable and the outbox rollback
+/// would not touch it. The outbox-count assertion guards the coupled
+/// path's own cleanliness (it also holds under a decoupled enqueue, whose
+/// autocommit statement rolls the trigger's child back on its own).
+#[tokio::test]
+async fn test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = DesiredStateRepository::new(pool.clone());
+
+    let input = VmDesiredStateInput {
+        vm_id: ResourceId::new("vm-audit-commit-fail").unwrap(),
+        node_id: None,
+        display_name: "audit-commit-fail".to_string(),
+        tenant_id: None,
+        placement_policy: None,
+        desired_generation: Generation::new(5),
+        desired_status: Some("Running".to_string()),
+        requested_by: Some("test".to_string()),
+        updated_by: Some("test".to_string()),
+        target_node_id: None,
+        cpu_count: Some(2),
+        memory_bytes: Some(1024),
+        image_ref: Some("img".to_string()),
+        boot_mode: None,
+        desired_power_state: Some("on".to_string()),
+        vsock_enabled: None,
+        requested_unix_ms: 1000,
+    };
+    repo.upsert_vm(&input, None).await.unwrap();
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-reconcile-commit-fail".into(),
+        audit_id: "audit-ob-reconcile-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "ApplyVmDesiredState".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.ReconcileService/ApplyVmDesiredState".into(),
+            resource_kind: Some("vm".into()),
+            resource_id: Some("vm-audit-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+    let mut newer = input.clone();
+    newer.desired_generation = Generation::new(6);
+    newer.requested_unix_ms = 2000;
+
+    let error = repo
+        .upsert_vm(&newer, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    let (generation,): (i64,) = sqlx::query_as(
+        "SELECT desired_generation FROM vm_desired_state WHERE vm_id = 'vm-audit-commit-fail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        generation, 5,
+        "the desired-state write must roll back with the evidence"
+    );
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
 }
 
 // ── #384: transactional clone target materialization ──────────────────────
@@ -1113,7 +1329,7 @@ async fn test_set_vm_resources_stale_vs_not_found() {
         vsock_enabled: None,
         requested_unix_ms: 1000,
     };
-    repo.upsert_vm(&vm_input).await.unwrap();
+    repo.upsert_vm(&vm_input, None).await.unwrap();
 
     // Stale generation → StaleGeneration error
     let stale_patch = VmResourcesPatchInput {
@@ -1881,6 +2097,7 @@ async fn network_fragment_upsert_refuses_to_journal_over_a_deleting_tombstone() 
         .upsert_network_with_exposures(
             &fragment_input("net-499-dead", CP_WALL_CLOCK_GENERATION),
             &fragment_exposures("net-499-dead"),
+            None,
         )
         .await
         .expect_err("a fragment upsert over a tombstone must fail");
@@ -1920,6 +2137,7 @@ async fn network_fragment_upsert_still_applies_to_a_live_network() {
     repo.upsert_network_with_exposures(
         &fragment_input("net-499-live", CP_WALL_CLOCK_GENERATION),
         &fragment_exposures("net-499-live"),
+        None,
     )
     .await
     .expect("a fragment upsert on a live network must still apply");
@@ -1956,6 +2174,7 @@ async fn network_fragment_stale_generation_is_still_the_stale_generation_error()
         .upsert_network_with_exposures(
             &fragment_input("net-499-stale", 50),
             &fragment_exposures("net-499-stale"),
+            None,
         )
         .await
         .expect_err("a stale-generation fragment must still fail");
@@ -2037,7 +2256,7 @@ async fn test_upsert_vm_vsock_opt_in_defaults_off_and_is_preserved_by_unspecifie
     };
 
     // Fresh insert, unspecified: off.
-    repo.upsert_vm(&base).await.unwrap();
+    repo.upsert_vm(&base, None).await.unwrap();
     let stored: Option<i64> = sqlx::query_scalar(
         "SELECT vsock_enabled FROM vm_desired_state WHERE vm_id = 'vm-vsock-carry'",
     )
@@ -2051,7 +2270,7 @@ async fn test_upsert_vm_vsock_opt_in_defaults_off_and_is_preserved_by_unspecifie
     opted_in.desired_generation = Generation::new(2);
     opted_in.vsock_enabled = Some(true);
     opted_in.requested_unix_ms = 2000;
-    repo.upsert_vm(&opted_in).await.unwrap();
+    repo.upsert_vm(&opted_in, None).await.unwrap();
     let stored: Option<i64> = sqlx::query_scalar(
         "SELECT vsock_enabled FROM vm_desired_state WHERE vm_id = 'vm-vsock-carry'",
     )
@@ -2065,7 +2284,7 @@ async fn test_upsert_vm_vsock_opt_in_defaults_off_and_is_preserved_by_unspecifie
     let mut unrelated = base.clone();
     unrelated.desired_generation = Generation::new(3);
     unrelated.requested_unix_ms = 3000;
-    repo.upsert_vm(&unrelated).await.unwrap();
+    repo.upsert_vm(&unrelated, None).await.unwrap();
     let stored: Option<i64> = sqlx::query_scalar(
         "SELECT vsock_enabled FROM vm_desired_state WHERE vm_id = 'vm-vsock-carry'",
     )
@@ -2084,7 +2303,7 @@ async fn test_upsert_vm_vsock_opt_in_defaults_off_and_is_preserved_by_unspecifie
     opted_out.desired_generation = Generation::new(4);
     opted_out.vsock_enabled = Some(false);
     opted_out.requested_unix_ms = 4000;
-    repo.upsert_vm(&opted_out).await.unwrap();
+    repo.upsert_vm(&opted_out, None).await.unwrap();
     let stored: Option<i64> = sqlx::query_scalar(
         "SELECT vsock_enabled FROM vm_desired_state WHERE vm_id = 'vm-vsock-carry'",
     )

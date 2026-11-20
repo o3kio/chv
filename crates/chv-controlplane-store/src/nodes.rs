@@ -548,8 +548,35 @@ impl NodeRepository {
         Ok(())
     }
 
+    /// Apply a node desired-state fragment, preserving the existing
+    /// scheduling/drain policy columns.
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the patch and the outbox enqueue share one transaction,
+    /// so the evidence commits with the desired-state write or not at
+    /// all.
     pub async fn set_state_preserving_policy(
         &self,
+        input: &NodeStatePatchInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::set_state_preserving_policy_on(&mut conn, input).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin().await?;
+                Self::set_state_preserving_policy_on(&mut tx, input).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn set_state_preserving_policy_on(
+        conn: &mut sqlx::SqliteConnection,
         input: &NodeStatePatchInput,
     ) -> Result<(), StoreError> {
         sqlx::query(PATCH_NODE_STATE_PRESERVING_POLICY_SQL)
@@ -560,7 +587,7 @@ impl NodeRepository {
             .bind(&input.updated_by)
             .bind(&input.state_reason)
             .bind(input.requested_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         Ok(())
     }

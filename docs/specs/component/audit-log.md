@@ -215,7 +215,7 @@ that user's privileged actions.
 A request is classified once, executed once, and then the middleware
 attempts one insert. Under a healthy database this is exactly one row
 per mutating request, including failed and denied attempts. Adopted BFF
-routes and the three adopted enrollment RPCs keep the same
+routes and the adopted gRPC RPCs (enrollment and reconcile) keep the same
 exactly-one-row guarantee through a different emitter: the handler
 commits the row into `audit_outbox` with the mutation and the emitter's
 check-or-insert skips the direct insert (see the transactional-outbox
@@ -254,22 +254,24 @@ returns. If the insert fails:
   re-enroll. This is the deliberate fail-closed tradeoff, not automatic
   recovery.
 
-**Adopted enrollment RPCs.** `EnrollNode`, `RotateNodeCertificate`, and
-`ReportBootstrapResult` commit their evidence row with the mutation's
-final transaction (see the transactional-outbox section), so the
-post-hoc insert above is skipped on success. The failure modes are
-narrower but not gone: an enqueue failure fails the final transaction
-(the adapter then records the failed request once on the direct path),
-and a crash before the final transaction commits is not covered for the
-earlier enrollment writes. The `EnrollNode` token caveat stands — the
-token is consumed in an earlier commit, so a rolled-back enrollment
-still burns it and the operator must issue a new one.
+**Adopted gRPC RPCs.** The three enrollment RPCs and the five reconcile
+RPCs commit their evidence row with the mutation's transaction (see the
+transactional-outbox section), so the post-hoc insert above is skipped
+on success. The failure modes are narrower but not gone: an enqueue
+failure fails the mutation transaction (the adapter then records the
+failed request once on the direct path), and a crash before the coupled
+transaction commits is not covered for any earlier writes the RPC makes.
+The `EnrollNode` token caveat stands — the token is consumed in an
+earlier commit, so a rolled-back enrollment still burns it and the
+operator must issue a new one. The reconcile residual is smaller: only
+the convergence-event append (and, for `AcknowledgeDesiredStateVersion`,
+the operation-status update) follows the coupled write.
 
 Residual risk: the mutation has already happened when the insert is
 attempted. A 500 `AUDIT_LOG_WRITE_FAILED` therefore does not roll the
 mutation back; it tells the caller the audit trail is incomplete.
 
-### Transactional outbox (BFF and enrollment gRPC adopted)
+### Transactional outbox (BFF and gRPC adopted)
 
 The control plane ships an `audit_outbox` table (migration `0071`) and a
 bounded dispatcher for it (#706 half 1). Mutation sites are adopted
@@ -302,13 +304,27 @@ final mutation transaction:
 | `RotateNodeCertificate` | `RotateNodeCertificate` | the compare-and-swap that records the new serial and the outbox row are one transaction; a lost race enqueues neither and the adapter records the conflict on the direct path |
 | `ReportBootstrapResult` | `ReportBootstrapResult` | the bootstrap-result upsert and the outbox row are one transaction |
 
+**Adopted in PR 3b (gRPC reconcile).** Same adapter shape; the service
+enqueues inside the desired-state write it already runs in a
+transaction:
+
+| RPC | Action | Shape |
+|---|---|---|
+| `ApplyNodeDesiredState` | `ApplyNodeDesiredState` | `set_state_preserving_policy` and the outbox row are one transaction (the single mutation statement plus the outbox INSERT on the adopted path) |
+| `ApplyVmDesiredState` | `ApplyVmDesiredState` | the existing desired-state upsert transaction now also enqueues; a stale generation rolls both back |
+| `ApplyVolumeDesiredState` | `ApplyVolumeDesiredState` | as above |
+| `ApplyNetworkDesiredState` | `ApplyNetworkDesiredState` | as above, including the exposure rows; a `Deleting` tombstone or stale generation rolls everything back |
+| `AcknowledgeDesiredStateVersion` | `AcknowledgeDesiredStateVersion` | the observed-state acknowledgement and the outbox row are one transaction (the single mutation statement plus the outbox INSERT on the adopted path); a missing observed-state row enqueues neither |
+
 **Not adopted (still post-hoc).** Every other audited route — notably
-the whole gRPC `LifecycleService` and `ReconcileService` surfaces, the
-`Unimplemented` shims, `vm.delete`, `volume.delete`,
-snapshot/clone/restore mutations, anything that performs filesystem or
-agent RPC work inside the handler, and the guest-agent browser routes.
-They keep today's direct insert and its narrow crash window. Denied and
-failed requests also stay post-hoc: there is no state change to lose.
+the whole gRPC `LifecycleService` surface (agent-ack fan-out and
+filesystem work inside the handlers), the `Unimplemented` shims,
+`vm.delete`, `volume.delete`, snapshot/clone/restore mutations, anything
+that performs filesystem or agent RPC work inside the handler, and the
+guest-agent browser routes. They keep today's direct insert and its
+narrow crash window. Denied and failed requests also stay post-hoc:
+there is no state change to lose. The reconcile surface has no
+read-shaped or agent-fan-out RPC, so all five of its RPCs are adopted.
 
 **Check-or-insert (HTTP).** For every classified HTTP mutation the
 middleware mints (server-side, UUIDv4, never read from a request header
@@ -330,10 +346,11 @@ checks the outbox by primary key:
   durable outbox row and skips the direct insert; otherwise it falls back
   to the direct insert.
 
-**Check-or-insert (gRPC).** The three adopted enrollment RPCs use the
-same composition in `finish_audited`: the adapter mints an
-`outbox_id`/`audit_id` pair (UUIDv4, never from the wire), hands the
-`AuditOutboxInsert` to the service, and after the RPC returns:
+**Check-or-insert (gRPC).** The adopted gRPC RPCs (the three enrollment
+RPCs and the five reconcile RPCs) use the same composition in
+`finish_audited`: the adapter mints an `outbox_id`/`audit_id` pair
+(UUIDv4, never from the wire), hands the `AuditOutboxInsert` to the
+service, and after the RPC returns:
 
 - **row present** → the evidence committed with the mutation's final
   transaction; the direct insert is skipped. A non-success final status
@@ -409,17 +426,36 @@ The contract adoption relies on:
   the middleware records that failed request once on the direct path.
   Denied/failed/unadopted paths keep the direct post-hoc insert above.
 - **The crash window closes only where mutation and outbox share a
-  commit.** On the three adopted enrollment RPCs the row commits with
-  the mutation's **final** transaction, so a crash after that commit and
+  commit.** Every adopted store method enqueues inside the transaction
+  that already commits the mutation, so a crash after that commit and
   before the adapter's post-hoc insert loses nothing: the dispatcher
-  replays the row. `EnrollNode` remains multi-statement: its one-time
-  token consumption is a separate, earlier commit, as are the node and
-  inventory rows. A crash between those commits and the final one leaves
-  a partially applied enrollment with **no** outbox row — the token can
-  be consumed with no enrollment evidence. That is a residual risk, not
-  a covered case; folding enrollment into one transaction is follow-up
-  work. `vms/import` has the same shape: its temporary-directory setup
-  and file move precede the final transaction.
+  replays the row. Coverage is per-write, not per-RPC, where an RPC
+  performs more than one commit:
+  - the three enrollment RPCs carry the row on their **final**
+    transaction (details above). `EnrollNode` remains multi-statement:
+    its one-time token consumption is a separate, earlier commit, as are
+    the node and inventory rows. A crash between those commits and the
+    final one leaves a partially applied enrollment with **no** outbox
+    row — the token can be consumed with no enrollment evidence. That is
+    a residual risk, not a covered case; folding enrollment into one
+    transaction is follow-up work. `vms/import` has the same shape: its
+    temporary-directory setup and file move precede the final
+    transaction.
+  - the four reconcile `Apply*DesiredState` RPCs couple their **primary**
+    desired-state write (the one that changes the resource). The
+    convergence event appended afterwards is a separate commit: a crash
+    between the two leaves the desired-state change and its audit row
+    durable with no `events` row (the same partial-mutation shape that
+    exists today, now with the evidence present rather than missing), and
+    a late event-append failure patches the already-committed row to
+    `failed` — the mutation and evidence stay, only the recorded outcome
+    changes. Coupling the *later* event append instead was rejected: it
+    would leave the earlier state change unaudited on crash.
+  - `AcknowledgeDesiredStateVersion` couples the observed-state
+    acknowledgement; the operation-status update and the convergence
+    event that follow are separate commits with the same residual shape.
+  - `RotateNodeCertificate`, `ReportBootstrapResult`, and the reconcile
+    RPCs have no earlier mutation commit on their adopted path.
 
 **Lock scope.** Wrapping the formerly autocommit `users`/`tokens`
 statements in a transaction extends the SQLite write lock by one INSERT
@@ -435,10 +471,17 @@ On gRPC the adopted store methods take an optional outbox row and open a
 transaction only when one is present (otherwise they keep the original
 autocommit statement). `register_fabric_identity` already had its own
 transaction, so enrollment adds only the INSERT there; the rotation
-compare-and-swap and the bootstrap-result upsert gain a one-statement
-transaction (plus the INSERT) on the adopted path. The transaction is
-held for the store call only — never across certificate minting or
-transport work — so no new lock ordering is introduced.
+compare-and-swap and the bootstrap-result upsert gain a transaction
+around the mutation statement plus the outbox INSERT on the adopted
+path. On the reconcile path
+`upsert_vm`, `upsert_volume`, and `upsert_network_with_exposures`
+already opened a transaction, so only the INSERT is new;
+`set_state_preserving_policy` and the four observed-state
+acknowledgements gain a transaction around the mutation statement plus
+the outbox INSERT on the adopted path. Every transaction is held for the
+store call only — never across certificate minting, the convergence
+event append, the operation-status update, or transport work — so no new
+lock ordering is introduced.
 
 **Actor-field cap (NIT 5 decision).** The store caps the serialized
 payload at 16 KiB; the direct path has no explicit bound on `actor_id` /
@@ -483,10 +526,30 @@ enqueue could not satisfy. The gRPC tests additionally cover each
 adopted RPC's dispatched row, the failed/denied direct row with no
 outbox row, crash replay, an unadopted lifecycle RPC, and the oversized
 payload rollback (`oversized_audit_payload_rolls_back_the_adopted_rotation`
-in `enrollment.rs`). The store suite pins the rotation transaction's
-atomicity directly
+in `enrollment.rs`, and
+`server_audit_reconcile_oversized_payload_rolls_back_the_adopted_write`
+for reconcile). The reconcile slice adds, per adopted RPC, one
+dispatched row reusing the pre-minted `audit_id` with a second pass
+proven to be a no-op; a stale-generation rollback (no outbox row, no
+desired-state change, one direct failed row); a missing observed-state
+row on `AcknowledgeDesiredStateVersion` (one direct 404 row, no outbox
+row); crash replay; the post-commit-failure patch path (a reconcile
+service that enqueues and then fails keeps exactly one row whose
+outcome/status are patched); the unadopted shape (a service that
+ignores the ticket writes one direct row and no outbox row); and both
+check-error branches of the gRPC composition (a committed enqueue whose
+lookup fails must not direct-insert and is replayed from the durable
+row; an uncommitted one falls back to exactly one direct failed row).
+The store suite pins the rotation transaction's atomicity directly
 (`test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap`:
-a lost compare-and-swap commits neither the serial nor the outbox row).
+a lost compare-and-swap commits neither the serial nor the outbox row)
+and the reconcile upsert's
+(`test_upsert_vm_audit_is_atomic_with_the_desired_state_write`: a stale
+generation commits neither the fragment nor the outbox row, an accepted
+one commits both with the pre-minted ids;
+`test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write`:
+a successful enqueue whose COMMIT fails rolls the desired-state write
+back too).
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see
