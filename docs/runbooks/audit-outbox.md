@@ -81,8 +81,10 @@ recovery path we cannot honour.
 > leaves the applied state and a `success` row with a possibly stale
 > operation status. An intent failure (e.g. pause/resume on a node with
 > no `node_desired_state` row) rolls the enqueue back and writes exactly
-> one direct failed row; no pending row appears. The rest of the
-> lifecycle surface is still post-hoc.
+> one direct failed row; no pending row appears. The five node
+> transitions above are adopted; the rest of the lifecycle surface,
+> apart from the volume snapshot family covered below, is still
+> post-hoc.
 >
 > The BFF twin is also still post-hoc: `POST /v1/nodes/mutate`
 > (`node.mutate`, the WebUI/chvctl path) calls the same five service
@@ -278,9 +280,9 @@ post-hoc crash window. On the gRPC path, check `operations` for a
 still-`Pending` `PauseNodeScheduling`-style row with its
 `OperationStarted` event and no matching `node_desired_state` change
 (the journal-only crash window), and `chv_grpc_audit_write_failures_total`
-/ the `AUDIT_LOG_WRITE_FAILED` log for a failed direct insert. If the
-state change *is* present but the row missing, check `audit_outbox` for
-a pending row before concluding evidence was lost.
+/ the `AUDIT LOG WRITE FAILED` error log for a failed direct insert. If
+the state change *is* present but the row missing, check `audit_outbox`
+for a pending row before concluding evidence was lost.
 
 For the volume snapshot family specifically: a **denied** request
 always leaves a direct `denied` row — a missing row is never a denial.
@@ -292,10 +294,11 @@ check `operations` for a still-`Pending` `SnapshotVolume`-style row
 with its `OperationStarted` event and no matching
 `volume_desired_state` snapshot-op change (the journal-only crash
 window), and `chv_grpc_audit_write_failures_total` / the
-`AUDIT_LOG_WRITE_FAILED` log for a failed direct insert. If the intent
-*is* present but the row missing, check `audit_outbox` for a pending
-row before concluding evidence was lost. A direct failed 409 row means
-a `Deleting` tombstone refused the patch (the volume row is unchanged).
+`AUDIT LOG WRITE FAILED` error log for a failed direct insert. If the
+intent *is* present but the row missing, check `audit_outbox` for a
+pending row before concluding evidence was lost. A direct failed 409
+row means a `Deleting` tombstone refused the patch (the volume row is
+unchanged).
 
 A dispatched row is indistinguishable from a direct one in `audit_log`;
 for 7 days you can join `audit_outbox.audit_id` to prove a row was
@@ -407,13 +410,14 @@ are never pruned, regardless of age.
   autocommit statement. Its `'Deleting'`-tombstone check runs on the
   **same connection inside that transaction** (a connection-taking
   helper shared with the pool-level form, so the conflict semantics are
-  identical). Calling the pool-level helper there would need a second
-  pool connection while the first still holds the write lock; under
-  concurrent adopted mutations that stalls on connection acquisition
-  (the shipped configs allow 4 connections, and the in-memory test pool
-  holds one and blocks outright). Running it on the held connection
-  needs no extra connection and observes exactly the row state the patch
-  saw.
+  identical). The pool-level helper would acquire a *second* connection
+  while the first still holds the `BEGIN IMMEDIATE` write lock. That
+  costs a connection per in-flight adopted mutation — the shipped
+  configs allow four, so concurrent mutations can stall waiting for one
+  — and on SQLite's shared-cache in-memory test database the second
+  connection's read blocks on the held write lock. Running the check on
+  the held connection needs no extra connection and observes exactly
+  the row state the patch saw.
 - **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
   service (VM power, volume attach/resize/clone, networks, migrate,
   overlay, ARP, resolve inspect) and every unadopted BFF route still

@@ -766,11 +766,13 @@ impl DesiredStateRepository {
     /// The adopted [`Self::set_volume_snapshot`] path must run this check
     /// on the SAME connection that holds its `BEGIN IMMEDIATE` write
     /// transaction. The pool-level helper would acquire a *second*
-    /// connection while the first still holds the write lock; under
-    /// concurrent adopted mutations that stalls on connection acquisition
-    /// (shipped configs allow 4 connections; the in-memory test pool holds
-    /// one and blocks outright). Running it on the held connection needs no
-    /// extra connection and observes exactly the row state the patch saw.
+    /// connection while the first still holds the write lock: that costs a
+    /// connection per in-flight adopted mutation (the shipped configs allow
+    /// four, so concurrent mutations can stall waiting for one), and on
+    /// SQLite's shared-cache in-memory test database the second
+    /// connection's read blocks on the held write lock. Running the check on
+    /// the held connection needs no extra connection and observes exactly
+    /// the row state the patch saw.
     async fn refuse_volume_patch_if_deleting_on(
         conn: &mut sqlx::SqliteConnection,
         volume_id: &ResourceId,
@@ -935,12 +937,13 @@ impl DesiredStateRepository {
             // reporting a stale generation. This must run on `conn` (the
             // same connection that holds the adopted write transaction):
             // the pool-level helper would acquire a *second* connection
-            // while the first still holds the write lock; under concurrent
-            // adopted mutations that stalls on connection acquisition
-            // (shipped configs allow 4 connections; the in-memory test
-            // pool holds one and blocks outright). Running it here needs
-            // no extra connection and observes exactly the row state the
-            // patch saw.
+            // while the first still holds the write lock: that costs a
+            // connection per in-flight adopted mutation (the shipped
+            // configs allow four, so concurrent mutations can stall waiting
+            // for one), and on SQLite's shared-cache in-memory test
+            // database the second connection's read blocks on the held
+            // write lock. Running it here needs no extra connection and
+            // observes exactly the row state the patch saw.
             return Self::refuse_volume_patch_if_deleting_on(conn, &input.volume_id, generation)
                 .await;
         }

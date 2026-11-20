@@ -20,11 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upsert (whose zero-rows conflict arm runs the `'Deleting'`-tombstone
   check on the **same connection** and fails the transaction) → outbox
   INSERT → commit. The tombstone helper gained a
-  connection-taking form because calling the pool-level helper inside the
-  write transaction would need a second connection while the first still
-  holds the write lock; under concurrent adopted mutations that stalls on
-  connection acquisition (shipped configs allow 4 connections; the
-  in-memory test pool holds one and blocks outright). The coupling is
+  connection-taking form because the pool-level helper would acquire a
+  *second* connection while the first still holds the `BEGIN IMMEDIATE`
+  write lock. That costs a connection per in-flight adopted mutation —
+  the shipped configs allow four, so concurrent mutations can stall
+  waiting for one — and on SQLite's shared-cache in-memory test database
+  the second connection's read blocks on the held write lock. Running the
+  check on the held connection needs no extra connection and observes
+  exactly the row state the patch saw. The coupling is
   deliberately intent-anchored, not journal-anchored: a crash after the
   earlier `operations` INSERT but before the intent would otherwise leave
   a false `success` row for a snapshot operation that never applied.

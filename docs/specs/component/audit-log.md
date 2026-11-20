@@ -649,12 +649,14 @@ For the PR 4 volume snapshots `set_volume_snapshot` wraps the single
 intent UPSERT plus the outbox INSERT in `BEGIN IMMEDIATE` when a row is
 present (`None` keeps the autocommit statement). Its `'Deleting'`
 tombstone check now runs on the **same connection inside that
-transaction**: the pool-level helper would need a **second** connection
-while the first still holds the `BEGIN IMMEDIATE` write lock; under
-concurrent adopted mutations that stalls on connection acquisition
-(shipped configs allow 4 connections; the in-memory test pool holds one
-and blocks outright), and running on the held connection additionally
-observes exactly the row state the patch saw. The check is a
+transaction**: the pool-level helper would acquire a **second**
+connection while the first still holds the `BEGIN IMMEDIATE` write
+lock. That costs a connection per in-flight adopted mutation — the
+shipped configs allow four, so concurrent mutations can stall waiting
+for one — and on SQLite's shared-cache in-memory test database the
+second connection's read blocks on the held write lock. Running the
+check on the held connection needs no extra connection and observes
+exactly the row state the patch saw. The check is a
 connection-taking helper shared by both branches, so the conflict
 semantics are identical.
 Every transaction is held for the store call only — never across

@@ -1970,6 +1970,22 @@ async fn snapshot_state(
     .expect("read volume desired state")
 }
 
+/// A node whose inventory reports `core-managed` authority — the #378
+/// accept-time rejection this test pins (mirrors
+/// `tests::seed_node_with_authority_mode`).
+async fn seed_core_managed_node(db: &TestDb, node_id: &str) {
+    seed_node(db, node_id, None).await;
+    sqlx::query(
+        "INSERT INTO node_inventory \
+         (node_id, architecture, cpu_count, memory_bytes, authority_mode) \
+         VALUES ($1, 'x86_64', 1, 1024, 'core-managed')",
+    )
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .expect("seed core-managed inventory");
+}
+
 async fn call_snapshot_rpc(
     server: &LifecycleServer,
     rpc: SnapshotRpc,
@@ -2211,6 +2227,67 @@ async fn server_audit_volume_snapshot_tombstone_writes_one_direct_row_and_no_out
         assert_eq!(operation_status, "Failed");
         assert_eq!(error_code.as_deref(), Some("INTENT_PERSISTENCE_FAILED"));
     }
+}
+
+#[tokio::test]
+async fn server_audit_snapshot_capability_denial_writes_one_direct_row_and_no_outbox() {
+    let db = TestDb::new().await;
+    // One RPC is enough: all three snapshot-family RPCs share the same
+    // pre-journaling pre-check (`ensure_volume_snapshot_family_supported`).
+    seed_core_managed_node(&db, "node-a").await;
+    seed_snapshot_volume(
+        &db.pool,
+        "vol-a",
+        "node-a",
+        1,
+        None,
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+    let server = adopted_lifecycle_server(&db);
+
+    let status = call_snapshot_rpc(&server, SnapshotRpc::Snapshot, "op-capability-denied")
+        .await
+        .expect_err("a core-managed node must refuse the snapshot before journaling");
+    assert_eq!(
+        status.code(),
+        Code::InvalidArgument,
+        "the accept-time capability rejection is a 400"
+    );
+    assert!(
+        status.message().contains("core-managed"),
+        "got: {}",
+        status.message()
+    );
+
+    // The rejection is recorded exactly once on the direct path: the
+    // pre-check runs before the operation row and before any adopted
+    // enqueue, so there is no ticket and no outbox row.
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one direct failed row");
+    assert_eq!(rows[0].action, "SnapshotVolume");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 400);
+    assert_eq!(rows[0].resource_kind.as_deref(), Some("volume"));
+    assert_eq!(rows[0].resource_id.as_deref(), Some("vol-a"));
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "a pre-journaling rejection enqueues nothing"
+    );
+
+    // No operation row and no intent: the journaling half is pinned in
+    // `tests.rs`; here we prove the volume row survives byte-for-byte.
+    let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count operations");
+    assert_eq!(operations, 0, "the rejection must not journal an operation");
+    assert_eq!(
+        snapshot_state(&db.pool, "vol-a").await,
+        (Some("seed".into()), Some("seed-name".into()), None, 1),
+        "the rejected request must leave the volume row unchanged"
+    );
 }
 
 #[tokio::test]
