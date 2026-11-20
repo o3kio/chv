@@ -490,7 +490,7 @@ macro_rules! audited_lifecycle_call {
 
 /// Same peer-pinned shape as [`audited_lifecycle_call`], but for a
 /// lifecycle RPC whose service enqueues the audit row inside its intent
-/// transaction (#706 PR 3c).
+/// transaction (#706 PRs 3c and 4).
 ///
 /// The adapter mints the ticket, hands the coupling to the service, and
 /// then runs the same check-or-insert as every other adopted path.
@@ -1373,7 +1373,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::SnapshotVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "SnapshotVolume",
@@ -1388,7 +1388,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::RestoreVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "RestoreVolume",
@@ -1403,7 +1403,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::DeleteVolumeSnapshotRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "DeleteVolumeSnapshot",

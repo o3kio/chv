@@ -636,12 +636,15 @@ impl MutationService for ControlPlaneMutationService {
         let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
-            .snapshot_volume(proto::SnapshotVolumeRequest {
-                meta,
-                node_id: row.node_id.clone(),
-                volume_id: volume_id.clone(),
-                snapshot_name,
-            })
+            .snapshot_volume(
+                proto::SnapshotVolumeRequest {
+                    meta,
+                    node_id: row.node_id.clone(),
+                    volume_id: volume_id.clone(),
+                    snapshot_name,
+                },
+                None,
+            )
             .await;
 
         let ack = Self::map_ack(ack)?;
@@ -685,12 +688,15 @@ impl MutationService for ControlPlaneMutationService {
         let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
-            .restore_volume(proto::RestoreVolumeRequest {
-                meta,
-                node_id: row.node_id.clone(),
-                volume_id: volume_id.clone(),
-                snapshot_name,
-            })
+            .restore_volume(
+                proto::RestoreVolumeRequest {
+                    meta,
+                    node_id: row.node_id.clone(),
+                    volume_id: volume_id.clone(),
+                    snapshot_name,
+                },
+                None,
+            )
             .await;
 
         let ack = Self::map_ack(ack)?;
@@ -734,12 +740,15 @@ impl MutationService for ControlPlaneMutationService {
         let meta = Some(self.build_meta(row.node_id.clone(), requested_by).await?);
         let ack = self
             .lifecycle_service
-            .delete_volume_snapshot(proto::DeleteVolumeSnapshotRequest {
-                meta,
-                node_id: row.node_id.clone(),
-                volume_id: volume_id.clone(),
-                snapshot_name,
-            })
+            .delete_volume_snapshot(
+                proto::DeleteVolumeSnapshotRequest {
+                    meta,
+                    node_id: row.node_id.clone(),
+                    volume_id: volume_id.clone(),
+                    snapshot_name,
+                },
+                None,
+            )
             .await;
 
         let ack = Self::map_ack(ack)?;
@@ -1005,18 +1014,21 @@ mod tests {
         async fn snapshot_volume(
             &self,
             _request: proto::SnapshotVolumeRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no snapshot_volume in the A9 tests")
         }
         async fn restore_volume(
             &self,
             _request: proto::RestoreVolumeRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no restore_volume in the A9 tests")
         }
         async fn delete_volume_snapshot(
             &self,
             _request: proto::DeleteVolumeSnapshotRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no delete_volume_snapshot in the A9 tests")
         }

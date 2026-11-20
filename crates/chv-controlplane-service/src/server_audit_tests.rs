@@ -74,6 +74,36 @@ macro_rules! mock_lifecycle_impl {
                 }
             )*
 
+            // The adopted `SnapshotVolume` arm mirrors the
+            // `EnqueueThenFail` shape: commit the outbox row with the
+            // intent transaction, mark the coupling, then fail anyway, so
+            // the adapter's patch path is exercised on the real wire
+            // macro.
+            async fn snapshot_volume(
+                &self,
+                _request: proto::SnapshotVolumeRequest,
+                audit: Option<&AdoptedAudit<'_>>,
+            ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+                let Some(pool) = &self.enqueue_then_fail else {
+                    return Err(ControlPlaneServiceError::Unsupported(
+                        "unused in audit tests".into(),
+                    ));
+                };
+                let audit = audit.expect("the adapter passes the coupling");
+                let mut tx = pool
+                    .begin_with("BEGIN IMMEDIATE;")
+                    .await
+                    .expect("begin adopted tx");
+                chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
+                    .await
+                    .expect("enqueue evidence");
+                tx.commit().await.expect("commit evidence");
+                audit.mark_committed();
+                Err(ControlPlaneServiceError::Internal(
+                    "post-commit failure".into(),
+                ))
+            }
+
             // The five adopted node-transition RPCs take the coupling; the
             // mock never enqueues, so the adapter falls through to the
             // direct path (the shape an adopted call without a ticket has).
@@ -126,9 +156,6 @@ mock_lifecycle_impl! {
     attach_volume(proto::AttachVolumeRequest),
     detach_volume(proto::DetachVolumeRequest),
     resize_volume(proto::ResizeVolumeRequest),
-    snapshot_volume(proto::SnapshotVolumeRequest),
-    restore_volume(proto::RestoreVolumeRequest),
-    delete_volume_snapshot(proto::DeleteVolumeSnapshotRequest),
     clone_volume(proto::CloneVolumeRequest),
     pause_vm(proto::PauseVmRequest),
     resume_vm(proto::ResumeVmRequest),
@@ -148,6 +175,8 @@ mock_lifecycle_impl! {
     send_gratuitous_arp(proto::SendGratuitousArpRequest),
     resolve_inspect_required_operation(proto::ResolveInspectRequiredOperationRequest),
     ; adopted:
+    restore_volume(proto::RestoreVolumeRequest),
+    delete_volume_snapshot(proto::DeleteVolumeSnapshotRequest),
     resume_node_scheduling(proto::ResumeNodeSchedulingRequest),
     drain_node(proto::DrainNodeRequest),
     enter_maintenance(proto::EnterMaintenanceRequest),
@@ -1858,6 +1887,658 @@ async fn server_audit_post_commit_failure_patches_the_committed_row_exactly_once
     assert_eq!(dispatched[0].audit_id, rows[0].audit_id);
     assert_eq!(dispatched[0].outcome, "failed");
     assert_eq!(dispatched[0].status_code, 500);
+}
+
+// ---------------------------------------------------------------------------
+// #706 PR 4 — volume snapshot-family RPCs coupled to the audit outbox.
+//
+// These drive the *real* `LifecycleServiceImplementation` through the real
+// `LifecycleServer` adapter, so the outbox row is enqueued inside the
+// volume-desired-state write's transaction exactly as in production.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum SnapshotRpc {
+    Snapshot,
+    Restore,
+    Delete,
+}
+
+impl SnapshotRpc {
+    fn action(self) -> &'static str {
+        match self {
+            SnapshotRpc::Snapshot => "SnapshotVolume",
+            SnapshotRpc::Restore => "RestoreVolume",
+            SnapshotRpc::Delete => "DeleteVolumeSnapshot",
+        }
+    }
+
+    /// The `snapshot_op` value each arm must write.
+    fn op(self) -> &'static str {
+        match self {
+            SnapshotRpc::Snapshot => "create",
+            SnapshotRpc::Restore => "restore",
+            SnapshotRpc::Delete => "delete",
+        }
+    }
+}
+
+async fn seed_snapshot_volume(
+    pool: &StorePool,
+    volume_id: &str,
+    node_id: &str,
+    generation: i64,
+    status: Option<&str>,
+    snapshot_op: Option<&str>,
+    snapshot_name: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO volumes (volume_id, node_id, display_name, capacity_bytes) \
+         VALUES ($1, $2, $1, 1024)",
+    )
+    .bind(volume_id)
+    .bind(node_id)
+    .execute(pool)
+    .await
+    .expect("seed volume row");
+    sqlx::query(
+        "INSERT INTO volume_desired_state \
+         (volume_id, desired_generation, desired_status, snapshot_op, snapshot_name) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(volume_id)
+    .bind(generation)
+    .bind(status)
+    .bind(snapshot_op)
+    .bind(snapshot_name)
+    .execute(pool)
+    .await
+    .expect("seed volume desired state");
+}
+
+async fn snapshot_state(
+    pool: &StorePool,
+    volume_id: &str,
+) -> (Option<String>, Option<String>, Option<String>, i64) {
+    sqlx::query_as(
+        "SELECT snapshot_op, snapshot_name, desired_status, desired_generation \
+         FROM volume_desired_state WHERE volume_id = $1",
+    )
+    .bind(volume_id)
+    .fetch_one(pool)
+    .await
+    .expect("read volume desired state")
+}
+
+/// A node whose inventory reports `core-managed` authority — the #378
+/// accept-time rejection this test pins (mirrors
+/// `tests::seed_node_with_authority_mode`).
+async fn seed_core_managed_node(db: &TestDb, node_id: &str) {
+    seed_node(db, node_id, None).await;
+    sqlx::query(
+        "INSERT INTO node_inventory \
+         (node_id, architecture, cpu_count, memory_bytes, authority_mode) \
+         VALUES ($1, 'x86_64', 1, 1024, 'core-managed')",
+    )
+    .bind(node_id)
+    .execute(&db.pool)
+    .await
+    .expect("seed core-managed inventory");
+}
+
+async fn call_snapshot_rpc(
+    server: &LifecycleServer,
+    rpc: SnapshotRpc,
+    operation_id: &str,
+) -> Result<tonic::Response<proto::AckResponse>, tonic::Status> {
+    let operation = operation_id.to_string();
+    let meta = Some(node_transition_meta("node-a", &operation));
+    match rpc {
+        SnapshotRpc::Snapshot => {
+            server
+                .snapshot_volume(node_transition_request(
+                    proto::SnapshotVolumeRequest {
+                        meta,
+                        node_id: "node-a".into(),
+                        volume_id: "vol-a".into(),
+                        snapshot_name: "snap-1".into(),
+                    },
+                    "node-a",
+                    &operation,
+                ))
+                .await
+        }
+        SnapshotRpc::Restore => {
+            server
+                .restore_volume(node_transition_request(
+                    proto::RestoreVolumeRequest {
+                        meta,
+                        node_id: "node-a".into(),
+                        volume_id: "vol-a".into(),
+                        snapshot_name: "snap-1".into(),
+                    },
+                    "node-a",
+                    &operation,
+                ))
+                .await
+        }
+        SnapshotRpc::Delete => {
+            server
+                .delete_volume_snapshot(node_transition_request(
+                    proto::DeleteVolumeSnapshotRequest {
+                        meta,
+                        node_id: "node-a".into(),
+                        volume_id: "vol-a".into(),
+                        snapshot_name: "snap-1".into(),
+                    },
+                    "node-a",
+                    &operation,
+                ))
+                .await
+        }
+    }
+}
+
+fn snapshot_audit_insert(
+    outbox_id: &str,
+    audit_id: &str,
+    action: &str,
+    created_at_ms: i64,
+) -> AuditOutboxInsert {
+    AuditOutboxInsert {
+        outbox_id: outbox_id.into(),
+        audit_id: audit_id.into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: created_at_ms,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: action.into(),
+            method: "gRPC".into(),
+            path: format!("chv.controlplane.node.v1.LifecycleService/{action}"),
+            resource_kind: Some("volume".into()),
+            resource_id: Some("vol-a".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: Some("op-snapshot-crash".into()),
+            source_ip: None,
+            metadata: r#"{"transport":"grpc","auth_source":"mtls"}"#.into(),
+        },
+        created_at_ms,
+    }
+}
+
+#[tokio::test]
+async fn server_audit_volume_snapshot_family_adopts_outbox_per_rpc() {
+    for rpc in [
+        SnapshotRpc::Snapshot,
+        SnapshotRpc::Restore,
+        SnapshotRpc::Delete,
+    ] {
+        let db = TestDb::new().await;
+        seed_node(&db, "node-a", None).await;
+        // The seed names a *different* snapshot op/name so the applied
+        // read-back below proves the transition instead of echoing the
+        // seed (the PR 3c lesson).
+        seed_snapshot_volume(
+            &db.pool,
+            "vol-a",
+            "node-a",
+            1,
+            None,
+            Some("seed"),
+            Some("seed-name"),
+        )
+        .await;
+        let server = adopted_lifecycle_server(&db);
+        let op = format!("op-{rpc:?}");
+
+        call_snapshot_rpc(&server, rpc, &op)
+            .await
+            .expect("the adopted snapshot-family RPC succeeds");
+
+        let (snapshot_op, snapshot_name, status, _generation) =
+            snapshot_state(&db.pool, "vol-a").await;
+        assert_eq!(
+            snapshot_op.as_deref(),
+            Some(rpc.op()),
+            "{rpc:?}: the intent must apply the RPC's snapshot op"
+        );
+        assert_eq!(
+            snapshot_name.as_deref(),
+            Some("snap-1"),
+            "{rpc:?}: the intent must apply the request's snapshot name"
+        );
+        assert_eq!(status, None, "{rpc:?}: the desired status is untouched");
+
+        assert!(
+            audit_rows(&db.pool).await.is_empty(),
+            "{rpc:?}: adopted success skips the post-hoc direct insert"
+        );
+        let rows = outbox_rows(&db.pool).await;
+        assert_eq!(rows.len(), 1, "{rpc:?}: exactly one outbox row");
+        let row = &rows[0];
+        assert_eq!(row.status, AUDIT_OUTBOX_PENDING);
+        assert!(
+            !row.audit_id.is_empty() && row.audit_id != row.outbox_id,
+            "{rpc:?}: a separate audit_id was pre-minted"
+        );
+        let payload = row.parse_payload().expect("payload parses");
+        let action = rpc.action();
+        assert_eq!(payload.action, action);
+        assert_eq!(
+            payload.path,
+            format!("chv.controlplane.node.v1.LifecycleService/{action}")
+        );
+        assert_eq!(payload.actor_id, "node-a");
+        assert_eq!(payload.actor_role, "node");
+        assert_eq!(payload.resource_kind.as_deref(), Some("volume"));
+        assert_eq!(payload.resource_id.as_deref(), Some("vol-a"));
+        assert_eq!(payload.operation_id.as_deref(), Some(op.as_str()));
+        assert_eq!(payload.outcome, "success");
+        assert_eq!(payload.status_code, 200);
+        assert_metadata_is_allowlisted(&payload.metadata, "mtls");
+
+        let dispatched = dispatch_one(&db, row.created_at_ms).await;
+        assert_eq!(
+            dispatched[0].audit_id, row.audit_id,
+            "{rpc:?}: dispatch reuses the pre-minted audit_id"
+        );
+        assert_eq!(dispatched[0].action, action);
+
+        let again = dispatcher(&db.pool)
+            .dispatch_pass(row.created_at_ms + 60_000)
+            .await
+            .expect("second pass");
+        assert_eq!(again, 0, "{rpc:?}: a dispatched row is never replayed");
+        assert_eq!(
+            audit_rows(&db.pool).await.len(),
+            1,
+            "{rpc:?}: no double write"
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_audit_volume_snapshot_tombstone_writes_one_direct_row_and_no_outbox() {
+    for rpc in [
+        SnapshotRpc::Snapshot,
+        SnapshotRpc::Restore,
+        SnapshotRpc::Delete,
+    ] {
+        let db = TestDb::new().await;
+        seed_node(&db, "node-a", None).await;
+        // A `Deleting` tombstone blocks the patch at the SQL level; the
+        // generation guard would allow the write, so this exercises the
+        // tombstone arm (and its in-transaction check) specifically.
+        seed_snapshot_volume(
+            &db.pool,
+            "vol-a",
+            "node-a",
+            1,
+            Some("Deleting"),
+            Some("seed"),
+            Some("seed-name"),
+        )
+        .await;
+        let server = adopted_lifecycle_server(&db);
+
+        let status = call_snapshot_rpc(&server, rpc, "op-tombstone")
+            .await
+            .expect_err("a snapshot-family intent over a tombstone must fail");
+        assert_eq!(
+            status.code(),
+            Code::AlreadyExists,
+            "{rpc:?}: the tombstone refusal is the loud Conflict"
+        );
+
+        assert!(
+            outbox_rows(&db.pool).await.is_empty(),
+            "{rpc:?}: the rolled-back intent enqueues nothing"
+        );
+        let rows = audit_rows(&db.pool).await;
+        assert_eq!(rows.len(), 1, "{rpc:?}: exactly one direct failed row");
+        assert_eq!(rows[0].action, rpc.action());
+        assert_eq!(rows[0].outcome, "failed");
+        assert_eq!(rows[0].status_code, 409);
+        assert_eq!(rows[0].resource_kind.as_deref(), Some("volume"));
+        assert_eq!(rows[0].resource_id.as_deref(), Some("vol-a"));
+
+        let state = snapshot_state(&db.pool, "vol-a").await;
+        assert_eq!(
+            state,
+            (
+                Some("seed".into()),
+                Some("seed-name".into()),
+                Some("Deleting".into()),
+                1
+            ),
+            "{rpc:?}: the tombstone must survive the refused patch byte-for-byte"
+        );
+
+        // The existing failure machinery still journals the intent failure.
+        let (operation_status, error_code): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_code FROM operations WHERE operation_type = $1")
+                .bind(rpc.action())
+                .fetch_one(&db.pool)
+                .await
+                .expect("operation row exists");
+        assert_eq!(operation_status, "Failed");
+        assert_eq!(error_code.as_deref(), Some("INTENT_PERSISTENCE_FAILED"));
+    }
+}
+
+#[tokio::test]
+async fn server_audit_snapshot_capability_denial_writes_one_direct_row_and_no_outbox() {
+    let db = TestDb::new().await;
+    // One RPC is enough: all three snapshot-family RPCs share the same
+    // pre-journaling pre-check (`ensure_volume_snapshot_family_supported`).
+    seed_core_managed_node(&db, "node-a").await;
+    seed_snapshot_volume(
+        &db.pool,
+        "vol-a",
+        "node-a",
+        1,
+        None,
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+    let server = adopted_lifecycle_server(&db);
+
+    let status = call_snapshot_rpc(&server, SnapshotRpc::Snapshot, "op-capability-denied")
+        .await
+        .expect_err("a core-managed node must refuse the snapshot before journaling");
+    assert_eq!(
+        status.code(),
+        Code::InvalidArgument,
+        "the accept-time capability rejection is a 400"
+    );
+    assert!(
+        status.message().contains("core-managed"),
+        "got: {}",
+        status.message()
+    );
+
+    // The rejection is recorded exactly once on the direct path: the
+    // pre-check runs before the operation row and before any adopted
+    // enqueue, so there is no ticket and no outbox row.
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one direct failed row");
+    assert_eq!(rows[0].action, "SnapshotVolume");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 400);
+    assert_eq!(rows[0].resource_kind.as_deref(), Some("volume"));
+    assert_eq!(rows[0].resource_id.as_deref(), Some("vol-a"));
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "a pre-journaling rejection enqueues nothing"
+    );
+
+    // No operation row and no intent: the journaling half is pinned in
+    // `tests.rs`; here we prove the volume row survives byte-for-byte.
+    let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count operations");
+    assert_eq!(operations, 0, "the rejection must not journal an operation");
+    assert_eq!(
+        snapshot_state(&db.pool, "vol-a").await,
+        (Some("seed".into()), Some("seed-name".into()), None, 1),
+        "the rejected request must leave the volume row unchanged"
+    );
+}
+
+#[tokio::test]
+async fn server_audit_volume_snapshot_crash_replay_writes_exactly_one_row() {
+    for rpc in [
+        SnapshotRpc::Snapshot,
+        SnapshotRpc::Restore,
+        SnapshotRpc::Delete,
+    ] {
+        let db = TestDb::new().await;
+        seed_node(&db, "node-a", None).await;
+        seed_snapshot_volume(
+            &db.pool,
+            "vol-a",
+            "node-a",
+            1,
+            None,
+            Some("seed"),
+            Some("seed-name"),
+        )
+        .await;
+        let service = lifecycle_impl(&db);
+
+        // Deterministic crash: commit the intent + outbox row, then never
+        // run the adapter's `finish_audited` (the process died before it).
+        let now = chv_common::now_unix_ms();
+        let outbox_id = format!("ob-snapshot-crash-{rpc:?}");
+        let audit_id = format!("audit-snapshot-crash-{rpc:?}");
+        let insert = snapshot_audit_insert(&outbox_id, &audit_id, rpc.action(), now);
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        let coupling = AdoptedAudit::new(&insert, &committed);
+        let meta = Some(node_transition_meta("node-a", "op-snapshot-crash"));
+
+        match rpc {
+            SnapshotRpc::Snapshot => service
+                .snapshot_volume(
+                    proto::SnapshotVolumeRequest {
+                        meta,
+                        node_id: "node-a".into(),
+                        volume_id: "vol-a".into(),
+                        snapshot_name: "snap-1".into(),
+                    },
+                    Some(&coupling),
+                )
+                .await
+                .expect("intent commits with its outbox row"),
+            SnapshotRpc::Restore => service
+                .restore_volume(
+                    proto::RestoreVolumeRequest {
+                        meta,
+                        node_id: "node-a".into(),
+                        volume_id: "vol-a".into(),
+                        snapshot_name: "snap-1".into(),
+                    },
+                    Some(&coupling),
+                )
+                .await
+                .expect("intent commits with its outbox row"),
+            SnapshotRpc::Delete => service
+                .delete_volume_snapshot(
+                    proto::DeleteVolumeSnapshotRequest {
+                        meta,
+                        node_id: "node-a".into(),
+                        volume_id: "vol-a".into(),
+                        snapshot_name: "snap-1".into(),
+                    },
+                    Some(&coupling),
+                )
+                .await
+                .expect("intent commits with its outbox row"),
+        };
+        assert!(
+            coupling.was_committed(),
+            "{rpc:?}: the service marks the enqueue committed"
+        );
+        let (snapshot_op, snapshot_name, _status, _generation) =
+            snapshot_state(&db.pool, "vol-a").await;
+        assert_eq!(snapshot_op.as_deref(), Some(rpc.op()));
+        assert_eq!(
+            snapshot_name.as_deref(),
+            Some("snap-1"),
+            "{rpc:?}: the patch persists the request's snapshot_name"
+        );
+
+        assert!(audit_rows(&db.pool).await.is_empty(), "no post-hoc row yet");
+        let pending = outbox_rows(&db.pool).await;
+        assert_eq!(pending.len(), 1);
+
+        let rows = dispatch_one(&db, pending[0].created_at_ms).await;
+        assert_eq!(rows[0].audit_id, audit_id);
+        assert_eq!(rows[0].action, rpc.action());
+        assert_eq!(rows[0].operation_id.as_deref(), Some("op-snapshot-crash"));
+
+        let again = dispatcher(&db.pool)
+            .dispatch_pass(pending[0].created_at_ms + 60_000)
+            .await
+            .expect("second pass");
+        assert_eq!(again, 0);
+        assert_eq!(audit_rows(&db.pool).await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn server_audit_volume_snapshot_post_commit_failure_patches_the_committed_row() {
+    let db = TestDb::new().await;
+    // Only `SnapshotVolume` is exercised: all three snapshot-family RPCs
+    // reach the same `finish_audited` patch path (PR 3c), so one arm
+    // covers the behaviour.
+    // The mock commits the outbox row and then fails. The real wire macro
+    // must patch that row instead of inserting a second one.
+    let server = LifecycleServer::new(Arc::new(MockLifecycle {
+        enqueue_then_fail: Some(db.pool.clone()),
+        ..Default::default()
+    }))
+    .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let status = server
+        .snapshot_volume(node_transition_request(
+            proto::SnapshotVolumeRequest {
+                meta: Some(node_transition_meta("node-a", "op-snapshot-post-commit")),
+                node_id: "node-a".into(),
+                volume_id: "vol-a".into(),
+                snapshot_name: "snap-1".into(),
+            },
+            "node-a",
+            "op-snapshot-post-commit",
+        ))
+        .await
+        .expect_err("the service failure must be preserved");
+    assert_eq!(status.code(), Code::Internal);
+
+    assert!(
+        audit_rows(&db.pool).await.is_empty(),
+        "a present outbox row suppresses the direct insert"
+    );
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one outbox row");
+    assert_eq!(rows[0].status, AUDIT_OUTBOX_PENDING);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(
+        payload.outcome, "failed",
+        "the commit-time success prediction is patched"
+    );
+    assert_eq!(payload.status_code, 500);
+    assert_eq!(payload.action, "SnapshotVolume");
+    assert_eq!(payload.resource_kind.as_deref(), Some("volume"));
+    assert_eq!(payload.resource_id.as_deref(), Some("vol-a"));
+
+    let dispatched = dispatch_one(&db, rows[0].created_at_ms).await;
+    assert_eq!(dispatched[0].audit_id, rows[0].audit_id);
+    assert_eq!(dispatched[0].outcome, "failed");
+    assert_eq!(dispatched[0].status_code, 500);
+}
+
+#[tokio::test]
+async fn server_audit_volume_snapshot_oversized_payload_rolls_back_the_intent() {
+    let db = TestDb::new().await;
+    // Only `SnapshotVolume` is exercised: all three snapshot-family RPCs
+    // enqueue through the same `enqueue_on_tx::validate` bound, so one arm
+    // covers the behaviour.
+    seed_node(&db, "node-a", None).await;
+    seed_snapshot_volume(
+        &db.pool,
+        "vol-a",
+        "node-a",
+        1,
+        None,
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+    let service = lifecycle_impl(&db);
+
+    let now = chv_common::now_unix_ms();
+    let mut oversized = snapshot_audit_insert(
+        "ob-snapshot-oversized",
+        "audit-snapshot-oversized",
+        "SnapshotVolume",
+        now,
+    );
+    // > the 16 KiB payload bound enforced by `enqueue_on_tx`.
+    oversized.payload.metadata = "x".repeat(16 * 1024 + 1);
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let coupling = AdoptedAudit::new(&oversized, &committed);
+
+    let error = service
+        .snapshot_volume(
+            proto::SnapshotVolumeRequest {
+                meta: Some(node_transition_meta("node-a", "op-snapshot-oversized")),
+                node_id: "node-a".into(),
+                volume_id: "vol-a".into(),
+                snapshot_name: "snap-1".into(),
+            },
+            Some(&coupling),
+        )
+        .await
+        .expect_err("oversized evidence must fail the mutation closed");
+    assert!(
+        matches!(
+            error,
+            ControlPlaneServiceError::Store(StoreError::InvalidConfiguration { .. })
+        ),
+        "expected the store's payload validation error, got {error:?}"
+    );
+
+    let state = snapshot_state(&db.pool, "vol-a").await;
+    assert_eq!(
+        state,
+        (Some("seed".into()), Some("seed-name".into()), None, 1),
+        "the intent must roll back with the evidence"
+    );
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "no outbox row survives the rollback"
+    );
+    assert!(!coupling.was_committed());
+}
+
+#[tokio::test]
+async fn server_audit_unadopted_clone_volume_writes_one_direct_row_and_no_outbox() {
+    let db = TestDb::new().await;
+    let server = LifecycleServer::new(Arc::new(MockLifecycle::default()))
+        .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let request = peer_request(
+        proto::CloneVolumeRequest {
+            meta: Some(meta("op-clone-unadopted")),
+            node_id: "node-a".into(),
+            source_volume_id: "vol-a".into(),
+            target_volume_id: "vol-b".into(),
+        },
+        "node-a",
+    );
+    // `CloneVolume` stays post-hoc: the mock returns Unsupported, and the
+    // adapter records that one direct row without touching the outbox.
+    server
+        .clone_volume(request)
+        .await
+        .expect_err("the mock clone is unimplemented");
+
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "unadopted RPCs never touch the outbox"
+    );
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one direct row, as before");
+    assert_eq!(rows[0].action, "CloneVolume");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 501);
+    assert_eq!(rows[0].resource_kind.as_deref(), Some("volume"));
+    assert_eq!(rows[0].resource_id.as_deref(), Some("vol-a"));
 }
 
 // ---------------------------------------------------------------------------

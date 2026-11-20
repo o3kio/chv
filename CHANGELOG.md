@@ -8,6 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **gRPC volume snapshot-family transitions adopt the audit outbox (#706
+  half 1, PR 4).** `SnapshotVolume`, `RestoreVolume`, and
+  `DeleteVolumeSnapshot` now commit their audit row with the **intent
+  write** (`set_volume_snapshot`: `snapshot_op =
+  create`/`restore`/`delete` plus `snapshot_name`); the adapter mints a
+  server-side `outbox_id`/`audit_id` ticket and `finish_audited` performs
+  the same check-or-insert as every other adopted path. The store method
+  takes an optional outbox row: `None` is byte-identical to the previous
+  autocommit statement, while `Some` runs `BEGIN IMMEDIATE` → intent
+  upsert (whose zero-rows conflict arm runs the `'Deleting'`-tombstone
+  check on the **same connection** and fails the transaction) → outbox
+  INSERT → commit. The tombstone helper gained a
+  connection-taking form because the pool-level helper would acquire a
+  *second* connection while the first still holds the `BEGIN IMMEDIATE`
+  write lock. That costs a connection per in-flight adopted mutation —
+  the shipped configs allow four, so concurrent mutations can stall
+  waiting for one — and on SQLite's shared-cache in-memory test database
+  the second connection's read blocks on the held write lock. Running the
+  check on the held connection needs no extra connection and observes
+  exactly the row state the patch saw. The coupling is
+  deliberately intent-anchored, not journal-anchored: a crash after the
+  earlier `operations` INSERT but before the intent would otherwise leave
+  a false `success` row for a snapshot operation that never applied.
+  **Residual window
+  (disclosed, not closed):** the operation row and `OperationStarted`
+  event are earlier, separate commits — a crash between them and the
+  intent leaves no state change and no row; a non-crash conflict after
+  the journal (a `Deleting` tombstone) writes exactly one direct failed
+  row (409, gRPC `ALREADY_EXISTS`), no outbox row, and leaves the volume
+  row unchanged; a crash after the intent commit but before the
+  operation-status update leaves the applied intent plus a `success` row
+  and a possibly stale operation status. Adoption is per-RPC: the BFF
+  twin routes `POST /v1/volumes/snapshot` (`volume.snapshot`),
+  `/v1/volumes/restore-snapshot` (`volume.restore_snapshot`), and
+  `/v1/volumes/delete-snapshot` (`volume.delete_snapshot`) call the same
+  three service methods in-process without a ticket and stay post-hoc,
+  as does `CloneVolume`; there is no global lifecycle-closure claim.
+  Verification is deterministic (per-RPC applied `snapshot_op`/
+  `snapshot_name` read-back seeded with a different value, one
+  dispatched row reusing the pre-minted `audit_id` with a no-op second
+  pass, tombstone refusal, crash replay, the post-commit patch path,
+  oversized-payload rollback, unadopted parity) plus store-level
+  intent/enqueue atomicity and deferred-FK commit-failure tests; no
+  `SIGKILL` end-to-end test is claimed. See
+  `docs/specs/component/audit-log.md` and
+  `docs/runbooks/audit-outbox.md`.
 - **gRPC node-lifecycle transitions adopt the audit outbox (#706 half 1,
   PR 3c).** `PauseNodeScheduling`, `ResumeNodeScheduling`, `DrainNode`,
   `EnterMaintenance`, and `ExitMaintenance` now commit their audit row
@@ -145,7 +191,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outbox_dispatch_interval_secs` (default 1) and
   `outbox_retention_days` (default 7, validated 1..=365).
   The plumbing itself changes no request behavior; adoption lands in
-  PR 2 (BFF, above) and PR 3a/3b/3c (gRPC). See
+  PR 2 (BFF, above) and PR 3a/3b/3c/4 (gRPC). See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 
@@ -164,8 +210,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(service, reason, peer)` rows are deduped for 60 seconds into
   `chv_grpc_denial_audit_suppressed_total`. Server-side tonic does not expose
   the RPC method, so rows carry the service as `path`; method-level fidelity
-  and the crash window (mutation commits before its audit row) remain open
-  under #706.
+  and the crash window for not-yet-adopted mutation sites (mutation commits
+  before its audit row) remains open under #706.
 - **RustSec advisories cleared from the dependency graph.** `rusqlite`
   0.32→0.41 and `sqlx` 0.8→0.9.1 now share a single
   `libsqlite3-sys` 0.39.1 (bundled SQLite 3.54.1), removing

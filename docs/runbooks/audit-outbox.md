@@ -17,8 +17,9 @@ recovery path we cannot honour.
 
 > **Rollout status (#706 half 1).** The outbox is live for the adopted
 > BFF routes, the three adopted gRPC enrollment RPCs, the five adopted
-> gRPC reconcile RPCs, and the five adopted gRPC node-lifecycle
-> transitions listed below.
+> gRPC reconcile RPCs, the five adopted gRPC node-lifecycle
+> transitions, and the three adopted gRPC volume snapshot-family RPCs
+> listed below.
 > On those paths a pending row means the mutation **committed** and its
 > evidence row is waiting for the dispatcher. The response was normally
 > 2xx, but a committed mutation whose final response was later patched
@@ -39,7 +40,8 @@ recovery path we cannot honour.
 > `ApplyVmDesiredState`, `ApplyVolumeDesiredState`,
 > `ApplyNetworkDesiredState`, and `AcknowledgeDesiredStateVersion`;
 > `PauseNodeScheduling`, `ResumeNodeScheduling`, `DrainNode`,
-> `EnterMaintenance`, and `ExitMaintenance`.
+> `EnterMaintenance`, and `ExitMaintenance`; and `SnapshotVolume`,
+> `RestoreVolume`, and `DeleteVolumeSnapshot`.
 >
 > **Enrollment specifics.** For `RotateNodeCertificate` and
 > `ReportBootstrapResult` the outbox row commits with the single
@@ -79,14 +81,39 @@ recovery path we cannot honour.
 > leaves the applied state and a `success` row with a possibly stale
 > operation status. An intent failure (e.g. pause/resume on a node with
 > no `node_desired_state` row) rolls the enqueue back and writes exactly
-> one direct failed row; no pending row appears. The rest of the
-> lifecycle surface is still post-hoc.
+> one direct failed row; no pending row appears. The five node
+> transitions above are adopted; the rest of the lifecycle surface,
+> apart from the volume snapshot family covered below, is still
+> post-hoc.
 >
 > The BFF twin is also still post-hoc: `POST /v1/nodes/mutate`
 > (`node.mutate`, the WebUI/chvctl path) calls the same five service
 > methods in-process without a ticket, so a pause/drain/maintenance
 > change made from the WebUI keeps the post-hoc insert and its crash
 > window and never appears in this table.
+>
+> **Volume snapshot specifics.** `SnapshotVolume`, `RestoreVolume`, and
+> `DeleteVolumeSnapshot` commit the row with the **intent write**
+> (`set_volume_snapshot`: `snapshot_op = create`/`restore`/`delete`
+> plus `snapshot_name`). A pending row here means the snapshot intent
+> **committed** and its evidence is queued. Their `operations` row and
+> `OperationStarted` event commit **earlier** and are not coupled: a
+> crash between them and the intent leaves no state change and **no
+> row** (pre-existing window), and a crash after the intent commit but
+> before the operation status update leaves the applied intent and a
+> `success` row with a possibly stale operation status. A `Deleting`
+> tombstone refuses the patch inside the write transaction, so a
+> non-crash conflict after the journal produces exactly one direct
+> failed row (409) and **no pending row**, with the volume row
+> unchanged.
+>
+> The BFF twin routes are still post-hoc: `POST /v1/volumes/snapshot`
+> (`volume.snapshot`), `POST /v1/volumes/restore-snapshot`
+> (`volume.restore_snapshot`), and `POST /v1/volumes/delete-snapshot`
+> (`volume.delete_snapshot`) call the same three service methods
+> in-process without a ticket, so a snapshot/restore/delete made from
+> the WebUI keeps the post-hoc insert and its crash window and never
+> appears in this table.
 >
 > A non-zero `chv_audit_outbox_pending` on a build without this adoption
 > (or with no adopted traffic) means something wrote the table out of
@@ -253,9 +280,25 @@ post-hoc crash window. On the gRPC path, check `operations` for a
 still-`Pending` `PauseNodeScheduling`-style row with its
 `OperationStarted` event and no matching `node_desired_state` change
 (the journal-only crash window), and `chv_grpc_audit_write_failures_total`
-/ the `AUDIT_LOG_WRITE_FAILED` log for a failed direct insert. If the
-state change *is* present but the row missing, check `audit_outbox` for
-a pending row before concluding evidence was lost.
+/ the `AUDIT LOG WRITE FAILED` error log for a failed direct insert. If
+the state change *is* present but the row missing, check `audit_outbox`
+for a pending row before concluding evidence was lost.
+
+For the volume snapshot family specifically: a **denied** request
+always leaves a direct `denied` row — a missing row is never a denial.
+If the trail has no row, first check how the change was made: the
+WebUI/chvctl paths (`POST /v1/volumes/snapshot`,
+`/v1/volumes/restore-snapshot`, `/v1/volumes/delete-snapshot`) are not
+outbox-coupled and keep the post-hoc crash window. On the gRPC path,
+check `operations` for a still-`Pending` `SnapshotVolume`-style row
+with its `OperationStarted` event and no matching
+`volume_desired_state` snapshot-op change (the journal-only crash
+window), and `chv_grpc_audit_write_failures_total` / the
+`AUDIT LOG WRITE FAILED` error log for a failed direct insert. If the
+intent *is* present but the row missing, check `audit_outbox` for a
+pending row before concluding evidence was lost. A direct failed 409
+row means a `Deleting` tombstone refused the patch (the volume row is
+unchanged).
 
 A dispatched row is indistinguishable from a direct one in `audit_log`;
 for 7 days you can join `audit_outbox.audit_id` to prove a row was
@@ -276,7 +319,7 @@ steady state. Changing either value requires a restart.
 Retention prunes up to 5,000 **dispatched** rows per pass. Pending rows
 are never pruned, regardless of age.
 
-## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a/3b/3c gRPC)
+## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a/3b/3c/4 gRPC)
 
 - **Audit loss / double-write (BFF):** the check-or-insert composition is
   what keeps this safe on adopted routes: a present outbox row suppresses
@@ -361,11 +404,25 @@ are never pruned, regardless of age.
   contention): `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths
   converted for #706 (all but `vms/import`, which keeps its pre-existing
   transaction) and these intent methods, not a repo-wide rule.
+- **Lock scope (PR 4):** `set_volume_snapshot` takes an optional outbox
+  row. With one it wraps the single intent UPSERT plus the outbox INSERT
+  in `begin_with("BEGIN IMMEDIATE;")`; without one it keeps the original
+  autocommit statement. Its `'Deleting'`-tombstone check runs on the
+  **same connection inside that transaction** (a connection-taking
+  helper shared with the pool-level form, so the conflict semantics are
+  identical). The pool-level helper would acquire a *second* connection
+  while the first still holds the `BEGIN IMMEDIATE` write lock. That
+  costs a connection per in-flight adopted mutation — the shipped
+  configs allow four, so concurrent mutations can stall waiting for one
+  — and on SQLite's shared-cache in-memory test database the second
+  connection's read blocks on the held write lock. Running the check on
+  the held connection needs no extra connection and observes exactly
+  the row state the patch saw.
 - **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
-  service (VM power, volumes, networks, migrate, overlay, ARP, resolve
-  inspect) and every unadopted BFF route still insert after the handler
-  returns, with the original narrow crash window. Denied and failed
-  requests stay post-hoc by design.
+  service (VM power, volume attach/resize/clone, networks, migrate,
+  overlay, ARP, resolve inspect) and every unadopted BFF route still
+  insert after the handler returns, with the original narrow crash
+  window. Denied and failed requests stay post-hoc by design.
 - **Lock scope (PR 2):** `users`/`tokens` mutations that were autocommit
   single statements are now wrapped in
   `begin_with("BEGIN IMMEDIATE;")` so the mutation and the outbox INSERT
