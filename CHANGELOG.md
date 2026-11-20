@@ -30,9 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure keeps the existing `Failed` journal and writes exactly one
   direct failed row (no outbox row). The rest of the lifecycle surface,
   including `StartVm`, stays post-hoc — this is per-RPC adoption, not a
-  global closure claim. Verification is deterministic (per-RPC
-  dispatched row reusing the pre-minted `audit_id` with a no-op second
-  pass, intent-failure journal preservation, crash replay, the
+  global closure claim. The BFF's `POST /v1/nodes/mutate` performs the
+  same five transitions in-process without a ticket and also stays
+  post-hoc. Verification is deterministic (per-RPC dispatched row
+  reusing the pre-minted `audit_id` with a no-op second pass,
+  intent-failure journal preservation, crash replay, the
   post-commit patch path, oversized-payload rollback) plus store-level
   intent/enqueue atomicity and deferred-FK commit-failure tests; no
   `SIGKILL` end-to-end test is claimed. The shared
@@ -40,7 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `begin()` to `BEGIN IMMEDIATE`, so `ApplyNodeDesiredState` (PR 3b) now
   runs its single-statement mutation plus the outbox INSERT in
   `BEGIN IMMEDIATE` too — identical atomicity and no lock-ordering
-  change. See `docs/specs/component/audit-log.md` and
+  change. The other PR 3a/3b adopted methods still open a deferred
+  `begin()` (same atomicity, busier first statement under contention);
+  `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths and these
+  intent methods, not a repo-wide rule. See
+  `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 - **gRPC reconcile mutations adopt the audit outbox (#706 half 1, PR 3b).**
   The five `ReconcileService` RPCs now commit their audit row with the
@@ -62,8 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence but loses the journal row, and a late journal failure patches
   the already-durable audit row to `failed`. The reconcile surface has
   no read-shaped or agent-fan-out RPC, so all five RPCs are adopted; the
-  rest of the gRPC lifecycle surface stayed post-hoc until PR 3c
-  (above). Verification is deterministic (one dispatched row per adopted
+  gRPC lifecycle surface stayed post-hoc until PR 3c (above), which
+  adopts its five node transitions — the rest of that surface stays
+  post-hoc. Verification is deterministic (one dispatched row per adopted
   RPC with a no-op second pass, stale generation and missing
   observed-state rollbacks with one direct failed row and no outbox row,
   crash replay, the post-commit patch path, unadopted shape,
@@ -109,19 +116,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the audit row) closes for exactly these routes; vm/volume deletes,
   filesystem/agent-RPC handlers, and the whole gRPC surface keep the
   direct post-hoc path until later PRs. Wrapping the formerly autocommit
-  `users`/`tokens` statements in `begin()` is a disclosed lock-scope
-  change (one extra INSERT under the same write lock, no new lock
-  ordering). Adopted enqueues **fail closed** on the store's 16 KiB
-  payload cap: an oversized actor is never truncated — the mutation
-  transaction rolls back and the failed attempt is recorded once on the
-  direct path. To keep that path unreachable for API-created users,
+  `users`/`tokens` statements in a `BEGIN IMMEDIATE` transaction is a
+  disclosed lock-scope change (one extra INSERT under the same write
+  lock, no new lock ordering). Adopted enqueues **fail closed** on the
+  store's 16 KiB payload cap: an oversized actor is never truncated — the
+  mutation transaction rolls back and the failed attempt is recorded once
+  on the direct path. To keep that path unreachable for API-created users,
   `POST /v1/users/create` now rejects usernames longer than 256
   characters with the existing 400 `BAD_REQUEST` shape (never truncated);
   usernames that already exceed the bound out-of-band remain a disclosed
   residual risk. The new `users`/`tokens` transactions use
-  `BEGIN IMMEDIATE` (the repo's write-serializing discipline), and the
-  crash-window evidence is deterministic integration tests — the design's
-  `SIGKILL` end-to-end test is a follow-up, not claimed. See
+  `BEGIN IMMEDIATE` (the write-serializing discipline these paths use),
+  and the crash-window evidence is deterministic integration tests — the
+  design's `SIGKILL` end-to-end test is a follow-up, not claimed. See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 
@@ -137,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outbox_dispatch_interval_secs` (default 1) and
   `outbox_retention_days` (default 7, validated 1..=365).
   The plumbing itself changes no request behavior; adoption lands in
-  PR 2 (BFF, above) and PR 3a/3b (gRPC). See
+  PR 2 (BFF, above) and PR 3a/3b/3c (gRPC). See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 
@@ -146,7 +153,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing/unparseable client certificate, an unusable certificate serial, or
   a revoked serial rejected by the steady-state `PeerIdentityInterceptor`
   now writes an anonymous `audit_log` row (`action=interceptor_denied`,
-  `method=gRPC`, `path=<gRPC service>`, `outcome=denied`, `status=401`, with
+  `method=gRPC`, `path=<gRPC service>`, `outcome=denied`,
+  `status_code=401`, with
   the reason in `metadata` — plus the certificate serial for revoked-serial
   rows only, never certificate material).
   Rejections move through a bounded channel to an off-path writer; a full or

@@ -133,8 +133,9 @@ exceeded, the writer is aborted and queued events are lost **uncounted**
 
 The crash window (a mutation commits before its audit row is written)
 remains open for the denial writer and for every mutation site not
-coupled to the audit outbox; the BFF and enrollment adoption below
-closes it for the listed routes and tracks the rest under #706.
+coupled to the audit outbox; the **BFF, enrollment, reconcile, and
+node-lifecycle adoption below closes it** for the listed routes and
+tracks the rest under #706.
 
 ## Mounting
 
@@ -215,8 +216,9 @@ that user's privileged actions.
 A request is classified once, executed once, and then the middleware
 attempts one insert. Under a healthy database this is exactly one row
 per mutating request, including failed and denied attempts. Adopted BFF
-routes and the adopted gRPC RPCs (enrollment and reconcile) keep the same
-exactly-one-row guarantee through a different emitter: the handler
+routes and the adopted gRPC RPCs (enrollment, reconcile, and the
+node-lifecycle transitions) keep the same exactly-one-row guarantee
+through a different emitter: the handler
 commits the row into `audit_outbox` with the mutation and the emitter's
 check-or-insert skips the direct insert (see the transactional-outbox
 section below).
@@ -320,7 +322,10 @@ transaction:
 **Adopted in PR 3c (gRPC lifecycle — node transitions).** Same adapter
 shape, but the coupling is **intent-anchored**: the privileged state
 change and its outbox row share one commit, and nothing else is folded
-in. The operation row and its `OperationStarted` event are earlier,
+in. This is the gRPC wire surface only: the BFF's
+`POST /v1/nodes/mutate` (`node.mutate`) calls the same five service
+methods in-process without a ticket and stays post-hoc (see Not adopted
+below). The operation row and its `OperationStarted` event are earlier,
 separate commits (residual below).
 
 | RPC | Action | Coupled intent write |
@@ -330,6 +335,10 @@ separate commits (residual below).
 | `DrainNode` | `DrainNode` | `set_drain_intent` (upsert `desired_state = Draining`) and the outbox row are one transaction |
 | `EnterMaintenance` | `EnterMaintenance` | `set_state_preserving_policy` (upsert `desired_state = Maintenance` plus `state_reason`) and the outbox row are one transaction |
 | `ExitMaintenance` | `ExitMaintenance` | `set_state_preserving_policy` (upsert `desired_state = TenantReady`) and the outbox row are one transaction |
+
+The `EnterMaintenance` reason is recorded in
+`node_desired_state.state_reason` and the operations journal, not in the
+audit row's `metadata`.
 
 Journal-anchoring these five (putting the outbox row in the operation
 INSERT) was **rejected** for this slice: that row commits before the
@@ -363,7 +372,8 @@ INSERT. Everything else in these five handlers is outside it, by design:
   no outbox row exists.
 - A **non-crash failure of the later `Accepted` status update** returns an
   error and patches the already-committed row to `failed`/500; the state
-  change and its evidence stay (evidence is not retracted).
+  change and its evidence stay (evidence is not retracted); the operation
+  row itself is left `Pending`, the same stale state as the crash case.
 - Adoption is **per-RPC**. The other lifecycle RPCs (including `StartVm`)
   remain post-hoc with their original crash window. This PR makes **no
   claim that the lifecycle surface is globally closed**; the remaining
@@ -371,12 +381,16 @@ INSERT. Everything else in these five handlers is outside it, by design:
 
 **Not adopted (still post-hoc).** Every other audited route — notably
 the rest of the gRPC `LifecycleService` surface (agent-ack fan-out and
-filesystem work inside the handlers) including `StartVm`, `StopVm`,
-`RebootVm`, `DeleteVm`, `ResizeVm`, `PauseVm`, `ResumeVm`,
+filesystem work inside the handlers) including `StartVm`, `CreateVm`,
+`StopVm`, `RebootVm`, `DeleteVm`, `ResizeVm`, `PauseVm`, `ResumeVm`,
 `PowerButtonVm`, the volume attach/resize/snapshot/clone RPCs, the
 network lifecycle RPCs, `MigrateVm`, `UpdateOverlay`,
 `SendGratuitousArp`, `ResolveInspectRequiredOperation`, the
-`Unimplemented` shims, `vm.delete`, `volume.delete`, anything that
+`Unimplemented` shims, the BFF node-action route `node.mutate`
+(`POST /v1/nodes/mutate`: its pause/resume/drain/maintenance actions run
+the same five service methods in-process with no ticket, so those
+transitions are crash-safe only on the gRPC wire surface),
+`vm.delete`, `volume.delete`, anything that
 performs filesystem or agent RPC work inside the handler, and the
 guest-agent browser routes. They keep today's direct insert and its
 narrow crash window. Denied and failed requests also stay post-hoc:
@@ -530,22 +544,23 @@ The contract adoption relies on:
 statements in a transaction extends the SQLite write lock by one INSERT
 (the outbox row) per adopted mutation; it introduces no new lock
 ordering. Those transactions, and `networks/create`, use
-`BEGIN IMMEDIATE` — the repo's write-serializing discipline — because
-their first statement is a write; a deferred `BEGIN` would only defer
-the same lock and risk a `SQLITE_BUSY` at that first write statement
-(the mutation) instead of at `BEGIN`. `networks/update`,
+`BEGIN IMMEDIATE` — the discipline the BFF outbox paths and the PR 3c
+intent methods follow — because their first statement is a write; a
+deferred `BEGIN` would only defer the same lock and risk a
+`SQLITE_BUSY` at that first write statement (the mutation) instead of
+at `BEGIN`. The PR 3a/3b adopted methods still open a deferred
+`begin()`: identical atomicity, but the first statement performs the
+lock upgrade (busier under contention). `networks/update`,
 `networks/delete`, and `vms/import` already held a transaction, so only
 the extra INSERT is new there.
 
-On gRPC the adopted store methods take an optional outbox row and open a
-transaction only when one is present (otherwise they keep the original
-autocommit statement). `register_fabric_identity` already had its own
-transaction, so enrollment adds only the INSERT there; the rotation
-compare-and-swap and the bootstrap-result upsert gain a transaction
-around the mutation statement plus the outbox INSERT on the adopted
-path. On the reconcile path
-`upsert_vm`, `upsert_volume`, and `upsert_network_with_exposures`
-already opened a transaction, so only the INSERT is new;
+On gRPC the adopted store methods take an optional outbox row; most open
+a transaction only when one is present (otherwise they keep the original
+autocommit statement), while `register_fabric_identity` and the three
+desired-state upserts already held one unconditionally. Enrollment adds
+only the INSERT there; the rotation compare-and-swap and the
+bootstrap-result upsert gain a transaction around the mutation statement
+plus the outbox INSERT on the adopted path. On the reconcile path
 `set_state_preserving_policy` and the four observed-state
 acknowledgements gain a transaction around the mutation statement plus
 the outbox INSERT on the adopted path. For the PR 3c node transitions
@@ -619,13 +634,15 @@ ignores the ticket writes one direct row and no outbox row); and both
 check-error branches of the gRPC composition (a committed enqueue whose
 lookup fails must not direct-insert and is replayed from the durable
 row; an uncommitted one falls back to exactly one direct failed row).
-The PR 3c lifecycle slice adds, per adopted RPC, the same one-dispatched-
-row proof (pre-minted `audit_id` reused, second pass a no-op), an intent
-failure (missing `node_desired_state` row: no outbox row, the `Failed`
-operation journal and `OperationFailed` event intact, exactly one direct
-404 row), crash replay, the `EnqueueThenFail` patch path on
-`PauseNodeScheduling`, and an oversized payload that rolls the intent
-back (state unchanged, zero outbox rows).
+The PR 3c lifecycle slice adds, per adopted RPC, an applied-intent
+read-back from `node_desired_state` (state, reason, and
+`scheduling_paused`/`allow_workload_stop` as applicable) plus the same
+one-dispatched-row proof (pre-minted `audit_id` reused, second pass a
+no-op), an intent failure (missing `node_desired_state` row: no outbox
+row, the `Failed` operation journal and `OperationFailed` event intact,
+exactly one direct 404 row), crash replay, the `EnqueueThenFail` patch
+path on `PauseNodeScheduling`, and an oversized payload that rolls the
+intent back (state unchanged, zero outbox rows).
 The store suite pins the rotation transaction's atomicity directly
 (`test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap`:
 a lost compare-and-swap commits neither the serial nor the outbox row)
@@ -635,12 +652,16 @@ generation commits neither the fragment nor the outbox row, an accepted
 one commits both with the pre-minted ids;
 `test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write`:
 a successful enqueue whose COMMIT fails rolls the desired-state write
-back too, and the PR 3c
-`test_set_scheduling_paused_audit_commit_failure_rolls_back_the_intent`:
-the same deferred-FK construction rolls the node scheduling intent back
-with the outbox row, while
-`test_set_scheduling_paused_audit_is_atomic_with_the_intent` pins the
-committed pair and the `NotFound` rollback).
+back too. The PR 3c intent methods have the same pair:
+`test_set_scheduling_paused_audit_commit_failure_rolls_back_the_intent`
+(and `..._is_atomic_with_the_intent`, which also pins the `NotFound`
+rollback),
+`test_set_drain_intent_audit_commit_failure_rolls_back_the_intent`
+(and `..._is_atomic_with_the_intent`, which pins the applied `Draining`
+state and the pre-minted ids), and
+`test_set_state_preserving_policy_audit_commit_failure_rolls_back_the_state`
+(and `..._is_atomic_with_the_state`, which pins `Maintenance` plus
+`state_reason`).
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see
@@ -668,8 +689,8 @@ row is anonymous, and `auth_source` is `insecure`. Interceptor-level
 certificate rejections **do** write a durable anonymous row, even though
 they happen outside the handler: `action=interceptor_denied`,
 `method=gRPC`, `path=<fully-qualified gRPC service>`, `outcome=denied`,
-`status=401`, with the reason and serial in `metadata` (see the denial
-boundary above).
+`status_code=401`, with the reason and serial in `metadata` (see the
+denial boundary above).
 
 ## Redaction contract
 

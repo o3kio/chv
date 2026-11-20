@@ -82,6 +82,12 @@ recovery path we cannot honour.
 > one direct failed row; no pending row appears. The rest of the
 > lifecycle surface is still post-hoc.
 >
+> The BFF twin is also still post-hoc: `POST /v1/nodes/mutate`
+> (`node.mutate`, the WebUI/chvctl path) calls the same five service
+> methods in-process without a ticket, so a pause/drain/maintenance
+> change made from the WebUI keeps the post-hoc insert and its crash
+> window and never appears in this table.
+>
 > A non-zero `chv_audit_outbox_pending` on a build without this adoption
 > (or with no adopted traffic) means something wrote the table out of
 > band — investigate before assuming adoption.
@@ -97,8 +103,9 @@ recovery path we cannot honour.
 | Admin read surface | `POST /v1/audit-log`, `POST /v1/audit-log/export` — reads `audit_log` only; pending outbox rows are never exposed |
 
 A pending outbox row is **not** evidence that the mutation failed. On an
-adopted route it means the mutation committed — the caller already got
-its 2xx — and the evidence row has not been written to `audit_log` yet.
+adopted route it means the mutation committed — the caller normally
+already got its 2xx — and the evidence row has not been written to
+`audit_log` yet.
 Evidence is delayed, not lost. A non-2xx final response on an adopted
 route is patched into the pending row (`outcome`/`status_code`) before
 dispatch; if the dispatcher wins that race the row keeps its commit-time
@@ -238,6 +245,22 @@ exists. A consumed token with no node row means the process died after
 the token commit and before the final write — there is no outbox row to
 replay, and the operator must issue a fresh token.
 
+For the node transitions specifically: a **denied** request always
+leaves a direct `denied` row — a missing row is never a denial. If the
+trail has no row, first check how the change was made: the WebUI/chvctl
+path (`POST /v1/nodes/mutate`) is not outbox-coupled and keeps the
+post-hoc crash window. On the gRPC path, check `operations` for a
+still-`Pending` `PauseNodeScheduling`-style row with its
+`OperationStarted` event and no matching `node_desired_state` change
+(the journal-only crash window), and `chv_grpc_audit_write_failures_total`
+/ the `AUDIT_LOG_WRITE_FAILED` log for a failed direct insert. If the
+state change *is* present but the row missing, check `audit_outbox` for
+a pending row before concluding evidence was lost.
+
+A dispatched row is indistinguishable from a direct one in `audit_log`;
+for 7 days you can join `audit_outbox.audit_id` to prove a row was
+outbox-coupled.
+
 ## 4. Configuration
 
 ```toml
@@ -262,9 +285,10 @@ are never pruned, regardless of age.
   risk a duplicate. The BFF integration suite covers adopted success,
   rollback, crash-before-middleware, injected post-commit 500, unadopted
   routes, and the oversized-actor fail-closed case.
-- **Audit loss / double-write (gRPC enrollment and reconcile):** the
-  adapter mints a per-request `outbox_id`/`audit_id` (UUIDv4, never from
-  the wire) and applies the same check-or-insert in `finish_audited`. A
+- **Audit loss / double-write (gRPC enrollment, reconcile, and
+  lifecycle):** the adapter mints a per-request
+  `outbox_id`/`audit_id` (UUIDv4, never from the wire) and applies the
+  same check-or-insert in `finish_audited`. A
   committed outbox row suppresses the direct insert; a missing row takes
   the direct path (denied, rolled back, or unadopted); a failed check
   consults the request's committed flag, set by the service once its
@@ -309,8 +333,8 @@ are never pruned, regardless of age.
   these RPCs was rejected because it would produce a false `success` row
   for a state change a later crash prevented. Per-RPC adoption only: the
   rest of the lifecycle surface is not covered.
-- **Lock scope (PR 3a):** the adopted store methods take an optional
-  outbox row and open a transaction only when one is present;
+- **Lock scope (PR 3a):** the PR 3a adopted store methods take an
+  optional outbox row and open a transaction only when one is present;
   `register_fabric_identity` already had a transaction, and the rotation
   compare-and-swap / bootstrap-result upsert gain a transaction around
   the mutation statement plus the outbox INSERT. The transaction is held
@@ -332,7 +356,10 @@ are never pruned, regardless of age.
   INSERT in `begin_with("BEGIN IMMEDIATE;")`; without one they keep the
   original autocommit statement byte-for-byte. The lock is held for one
   extra INSERT and never across the operation-status update or any
-  transport work.
+  transport work. The PR 3a/3b adopted store methods still open a
+  deferred `begin()` (same atomicity, busier first statement under
+  contention): `BEGIN IMMEDIATE` is the discipline of the BFF outbox
+  paths and these intent methods, not a repo-wide rule.
 - **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
   service (VM power, volumes, networks, migrate, overlay, ARP, resolve
   inspect) and every unadopted BFF route still insert after the handler

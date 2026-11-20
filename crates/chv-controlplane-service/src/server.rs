@@ -1,4 +1,5 @@
-use crate::enrollment::{AdoptedAudit, EnrollmentService};
+use crate::audit_coupling::AdoptedAudit;
+use crate::enrollment::EnrollmentService;
 use crate::inventory::InventoryService;
 use crate::lifecycle::LifecycleService;
 use crate::peer_identity::{verify_peer_matches, InsecurePeer, PeerCertificateSerial, PeerNodeId};

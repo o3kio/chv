@@ -17,7 +17,7 @@ use chv_controlplane_store::{
     test_util::TestDb, AuditLogInsert, AuditLogRepository, AuditLogRow, AuditOutboxInsert,
     AuditOutboxRepository, AuditOutboxRow, BootstrapTokenRepository, DesiredStateRepository,
     EventRepository, NodeRepository, NodeUpsertInput, ObservedStateRepository, OperationRepository,
-    StorePool, VtepRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
+    StoreError, StorePool, VtepRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
 };
 use chv_controlplane_types::domain::NodeId;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -100,7 +100,10 @@ macro_rules! mock_lifecycle_impl {
                     ));
                 };
                 let audit = audit.expect("the adapter passes the coupling");
-                let mut tx = pool.begin().await.expect("begin adopted tx");
+                let mut tx = pool
+                    .begin_with("BEGIN IMMEDIATE;")
+                    .await
+                    .expect("begin adopted tx");
                 chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
                     .await
                     .expect("enqueue evidence");
@@ -1363,6 +1366,44 @@ async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
         }
     }
 
+    /// Read back the applied intent. Asserting only the outbox row would
+    /// keep passing if the store's intent statement were deleted: the
+    /// enqueue still commits on its own.
+    async fn assert_desired_state_applied(pool: &StorePool, rpc: Rpc) {
+        let (state, reason, paused, allow_stop): (String, Option<String>, i64, Option<i64>) =
+            sqlx::query_as(
+                "SELECT desired_state, state_reason, scheduling_paused, allow_workload_stop \
+                 FROM node_desired_state WHERE node_id = 'node-a'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read applied desired state");
+
+        match rpc {
+            Rpc::Pause => assert_eq!(paused, 1, "{rpc:?}: pause must apply"),
+            Rpc::Resume => assert_eq!(paused, 0, "{rpc:?}: resume must apply"),
+            Rpc::Drain => {
+                assert_eq!(state, "Draining", "{rpc:?}: drain must apply");
+                assert_eq!(
+                    allow_stop,
+                    Some(1),
+                    "{rpc:?}: drain must record allow_workload_stop"
+                );
+            }
+            Rpc::EnterMaintenance => {
+                assert_eq!(state, "Maintenance", "{rpc:?}: maintenance must apply");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("upgrade"),
+                    "{rpc:?}: maintenance reason must apply"
+                );
+            }
+            Rpc::ExitMaintenance => {
+                assert_eq!(state, "TenantReady", "{rpc:?}: exit must apply");
+            }
+        }
+    }
+
     for rpc in [
         Rpc::Pause,
         Rpc::Resume,
@@ -1372,7 +1413,17 @@ async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
     ] {
         let db = TestDb::new().await;
         seed_node(&db, "node-a", None).await;
-        seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false).await;
+        // Seed the resume case paused so a no-op resume fails the applied
+        // assertion. Each iteration owns a fresh `TestDb`, so this cannot
+        // leak into the other arms.
+        seed_node_desired_state(
+            &db.pool,
+            "node-a",
+            "TenantReady",
+            1,
+            matches!(rpc, Rpc::Resume),
+        )
+        .await;
         let server = adopted_lifecycle_server(&db);
         let op = format!("op-{rpc:?}");
 
@@ -1435,6 +1486,8 @@ async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
                 .await
                 .expect("exit maintenance succeeds"),
         };
+
+        assert_desired_state_applied(&db.pool, rpc).await;
 
         assert!(
             audit_rows(&db.pool).await.is_empty(),
@@ -1686,7 +1739,10 @@ async fn server_audit_node_transition_oversized_payload_rolls_back_the_intent() 
         .await
         .expect_err("oversized evidence must fail the mutation closed");
     assert!(
-        format!("{error:?}").contains("audit outbox payload"),
+        matches!(
+            error,
+            ControlPlaneServiceError::Store(StoreError::InvalidConfiguration { .. })
+        ),
         "expected the store's payload validation error, got {error:?}"
     );
 

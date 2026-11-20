@@ -86,7 +86,7 @@ pub(crate) async fn issue_unrevoked_node_certificate(
     )))
 }
 
-pub use crate::audit_coupling::AdoptedAudit;
+use crate::audit_coupling::AdoptedAudit;
 
 #[async_trait]
 pub trait EnrollmentService: Send + Sync {
