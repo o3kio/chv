@@ -1,9 +1,8 @@
 use crate::error::ControlPlaneServiceError;
 use async_trait::async_trait;
 use chv_controlplane_store::{
-    AuditOutboxInsert, BootstrapTokenRepository, BootstrapTokenValidation,
-    NodeBootstrapResultInput, NodeInventoryInput, NodeRepository, NodeUpsertInput,
-    NodeVersionInput, VtepRepository,
+    BootstrapTokenRepository, BootstrapTokenValidation, NodeBootstrapResultInput,
+    NodeInventoryInput, NodeRepository, NodeUpsertInput, NodeVersionInput, VtepRepository,
 };
 use chv_controlplane_types::domain::NodeId;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -87,47 +86,7 @@ pub(crate) async fn issue_unrevoked_node_certificate(
     )))
 }
 
-/// Handler-side handle to one adopted mutation's audit evidence (#706).
-///
-/// Mirrors the BFF's `AuditOutboxTicket`: [`Self::insert`] is the
-/// pre-minted outbox row the service enqueues inside its final mutation
-/// transaction, and the committed flag is flipped by the service
-/// immediately after that store call returns `Ok` (i.e. the enqueue
-/// committed). The gRPC adapter's check-or-insert reads the flag to tell
-/// "nothing was enqueued" from "the evidence is durable even though the
-/// final check failed", so a check error can never produce a duplicate
-/// row.
-pub struct AdoptedAudit<'a> {
-    insert: &'a AuditOutboxInsert,
-    committed: &'a std::sync::atomic::AtomicBool,
-}
-
-impl<'a> AdoptedAudit<'a> {
-    pub fn new(
-        insert: &'a AuditOutboxInsert,
-        committed: &'a std::sync::atomic::AtomicBool,
-    ) -> Self {
-        Self { insert, committed }
-    }
-
-    /// The row to enqueue in the mutation's final transaction.
-    pub fn insert(&self) -> &AuditOutboxInsert {
-        self.insert
-    }
-
-    /// Record that this request's enqueue committed with its mutation.
-    /// Called right after the adopted store call returns `Ok`; every
-    /// adopted store method enqueues as its last fallible statement, so
-    /// `Ok` there means the evidence is durable.
-    pub fn mark_committed(&self) {
-        self.committed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub fn was_committed(&self) -> bool {
-        self.committed.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
+use crate::audit_coupling::AdoptedAudit;
 
 #[async_trait]
 pub trait EnrollmentService: Send + Sync {

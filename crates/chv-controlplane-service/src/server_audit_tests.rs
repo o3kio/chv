@@ -2,10 +2,10 @@
 //! enrollment boundaries (#658). These tests drive the real server
 //! adapters against a `TestDb`, with synthetic peer-identity extensions.
 
+use crate::audit_coupling::AdoptedAudit;
 use crate::audit_outbox_dispatcher::AuditOutboxDispatcher;
 use crate::enrollment::{
-    AdoptedAudit, CertificateIssuer, EnrollmentService, EnrollmentServiceImplementation,
-    IssuedCertificate,
+    CertificateIssuer, EnrollmentService, EnrollmentServiceImplementation, IssuedCertificate,
 };
 use crate::error::ControlPlaneServiceError;
 use crate::lifecycle::LifecycleService;
@@ -17,7 +17,7 @@ use chv_controlplane_store::{
     test_util::TestDb, AuditLogInsert, AuditLogRepository, AuditLogRow, AuditOutboxInsert,
     AuditOutboxRepository, AuditOutboxRow, BootstrapTokenRepository, DesiredStateRepository,
     EventRepository, NodeRepository, NodeUpsertInput, ObservedStateRepository, OperationRepository,
-    StorePool, VtepRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
+    StoreError, StorePool, VtepRepository, AUDIT_OUTBOX_DISPATCHED, AUDIT_OUTBOX_PENDING,
 };
 use chv_controlplane_types::domain::NodeId;
 use control_plane_node_api::control_plane_node_api as proto;
@@ -30,6 +30,10 @@ use tonic::{Code, Request};
 #[derive(Default)]
 struct MockLifecycle {
     fail_start: bool,
+    /// When set, the adopted `pause_node_scheduling` path enqueues the row,
+    /// commits it, marks the coupling, and then fails anyway — the
+    /// forward-compatible shape the patch path must survive.
+    enqueue_then_fail: Option<StorePool>,
 }
 
 fn ok_ack() -> proto::AckResponse {
@@ -43,7 +47,7 @@ fn ok_ack() -> proto::AckResponse {
 }
 
 macro_rules! mock_lifecycle_impl {
-    ($($name:ident($ty:ty)),* $(,)?) => {
+    ($($name:ident($ty:ty)),* $(,)?; adopted: $($aname:ident($aty:ty)),* $(,)?) => {
         #[tonic::async_trait]
         impl LifecycleService for MockLifecycle {
             async fn start_vm(
@@ -69,6 +73,46 @@ macro_rules! mock_lifecycle_impl {
                     ))
                 }
             )*
+
+            // The five adopted node-transition RPCs take the coupling; the
+            // mock never enqueues, so the adapter falls through to the
+            // direct path (the shape an adopted call without a ticket has).
+            $(
+                async fn $aname(
+                    &self,
+                    _request: $aty,
+                    _audit: Option<&AdoptedAudit<'_>>,
+                ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+                    Err(ControlPlaneServiceError::Unsupported(
+                        "unused in audit tests".into(),
+                    ))
+                }
+            )*
+
+            async fn pause_node_scheduling(
+                &self,
+                _request: proto::PauseNodeSchedulingRequest,
+                audit: Option<&AdoptedAudit<'_>>,
+            ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
+                let Some(pool) = &self.enqueue_then_fail else {
+                    return Err(ControlPlaneServiceError::Unsupported(
+                        "unused in audit tests".into(),
+                    ));
+                };
+                let audit = audit.expect("the adapter passes the coupling");
+                let mut tx = pool
+                    .begin_with("BEGIN IMMEDIATE;")
+                    .await
+                    .expect("begin adopted tx");
+                chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
+                    .await
+                    .expect("enqueue evidence");
+                tx.commit().await.expect("commit evidence");
+                audit.mark_committed();
+                Err(ControlPlaneServiceError::Internal(
+                    "post-commit failure".into(),
+                ))
+            }
         }
     };
 }
@@ -86,11 +130,6 @@ mock_lifecycle_impl! {
     restore_volume(proto::RestoreVolumeRequest),
     delete_volume_snapshot(proto::DeleteVolumeSnapshotRequest),
     clone_volume(proto::CloneVolumeRequest),
-    pause_node_scheduling(proto::PauseNodeSchedulingRequest),
-    resume_node_scheduling(proto::ResumeNodeSchedulingRequest),
-    drain_node(proto::DrainNodeRequest),
-    enter_maintenance(proto::EnterMaintenanceRequest),
-    exit_maintenance(proto::ExitMaintenanceRequest),
     pause_vm(proto::PauseVmRequest),
     resume_vm(proto::ResumeVmRequest),
     power_button_vm(proto::PowerButtonVmRequest),
@@ -108,6 +147,11 @@ mock_lifecycle_impl! {
     update_overlay(proto::UpdateOverlayRequest),
     send_gratuitous_arp(proto::SendGratuitousArpRequest),
     resolve_inspect_required_operation(proto::ResolveInspectRequiredOperationRequest),
+    ; adopted:
+    resume_node_scheduling(proto::ResumeNodeSchedulingRequest),
+    drain_node(proto::DrainNodeRequest),
+    enter_maintenance(proto::EnterMaintenanceRequest),
+    exit_maintenance(proto::ExitMaintenanceRequest),
 }
 
 #[derive(Default)]
@@ -209,7 +253,17 @@ impl EnrollmentService for EnqueueThenFail {
         audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let audit = audit.expect("the adapter passes the coupling");
-        let mut tx = self.pool.begin().await.expect("begin adopted tx");
+        // The enqueue commits in its own transaction before the failure,
+        // which is all this mock needs: the adapter sees a durable outbox
+        // row and a failed status. `BEGIN IMMEDIATE` is used here because
+        // the row must be durable before the simulated failure; the
+        // production enrollment path (`upsert_bootstrap_result`) still
+        // opens a deferred `begin()`.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE;")
+            .await
+            .expect("begin adopted tx");
         chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
             .await
             .expect("enqueue evidence");
@@ -567,8 +621,11 @@ async fn server_audit_unimplemented_shim_writes_failed_row() {
 #[tokio::test]
 async fn server_audit_service_failure_preserves_status_and_records_failed_row() {
     let db = TestDb::new().await;
-    let server = LifecycleServer::new(Arc::new(MockLifecycle { fail_start: true }))
-        .with_audit(AuditLogRepository::new(db.pool.clone()));
+    let server = LifecycleServer::new(Arc::new(MockLifecycle {
+        fail_start: true,
+        ..Default::default()
+    }))
+    .with_audit(AuditLogRepository::new(db.pool.clone()));
 
     let request = peer_request(
         proto::StartVmRequest {
@@ -1226,6 +1283,505 @@ async fn server_audit_adopted_crash_replay_writes_exactly_one_row() {
         .expect("second pass");
     assert_eq!(again, 0);
     assert_eq!(audit_rows(&db.pool).await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// #706 PR 3c — node lifecycle transitions coupled to the transactional
+// audit outbox.
+//
+// These drive the *real* `LifecycleServiceImplementation`, so the outbox
+// row is enqueued inside the intent write's transaction exactly as in
+// production. The coupling is intent-anchored: the privileged state change
+// (`set_scheduling_paused`, `set_drain_intent`,
+// `set_state_preserving_policy`) and its audit row share one commit. The
+// operation row and `OperationStarted` event are earlier, separate commits
+// and remain outside the coupled unit.
+// ---------------------------------------------------------------------------
+
+fn node_transition_meta(node_id: &str, operation_id: &str) -> proto::RequestMeta {
+    proto::RequestMeta {
+        operation_id: operation_id.into(),
+        requested_by: "test-user".into(),
+        target_node_id: node_id.into(),
+        desired_state_version: "1".into(),
+        request_unix_ms: 1_000,
+    }
+}
+
+fn node_transition_request<T>(message: T, node_id: &str, operation_id: &str) -> Request<T> {
+    let mut request = peer_request(message, node_id);
+    request.metadata_mut().insert(
+        chv_common::OPERATION_ID_METADATA_KEY,
+        operation_id.parse().expect("metadata value"),
+    );
+    request
+}
+
+fn lifecycle_impl(db: &TestDb) -> crate::lifecycle::LifecycleServiceImplementation {
+    crate::lifecycle::LifecycleServiceImplementation::new(
+        NodeRepository::new(db.pool.clone()),
+        OperationRepository::new(db.pool.clone()),
+        EventRepository::new(db.pool.clone()),
+        DesiredStateRepository::new(db.pool.clone()),
+    )
+}
+
+fn adopted_lifecycle_server(db: &TestDb) -> LifecycleServer {
+    LifecycleServer::new(Arc::new(lifecycle_impl(db)))
+        .with_audit(AuditLogRepository::new(db.pool.clone()))
+}
+
+async fn seed_node_desired_state(
+    pool: &StorePool,
+    node_id: &str,
+    state: &str,
+    generation: i64,
+    scheduling_paused: bool,
+    state_reason: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, state_reason, requested_at, updated_at, \
+          scheduling_paused) \
+         VALUES ($1, $2, $3, $4, strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), $5)",
+    )
+    .bind(node_id)
+    .bind(generation)
+    .bind(state)
+    .bind(state_reason)
+    .bind(scheduling_paused)
+    .execute(pool)
+    .await
+    .expect("seed node desired state");
+}
+
+#[tokio::test]
+async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
+    #[derive(Clone, Copy, Debug)]
+    enum Rpc {
+        Pause,
+        Resume,
+        Drain,
+        EnterMaintenance,
+        ExitMaintenance,
+    }
+
+    impl Rpc {
+        fn action(self) -> &'static str {
+            match self {
+                Rpc::Pause => "PauseNodeScheduling",
+                Rpc::Resume => "ResumeNodeScheduling",
+                Rpc::Drain => "DrainNode",
+                Rpc::EnterMaintenance => "EnterMaintenance",
+                Rpc::ExitMaintenance => "ExitMaintenance",
+            }
+        }
+
+        /// The pre-state each arm must transition *from*. Seeding a single
+        /// `TenantReady` row for every arm would make the applied assertions
+        /// below read back the seed instead of a transition (the exit arm
+        /// asserts `TenantReady`, which would then hold even if the exit
+        /// patch were a no-op).
+        fn seed(self) -> (&'static str, bool, Option<&'static str>) {
+            match self {
+                Rpc::Pause | Rpc::Resume | Rpc::Drain | Rpc::EnterMaintenance => {
+                    ("TenantReady", matches!(self, Rpc::Resume), None)
+                }
+                Rpc::ExitMaintenance => ("Maintenance", false, Some("upgrade")),
+            }
+        }
+    }
+
+    /// Read back the applied intent. Asserting only the outbox row would
+    /// keep passing if the store's intent statement were deleted: the
+    /// enqueue still commits on its own.
+    async fn assert_desired_state_applied(pool: &StorePool, rpc: Rpc) {
+        let (state, reason, paused, allow_stop): (String, Option<String>, i64, Option<i64>) =
+            sqlx::query_as(
+                "SELECT desired_state, state_reason, scheduling_paused, allow_workload_stop \
+                 FROM node_desired_state WHERE node_id = 'node-a'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read applied desired state");
+
+        match rpc {
+            Rpc::Pause => assert_eq!(paused, 1, "{rpc:?}: pause must apply"),
+            Rpc::Resume => assert_eq!(paused, 0, "{rpc:?}: resume must apply"),
+            Rpc::Drain => {
+                assert_eq!(state, "Draining", "{rpc:?}: drain must apply");
+                assert_eq!(
+                    allow_stop,
+                    Some(1),
+                    "{rpc:?}: drain must record allow_workload_stop"
+                );
+            }
+            Rpc::EnterMaintenance => {
+                assert_eq!(state, "Maintenance", "{rpc:?}: maintenance must apply");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("upgrade"),
+                    "{rpc:?}: maintenance reason must apply"
+                );
+            }
+            Rpc::ExitMaintenance => {
+                assert_eq!(state, "TenantReady", "{rpc:?}: exit must apply");
+                assert_eq!(
+                    reason, None,
+                    "{rpc:?}: exit must clear the maintenance reason"
+                );
+            }
+        }
+    }
+
+    for rpc in [
+        Rpc::Pause,
+        Rpc::Resume,
+        Rpc::Drain,
+        Rpc::EnterMaintenance,
+        Rpc::ExitMaintenance,
+    ] {
+        let db = TestDb::new().await;
+        seed_node(&db, "node-a", None).await;
+        // Each iteration owns a fresh `TestDb`, so the per-arm pre-state
+        // cannot leak into another arm and each applied assertion tests a
+        // real transition.
+        let (seed_state, seed_paused, seed_reason) = rpc.seed();
+        seed_node_desired_state(&db.pool, "node-a", seed_state, 1, seed_paused, seed_reason).await;
+        let server = adopted_lifecycle_server(&db);
+        let op = format!("op-{rpc:?}");
+
+        match rpc {
+            Rpc::Pause => server
+                .pause_node_scheduling(node_transition_request(
+                    proto::PauseNodeSchedulingRequest {
+                        meta: Some(node_transition_meta("node-a", &op)),
+                        node_id: "node-a".into(),
+                    },
+                    "node-a",
+                    &op,
+                ))
+                .await
+                .expect("pause succeeds"),
+            Rpc::Resume => server
+                .resume_node_scheduling(node_transition_request(
+                    proto::ResumeNodeSchedulingRequest {
+                        meta: Some(node_transition_meta("node-a", &op)),
+                        node_id: "node-a".into(),
+                    },
+                    "node-a",
+                    &op,
+                ))
+                .await
+                .expect("resume succeeds"),
+            Rpc::Drain => server
+                .drain_node(node_transition_request(
+                    proto::DrainNodeRequest {
+                        meta: Some(node_transition_meta("node-a", &op)),
+                        node_id: "node-a".into(),
+                        allow_workload_stop: true,
+                    },
+                    "node-a",
+                    &op,
+                ))
+                .await
+                .expect("drain succeeds"),
+            Rpc::EnterMaintenance => server
+                .enter_maintenance(node_transition_request(
+                    proto::EnterMaintenanceRequest {
+                        meta: Some(node_transition_meta("node-a", &op)),
+                        node_id: "node-a".into(),
+                        reason: "upgrade".into(),
+                    },
+                    "node-a",
+                    &op,
+                ))
+                .await
+                .expect("enter maintenance succeeds"),
+            Rpc::ExitMaintenance => server
+                .exit_maintenance(node_transition_request(
+                    proto::ExitMaintenanceRequest {
+                        meta: Some(node_transition_meta("node-a", &op)),
+                        node_id: "node-a".into(),
+                    },
+                    "node-a",
+                    &op,
+                ))
+                .await
+                .expect("exit maintenance succeeds"),
+        };
+
+        assert_desired_state_applied(&db.pool, rpc).await;
+
+        assert!(
+            audit_rows(&db.pool).await.is_empty(),
+            "{rpc:?}: adopted success skips the post-hoc direct insert"
+        );
+        let rows = outbox_rows(&db.pool).await;
+        assert_eq!(rows.len(), 1, "{rpc:?}: exactly one outbox row");
+        let row = &rows[0];
+        assert_eq!(row.status, AUDIT_OUTBOX_PENDING);
+        assert!(
+            !row.audit_id.is_empty() && row.audit_id != row.outbox_id,
+            "{rpc:?}: a separate audit_id was pre-minted"
+        );
+        let payload = row.parse_payload().expect("payload parses");
+        let action = rpc.action();
+        assert_eq!(payload.action, action);
+        assert_eq!(
+            payload.path,
+            format!("chv.controlplane.node.v1.LifecycleService/{action}")
+        );
+        assert_eq!(payload.actor_id, "node-a");
+        assert_eq!(payload.actor_role, "node");
+        assert_eq!(payload.resource_kind.as_deref(), Some("node"));
+        assert_eq!(payload.resource_id.as_deref(), Some("node-a"));
+        assert_eq!(payload.operation_id.as_deref(), Some(op.as_str()));
+        assert_eq!(payload.outcome, "success");
+        assert_eq!(payload.status_code, 200);
+        assert_metadata_is_allowlisted(&payload.metadata, "mtls");
+
+        let dispatched = dispatch_one(&db, row.created_at_ms).await;
+        assert_eq!(
+            dispatched[0].audit_id, row.audit_id,
+            "{rpc:?}: dispatch reuses the pre-minted audit_id"
+        );
+        assert_eq!(dispatched[0].action, action);
+
+        let again = dispatcher(&db.pool)
+            .dispatch_pass(row.created_at_ms + 60_000)
+            .await
+            .expect("second pass");
+        assert_eq!(again, 0, "{rpc:?}: a dispatched row is never replayed");
+        assert_eq!(
+            audit_rows(&db.pool).await.len(),
+            1,
+            "{rpc:?}: no double write"
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_audit_node_transition_intent_failure_keeps_failed_journal_and_one_direct_row() {
+    let db = TestDb::new().await;
+    // No node_desired_state row: the pause UPDATE matches nothing and the
+    // store returns NotFound, so the intent transaction (and the enqueue)
+    // rolls back.
+    seed_node(&db, "node-a", None).await;
+    let server = adopted_lifecycle_server(&db);
+
+    let status = server
+        .pause_node_scheduling(peer_request(
+            proto::PauseNodeSchedulingRequest {
+                meta: Some(node_transition_meta("node-a", "op-pause-intent-failure")),
+                node_id: "node-a".into(),
+            },
+            "node-a",
+        ))
+        .await
+        .expect_err("a missing desired-state row must fail the pause");
+    assert_eq!(status.code(), Code::NotFound);
+
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "a rolled-back intent enqueues nothing"
+    );
+    let rows = audit_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one direct failed row");
+    assert_eq!(rows[0].action, "PauseNodeScheduling");
+    assert_eq!(rows[0].outcome, "failed");
+    assert_eq!(rows[0].status_code, 404);
+
+    // The existing failure path is untouched: the operation is journaled
+    // Failed and the OperationFailed event still exists.
+    let (operation_status, error_code): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, error_code FROM operations WHERE operation_type = 'PauseNodeScheduling'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("operation row exists");
+    assert_eq!(operation_status, "Failed");
+    assert_eq!(error_code.as_deref(), Some("INTENT_PERSISTENCE_FAILED"));
+    let (failed_events,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = 'OperationFailed'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count failed events");
+    assert_eq!(failed_events, 1, "the Failed journal keeps its event");
+}
+
+#[tokio::test]
+async fn server_audit_node_transition_crash_replay_writes_exactly_one_row() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false, None).await;
+    let service = lifecycle_impl(&db);
+
+    // Deterministic crash: commit the intent + outbox row, then never run
+    // the adapter's `finish_audited` (the process died before it).
+    let now = chv_common::now_unix_ms();
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-node-crash".into(),
+        audit_id: "audit-node-crash".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: now,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "PauseNodeScheduling".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/PauseNodeScheduling".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-a".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: Some("op-node-crash".into()),
+            source_ip: None,
+            metadata: r#"{"transport":"grpc","auth_source":"mtls"}"#.into(),
+        },
+        created_at_ms: now,
+    };
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let coupling = AdoptedAudit::new(&insert, &committed);
+    service
+        .pause_node_scheduling(
+            proto::PauseNodeSchedulingRequest {
+                meta: Some(node_transition_meta("node-a", "op-node-crash")),
+                node_id: "node-a".into(),
+            },
+            Some(&coupling),
+        )
+        .await
+        .expect("intent commits with its outbox row");
+    assert!(
+        coupling.was_committed(),
+        "the service marks the enqueue committed"
+    );
+
+    assert!(audit_rows(&db.pool).await.is_empty(), "no post-hoc row yet");
+    let pending = outbox_rows(&db.pool).await;
+    assert_eq!(pending.len(), 1);
+
+    let rows = dispatch_one(&db, pending[0].created_at_ms).await;
+    assert_eq!(rows[0].audit_id, "audit-node-crash");
+    assert_eq!(rows[0].action, "PauseNodeScheduling");
+    assert_eq!(rows[0].operation_id.as_deref(), Some("op-node-crash"));
+
+    let again = dispatcher(&db.pool)
+        .dispatch_pass(pending[0].created_at_ms + 60_000)
+        .await
+        .expect("second pass");
+    assert_eq!(again, 0);
+    assert_eq!(audit_rows(&db.pool).await.len(), 1);
+}
+
+#[tokio::test]
+async fn server_audit_node_transition_post_commit_failure_patches_the_committed_row() {
+    let db = TestDb::new().await;
+    let server = LifecycleServer::new(Arc::new(MockLifecycle {
+        enqueue_then_fail: Some(db.pool.clone()),
+        ..Default::default()
+    }))
+    .with_audit(AuditLogRepository::new(db.pool.clone()));
+
+    let status = server
+        .pause_node_scheduling(peer_request(
+            proto::PauseNodeSchedulingRequest {
+                meta: Some(node_transition_meta("node-a", "op-node-post-commit")),
+                node_id: "node-a".into(),
+            },
+            "node-a",
+        ))
+        .await
+        .expect_err("the service failure must be preserved");
+    assert_eq!(status.code(), Code::Internal);
+
+    // The committed row is the only evidence: no direct row was added.
+    assert!(
+        audit_rows(&db.pool).await.is_empty(),
+        "a present outbox row suppresses the direct insert"
+    );
+    let rows = outbox_rows(&db.pool).await;
+    assert_eq!(rows.len(), 1, "exactly one outbox row");
+    assert_eq!(rows[0].status, AUDIT_OUTBOX_PENDING);
+    let payload = rows[0].parse_payload().expect("payload parses");
+    assert_eq!(
+        payload.outcome, "failed",
+        "the commit-time success prediction is patched"
+    );
+    assert_eq!(payload.status_code, 500);
+    assert_eq!(payload.action, "PauseNodeScheduling");
+
+    let dispatched = dispatch_one(&db, rows[0].created_at_ms).await;
+    assert_eq!(dispatched[0].audit_id, rows[0].audit_id);
+    assert_eq!(dispatched[0].outcome, "failed");
+    assert_eq!(dispatched[0].status_code, 500);
+}
+
+#[tokio::test]
+async fn server_audit_node_transition_oversized_payload_rolls_back_the_intent() {
+    let db = TestDb::new().await;
+    seed_node(&db, "node-a", None).await;
+    seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false, None).await;
+    let service = lifecycle_impl(&db);
+
+    let now = chv_common::now_unix_ms();
+    let oversized = AuditOutboxInsert {
+        outbox_id: "ob-node-oversized".into(),
+        audit_id: "audit-node-oversized".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: now,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "PauseNodeScheduling".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/PauseNodeScheduling".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-a".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            // > the 16 KiB payload bound enforced by `enqueue_on_tx`.
+            metadata: "x".repeat(16 * 1024 + 1),
+        },
+        created_at_ms: now,
+    };
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let coupling = AdoptedAudit::new(&oversized, &committed);
+    let error = service
+        .pause_node_scheduling(
+            proto::PauseNodeSchedulingRequest {
+                meta: Some(node_transition_meta("node-a", "op-node-oversized")),
+                node_id: "node-a".into(),
+            },
+            Some(&coupling),
+        )
+        .await
+        .expect_err("oversized evidence must fail the mutation closed");
+    assert!(
+        matches!(
+            error,
+            ControlPlaneServiceError::Store(StoreError::InvalidConfiguration { .. })
+        ),
+        "expected the store's payload validation error, got {error:?}"
+    );
+
+    let (paused,): (i64,) =
+        sqlx::query_as("SELECT scheduling_paused FROM node_desired_state WHERE node_id = 'node-a'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read desired state");
+    assert_eq!(paused, 0, "the intent must roll back with the evidence");
+    assert!(
+        outbox_rows(&db.pool).await.is_empty(),
+        "no outbox row survives the rollback"
+    );
+    assert!(!coupling.was_committed());
 }
 
 #[tokio::test]

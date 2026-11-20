@@ -1,4 +1,4 @@
-use crate::enrollment::AdoptedAudit;
+use crate::audit_coupling::AdoptedAudit;
 use crate::error::ControlPlaneServiceError;
 use async_trait::async_trait;
 use chv_controlplane_store::{

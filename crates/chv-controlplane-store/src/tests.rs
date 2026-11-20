@@ -1,8 +1,8 @@
 use crate::*;
-use chv_controlplane_types::domain::{Generation, NodeId, ResourceId};
+use chv_controlplane_types::domain::{Generation, NodeId, NodeState, ResourceId};
 
-// NOTE: These tests use an ephemeral Postgres instance via testcontainers.
-// No manual setup is required.
+// NOTE: These tests run against the in-memory SQLite pool created by
+// `TestDb`; no external database or manual setup is required.
 
 use crate::test_util::{test_credential_encryption, TestDb};
 
@@ -958,8 +958,688 @@ async fn test_upsert_vm_audit_commit_failure_rolls_back_the_desired_state_write(
     assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
 }
 
-// ── #384: transactional clone target materialization ──────────────────────
-//
+/// #706 PR 3c: a node scheduling transition and its audit-outbox row are
+/// one commit. The `None` branch keeps the original autocommit statement;
+/// the `Some` branch enqueues the pre-minted row last, inside the same
+/// transaction as the intent update.
+#[tokio::test]
+async fn test_set_scheduling_paused_audit_is_atomic_with_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-sched-atomic").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 1, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let input = NodeSchedulingPatchInput {
+        node_id: node_id.clone(),
+        desired_generation: Generation::new(2),
+        scheduling_paused: true,
+        requested_by: Some("test".into()),
+        updated_by: None,
+        requested_unix_ms: 1_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-sched-atomic".into(),
+        audit_id: "audit-ob-sched-atomic".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-sched-atomic".into(),
+            actor_username: "node-sched-atomic".into(),
+            actor_role: "node".into(),
+            action: "PauseNodeScheduling".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/PauseNodeScheduling".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-sched-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    repo.set_scheduling_paused(&input, Some(&insert))
+        .await
+        .expect("the adopted scheduling write commits");
+
+    let (paused,): (i64,) = sqlx::query_as(
+        "SELECT scheduling_paused FROM node_desired_state WHERE node_id = 'node-sched-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paused, 1, "the intent committed");
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-sched-atomic");
+    assert_eq!(audit_id, "audit-ob-sched-atomic");
+
+    // A missing desired-state row is the store's in-tx rejection: neither
+    // the (never applied) patch nor an outbox row may commit.
+    let missing = NodeSchedulingPatchInput {
+        node_id: NodeId::new("node-sched-missing").unwrap(),
+        ..input.clone()
+    };
+    let rejected = repo
+        .set_scheduling_paused(
+            &missing,
+            Some(&AuditOutboxInsert {
+                outbox_id: "ob-sched-missing".into(),
+                audit_id: "audit-ob-sched-missing".into(),
+                ..insert
+            }),
+        )
+        .await;
+    assert!(matches!(rejected, Err(StoreError::NotFound { .. })));
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox_rows, 1,
+        "a rejected intent enqueues nothing (only the accepted row remains)"
+    );
+}
+
+/// #706 PR 3c: an enqueue that succeeds but whose **commit** fails must
+/// roll the intent write back too (the same deferred-FK construction as
+/// the reconcile and BFF atomicity tests).
+#[tokio::test]
+async fn test_set_scheduling_paused_audit_commit_failure_rolls_back_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-sched-commit-fail").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 5, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let input = NodeSchedulingPatchInput {
+        node_id: node_id.clone(),
+        desired_generation: Generation::new(6),
+        scheduling_paused: true,
+        requested_by: Some("test".into()),
+        updated_by: None,
+        requested_unix_ms: 2_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-sched-commit-fail".into(),
+        audit_id: "audit-ob-sched-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-sched-commit-fail".into(),
+            actor_username: "node-sched-commit-fail".into(),
+            actor_role: "node".into(),
+            action: "PauseNodeScheduling".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/PauseNodeScheduling".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-sched-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    let error = repo
+        .set_scheduling_paused(&input, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    let (paused, generation): (i64, i64) = sqlx::query_as(
+        "SELECT scheduling_paused, desired_generation FROM node_desired_state \
+         WHERE node_id = 'node-sched-commit-fail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paused, 0, "the intent must roll back with the evidence");
+    assert_eq!(generation, 5, "the intent must roll back with the evidence");
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
+}
+
+/// #706 PR 3c: the drain-intent upsert and its audit-outbox row are one
+/// commit. The upsert has no in-tx rejection path (it inserts or patches
+/// unconditionally), so only the committed pair is asserted here; the
+/// commit-failure case below proves the rollback half.
+#[tokio::test]
+async fn test_set_drain_intent_audit_is_atomic_with_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-drain-atomic").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 1, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let input = NodeDrainIntentInput {
+        node_id: node_id.clone(),
+        desired_generation: Generation::new(2),
+        allow_workload_stop: Some(true),
+        requested_by: Some("test".into()),
+        updated_by: None,
+        requested_unix_ms: 1_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-drain-atomic".into(),
+        audit_id: "audit-ob-drain-atomic".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-drain-atomic".into(),
+            actor_username: "node-drain-atomic".into(),
+            actor_role: "node".into(),
+            action: "DrainNode".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/DrainNode".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-drain-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    repo.set_drain_intent(&input, Some(&insert))
+        .await
+        .expect("the adopted drain write commits");
+
+    let (state, allow_stop, generation): (String, Option<i64>, i64) = sqlx::query_as(
+        "SELECT desired_state, allow_workload_stop, desired_generation \
+         FROM node_desired_state WHERE node_id = 'node-drain-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "Draining", "the drain intent committed");
+    assert_eq!(allow_stop, Some(1), "the drain policy committed");
+    assert_eq!(generation, 2, "the generation committed");
+
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 1, "exactly one outbox row");
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-drain-atomic");
+    assert_eq!(audit_id, "audit-ob-drain-atomic");
+}
+
+/// #706 PR 3c: the drain-intent upsert must roll back when its evidence
+/// commit fails (same deferred-FK construction as the scheduling test).
+#[tokio::test]
+async fn test_set_drain_intent_audit_commit_failure_rolls_back_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-drain-commit-fail").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 5, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let input = NodeDrainIntentInput {
+        node_id: node_id.clone(),
+        desired_generation: Generation::new(6),
+        allow_workload_stop: Some(true),
+        requested_by: Some("test".into()),
+        updated_by: None,
+        requested_unix_ms: 2_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-drain-commit-fail".into(),
+        audit_id: "audit-ob-drain-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-drain-commit-fail".into(),
+            actor_username: "node-drain-commit-fail".into(),
+            actor_role: "node".into(),
+            action: "DrainNode".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/DrainNode".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-drain-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    let error = repo
+        .set_drain_intent(&input, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    let (state, allow_stop, generation): (String, Option<i64>, i64) = sqlx::query_as(
+        "SELECT desired_state, allow_workload_stop, desired_generation \
+         FROM node_desired_state WHERE node_id = 'node-drain-commit-fail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "TenantReady", "the prior state must survive");
+    assert_eq!(allow_stop, None, "no drain policy may survive");
+    assert_eq!(generation, 5, "the intent must roll back with the evidence");
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
+}
+
+/// #706 PR 3c: the state-preserving-policy patch (enter/exit maintenance)
+/// and its audit-outbox row are one commit.
+#[tokio::test]
+async fn test_set_state_preserving_policy_audit_is_atomic_with_the_state() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-state-atomic").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 1, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let input = NodeStatePatchInput {
+        node_id: node_id.clone(),
+        desired_state: NodeState::Maintenance,
+        desired_generation: Generation::new(2),
+        requested_by: Some("test".into()),
+        updated_by: None,
+        state_reason: Some("upgrade".into()),
+        requested_unix_ms: 1_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-state-atomic".into(),
+        audit_id: "audit-ob-state-atomic".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-state-atomic".into(),
+            actor_username: "node-state-atomic".into(),
+            actor_role: "node".into(),
+            action: "EnterMaintenance".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/EnterMaintenance".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-state-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    repo.set_state_preserving_policy(&input, Some(&insert))
+        .await
+        .expect("the adopted state write commits");
+
+    let (state, reason, generation): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT desired_state, state_reason, desired_generation \
+         FROM node_desired_state WHERE node_id = 'node-state-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "Maintenance", "the state patch committed");
+    assert_eq!(reason.as_deref(), Some("upgrade"), "the reason committed");
+    assert_eq!(generation, 2, "the generation committed");
+
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 1, "exactly one outbox row");
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-state-atomic");
+    assert_eq!(audit_id, "audit-ob-state-atomic");
+
+    // Exit direction: without this phase the test would still pass if the
+    // exit patch were a no-op, because the node is already `Maintenance`
+    // from the phase above and the exit assertion would read the seed back.
+    // The phase above leaves the row in the pre-state this phase exits
+    // from; assert it so a regression there cannot silently weaken the
+    // exit assertions below.
+    let (pre_state, pre_reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT desired_state, state_reason \
+         FROM node_desired_state WHERE node_id = 'node-state-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pre_state, "Maintenance", "exit phase starts in maintenance");
+    assert_eq!(
+        pre_reason.as_deref(),
+        Some("upgrade"),
+        "exit phase starts with the maintenance reason"
+    );
+
+    let exit_input = NodeStatePatchInput {
+        node_id: node_id.clone(),
+        desired_state: NodeState::TenantReady,
+        desired_generation: Generation::new(3),
+        requested_by: Some("test".into()),
+        updated_by: None,
+        state_reason: None,
+        requested_unix_ms: 2_000,
+    };
+    let exit_insert = AuditOutboxInsert {
+        outbox_id: "ob-state-exit".into(),
+        audit_id: "audit-ob-state-exit".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-state-atomic".into(),
+            actor_username: "node-state-atomic".into(),
+            actor_role: "node".into(),
+            action: "ExitMaintenance".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/ExitMaintenance".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-state-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    repo.set_state_preserving_policy(&exit_input, Some(&exit_insert))
+        .await
+        .expect("the adopted exit write commits");
+
+    let (state, reason, generation): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT desired_state, state_reason, desired_generation \
+         FROM node_desired_state WHERE node_id = 'node-state-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "TenantReady", "the exit patch committed");
+    assert_eq!(reason, None, "the exit patch cleared the reason");
+    assert_eq!(generation, 3, "the exit generation committed");
+
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 2, "the exit enqueued its own outbox row");
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox WHERE outbox_id = $1")
+            .bind("ob-state-exit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-state-exit");
+    assert_eq!(audit_id, "audit-ob-state-exit");
+}
+
+/// #706 PR 3c: the state-preserving-policy patch must roll back when its
+/// evidence commit fails (same deferred-FK construction as the
+/// scheduling test).
+#[tokio::test]
+async fn test_set_state_preserving_policy_audit_commit_failure_rolls_back_the_state() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = NodeRepository::new(pool.clone());
+    let node_id = NodeId::new("node-state-commit-fail").unwrap();
+
+    sqlx::query("INSERT INTO nodes (node_id, hostname, display_name) VALUES ($1, 'host', 'host')")
+        .bind(node_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO node_desired_state \
+         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
+         VALUES ($1, 5, 'TenantReady', strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), false)",
+    )
+    .bind(node_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let input = NodeStatePatchInput {
+        node_id: node_id.clone(),
+        desired_state: NodeState::Maintenance,
+        desired_generation: Generation::new(6),
+        requested_by: Some("test".into()),
+        updated_by: None,
+        state_reason: Some("upgrade".into()),
+        requested_unix_ms: 2_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-state-commit-fail".into(),
+        audit_id: "audit-ob-state-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-state-commit-fail".into(),
+            actor_username: "node-state-commit-fail".into(),
+            actor_role: "node".into(),
+            action: "EnterMaintenance".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/EnterMaintenance".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-state-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    let error = repo
+        .set_state_preserving_policy(&input, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    let (state, reason, generation): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT desired_state, state_reason, desired_generation \
+         FROM node_desired_state WHERE node_id = 'node-state-commit-fail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "TenantReady", "the prior state must survive");
+    assert_eq!(reason, None, "no reason may survive");
+    assert_eq!(generation, 5, "the state must roll back with the evidence");
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
+}
+
+// ── #384: transactional clone target materialization ──────────────────────//
 // `materialize_clone_target` is the clone path's store core: ONE
 // `BEGIN IMMEDIATE` transaction that reads the source row (under the
 // write lock, so a racing resize cannot split the read from the target

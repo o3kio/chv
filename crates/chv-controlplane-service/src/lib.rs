@@ -1,4 +1,5 @@
 pub mod api;
+pub(crate) mod audit_coupling;
 mod backup_shipper;
 mod backup_worker;
 mod bff_mutations;

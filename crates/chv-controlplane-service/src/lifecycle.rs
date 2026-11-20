@@ -1,3 +1,4 @@
+use crate::audit_coupling::AdoptedAudit;
 use crate::error::ControlPlaneServiceError;
 use async_trait::async_trait;
 use chv_controlplane_store::{
@@ -84,29 +85,44 @@ pub trait LifecycleService: Send + Sync {
         request: proto::CloneVolumeRequest,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the node-scheduling intent write and the outbox enqueue
+    /// share one transaction, so the evidence commits with the state
+    /// change or not at all. The operation row and its `OperationStarted`
+    /// event are earlier, separate commits (residual window documented in
+    /// `docs/specs/component/audit-log.md`).
     async fn pause_node_scheduling(
         &self,
         request: proto::PauseNodeSchedulingRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::pause_node_scheduling`].
     async fn resume_node_scheduling(
         &self,
         request: proto::ResumeNodeSchedulingRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::pause_node_scheduling`].
     async fn drain_node(
         &self,
         request: proto::DrainNodeRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::pause_node_scheduling`].
     async fn enter_maintenance(
         &self,
         request: proto::EnterMaintenanceRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::pause_node_scheduling`].
     async fn exit_maintenance(
         &self,
         request: proto::ExitMaintenanceRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
     async fn pause_vm(
@@ -684,8 +700,34 @@ impl LifecycleServiceImplementation {
         Fut: std::future::Future<Output = Result<(), E>>,
         E: Into<ControlPlaneServiceError>,
     {
+        self.persist_intent_and_accept_adopted(operation_id, None, persist)
+            .await
+    }
+
+    /// [`Self::persist_intent_and_accept`] for an adopted intent write
+    /// (#706): the coupling's committed flag is flipped as soon as the
+    /// store call returns `Ok` — i.e. the intent and its outbox row
+    /// committed — and *before* the separate `Accepted` status update, so
+    /// a later status failure cannot make the adapter re-insert evidence
+    /// the outbox already holds.
+    async fn persist_intent_and_accept_adopted<F, Fut, E>(
+        &self,
+        operation_id: &OperationId,
+        audit: Option<&AdoptedAudit<'_>>,
+        persist: F,
+    ) -> Result<(), ControlPlaneServiceError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+        E: Into<ControlPlaneServiceError>,
+    {
         match persist().await {
-            Ok(()) => self.accept_operation(operation_id).await,
+            Ok(()) => {
+                if let Some(audit) = audit {
+                    audit.mark_committed();
+                }
+                self.accept_operation(operation_id).await
+            }
             Err(e) => {
                 let err = e.into();
                 self.fail_operation(operation_id, &err).await?;
@@ -1403,6 +1445,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn pause_node_scheduling(
         &self,
         request: proto::PauseNodeSchedulingRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1419,16 +1462,19 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.node_repo
-                .set_scheduling_paused(&NodeSchedulingPatchInput {
-                    node_id: node_id.clone(),
-                    desired_generation,
-                    scheduling_paused: true,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_scheduling_paused(
+                    &NodeSchedulingPatchInput {
+                        node_id: node_id.clone(),
+                        desired_generation,
+                        scheduling_paused: true,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    audit.map(AdoptedAudit::insert),
+                )
                 .await
         })
         .await?;
@@ -1442,6 +1488,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn resume_node_scheduling(
         &self,
         request: proto::ResumeNodeSchedulingRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1458,16 +1505,19 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.node_repo
-                .set_scheduling_paused(&NodeSchedulingPatchInput {
-                    node_id: node_id.clone(),
-                    desired_generation,
-                    scheduling_paused: false,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_scheduling_paused(
+                    &NodeSchedulingPatchInput {
+                        node_id: node_id.clone(),
+                        desired_generation,
+                        scheduling_paused: false,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    audit.map(AdoptedAudit::insert),
+                )
                 .await
         })
         .await?;
@@ -1481,6 +1531,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn drain_node(
         &self,
         request: proto::DrainNodeRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1500,16 +1551,19 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.node_repo
-                .set_drain_intent(&NodeDrainIntentInput {
-                    node_id: node_id.clone(),
-                    desired_generation,
-                    allow_workload_stop: Some(request.allow_workload_stop),
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_drain_intent(
+                    &NodeDrainIntentInput {
+                        node_id: node_id.clone(),
+                        desired_generation,
+                        allow_workload_stop: Some(request.allow_workload_stop),
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    audit.map(AdoptedAudit::insert),
+                )
                 .await
         })
         .await?;
@@ -1520,6 +1574,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn enter_maintenance(
         &self,
         request: proto::EnterMaintenanceRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1536,7 +1591,7 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.node_repo
                 .set_state_preserving_policy(
                     &NodeStatePatchInput {
@@ -1548,7 +1603,7 @@ impl LifecycleService for LifecycleServiceImplementation {
                         state_reason: Some(request.reason),
                         requested_unix_ms: Self::now_ms(),
                     },
-                    None,
+                    audit.map(AdoptedAudit::insert),
                 )
                 .await
         })
@@ -1560,6 +1615,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn exit_maintenance(
         &self,
         request: proto::ExitMaintenanceRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1576,7 +1632,7 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.node_repo
                 .set_state_preserving_policy(
                     &NodeStatePatchInput {
@@ -1588,7 +1644,7 @@ impl LifecycleService for LifecycleServiceImplementation {
                         state_reason: None,
                         requested_unix_ms: Self::now_ms(),
                     },
-                    None,
+                    audit.map(AdoptedAudit::insert),
                 )
                 .await
         })

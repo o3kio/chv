@@ -166,7 +166,7 @@ per-serial, not fleet-wide.
   serial.
 - The first rejection per 60s window per `(service, reason, peer)` now
   writes a durable `audit_log` row: `action=interceptor_denied`,
-  `outcome=denied`, `status=401`, `path=<gRPC service>`, with the reason
+  `outcome=denied`, `status_code=401`, `path=<gRPC service>`, with the reason
   (and serial) in `metadata`. The peer key is the certificate serial when
   usable, otherwise the source IP (so the service is part of the dedupe
   key). Repeated attempts within the window are suppressed into

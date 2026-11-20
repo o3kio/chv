@@ -429,44 +429,59 @@ impl MutationService for ControlPlaneMutationService {
         let ack = match action.as_str() {
             "pause_scheduling" => {
                 self.lifecycle_service
-                    .pause_node_scheduling(proto::PauseNodeSchedulingRequest {
-                        meta,
-                        node_id: node_id.clone(),
-                    })
+                    .pause_node_scheduling(
+                        proto::PauseNodeSchedulingRequest {
+                            meta,
+                            node_id: node_id.clone(),
+                        },
+                        None,
+                    )
                     .await
             }
             "resume_scheduling" => {
                 self.lifecycle_service
-                    .resume_node_scheduling(proto::ResumeNodeSchedulingRequest {
-                        meta,
-                        node_id: node_id.clone(),
-                    })
+                    .resume_node_scheduling(
+                        proto::ResumeNodeSchedulingRequest {
+                            meta,
+                            node_id: node_id.clone(),
+                        },
+                        None,
+                    )
                     .await
             }
             "drain" => {
                 self.lifecycle_service
-                    .drain_node(proto::DrainNodeRequest {
-                        meta,
-                        node_id: node_id.clone(),
-                        allow_workload_stop: false,
-                    })
+                    .drain_node(
+                        proto::DrainNodeRequest {
+                            meta,
+                            node_id: node_id.clone(),
+                            allow_workload_stop: false,
+                        },
+                        None,
+                    )
                     .await
             }
             "enter_maintenance" => {
                 self.lifecycle_service
-                    .enter_maintenance(proto::EnterMaintenanceRequest {
-                        meta,
-                        node_id: node_id.clone(),
-                        reason: "webui initiated".into(),
-                    })
+                    .enter_maintenance(
+                        proto::EnterMaintenanceRequest {
+                            meta,
+                            node_id: node_id.clone(),
+                            reason: "webui initiated".into(),
+                        },
+                        None,
+                    )
                     .await
             }
             "exit_maintenance" => {
                 self.lifecycle_service
-                    .exit_maintenance(proto::ExitMaintenanceRequest {
-                        meta,
-                        node_id: node_id.clone(),
-                    })
+                    .exit_maintenance(
+                        proto::ExitMaintenanceRequest {
+                            meta,
+                            node_id: node_id.clone(),
+                        },
+                        None,
+                    )
                     .await
             }
             _ => return Err(BffError::BadRequest(format!("invalid action: {}", action))),
@@ -1014,30 +1029,35 @@ mod tests {
         async fn pause_node_scheduling(
             &self,
             _request: proto::PauseNodeSchedulingRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no pause_node_scheduling in the A9 tests")
         }
         async fn resume_node_scheduling(
             &self,
             _request: proto::ResumeNodeSchedulingRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no resume_node_scheduling in the A9 tests")
         }
         async fn drain_node(
             &self,
             _request: proto::DrainNodeRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no drain_node in the A9 tests")
         }
         async fn enter_maintenance(
             &self,
             _request: proto::EnterMaintenanceRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no enter_maintenance in the A9 tests")
         }
         async fn exit_maintenance(
             &self,
             _request: proto::ExitMaintenanceRequest,
+            _audit: Option<&crate::audit_coupling::AdoptedAudit<'_>>,
         ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
             unreachable!("no exit_maintenance in the A9 tests")
         }

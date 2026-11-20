@@ -3050,7 +3050,7 @@ async fn test_drain_node_updates_desired_state() {
         allow_workload_stop: false,
     };
 
-    let result = service.drain_node(request).await;
+    let result = service.drain_node(request, None).await;
     assert!(result.is_ok(), "Expected success, got {:?}", result);
 
     let row = sqlx::query("SELECT desired_state FROM node_desired_state WHERE node_id = ?")
@@ -3091,7 +3091,7 @@ async fn test_enter_maintenance_updates_desired_state() {
         reason: "upgrade".into(),
     };
 
-    let resp = service.enter_maintenance(req).await.unwrap();
+    let resp = service.enter_maintenance(req, None).await.unwrap();
     assert_eq!(resp.result.unwrap().status, "OK");
 
     let row = sqlx::query("SELECT desired_state FROM node_desired_state WHERE node_id = ?")
@@ -3169,7 +3169,7 @@ async fn test_lifecycle_invalid_node_id() {
         allow_workload_stop: false,
     };
 
-    let result = service.drain_node(req).await;
+    let result = service.drain_node(req, None).await;
     match result {
         Err(ControlPlaneServiceError::NotFound(_)) => { /* correct */ }
         other => panic!("Expected NotFound for invalid node, got {:?}", other),
@@ -4211,7 +4211,7 @@ async fn test_pause_node_scheduling_persists_scheduling_paused() {
         node_id: "node-pause".into(),
     };
 
-    service.pause_node_scheduling(req).await.unwrap();
+    service.pause_node_scheduling(req, None).await.unwrap();
 
     let row = sqlx::query("SELECT scheduling_paused FROM node_desired_state WHERE node_id = ?")
         .bind("node-pause")
@@ -4257,7 +4257,7 @@ async fn test_pause_node_scheduling_preserves_existing_desired_state() {
         node_id: "pause-preserve".into(),
     };
 
-    service.pause_node_scheduling(req).await.unwrap();
+    service.pause_node_scheduling(req, None).await.unwrap();
 
     let row = sqlx::query(
         "SELECT desired_state, scheduling_paused, allow_workload_stop FROM node_desired_state WHERE node_id = ?",
@@ -4304,7 +4304,7 @@ async fn test_resume_node_scheduling_clears_scheduling_paused() {
         node_id: "node-resume".into(),
     };
 
-    service.resume_node_scheduling(req).await.unwrap();
+    service.resume_node_scheduling(req, None).await.unwrap();
 
     let row = sqlx::query("SELECT scheduling_paused FROM node_desired_state WHERE node_id = ?")
         .bind("node-resume")
@@ -4344,7 +4344,7 @@ async fn test_pause_node_scheduling_rejects_missing_desired_state() {
         node_id: "pause-missing".into(),
     };
 
-    let result = service.pause_node_scheduling(req).await;
+    let result = service.pause_node_scheduling(req, None).await;
     match result {
         Err(ControlPlaneServiceError::NotFound(msg)) => {
             assert!(msg.contains("node_desired_state"), "msg: {}", msg);
@@ -4393,7 +4393,7 @@ async fn test_resume_node_scheduling_rejects_missing_desired_state() {
         node_id: "resume-missing".into(),
     };
 
-    let result = service.resume_node_scheduling(req).await;
+    let result = service.resume_node_scheduling(req, None).await;
     match result {
         Err(ControlPlaneServiceError::NotFound(msg)) => {
             assert!(msg.contains("node_desired_state"), "msg: {}", msg);
@@ -4441,7 +4441,7 @@ async fn test_exit_maintenance_persists_tenant_ready() {
         node_id: "node-exit".into(),
     };
 
-    service.exit_maintenance(req).await.unwrap();
+    service.exit_maintenance(req, None).await.unwrap();
 
     let row = sqlx::query(
         "SELECT desired_state, scheduling_paused FROM node_desired_state WHERE node_id = ?",
@@ -4481,7 +4481,7 @@ async fn test_drain_node_persists_allow_workload_stop() {
         allow_workload_stop: true,
     };
 
-    service.drain_node(req).await.unwrap();
+    service.drain_node(req, None).await.unwrap();
 
     let row = sqlx::query("SELECT allow_workload_stop FROM node_desired_state WHERE node_id = ?")
         .bind("node-drain2")

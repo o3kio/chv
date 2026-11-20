@@ -16,17 +16,18 @@ detection, triage, and safe restart. It promises no manual data-loss
 recovery path we cannot honour.
 
 > **Rollout status (#706 half 1).** The outbox is live for the adopted
-> BFF routes, the three adopted gRPC enrollment RPCs, and the five
-> adopted gRPC reconcile RPCs listed below.
+> BFF routes, the three adopted gRPC enrollment RPCs, the five adopted
+> gRPC reconcile RPCs, and the five adopted gRPC node-lifecycle
+> transitions listed below.
 > On those paths a pending row means the mutation **committed** and its
 > evidence row is waiting for the dispatcher. The response was normally
 > 2xx, but a committed mutation whose final response was later patched
 > to a non-2xx (e.g. a downstream middleware failure) keeps its pending
 > row too — with `outcome` and `status_code` rewritten to match; see the
-> patch note below. The gRPC lifecycle surface and every unadopted BFF
-> route still use the direct post-hoc insert; their rows never appear in
-> this table, and their narrow crash window remains open (tracked under
-> #706).
+> patch note below. The rest of the gRPC lifecycle surface and every
+> unadopted BFF route still use the direct post-hoc insert; their rows
+> never appear in this table, and their narrow crash window remains open
+> (tracked under #706).
 >
 > Adopted BFF routes: `POST /v1/users/create`, `/v1/users/update`,
 > `/v1/users/delete`, `/v1/tokens/create`, `/v1/tokens/revoke`,
@@ -36,7 +37,9 @@ recovery path we cannot honour.
 > Adopted gRPC RPCs: `EnrollNode`, `RotateNodeCertificate`, and
 > `ReportBootstrapResult`; `ApplyNodeDesiredState`,
 > `ApplyVmDesiredState`, `ApplyVolumeDesiredState`,
-> `ApplyNetworkDesiredState`, and `AcknowledgeDesiredStateVersion`.
+> `ApplyNetworkDesiredState`, and `AcknowledgeDesiredStateVersion`;
+> `PauseNodeScheduling`, `ResumeNodeScheduling`, `DrainNode`,
+> `EnterMaintenance`, and `ExitMaintenance`.
 >
 > **Enrollment specifics.** For `RotateNodeCertificate` and
 > `ReportBootstrapResult` the outbox row commits with the single
@@ -63,6 +66,28 @@ recovery path we cannot honour.
 > commit, so no outbox row exists and the failed request appears only in
 > `audit_log`.
 >
+> **Lifecycle specifics (node transitions).** `PauseNodeScheduling`,
+> `ResumeNodeScheduling`, `DrainNode`, `EnterMaintenance`, and
+> `ExitMaintenance` commit the row with the **intent write**
+> (`set_scheduling_paused`, `set_drain_intent`, or
+> `set_state_preserving_policy`). A pending row here means: the node's
+> scheduling/drain/maintenance state change **committed**, and its
+> evidence is queued. Their `operations` row and `OperationStarted` event
+> commit **earlier** and are not coupled: a crash between them and the
+> intent leaves no state change and **no row** (pre-existing window), and
+> a crash after the intent commit but before the operation status update
+> leaves the applied state and a `success` row with a possibly stale
+> operation status. An intent failure (e.g. pause/resume on a node with
+> no `node_desired_state` row) rolls the enqueue back and writes exactly
+> one direct failed row; no pending row appears. The rest of the
+> lifecycle surface is still post-hoc.
+>
+> The BFF twin is also still post-hoc: `POST /v1/nodes/mutate`
+> (`node.mutate`, the WebUI/chvctl path) calls the same five service
+> methods in-process without a ticket, so a pause/drain/maintenance
+> change made from the WebUI keeps the post-hoc insert and its crash
+> window and never appears in this table.
+>
 > A non-zero `chv_audit_outbox_pending` on a build without this adoption
 > (or with no adopted traffic) means something wrote the table out of
 > band — investigate before assuming adoption.
@@ -78,8 +103,9 @@ recovery path we cannot honour.
 | Admin read surface | `POST /v1/audit-log`, `POST /v1/audit-log/export` — reads `audit_log` only; pending outbox rows are never exposed |
 
 A pending outbox row is **not** evidence that the mutation failed. On an
-adopted route it means the mutation committed — the caller already got
-its 2xx — and the evidence row has not been written to `audit_log` yet.
+adopted route it means the mutation committed — the caller normally
+already got its 2xx — and the evidence row has not been written to
+`audit_log` yet.
 Evidence is delayed, not lost. A non-2xx final response on an adopted
 route is patched into the pending row (`outcome`/`status_code`) before
 dispatch; if the dispatcher wins that race the row keeps its commit-time
@@ -219,6 +245,22 @@ exists. A consumed token with no node row means the process died after
 the token commit and before the final write — there is no outbox row to
 replay, and the operator must issue a fresh token.
 
+For the node transitions specifically: a **denied** request always
+leaves a direct `denied` row — a missing row is never a denial. If the
+trail has no row, first check how the change was made: the WebUI/chvctl
+path (`POST /v1/nodes/mutate`) is not outbox-coupled and keeps the
+post-hoc crash window. On the gRPC path, check `operations` for a
+still-`Pending` `PauseNodeScheduling`-style row with its
+`OperationStarted` event and no matching `node_desired_state` change
+(the journal-only crash window), and `chv_grpc_audit_write_failures_total`
+/ the `AUDIT_LOG_WRITE_FAILED` log for a failed direct insert. If the
+state change *is* present but the row missing, check `audit_outbox` for
+a pending row before concluding evidence was lost.
+
+A dispatched row is indistinguishable from a direct one in `audit_log`;
+for 7 days you can join `audit_outbox.audit_id` to prove a row was
+outbox-coupled.
+
 ## 4. Configuration
 
 ```toml
@@ -234,7 +276,7 @@ steady state. Changing either value requires a restart.
 Retention prunes up to 5,000 **dispatched** rows per pass. Pending rows
 are never pruned, regardless of age.
 
-## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a/3b gRPC)
+## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a/3b/3c gRPC)
 
 - **Audit loss / double-write (BFF):** the check-or-insert composition is
   what keeps this safe on adopted routes: a present outbox row suppresses
@@ -243,9 +285,10 @@ are never pruned, regardless of age.
   risk a duplicate. The BFF integration suite covers adopted success,
   rollback, crash-before-middleware, injected post-commit 500, unadopted
   routes, and the oversized-actor fail-closed case.
-- **Audit loss / double-write (gRPC enrollment and reconcile):** the
-  adapter mints a per-request `outbox_id`/`audit_id` (UUIDv4, never from
-  the wire) and applies the same check-or-insert in `finish_audited`. A
+- **Audit loss / double-write (gRPC enrollment, reconcile, and
+  lifecycle):** the adapter mints a per-request
+  `outbox_id`/`audit_id` (UUIDv4, never from the wire) and applies the
+  same check-or-insert in `finish_audited`. A
   committed outbox row suppresses the direct insert; a missing row takes
   the direct path (denied, rolled back, or unadopted); a failed check
   consults the request's committed flag, set by the service once its
@@ -277,8 +320,21 @@ are never pruned, regardless of age.
   than lost. A late journal failure returns an error and patches the
   already-committed row to `failed`/500; the evidence is not retracted.
   This is per-write coverage, not a claim that the whole RPC is atomic.
-- **Lock scope (PR 3a):** the adopted store methods take an optional
-  outbox row and open a transaction only when one is present;
+- **Lifecycle multi-commit risk (PR 3c):** the five node transitions
+  couple only the intent write. Their `operations` INSERT and
+  `OperationStarted` event are earlier, independent commits: a crash
+  between journal and intent leaves **no state change and no audit row**
+  (the pre-existing window, unchanged); a crash after the intent commit
+  but before the `Accepted` status update leaves the applied state and
+  its `success` row with a possibly stale operation status (`Pending` is
+  neither dispatched nor reaped today). An intent failure keeps the
+  existing `Failed` journal and writes exactly one direct failed row;
+  the intent transaction and its enqueue roll back. Journal-anchoring
+  these RPCs was rejected because it would produce a false `success` row
+  for a state change a later crash prevented. Per-RPC adoption only: the
+  rest of the lifecycle surface is not covered.
+- **Lock scope (PR 3a):** the PR 3a adopted store methods take an
+  optional outbox row and open a transaction only when one is present;
   `register_fabric_identity` already had a transaction, and the rotation
   compare-and-swap / bootstrap-result upsert gain a transaction around
   the mutation statement plus the outbox INSERT. The transaction is held
@@ -291,16 +347,34 @@ are never pruned, regardless of age.
   acknowledgements gain a transaction around the mutation statement plus
   the outbox INSERT on the adopted path. The transaction never spans the
   convergence event append or the operation-status update.
-- **Remaining surfaces stay post-hoc:** the gRPC lifecycle service
-  (agent-ack fan-out, large surface) and every unadopted BFF route still
-  insert after the handler returns, with the original narrow crash
-  window. Denied and failed requests stay post-hoc by design.
+- **Lock scope (PR 3c):** `set_scheduling_paused` and `set_drain_intent`
+  take an optional outbox row. `set_state_preserving_policy` already took
+  one in PR 3b (it also serves `ApplyNodeDesiredState`); PR 3c changed
+  only that adopted branch's transaction mode, from a deferred `begin()`
+  to `BEGIN IMMEDIATE`, so the reconcile RPC gets the same mode. With a
+  row these methods wrap the single intent statement plus the outbox
+  INSERT in `begin_with("BEGIN IMMEDIATE;")`; without one they keep the
+  original autocommit statement byte-for-byte. The lock is held for one
+  extra INSERT and never across the operation-status update or any
+  transport work. The **other** PR 3a/3b adopted store methods still open a
+  deferred `begin()` (same atomicity, busier first statement under
+  contention): `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths
+  converted for #706 (all but `vms/import`, which keeps its pre-existing
+  transaction) and these intent methods, not a repo-wide rule.
+- **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
+  service (VM power, volumes, networks, migrate, overlay, ARP, resolve
+  inspect) and every unadopted BFF route still insert after the handler
+  returns, with the original narrow crash window. Denied and failed
+  requests stay post-hoc by design.
 - **Lock scope (PR 2):** `users`/`tokens` mutations that were autocommit
   single statements are now wrapped in
   `begin_with("BEGIN IMMEDIATE;")` so the mutation and the outbox INSERT
   commit together. The write lock is held for one extra INSERT; no new
-  lock ordering is introduced. `networks` already held a transaction, so
-  only the INSERT is new there; `vms/import` likewise keeps its existing
+  lock ordering is introduced. `networks/update` and `networks/delete`
+  already held a transaction, so only the INSERT is new there;
+  `networks/create`'s transaction pre-existed but its mode was converted
+  from a deferred `begin()` to `BEGIN IMMEDIATE` in PR 2, so it now takes
+  the write lock at `BEGIN`; `vms/import` likewise keeps its existing
   transaction.
 - **Oversized actor (PR 2, NIT 5):** adopted sites fail closed. A payload
   over the store's 16 KiB bound is not truncated; enqueue fails, the
@@ -316,6 +390,10 @@ are never pruned, regardless of age.
   gRPC adoption suite does the same for the enrollment and reconcile
   RPCs and also pins the post-commit-failure patch path (one row,
   rewritten outcome/status; removing `finalize_pending` fails it). The
+  PR 3c lifecycle tests add per-RPC dispatch reuse, intent-failure
+  journal preservation with one direct failed row, crash replay, the
+  patch path, and the oversized-payload rollback, plus a store-level
+  deferred-FK commit-failure test for the scheduling intent. The
   design's `SIGKILL` end-to-end test (long dispatch interval, kill,
   restart) is **not implemented yet** and is a follow-up; this runbook
   does not claim one.
