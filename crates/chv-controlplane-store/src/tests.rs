@@ -2587,16 +2587,19 @@ async fn volume_snapshot_patch_refuses_to_journal_over_a_deleting_tombstone() {
     seed_vds_volume(&pool, "vol-s1-snap", 2, Some("Deleting")).await;
 
     let err = repo
-        .set_volume_snapshot(&VolumeSnapshotPatchInput {
-            volume_id: ResourceId::new("vol-s1-snap").unwrap(),
-            desired_generation: Generation::new(CP_WALL_CLOCK_GENERATION as u64),
-            desired_status: None,
-            requested_by: Some("test".into()),
-            updated_by: None,
-            snapshot_op: Some("create".into()),
-            snapshot_name: Some("snap".into()),
-            requested_unix_ms: CP_WALL_CLOCK_GENERATION,
-        })
+        .set_volume_snapshot(
+            &VolumeSnapshotPatchInput {
+                volume_id: ResourceId::new("vol-s1-snap").unwrap(),
+                desired_generation: Generation::new(CP_WALL_CLOCK_GENERATION as u64),
+                desired_status: None,
+                requested_by: Some("test".into()),
+                updated_by: None,
+                snapshot_op: Some("create".into()),
+                snapshot_name: Some("snap".into()),
+                requested_unix_ms: CP_WALL_CLOCK_GENERATION,
+            },
+            None,
+        )
         .await
         .expect_err("a snapshot patch over a tombstone must fail");
     assert!(
@@ -2608,6 +2611,295 @@ async fn volume_snapshot_patch_refuses_to_journal_over_a_deleting_tombstone() {
         (2, Some("Deleting".into()), None),
         "the tombstone must survive the refused patch byte-for-byte"
     );
+}
+
+/// Seed a volume plus its desired-state row with a snapshot-family intent,
+/// so the tests can prove a *transition* rather than read back the seed.
+async fn seed_snapshot_vds(
+    pool: &StorePool,
+    volume_id: &str,
+    generation: i64,
+    status: Option<&str>,
+    snapshot_op: Option<&str>,
+    snapshot_name: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO volumes (volume_id, display_name, capacity_bytes) VALUES ($1, $1, 1024)",
+    )
+    .bind(volume_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO volume_desired_state \
+         (volume_id, desired_generation, desired_status, snapshot_op, snapshot_name) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(volume_id)
+    .bind(generation)
+    .bind(status)
+    .bind(snapshot_op)
+    .bind(snapshot_name)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn snapshot_vds_shape(
+    pool: &StorePool,
+    volume_id: &str,
+) -> (Option<String>, Option<String>, Option<String>, i64) {
+    sqlx::query_as(
+        "SELECT snapshot_op, snapshot_name, desired_status, desired_generation \
+         FROM volume_desired_state WHERE volume_id = $1",
+    )
+    .bind(volume_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// #706 PR 4: a volume snapshot-family intent and its audit-outbox row are
+/// one commit. The `None` branch keeps the original autocommit statement;
+/// the `Some` branch enqueues the pre-minted row last, inside the same
+/// `BEGIN IMMEDIATE` transaction as the intent upsert — including the
+/// `'Deleting'` tombstone refusal, which must run on that same connection.
+#[tokio::test]
+async fn test_set_volume_snapshot_audit_is_atomic_with_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = DesiredStateRepository::new(pool.clone());
+
+    seed_snapshot_vds(
+        &pool,
+        "vol-snap-atomic",
+        2,
+        None,
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+
+    let input = VolumeSnapshotPatchInput {
+        volume_id: ResourceId::new("vol-snap-atomic").unwrap(),
+        desired_generation: Generation::new(3),
+        desired_status: None,
+        requested_by: Some("test".into()),
+        updated_by: None,
+        snapshot_op: Some("create".into()),
+        snapshot_name: Some("snap-new".into()),
+        requested_unix_ms: 1_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-snap-atomic".into(),
+        audit_id: "audit-ob-snap-atomic".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 1_000,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "SnapshotVolume".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/SnapshotVolume".into(),
+            resource_kind: Some("volume".into()),
+            resource_id: Some("vol-snap-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 1_000,
+    };
+
+    repo.set_volume_snapshot(&input, Some(&insert))
+        .await
+        .expect("the adopted snapshot write commits");
+
+    assert_eq!(
+        snapshot_vds_shape(&pool, "vol-snap-atomic").await,
+        (Some("create".into()), Some("snap-new".into()), None, 3),
+        "the intent committed with the evidence"
+    );
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-snap-atomic");
+    assert_eq!(audit_id, "audit-ob-snap-atomic");
+
+    // The `None` branch is the pre-#706 shape: the intent still commits in
+    // its own autocommit statement and no outbox row is written.
+    let mut plain = input.clone();
+    plain.desired_generation = Generation::new(4);
+    plain.snapshot_op = Some("restore".into());
+    plain.snapshot_name = Some("snap-plain".into());
+    repo.set_volume_snapshot(&plain, None)
+        .await
+        .expect("the unadopted snapshot write still commits");
+    assert_eq!(
+        snapshot_vds_shape(&pool, "vol-snap-atomic").await,
+        (Some("restore".into()), Some("snap-plain".into()), None, 4)
+    );
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 1, "the None branch enqueues nothing");
+
+    // A `Deleting` tombstone refuses the adopted patch from inside the
+    // write transaction (the same-connection check), and enqueues nothing.
+    seed_snapshot_vds(
+        &pool,
+        "vol-snap-tombstone",
+        1,
+        Some("Deleting"),
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+    let refused = repo
+        .set_volume_snapshot(
+            &VolumeSnapshotPatchInput {
+                volume_id: ResourceId::new("vol-snap-tombstone").unwrap(),
+                desired_generation: Generation::new(2),
+                desired_status: None,
+                requested_by: Some("test".into()),
+                updated_by: None,
+                snapshot_op: Some("delete".into()),
+                snapshot_name: Some("snap-x".into()),
+                requested_unix_ms: 2_000,
+            },
+            Some(&AuditOutboxInsert {
+                outbox_id: "ob-snap-tombstone".into(),
+                audit_id: "audit-ob-snap-tombstone".into(),
+                ..insert.clone()
+            }),
+        )
+        .await
+        .expect_err("a snapshot patch over a tombstone must fail");
+    assert!(
+        matches!(refused, StoreError::Conflict { .. }),
+        "the refusal must be the loud Conflict, got: {refused:?}"
+    );
+    assert_eq!(
+        snapshot_vds_shape(&pool, "vol-snap-tombstone").await,
+        (
+            Some("seed".into()),
+            Some("seed-name".into()),
+            Some("Deleting".into()),
+            1
+        ),
+        "the tombstone must survive the refused patch byte-for-byte"
+    );
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox_rows, 1,
+        "a refused intent enqueues nothing (only the accepted row remains)"
+    );
+}
+
+/// #706 PR 4: an enqueue that succeeds but whose **commit** fails must roll
+/// the snapshot intent back too (the same deferred-FK construction as the
+/// PR 3c intent tests).
+#[tokio::test]
+async fn test_set_volume_snapshot_audit_commit_failure_rolls_back_the_intent() {
+    let test_db = TestDb::new().await;
+    let pool = test_db.pool.clone();
+    let repo = DesiredStateRepository::new(pool.clone());
+
+    seed_snapshot_vds(
+        &pool,
+        "vol-snap-commit-fail",
+        5,
+        None,
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+
+    sqlx::query("CREATE TABLE guard_parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE guard_child (id INTEGER PRIMARY KEY \
+         REFERENCES guard_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER guard_audit_outbox AFTER INSERT ON audit_outbox \
+         BEGIN INSERT INTO guard_child (id) VALUES (1); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "deferred FK needs foreign_keys=ON");
+
+    let input = VolumeSnapshotPatchInput {
+        volume_id: ResourceId::new("vol-snap-commit-fail").unwrap(),
+        desired_generation: Generation::new(6),
+        desired_status: None,
+        requested_by: Some("test".into()),
+        updated_by: None,
+        snapshot_op: Some("delete".into()),
+        snapshot_name: Some("snap-fail".into()),
+        requested_unix_ms: 2_000,
+    };
+    let insert = AuditOutboxInsert {
+        outbox_id: "ob-snap-commit-fail".into(),
+        audit_id: "audit-ob-snap-commit-fail".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-a".into(),
+            actor_username: "node-a".into(),
+            actor_role: "node".into(),
+            action: "DeleteVolumeSnapshot".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/DeleteVolumeSnapshot".into(),
+            resource_kind: Some("volume".into()),
+            resource_id: Some("vol-snap-commit-fail".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    let error = repo
+        .set_volume_snapshot(&input, Some(&insert))
+        .await
+        .expect_err("a failed evidence commit must fail the mutation");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("FOREIGN KEY") || message.contains("commit"),
+        "expected a commit-time constraint failure, got: {message}"
+    );
+
+    assert_eq!(
+        snapshot_vds_shape(&pool, "vol-snap-commit-fail").await,
+        (Some("seed".into()), Some("seed-name".into()), None, 5),
+        "the intent must roll back with the evidence"
+    );
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 0, "the enqueue must not survive the rollback");
 }
 
 #[tokio::test]

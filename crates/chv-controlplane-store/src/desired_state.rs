@@ -757,11 +757,29 @@ impl DesiredStateRepository {
         volume_id: &ResourceId,
         generation: i64,
     ) -> Result<(), StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::refuse_volume_patch_if_deleting_on(&mut conn, volume_id, generation).await
+    }
+
+    /// [`Self::refuse_volume_patch_if_deleting`] on an explicit connection.
+    ///
+    /// The adopted [`Self::set_volume_snapshot`] path must run this check
+    /// on the SAME connection that holds its `BEGIN IMMEDIATE` write
+    /// transaction. Calling the pool-level helper there would try to
+    /// acquire a second connection while the pool's writer is held
+    /// (`max_connections(1)`) and self-deadlock; running it inside the
+    /// transaction also observes exactly the row state the blocked patch
+    /// saw.
+    async fn refuse_volume_patch_if_deleting_on(
+        conn: &mut sqlx::SqliteConnection,
+        volume_id: &ResourceId,
+        generation: i64,
+    ) -> Result<(), StoreError> {
         let status: Option<Option<String>> = sqlx::query_scalar(
             "SELECT desired_status FROM volume_desired_state WHERE volume_id = $1",
         )
         .bind(volume_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await?;
         if matches!(&status, Some(Some(status)) if status == "Deleting") {
             return Err(StoreError::Conflict {
@@ -856,8 +874,37 @@ impl DesiredStateRepository {
         Ok(())
     }
 
+    /// Persist a volume snapshot-family intent fragment (create, restore,
+    /// or delete).
+    ///
+    /// `audit` is the request's pre-minted audit-outbox row (#706 PR 4).
+    /// When present, the intent patch, its `'Deleting'`-tombstone check,
+    /// and the outbox enqueue share one `BEGIN IMMEDIATE` transaction, so
+    /// the evidence commits with the snapshot/restore/delete intent or
+    /// not at all. Every other caller passes `None` and keeps the
+    /// original autocommit statement byte-for-byte.
     pub async fn set_volume_snapshot(
         &self,
+        input: &VolumeSnapshotPatchInput,
+        audit: Option<&AuditOutboxInsert>,
+    ) -> Result<(), StoreError> {
+        match audit {
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                Self::set_volume_snapshot_on(&mut conn, input).await
+            }
+            Some(audit) => {
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE;").await?;
+                Self::set_volume_snapshot_on(&mut tx, input).await?;
+                enqueue_adopted_row(&mut tx, audit).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn set_volume_snapshot_on(
+        conn: &mut sqlx::SqliteConnection,
         input: &VolumeSnapshotPatchInput,
     ) -> Result<(), StoreError> {
         let generation = generation_to_i64(input.desired_generation)?;
@@ -870,7 +917,7 @@ impl DesiredStateRepository {
             .bind(&input.snapshot_op)
             .bind(&input.snapshot_name)
             .bind(input.requested_unix_ms)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await
             .map_err(|e| match &e {
                 sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
@@ -884,9 +931,11 @@ impl DesiredStateRepository {
         if result.rows_affected() == 0 {
             // #522 (review S1): a 'Deleting' tombstone blocks the
             // conflict arm (see the SQL) — refuse loudly instead of
-            // reporting a stale generation.
-            return self
-                .refuse_volume_patch_if_deleting(&input.volume_id, generation)
+            // reporting a stale generation. This must run on `conn` (the
+            // same connection that holds the adopted write transaction):
+            // the pool-level helper would need a second connection and
+            // self-deadlock at `max_connections(1)`.
+            return Self::refuse_volume_patch_if_deleting_on(conn, &input.volume_id, generation)
                 .await;
         }
         Ok(())

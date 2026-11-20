@@ -65,19 +65,30 @@ pub trait LifecycleService: Send + Sync {
         request: proto::ResizeVolumeRequest,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` is the request's pre-minted audit-outbox row (#706). When
+    /// present, the volume snapshot intent write and the outbox enqueue
+    /// share one transaction, so the evidence commits with the state
+    /// change or not at all. The operation row and its `OperationStarted`
+    /// event are earlier, separate commits (residual window documented in
+    /// `docs/specs/component/audit-log.md`).
     async fn snapshot_volume(
         &self,
         request: proto::SnapshotVolumeRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::snapshot_volume`].
     async fn restore_volume(
         &self,
         request: proto::RestoreVolumeRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
+    /// `audit` follows [`Self::snapshot_volume`].
     async fn delete_volume_snapshot(
         &self,
         request: proto::DeleteVolumeSnapshotRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError>;
 
     async fn clone_volume(
@@ -1175,6 +1186,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn snapshot_volume(
         &self,
         request: proto::SnapshotVolumeRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1198,18 +1210,21 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.desired_state_repo
-                .set_volume_snapshot(&chv_controlplane_store::VolumeSnapshotPatchInput {
-                    volume_id: volume_id.clone(),
-                    desired_generation,
-                    desired_status: None,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    snapshot_op: Some("create".to_string()),
-                    snapshot_name: Some(request.snapshot_name),
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_volume_snapshot(
+                    &chv_controlplane_store::VolumeSnapshotPatchInput {
+                        volume_id: volume_id.clone(),
+                        desired_generation,
+                        desired_status: None,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        snapshot_op: Some("create".to_string()),
+                        snapshot_name: Some(request.snapshot_name),
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    audit.map(AdoptedAudit::insert),
+                )
                 .await
         })
         .await?;
@@ -1220,6 +1235,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn restore_volume(
         &self,
         request: proto::RestoreVolumeRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1241,18 +1257,21 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.desired_state_repo
-                .set_volume_snapshot(&chv_controlplane_store::VolumeSnapshotPatchInput {
-                    volume_id: volume_id.clone(),
-                    desired_generation,
-                    desired_status: None,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    snapshot_op: Some("restore".to_string()),
-                    snapshot_name: Some(request.snapshot_name),
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_volume_snapshot(
+                    &chv_controlplane_store::VolumeSnapshotPatchInput {
+                        volume_id: volume_id.clone(),
+                        desired_generation,
+                        desired_status: None,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        snapshot_op: Some("restore".to_string()),
+                        snapshot_name: Some(request.snapshot_name),
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    audit.map(AdoptedAudit::insert),
+                )
                 .await
         })
         .await?;
@@ -1263,6 +1282,7 @@ impl LifecycleService for LifecycleServiceImplementation {
     async fn delete_volume_snapshot(
         &self,
         request: proto::DeleteVolumeSnapshotRequest,
+        audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let meta = self.meta_from_request(request.meta)?;
         let node_id = Self::parse_node_id(request.node_id)?;
@@ -1284,18 +1304,21 @@ impl LifecycleService for LifecycleServiceImplementation {
             )
             .await?;
 
-        self.persist_intent_and_accept(&operation_id, || async {
+        self.persist_intent_and_accept_adopted(&operation_id, audit, || async {
             self.desired_state_repo
-                .set_volume_snapshot(&chv_controlplane_store::VolumeSnapshotPatchInput {
-                    volume_id: volume_id.clone(),
-                    desired_generation,
-                    desired_status: None,
-                    requested_by: Self::normalize_requested_by(&meta),
-                    updated_by: None,
-                    snapshot_op: Some("delete".to_string()),
-                    snapshot_name: Some(request.snapshot_name),
-                    requested_unix_ms: Self::now_ms(),
-                })
+                .set_volume_snapshot(
+                    &chv_controlplane_store::VolumeSnapshotPatchInput {
+                        volume_id: volume_id.clone(),
+                        desired_generation,
+                        desired_status: None,
+                        requested_by: Self::normalize_requested_by(&meta),
+                        updated_by: None,
+                        snapshot_op: Some("delete".to_string()),
+                        snapshot_name: Some(request.snapshot_name),
+                        requested_unix_ms: Self::now_ms(),
+                    },
+                    audit.map(AdoptedAudit::insert),
+                )
                 .await
         })
         .await?;

@@ -6075,7 +6075,7 @@ async fn snapshot_volume_rejects_core_managed_node() {
     seed_volume_on_node(&pool, "vol-cm-1", "node-cm").await;
 
     let result = service
-        .snapshot_volume(snapshot_request("node-cm", "vol-cm-1"))
+        .snapshot_volume(snapshot_request("node-cm", "vol-cm-1"), None)
         .await;
     match result {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
@@ -6096,7 +6096,7 @@ async fn restore_volume_rejects_core_managed_node() {
     seed_volume_on_node(&pool, "vol-cm-1", "node-cm").await;
 
     let result = service
-        .restore_volume(restore_request("node-cm", "vol-cm-1"))
+        .restore_volume(restore_request("node-cm", "vol-cm-1"), None)
         .await;
     match result {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
@@ -6117,7 +6117,7 @@ async fn delete_volume_snapshot_rejects_core_managed_node() {
     seed_volume_on_node(&pool, "vol-cm-1", "node-cm").await;
 
     let result = service
-        .delete_volume_snapshot(delete_snapshot_request("node-cm", "vol-cm-1"))
+        .delete_volume_snapshot(delete_snapshot_request("node-cm", "vol-cm-1"), None)
         .await;
     match result {
         Err(ControlPlaneServiceError::InvalidArgument(msg)) => {
@@ -6183,7 +6183,7 @@ async fn snapshot_family_fails_open_on_unknown_mode() {
         ("node-noreport", "vol-noreport-1"),
     ] {
         let ack = service
-            .snapshot_volume(snapshot_request(node, volume))
+            .snapshot_volume(snapshot_request(node, volume), None)
             .await
             .unwrap_or_else(|e| panic!("unknown mode must fail open ({node}): {e:?}"));
         assert_eq!(
@@ -6217,7 +6217,7 @@ async fn snapshot_volume_accepts_legacy_node_unchanged() {
     seed_volume_on_node(&pool, "vol-leg-1", "node-leg").await;
 
     let ack = service
-        .snapshot_volume(snapshot_request("node-leg", "vol-leg-1"))
+        .snapshot_volume(snapshot_request("node-leg", "vol-leg-1"), None)
         .await
         .expect("legacy node must accept exactly as before");
     assert_eq!(ack.result.expect("ack result").status, "OK");
@@ -6255,7 +6255,7 @@ async fn snapshot_family_ignores_core_managed_request_node_when_volume_on_legacy
     seed_volume_on_node(&pool, "vol-mismatch-leg", "node-leg").await;
 
     let ack = service
-        .snapshot_volume(snapshot_request("node-cm", "vol-mismatch-leg"))
+        .snapshot_volume(snapshot_request("node-cm", "vol-mismatch-leg"), None)
         .await
         .expect("volume on legacy node must accept regardless of request node");
     assert_eq!(ack.result.expect("ack result").status, "OK");
@@ -6295,17 +6295,20 @@ async fn snapshot_family_rejects_legacy_request_node_when_volume_on_core_managed
         let result = match op {
             "snapshot" => {
                 service
-                    .snapshot_volume(snapshot_request("node-leg", "vol-mismatch-cm"))
+                    .snapshot_volume(snapshot_request("node-leg", "vol-mismatch-cm"), None)
                     .await
             }
             "restore" => {
                 service
-                    .restore_volume(restore_request("node-leg", "vol-mismatch-cm"))
+                    .restore_volume(restore_request("node-leg", "vol-mismatch-cm"), None)
                     .await
             }
             _ => {
                 service
-                    .delete_volume_snapshot(delete_snapshot_request("node-leg", "vol-mismatch-cm"))
+                    .delete_volume_snapshot(
+                        delete_snapshot_request("node-leg", "vol-mismatch-cm"),
+                        None,
+                    )
                     .await
             }
         };
@@ -6334,7 +6337,7 @@ async fn snapshot_family_fails_open_when_volume_node_is_null() {
     seed_volume_without_node(&pool, "vol-orphan").await;
 
     let ack = service
-        .snapshot_volume(snapshot_request("node-cm", "vol-orphan"))
+        .snapshot_volume(snapshot_request("node-cm", "vol-orphan"), None)
         .await
         .expect("NULL volume node must fail open (accept)");
     assert_eq!(ack.result.expect("ack result").status, "OK");

@@ -39,7 +39,8 @@ recovery path we cannot honour.
 > `ApplyVmDesiredState`, `ApplyVolumeDesiredState`,
 > `ApplyNetworkDesiredState`, and `AcknowledgeDesiredStateVersion`;
 > `PauseNodeScheduling`, `ResumeNodeScheduling`, `DrainNode`,
-> `EnterMaintenance`, and `ExitMaintenance`.
+> `EnterMaintenance`, and `ExitMaintenance`; and `SnapshotVolume`,
+> `RestoreVolume`, and `DeleteVolumeSnapshot`.
 >
 > **Enrollment specifics.** For `RotateNodeCertificate` and
 > `ReportBootstrapResult` the outbox row commits with the single
@@ -87,6 +88,29 @@ recovery path we cannot honour.
 > methods in-process without a ticket, so a pause/drain/maintenance
 > change made from the WebUI keeps the post-hoc insert and its crash
 > window and never appears in this table.
+>
+> **Volume snapshot specifics.** `SnapshotVolume`, `RestoreVolume`, and
+> `DeleteVolumeSnapshot` commit the row with the **intent write**
+> (`set_volume_snapshot`: `snapshot_op = create`/`restore`/`delete`
+> plus `snapshot_name`). A pending row here means the snapshot intent
+> **committed** and its evidence is queued. Their `operations` row and
+> `OperationStarted` event commit **earlier** and are not coupled: a
+> crash between them and the intent leaves no state change and **no
+> row** (pre-existing window), and a crash after the intent commit but
+> before the operation status update leaves the applied intent and a
+> `success` row with a possibly stale operation status. A `Deleting`
+> tombstone refuses the patch inside the write transaction, so a
+> non-crash conflict after the journal produces exactly one direct
+> failed row (409) and **no pending row**, with the volume row
+> unchanged.
+>
+> The BFF twin routes are still post-hoc: `POST /v1/volumes/snapshot`
+> (`volume.snapshot`), `POST /v1/volumes/restore-snapshot`
+> (`volume.restore_snapshot`), and `POST /v1/volumes/delete-snapshot`
+> (`volume.delete_snapshot`) call the same three service methods
+> in-process without a ticket, so a snapshot/restore/delete made from
+> the WebUI keeps the post-hoc insert and its crash window and never
+> appears in this table.
 >
 > A non-zero `chv_audit_outbox_pending` on a build without this adoption
 > (or with no adopted traffic) means something wrote the table out of

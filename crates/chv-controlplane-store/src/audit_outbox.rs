@@ -26,10 +26,12 @@
 //! Adopted: the pure-DB BFF mutations (PR 2), the three enrollment
 //! gRPC RPCs (`EnrollNode`, `RotateNodeCertificate`,
 //! `ReportBootstrapResult`) in PR 3a, the five reconcile RPCs in PR 3b,
-//! and the five node-lifecycle transitions (`PauseNodeScheduling`,
+//! the five node-lifecycle transitions (`PauseNodeScheduling`,
 //! `ResumeNodeScheduling`, `DrainNode`, `EnterMaintenance`,
-//! `ExitMaintenance`) in PR 3c. Every other request path still writes
-//! its audit row post-hoc and never touches this table.
+//! `ExitMaintenance`) in PR 3c, and the three volume snapshot-family
+//! transitions (`SnapshotVolume`, `RestoreVolume`,
+//! `DeleteVolumeSnapshot`) in PR 4. Every other request path still
+//! writes its audit row post-hoc and never touches this table.
 
 use crate::audit_log::{insert_row_on_tx, AuditLogInsert};
 use crate::{StoreError, StorePool};

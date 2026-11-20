@@ -216,8 +216,9 @@ that user's privileged actions.
 A request is classified once, executed once, and then the middleware
 attempts one insert. Under a healthy database this is exactly one row
 per mutating request, including failed and denied attempts. Adopted BFF
-routes and the adopted gRPC RPCs (enrollment, reconcile, and the
-node-lifecycle transitions) keep the same exactly-one-row guarantee
+routes and the adopted gRPC RPCs (enrollment, reconcile, the
+node-lifecycle transitions, and the volume snapshot-family transitions)
+keep the same exactly-one-row guarantee
 through a different emitter: the handler
 commits the row into `audit_outbox` with the mutation and the emitter's
 check-or-insert skips the direct insert (see the transactional-outbox
@@ -257,7 +258,8 @@ returns. If the insert fails:
   recovery.
 
 **Adopted gRPC RPCs.** The three enrollment RPCs, the five reconcile
-RPCs, and the five node-lifecycle transitions commit their evidence row
+RPCs, the five node-lifecycle transitions, and the three volume
+snapshot-family RPCs commit their evidence row
 with the mutation's transaction (see the transactional-outbox section),
 so the post-hoc insert above is skipped on success. The failure modes
 are narrower but not gone: an enqueue failure fails the mutation
@@ -379,11 +381,64 @@ INSERT. Everything else in these five handlers is outside it, by design:
   claim that the lifecycle surface is globally closed**; the remaining
   groups are follow-up slices under #706.
 
+**Adopted in PR 4 (gRPC lifecycle — volume snapshots).** Same
+intent-anchored shape as PR 3c: the snapshot-family intent write and its
+outbox row share one commit, and nothing else is folded in. This is the
+gRPC wire surface only: the BFF's `POST /v1/volumes/snapshot`,
+`POST /v1/volumes/restore-snapshot`, and
+`POST /v1/volumes/delete-snapshot` (`volume.snapshot`,
+`volume.restore_snapshot`, `volume.delete_snapshot`) call the same three
+service methods in-process without a ticket and stay post-hoc (see Not
+adopted below). The operation row and its `OperationStarted` event are
+earlier, separate commits (residual below).
+
+| RPC | Action | Coupled intent write |
+|---|---|---|
+| `SnapshotVolume` | `SnapshotVolume` | `set_volume_snapshot` (`snapshot_op = create` plus `snapshot_name`) and the outbox row are one transaction |
+| `RestoreVolume` | `RestoreVolume` | `set_volume_snapshot` (`snapshot_op = restore` plus `snapshot_name`) and the outbox row are one transaction |
+| `DeleteVolumeSnapshot` | `DeleteVolumeSnapshot` | `set_volume_snapshot` (`snapshot_op = delete` plus `snapshot_name`) and the outbox row are one transaction |
+
+The accept-time `ensure_volume_snapshot_family_supported` capability
+read runs **before** journaling, exactly as before: a core-managed
+volume is rejected with no operation row, no intent, and no audit row.
+
+Journal-anchoring these three was **rejected** for the same reason as
+the node transitions: the `operations` INSERT commits before the intent,
+so a crash in between would leave a `success` audit row for a snapshot
+operation that never applied. False evidence is worse for incident
+response than missing evidence.
+
+**Residual window (volume snapshot family, PR 4).** The coupled unit is
+exactly one statement pair: the intent upsert (with its
+`'Deleting'`-tombstone refusal) and the outbox INSERT.
+
+- The `operations` INSERT and the `OperationStarted` event are **earlier,
+  separate commits**. A crash between them and the intent commit leaves
+  **no state change and no audit row** — the pre-existing window,
+  unchanged by this PR, not a covered case.
+- The tombstone refusal runs **inside** the adopted transaction on the
+  same connection. A **non-crash conflict after the journal** produces
+  exactly **one direct failed row** (`status_code = 409`, gRPC
+  `ALREADY_EXISTS`), a `Failed` operation journal with its
+  `OperationFailed` event, **no outbox row**, and the volume row
+  byte-for-byte unchanged.
+- A crash after the intent + outbox commit but before the operation's
+  `Accepted` status update leaves the **applied snapshot intent plus a
+  `success` audit row** and a possibly **stale operation status** — the
+  same audit-correct/journal-incomplete shape as PR 3c.
+- Adoption is **per-RPC**. The BFF twin routes and every other lifecycle
+  RPC (including `CloneVolume`) remain post-hoc. This PR makes **no
+  claim that the lifecycle surface is globally closed**.
+
 **Not adopted (still post-hoc).** Every other audited route — notably
 the rest of the gRPC `LifecycleService` surface (agent-ack fan-out and
 filesystem work inside the handlers) including `StartVm`, `CreateVm`,
 `StopVm`, `RebootVm`, `DeleteVm`, `ResizeVm`, `PauseVm`, `ResumeVm`,
-`PowerButtonVm`, the volume attach/resize/snapshot/clone RPCs, the
+`PowerButtonVm`, the volume attach/resize/clone RPCs, the BFF volume
+snapshot twin routes (`volume.snapshot`,
+`volume.restore_snapshot`, `volume.delete_snapshot` — they call the same
+three service methods in-process with no ticket, so those intents are
+crash-safe only on the gRPC wire surface), the
 network lifecycle RPCs, `MigrateVm`, `UpdateOverlay`,
 `SendGratuitousArp`, `ResolveInspectRequiredOperation`, the
 `Unimplemented` shims, the BFF node-action route `node.mutate`
@@ -419,7 +474,8 @@ checks the outbox by primary key:
   to the direct insert.
 
 **Check-or-insert (gRPC).** The adopted gRPC RPCs (the three enrollment
-RPCs, the five reconcile RPCs, and the five node-lifecycle transitions)
+RPCs, the five reconcile RPCs, the five node-lifecycle transitions, and
+the three volume snapshot-family RPCs)
 use the same composition in
 `finish_audited`: the adapter mints an `outbox_id`/`audit_id` pair
 (UUIDv4, never from the wire), hands the `AuditOutboxInsert` to the
@@ -537,6 +593,11 @@ The contract adoption relies on:
     status. Coupling the journal instead was rejected: it would record a
     `success` audit row for a scheduling change a later crash prevented
     (false evidence), not merely missing evidence.
+  - the three volume snapshot-family RPCs (`SnapshotVolume`,
+    `RestoreVolume`, `DeleteVolumeSnapshot`) couple the **intent** write
+    only. Their operation row and `OperationStarted` event are earlier
+    commits with the same residual shape as the node transitions, and
+    journal-anchoring was rejected for the same false-evidence reason.
   - `RotateNodeCertificate`, `ReportBootstrapResult`, and the reconcile
     RPCs have no earlier mutation commit on their adopted path.
 
@@ -576,6 +637,14 @@ branch keeps the original autocommit statement). Because
 `BEGIN IMMEDIATE` applies to that reconcile RPC too: it stays a
 single-statement mutation in one transaction under WAL with the 5s
 `busy_timeout`, with identical atomicity and no lock-ordering change.
+For the PR 4 volume snapshots `set_volume_snapshot` wraps the single
+intent UPSERT plus the outbox INSERT in `BEGIN IMMEDIATE` when a row is
+present (`None` keeps the autocommit statement). Its `'Deleting'`
+tombstone check now runs on the **same connection inside that
+transaction**: calling the pool-level helper there would need a second
+connection and self-deadlock at `max_connections(1)`. The check is a
+connection-taking helper shared by both branches, so the conflict
+semantics are identical.
 Every transaction is held for the store call only — never across
 certificate minting, the convergence event append, the operation-status
 update, or transport work — so no new lock ordering is introduced.
@@ -646,6 +715,17 @@ row, the `Failed` operation journal and `OperationFailed` event intact,
 exactly one direct 404 row), crash replay, the `EnqueueThenFail` patch
 path on `PauseNodeScheduling`, and an oversized payload that rolls the
 intent back (state unchanged, zero outbox rows).
+The PR 4 volume-snapshot slice adds, per adopted RPC, an applied-intent
+read-back from `volume_desired_state` (`snapshot_op` =
+`create`/`restore`/`delete` and the request's `snapshot_name`, seeded
+with a **different** op/name so the assertion cannot echo the seed) plus
+the same one-dispatched-row proof (pre-minted `audit_id` reused, second
+pass a no-op); a `Deleting` tombstone (one direct 409 row, no outbox
+row, tombstone byte-for-byte unchanged, `Failed` journal with
+`INTENT_PERSISTENCE_FAILED`); crash replay for all three RPCs; the
+`EnqueueThenFail` patch path on `SnapshotVolume`; an oversized payload
+that rolls the intent back (state unchanged, zero outbox rows); and
+`CloneVolume` parity (one direct row, no outbox row).
 The store suite pins the rotation transaction's atomicity directly
 (`test_rotate_certificate_serial_audit_is_atomic_with_the_compare_and_swap`:
 a lost compare-and-swap commits neither the serial nor the outbox row)
@@ -664,7 +744,14 @@ rollback),
 state and the pre-minted ids), and
 `test_set_state_preserving_policy_audit_commit_failure_rolls_back_the_state`
 (and `..._is_atomic_with_the_state`, which pins `Maintenance` plus
-`state_reason`).
+`state_reason`). The PR 4 snapshot-family intent method has the same
+pair:
+`test_set_volume_snapshot_audit_commit_failure_rolls_back_the_intent`
+(a successful enqueue whose COMMIT fails rolls the intent back too) and
+`test_set_volume_snapshot_audit_is_atomic_with_the_intent` (the `Some`
+branch commits the intent plus the pre-minted ids, the `None` branch
+still commits with no outbox row, and a `Deleting` tombstone is refused
+from inside the transaction with the row left unchanged).
 
 A stuck outbox (dispatcher wedged, database errors) delays evidence
 rather than losing it; see

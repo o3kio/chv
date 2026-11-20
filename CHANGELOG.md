@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **gRPC volume snapshot-family transitions adopt the audit outbox (#706
+  half 1, PR 4).** `SnapshotVolume`, `RestoreVolume`, and
+  `DeleteVolumeSnapshot` now commit their audit row with the **intent
+  write** (`set_volume_snapshot`: `snapshot_op =
+  create`/`restore`/`delete` plus `snapshot_name`); the adapter mints a
+  server-side `outbox_id`/`audit_id` ticket and `finish_audited` performs
+  the same check-or-insert as every other adopted path. The store method
+  takes an optional outbox row: `None` is byte-identical to the previous
+  autocommit statement, while `Some` runs `BEGIN IMMEDIATE` → intent
+  upsert → `'Deleting'`-tombstone check on the **same connection** →
+  outbox INSERT → commit. The tombstone helper gained a
+  connection-taking form because calling the pool-level helper inside the
+  write transaction would need a second connection and self-deadlock at
+  `max_connections(1)`. The coupling is deliberately intent-anchored,
+  not journal-anchored: a crash after the earlier `operations` INSERT
+  but before the intent would otherwise leave a false `success` row for
+  a snapshot operation that never applied. **Residual window
+  (disclosed, not closed):** the operation row and `OperationStarted`
+  event are earlier, separate commits — a crash between them and the
+  intent leaves no state change and no row; a non-crash conflict after
+  the journal (a `Deleting` tombstone) writes exactly one direct failed
+  row (409, gRPC `ALREADY_EXISTS`), no outbox row, and leaves the volume
+  row unchanged; a crash after the intent commit but before the
+  operation-status update leaves the applied intent plus a `success` row
+  and a possibly stale operation status. Adoption is per-RPC: the BFF
+  twin routes `POST /v1/volumes/snapshot` (`volume.snapshot`),
+  `/v1/volumes/restore-snapshot` (`volume.restore_snapshot`), and
+  `/v1/volumes/delete-snapshot` (`volume.delete_snapshot`) call the same
+  three service methods in-process without a ticket and stay post-hoc,
+  as does `CloneVolume`; there is no global lifecycle-closure claim.
+  Verification is deterministic (per-RPC applied `snapshot_op`/
+  `snapshot_name` read-back seeded with a different value, one
+  dispatched row reusing the pre-minted `audit_id` with a no-op second
+  pass, tombstone refusal, crash replay, the post-commit patch path,
+  oversized-payload rollback, unadopted parity) plus store-level
+  intent/enqueue atomicity and deferred-FK commit-failure tests; no
+  `SIGKILL` end-to-end test is claimed. See
+  `docs/specs/component/audit-log.md` and
+  `docs/runbooks/audit-outbox.md`.
 - **gRPC node-lifecycle transitions adopt the audit outbox (#706 half 1,
   PR 3c).** `PauseNodeScheduling`, `ResumeNodeScheduling`, `DrainNode`,
   `EnterMaintenance`, and `ExitMaintenance` now commit their audit row

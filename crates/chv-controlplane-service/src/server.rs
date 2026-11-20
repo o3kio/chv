@@ -1373,7 +1373,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::SnapshotVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "SnapshotVolume",
@@ -1388,7 +1388,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::RestoreVolumeRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "RestoreVolume",
@@ -1403,7 +1403,7 @@ impl proto::lifecycle_service_server::LifecycleService for LifecycleServer {
         &self,
         request: Request<proto::DeleteVolumeSnapshotRequest>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        audited_lifecycle_call!(
+        audited_adopted_lifecycle_call!(
             self,
             request,
             "DeleteVolumeSnapshot",
