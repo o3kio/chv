@@ -544,11 +544,13 @@ The contract adoption relies on:
 statements in a transaction extends the SQLite write lock by one INSERT
 (the outbox row) per adopted mutation; it introduces no new lock
 ordering. Those transactions, and `networks/create`, use
-`BEGIN IMMEDIATE` — the discipline the BFF outbox paths and the PR 3c
-intent methods follow — because their first statement is a write; a
+`BEGIN IMMEDIATE`, because their first statement is a write; a
 deferred `BEGIN` would only defer the same lock and risk a
 `SQLITE_BUSY` at that first write statement (the mutation) instead of
-at `BEGIN`. The PR 3a/3b adopted methods still open a deferred
+at `BEGIN`. The BFF outbox paths converted for #706 (all but
+`vms/import`, which keeps its pre-existing transaction) and the PR 3c
+intent methods follow the same discipline — not a repo-wide rule. The
+**other** PR 3a/3b adopted methods still open a deferred
 `begin()`: identical atomicity, but the first statement performs the
 lock upgrade (busier under contention). `networks/update`,
 `networks/delete`, and `vms/import` already held a transaction, so only
@@ -558,9 +560,10 @@ On gRPC the adopted store methods take an optional outbox row; most open
 a transaction only when one is present (otherwise they keep the original
 autocommit statement), while `register_fabric_identity` and the three
 desired-state upserts already held one unconditionally. Enrollment adds
-only the INSERT there; the rotation compare-and-swap and the
-bootstrap-result upsert gain a transaction around the mutation statement
-plus the outbox INSERT on the adopted path. On the reconcile path
+only the INSERT to `register_fabric_identity`; the rotation
+compare-and-swap and the bootstrap-result upsert gain a transaction
+around the mutation statement plus the outbox INSERT on the adopted
+path. On the reconcile path
 `set_state_preserving_policy` and the four observed-state
 acknowledgements gain a transaction around the mutation statement plus
 the outbox INSERT on the adopted path. For the PR 3c node transitions

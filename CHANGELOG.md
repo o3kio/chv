@@ -44,8 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BEGIN IMMEDIATE` too — identical atomicity and no lock-ordering
   change. The other PR 3a/3b adopted methods still open a deferred
   `begin()` (same atomicity, busier first statement under contention);
-  `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths and these
-  intent methods, not a repo-wide rule. See
+  `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths converted
+  for #706 (all but `vms/import`, which keeps its pre-existing
+  transaction) and these intent methods, not a repo-wide rule. See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 - **gRPC reconcile mutations adopt the audit outbox (#706 half 1, PR 3b).**

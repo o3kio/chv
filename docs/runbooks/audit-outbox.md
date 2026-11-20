@@ -356,10 +356,11 @@ are never pruned, regardless of age.
   INSERT in `begin_with("BEGIN IMMEDIATE;")`; without one they keep the
   original autocommit statement byte-for-byte. The lock is held for one
   extra INSERT and never across the operation-status update or any
-  transport work. The PR 3a/3b adopted store methods still open a
+  transport work. The **other** PR 3a/3b adopted store methods still open a
   deferred `begin()` (same atomicity, busier first statement under
-  contention): `BEGIN IMMEDIATE` is the discipline of the BFF outbox
-  paths and these intent methods, not a repo-wide rule.
+  contention): `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths
+  converted for #706 (all but `vms/import`, which keeps its pre-existing
+  transaction) and these intent methods, not a repo-wide rule.
 - **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
   service (VM power, volumes, networks, migrate, overlay, ARP, resolve
   inspect) and every unadopted BFF route still insert after the handler

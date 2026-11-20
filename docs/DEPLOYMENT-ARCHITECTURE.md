@@ -603,7 +603,7 @@ found it.
   unrecorded. This crash window remains open. mTLS-interceptor denials
   (missing, unparseable, or revoked certificate) now write a durable anonymous
   `audit_log` row (`action=interceptor_denied`, `outcome=denied`,
-  `status=401`, `path=<gRPC service>`, 60s
+  `status_code=401`, `path=<gRPC service>`, 60s
   per-`(service, reason, peer)` dedupe) instead of only metrics/logs.
   Tracked in #706 for the remaining outbox work.
 - **#709 — fixed in the rc.2 build.** In the `e82d49a1` candidate the

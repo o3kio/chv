@@ -1,8 +1,8 @@
 use crate::*;
 use chv_controlplane_types::domain::{Generation, NodeId, NodeState, ResourceId};
 
-// NOTE: These tests use an ephemeral Postgres instance via testcontainers.
-// No manual setup is required.
+// NOTE: These tests run against the in-memory SQLite pool created by
+// `TestDb`; no external database or manual setup is required.
 
 use crate::test_util::{test_credential_encryption, TestDb};
 
@@ -1447,6 +1447,87 @@ async fn test_set_state_preserving_policy_audit_is_atomic_with_the_state() {
             .unwrap();
     assert_eq!(outbox_id, "ob-state-atomic");
     assert_eq!(audit_id, "audit-ob-state-atomic");
+
+    // Exit direction: without this phase the test would still pass if the
+    // exit patch were a no-op, because the node is already `Maintenance`
+    // from the phase above and the exit assertion would read the seed back.
+    // The phase above leaves the row in the pre-state this phase exits
+    // from; assert it so a regression there cannot silently weaken the
+    // exit assertions below.
+    let (pre_state, pre_reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT desired_state, state_reason \
+         FROM node_desired_state WHERE node_id = 'node-state-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pre_state, "Maintenance", "exit phase starts in maintenance");
+    assert_eq!(
+        pre_reason.as_deref(),
+        Some("upgrade"),
+        "exit phase starts with the maintenance reason"
+    );
+
+    let exit_input = NodeStatePatchInput {
+        node_id: node_id.clone(),
+        desired_state: NodeState::TenantReady,
+        desired_generation: Generation::new(3),
+        requested_by: Some("test".into()),
+        updated_by: None,
+        state_reason: None,
+        requested_unix_ms: 2_000,
+    };
+    let exit_insert = AuditOutboxInsert {
+        outbox_id: "ob-state-exit".into(),
+        audit_id: "audit-ob-state-exit".into(),
+        payload: AuditLogInsert {
+            occurred_at_ms: 2_000,
+            actor_id: "node-state-atomic".into(),
+            actor_username: "node-state-atomic".into(),
+            actor_role: "node".into(),
+            action: "ExitMaintenance".into(),
+            method: "gRPC".into(),
+            path: "chv.controlplane.node.v1.LifecycleService/ExitMaintenance".into(),
+            resource_kind: Some("node".into()),
+            resource_id: Some("node-state-atomic".into()),
+            outcome: "success".into(),
+            status_code: 200,
+            correlation_id: None,
+            operation_id: None,
+            source_ip: None,
+            metadata: "{}".into(),
+        },
+        created_at_ms: 2_000,
+    };
+
+    repo.set_state_preserving_policy(&exit_input, Some(&exit_insert))
+        .await
+        .expect("the adopted exit write commits");
+
+    let (state, reason, generation): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT desired_state, state_reason, desired_generation \
+         FROM node_desired_state WHERE node_id = 'node-state-atomic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "TenantReady", "the exit patch committed");
+    assert_eq!(reason, None, "the exit patch cleared the reason");
+    assert_eq!(generation, 3, "the exit generation committed");
+
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows, 2, "the exit enqueued its own outbox row");
+    let (outbox_id, audit_id): (String, String) =
+        sqlx::query_as("SELECT outbox_id, audit_id FROM audit_outbox WHERE outbox_id = $1")
+            .bind("ob-state-exit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_id, "ob-state-exit");
+    assert_eq!(audit_id, "audit-ob-state-exit");
 }
 
 /// #706 PR 3c: the state-preserving-policy patch must roll back when its

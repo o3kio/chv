@@ -253,7 +253,14 @@ impl EnrollmentService for EnqueueThenFail {
         audit: Option<&AdoptedAudit<'_>>,
     ) -> Result<proto::AckResponse, ControlPlaneServiceError> {
         let audit = audit.expect("the adapter passes the coupling");
-        let mut tx = self.pool.begin().await.expect("begin adopted tx");
+        // Same tx mode as the adopted write paths (#706): the first
+        // statement is a write, so a deferred BEGIN would only move the
+        // lock upgrade to that statement.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE;")
+            .await
+            .expect("begin adopted tx");
         chv_controlplane_store::audit_outbox::enqueue_on_tx(&mut tx, audit.insert())
             .await
             .expect("enqueue evidence");
@@ -1327,16 +1334,19 @@ async fn seed_node_desired_state(
     state: &str,
     generation: i64,
     scheduling_paused: bool,
+    state_reason: Option<&str>,
 ) {
     sqlx::query(
         "INSERT INTO node_desired_state \
-         (node_id, desired_generation, desired_state, requested_at, updated_at, scheduling_paused) \
-         VALUES ($1, $2, $3, strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
-                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), $4)",
+         (node_id, desired_generation, desired_state, state_reason, requested_at, updated_at, \
+          scheduling_paused) \
+         VALUES ($1, $2, $3, $4, strftime('%Y-%m-%dT%H:%M:%SZ','now'), \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now'), $5)",
     )
     .bind(node_id)
     .bind(generation)
     .bind(state)
+    .bind(state_reason)
     .bind(scheduling_paused)
     .execute(pool)
     .await
@@ -1362,6 +1372,20 @@ async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
                 Rpc::Drain => "DrainNode",
                 Rpc::EnterMaintenance => "EnterMaintenance",
                 Rpc::ExitMaintenance => "ExitMaintenance",
+            }
+        }
+
+        /// The pre-state each arm must transition *from*. Seeding a single
+        /// `TenantReady` row for every arm would make the applied assertions
+        /// below read back the seed instead of a transition (the exit arm
+        /// asserts `TenantReady`, which would then hold even if the exit
+        /// patch were a no-op).
+        fn seed(self) -> (&'static str, bool, Option<&'static str>) {
+            match self {
+                Rpc::Pause | Rpc::Resume | Rpc::Drain | Rpc::EnterMaintenance => {
+                    ("TenantReady", matches!(self, Rpc::Resume), None)
+                }
+                Rpc::ExitMaintenance => ("Maintenance", false, Some("upgrade")),
             }
         }
     }
@@ -1400,6 +1424,10 @@ async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
             }
             Rpc::ExitMaintenance => {
                 assert_eq!(state, "TenantReady", "{rpc:?}: exit must apply");
+                assert_eq!(
+                    reason, None,
+                    "{rpc:?}: exit must clear the maintenance reason"
+                );
             }
         }
     }
@@ -1413,17 +1441,11 @@ async fn server_audit_node_transitions_adopt_outbox_per_rpc() {
     ] {
         let db = TestDb::new().await;
         seed_node(&db, "node-a", None).await;
-        // Seed the resume case paused so a no-op resume fails the applied
-        // assertion. Each iteration owns a fresh `TestDb`, so this cannot
-        // leak into the other arms.
-        seed_node_desired_state(
-            &db.pool,
-            "node-a",
-            "TenantReady",
-            1,
-            matches!(rpc, Rpc::Resume),
-        )
-        .await;
+        // Each iteration owns a fresh `TestDb`, so the per-arm pre-state
+        // cannot leak into another arm and each applied assertion tests a
+        // real transition.
+        let (seed_state, seed_paused, seed_reason) = rpc.seed();
+        seed_node_desired_state(&db.pool, "node-a", seed_state, 1, seed_paused, seed_reason).await;
         let server = adopted_lifecycle_server(&db);
         let op = format!("op-{rpc:?}");
 
@@ -1590,7 +1612,7 @@ async fn server_audit_node_transition_intent_failure_keeps_failed_journal_and_on
 async fn server_audit_node_transition_crash_replay_writes_exactly_one_row() {
     let db = TestDb::new().await;
     seed_node(&db, "node-a", None).await;
-    seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false).await;
+    seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false, None).await;
     let service = lifecycle_impl(&db);
 
     // Deterministic crash: commit the intent + outbox row, then never run
@@ -1699,7 +1721,7 @@ async fn server_audit_node_transition_post_commit_failure_patches_the_committed_
 async fn server_audit_node_transition_oversized_payload_rolls_back_the_intent() {
     let db = TestDb::new().await;
     seed_node(&db, "node-a", None).await;
-    seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false).await;
+    seed_node_desired_state(&db.pool, "node-a", "TenantReady", 1, false, None).await;
     let service = lifecycle_impl(&db);
 
     let now = chv_common::now_unix_ms();
