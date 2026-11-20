@@ -2286,9 +2286,14 @@ async fn server_audit_volume_snapshot_crash_replay_writes_exactly_one_row() {
             coupling.was_committed(),
             "{rpc:?}: the service marks the enqueue committed"
         );
-        let (snapshot_op, _snapshot_name, _status, _generation) =
+        let (snapshot_op, snapshot_name, _status, _generation) =
             snapshot_state(&db.pool, "vol-a").await;
         assert_eq!(snapshot_op.as_deref(), Some(rpc.op()));
+        assert_eq!(
+            snapshot_name.as_deref(),
+            Some("snap-1"),
+            "{rpc:?}: the patch persists the request's snapshot_name"
+        );
 
         assert!(audit_rows(&db.pool).await.is_empty(), "no post-hoc row yet");
         let pending = outbox_rows(&db.pool).await;
@@ -2311,6 +2316,9 @@ async fn server_audit_volume_snapshot_crash_replay_writes_exactly_one_row() {
 #[tokio::test]
 async fn server_audit_volume_snapshot_post_commit_failure_patches_the_committed_row() {
     let db = TestDb::new().await;
+    // Only `SnapshotVolume` is exercised: all three snapshot-family RPCs
+    // reach the same `finish_audited` patch path (PR 3c), so one arm
+    // covers the behaviour.
     // The mock commits the outbox row and then fails. The real wire macro
     // must patch that row instead of inserting a second one.
     let server = LifecycleServer::new(Arc::new(MockLifecycle {
@@ -2360,6 +2368,9 @@ async fn server_audit_volume_snapshot_post_commit_failure_patches_the_committed_
 #[tokio::test]
 async fn server_audit_volume_snapshot_oversized_payload_rolls_back_the_intent() {
     let db = TestDb::new().await;
+    // Only `SnapshotVolume` is exercised: all three snapshot-family RPCs
+    // enqueue through the same `enqueue_on_tx::validate` bound, so one arm
+    // covers the behaviour.
     seed_node(&db, "node-a", None).await;
     seed_snapshot_volume(
         &db.pool,

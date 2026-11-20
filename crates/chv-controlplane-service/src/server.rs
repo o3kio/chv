@@ -490,7 +490,7 @@ macro_rules! audited_lifecycle_call {
 
 /// Same peer-pinned shape as [`audited_lifecycle_call`], but for a
 /// lifecycle RPC whose service enqueues the audit row inside its intent
-/// transaction (#706 PR 3c).
+/// transaction (#706 PRs 3c and 4).
 ///
 /// The adapter mints the ticket, hands the coupling to the service, and
 /// then runs the same check-or-insert as every other adopted path.

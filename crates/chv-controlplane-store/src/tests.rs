@@ -2775,7 +2775,24 @@ async fn test_set_volume_snapshot_audit_is_atomic_with_the_intent() {
             Some(&AuditOutboxInsert {
                 outbox_id: "ob-snap-tombstone".into(),
                 audit_id: "audit-ob-snap-tombstone".into(),
-                ..insert.clone()
+                payload: AuditLogInsert {
+                    occurred_at_ms: 2_000,
+                    actor_id: "node-a".into(),
+                    actor_username: "node-a".into(),
+                    actor_role: "node".into(),
+                    action: "DeleteVolumeSnapshot".into(),
+                    method: "gRPC".into(),
+                    path: "chv.controlplane.node.v1.LifecycleService/DeleteVolumeSnapshot".into(),
+                    resource_kind: Some("volume".into()),
+                    resource_id: Some("vol-snap-tombstone".into()),
+                    outcome: "success".into(),
+                    status_code: 200,
+                    correlation_id: None,
+                    operation_id: None,
+                    source_ip: None,
+                    metadata: "{}".into(),
+                },
+                created_at_ms: 2_000,
             }),
         )
         .await
@@ -2801,6 +2818,75 @@ async fn test_set_volume_snapshot_audit_is_atomic_with_the_intent() {
     assert_eq!(
         outbox_rows, 1,
         "a refused intent enqueues nothing (only the accepted row remains)"
+    );
+
+    // Stale generation on a **live** volume (no 'Deleting' tombstone): the
+    // row's generation 100 outranks the request's desired_state_version
+    // "1", so the conflict arm must still report `StaleGeneration` — not
+    // the delete Conflict — leave the row byte-for-byte unchanged, and
+    // enqueue nothing.
+    seed_snapshot_vds(
+        &pool,
+        "vol-snap-stale",
+        100,
+        None,
+        Some("seed"),
+        Some("seed-name"),
+    )
+    .await;
+    let stale = repo
+        .set_volume_snapshot(
+            &VolumeSnapshotPatchInput {
+                volume_id: ResourceId::new("vol-snap-stale").unwrap(),
+                desired_generation: Generation::new(1),
+                desired_status: None,
+                requested_by: Some("test".into()),
+                updated_by: None,
+                snapshot_op: Some("create".into()),
+                snapshot_name: Some("snap-stale".into()),
+                requested_unix_ms: 3_000,
+            },
+            Some(&AuditOutboxInsert {
+                outbox_id: "ob-snap-stale".into(),
+                audit_id: "audit-ob-snap-stale".into(),
+                payload: AuditLogInsert {
+                    occurred_at_ms: 3_000,
+                    actor_id: "node-a".into(),
+                    actor_username: "node-a".into(),
+                    actor_role: "node".into(),
+                    action: "SnapshotVolume".into(),
+                    method: "gRPC".into(),
+                    path: "chv.controlplane.node.v1.LifecycleService/SnapshotVolume".into(),
+                    resource_kind: Some("volume".into()),
+                    resource_id: Some("vol-snap-stale".into()),
+                    outcome: "success".into(),
+                    status_code: 200,
+                    correlation_id: None,
+                    operation_id: None,
+                    source_ip: None,
+                    metadata: "{}".into(),
+                },
+                created_at_ms: 3_000,
+            }),
+        )
+        .await
+        .expect_err("a stale-generation snapshot patch must still fail");
+    assert!(
+        matches!(stale, StoreError::StaleGeneration { .. }),
+        "a live volume must keep the pre-existing StaleGeneration refusal, got: {stale:?}"
+    );
+    assert_eq!(
+        snapshot_vds_shape(&pool, "vol-snap-stale").await,
+        (Some("seed".into()), Some("seed-name".into()), None, 100),
+        "the refused stale patch must not touch the row"
+    );
+    let (outbox_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox_rows, 1,
+        "a stale-generation refusal enqueues nothing"
     );
 }
 

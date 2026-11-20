@@ -17,8 +17,9 @@ recovery path we cannot honour.
 
 > **Rollout status (#706 half 1).** The outbox is live for the adopted
 > BFF routes, the three adopted gRPC enrollment RPCs, the five adopted
-> gRPC reconcile RPCs, and the five adopted gRPC node-lifecycle
-> transitions listed below.
+> gRPC reconcile RPCs, the five adopted gRPC node-lifecycle
+> transitions, and the three adopted gRPC volume snapshot-family RPCs
+> listed below.
 > On those paths a pending row means the mutation **committed** and its
 > evidence row is waiting for the dispatcher. The response was normally
 > 2xx, but a committed mutation whose final response was later patched
@@ -281,6 +282,21 @@ still-`Pending` `PauseNodeScheduling`-style row with its
 state change *is* present but the row missing, check `audit_outbox` for
 a pending row before concluding evidence was lost.
 
+For the volume snapshot family specifically: a **denied** request
+always leaves a direct `denied` row — a missing row is never a denial.
+If the trail has no row, first check how the change was made: the
+WebUI/chvctl paths (`POST /v1/volumes/snapshot`,
+`/v1/volumes/restore-snapshot`, `/v1/volumes/delete-snapshot`) are not
+outbox-coupled and keep the post-hoc crash window. On the gRPC path,
+check `operations` for a still-`Pending` `SnapshotVolume`-style row
+with its `OperationStarted` event and no matching
+`volume_desired_state` snapshot-op change (the journal-only crash
+window), and `chv_grpc_audit_write_failures_total` / the
+`AUDIT_LOG_WRITE_FAILED` log for a failed direct insert. If the intent
+*is* present but the row missing, check `audit_outbox` for a pending
+row before concluding evidence was lost. A direct failed 409 row means
+a `Deleting` tombstone refused the patch (the volume row is unchanged).
+
 A dispatched row is indistinguishable from a direct one in `audit_log`;
 for 7 days you can join `audit_outbox.audit_id` to prove a row was
 outbox-coupled.
@@ -300,7 +316,7 @@ steady state. Changing either value requires a restart.
 Retention prunes up to 5,000 **dispatched** rows per pass. Pending rows
 are never pruned, regardless of age.
 
-## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a/3b/3c gRPC)
+## 5. Change-risk notes (PR 1 plumbing + PR 2 BFF + PR 3a/3b/3c/4 gRPC)
 
 - **Audit loss / double-write (BFF):** the check-or-insert composition is
   what keeps this safe on adopted routes: a present outbox row suppresses
@@ -385,11 +401,24 @@ are never pruned, regardless of age.
   contention): `BEGIN IMMEDIATE` is the discipline of the BFF outbox paths
   converted for #706 (all but `vms/import`, which keeps its pre-existing
   transaction) and these intent methods, not a repo-wide rule.
+- **Lock scope (PR 4):** `set_volume_snapshot` takes an optional outbox
+  row. With one it wraps the single intent UPSERT plus the outbox INSERT
+  in `begin_with("BEGIN IMMEDIATE;")`; without one it keeps the original
+  autocommit statement. Its `'Deleting'`-tombstone check runs on the
+  **same connection inside that transaction** (a connection-taking
+  helper shared with the pool-level form, so the conflict semantics are
+  identical). Calling the pool-level helper there would need a second
+  pool connection while the first still holds the write lock; under
+  concurrent adopted mutations that stalls on connection acquisition
+  (the shipped configs allow 4 connections, and the in-memory test pool
+  holds one and blocks outright). Running it on the held connection
+  needs no extra connection and observes exactly the row state the patch
+  saw.
 - **Remaining surfaces stay post-hoc:** the rest of the gRPC lifecycle
-  service (VM power, volumes, networks, migrate, overlay, ARP, resolve
-  inspect) and every unadopted BFF route still insert after the handler
-  returns, with the original narrow crash window. Denied and failed
-  requests stay post-hoc by design.
+  service (VM power, volume attach/resize/clone, networks, migrate,
+  overlay, ARP, resolve inspect) and every unadopted BFF route still
+  insert after the handler returns, with the original narrow crash
+  window. Denied and failed requests stay post-hoc by design.
 - **Lock scope (PR 2):** `users`/`tokens` mutations that were autocommit
   single statements are now wrapped in
   `begin_with("BEGIN IMMEDIATE;")` so the mutation and the outbox INSERT

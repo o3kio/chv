@@ -17,14 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same check-or-insert as every other adopted path. The store method
   takes an optional outbox row: `None` is byte-identical to the previous
   autocommit statement, while `Some` runs `BEGIN IMMEDIATE` → intent
-  upsert → `'Deleting'`-tombstone check on the **same connection** →
-  outbox INSERT → commit. The tombstone helper gained a
+  upsert (whose zero-rows conflict arm runs the `'Deleting'`-tombstone
+  check on the **same connection** and fails the transaction) → outbox
+  INSERT → commit. The tombstone helper gained a
   connection-taking form because calling the pool-level helper inside the
-  write transaction would need a second connection and self-deadlock at
-  `max_connections(1)`. The coupling is deliberately intent-anchored,
-  not journal-anchored: a crash after the earlier `operations` INSERT
-  but before the intent would otherwise leave a false `success` row for
-  a snapshot operation that never applied. **Residual window
+  write transaction would need a second connection while the first still
+  holds the write lock; under concurrent adopted mutations that stalls on
+  connection acquisition (shipped configs allow 4 connections; the
+  in-memory test pool holds one and blocks outright). The coupling is
+  deliberately intent-anchored, not journal-anchored: a crash after the
+  earlier `operations` INSERT but before the intent would otherwise leave
+  a false `success` row for a snapshot operation that never applied.
+  **Residual window
   (disclosed, not closed):** the operation row and `OperationStarted`
   event are earlier, separate commits — a crash between them and the
   intent leaves no state change and no row; a non-crash conflict after
@@ -184,7 +188,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outbox_dispatch_interval_secs` (default 1) and
   `outbox_retention_days` (default 7, validated 1..=365).
   The plumbing itself changes no request behavior; adoption lands in
-  PR 2 (BFF, above) and PR 3a/3b/3c (gRPC). See
+  PR 2 (BFF, above) and PR 3a/3b/3c/4 (gRPC). See
   `docs/specs/component/audit-log.md` and
   `docs/runbooks/audit-outbox.md`.
 
@@ -203,8 +207,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(service, reason, peer)` rows are deduped for 60 seconds into
   `chv_grpc_denial_audit_suppressed_total`. Server-side tonic does not expose
   the RPC method, so rows carry the service as `path`; method-level fidelity
-  and the crash window (mutation commits before its audit row) remain open
-  under #706.
+  and the crash window for not-yet-adopted mutation sites (mutation commits
+  before its audit row) remains open under #706.
 - **RustSec advisories cleared from the dependency graph.** `rusqlite`
   0.32→0.41 and `sqlx` 0.8→0.9.1 now share a single
   `libsqlite3-sys` 0.39.1 (bundled SQLite 3.54.1), removing

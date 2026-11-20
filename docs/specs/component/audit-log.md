@@ -133,9 +133,9 @@ exceeded, the writer is aborted and queued events are lost **uncounted**
 
 The crash window (a mutation commits before its audit row is written)
 remains open for the denial writer and for every mutation site not
-coupled to the audit outbox; the **BFF, enrollment, reconcile, and
-node-lifecycle adoption below closes it** for the listed routes and
-tracks the rest under #706.
+coupled to the audit outbox; the **BFF, enrollment, reconcile,
+node-lifecycle, and volume-snapshot adoption below closes it** for the
+listed routes and tracks the rest under #706.
 
 ## Mounting
 
@@ -400,7 +400,10 @@ earlier, separate commits (residual below).
 
 The accept-time `ensure_volume_snapshot_family_supported` capability
 read runs **before** journaling, exactly as before: a core-managed
-volume is rejected with no operation row, no intent, and no audit row.
+volume is rejected with no operation row, no intent, and no outbox
+row. The rejection itself is still recorded once on the direct path
+(a failed 400 row on both surfaces), per the one-row-per-RPC contract
+above.
 
 Journal-anchoring these three was **rejected** for the same reason as
 the node transitions: the `operations` INSERT commits before the intent,
@@ -426,6 +429,11 @@ exactly one statement pair: the intent upsert (with its
   `Accepted` status update leaves the **applied snapshot intent plus a
   `success` audit row** and a possibly **stale operation status** — the
   same audit-correct/journal-incomplete shape as PR 3c.
+- A **non-crash failure of the later `Accepted` status update** returns
+  an error and patches the already-committed row to `failed`/500; the
+  applied intent and its evidence stay (evidence is not retracted); the
+  operation row itself is left `Pending`, the same stale state as the
+  crash case — the same shape as PR 3c.
 - Adoption is **per-RPC**. The BFF twin routes and every other lifecycle
   RPC (including `CloneVolume`) remain post-hoc. This PR makes **no
   claim that the lifecycle surface is globally closed**.
@@ -610,8 +618,8 @@ deferred `BEGIN` would only defer the same lock and risk a
 `SQLITE_BUSY` at that first write statement (the mutation) instead of
 at `BEGIN`. The BFF outbox paths converted for #706 (all but
 `vms/import`, which keeps its pre-existing transaction) and the PR 3c
-intent methods follow the same discipline — not a repo-wide rule. The
-**other** PR 3a/3b adopted methods still open a deferred
+and PR 4 intent methods follow the same discipline — not a repo-wide
+rule. The **other** PR 3a/3b adopted methods still open a deferred
 `begin()`: identical atomicity, but the first statement performs the
 lock upgrade (busier under contention). `networks/update`,
 `networks/delete`, and `vms/import` already held a transaction, so only
@@ -641,8 +649,12 @@ For the PR 4 volume snapshots `set_volume_snapshot` wraps the single
 intent UPSERT plus the outbox INSERT in `BEGIN IMMEDIATE` when a row is
 present (`None` keeps the autocommit statement). Its `'Deleting'`
 tombstone check now runs on the **same connection inside that
-transaction**: calling the pool-level helper there would need a second
-connection and self-deadlock at `max_connections(1)`. The check is a
+transaction**: the pool-level helper would need a **second** connection
+while the first still holds the `BEGIN IMMEDIATE` write lock; under
+concurrent adopted mutations that stalls on connection acquisition
+(shipped configs allow 4 connections; the in-memory test pool holds one
+and blocks outright), and running on the held connection additionally
+observes exactly the row state the patch saw. The check is a
 connection-taking helper shared by both branches, so the conflict
 semantics are identical.
 Every transaction is held for the store call only — never across
