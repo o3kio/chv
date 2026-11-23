@@ -89,7 +89,7 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4", "v7"] }
 rand = "0.10"
 hex = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 metrics = "0.24"
 # Snappy block compression for the Prometheus remote-write v1 export
 # body (the protocol's required Content-Encoding).
