@@ -101,7 +101,7 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "fs"] }
 hyper-util = { version = "0.1", features = ["client", "server", "tokio"] }
 metrics-exporter-prometheus = "0.18"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 axum = "0.7"
 bcrypt = "0.19"
