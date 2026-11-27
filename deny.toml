@@ -27,15 +27,15 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 
 # A vulnerability is a hard fail. Yanked versions fail because they usually
 # indicate an upstream-acknowledged problem. Unmaintained advisories are
-# warnings, not failures: security.yml passes `--warn unmaintained` as the
-# standing policy so a new one is visible while vulnerabilities still fail the
-# gate. The two entries below therefore suppress the known chrono/humantime
-# advisories from the report rather than turning a hard failure into a pass;
-# each carries the documented migration plan required by the ignore-list
-# policy. The companion `.cargo/audit.toml` also reports unmaintained
-# advisories as informational (`informational_warnings`) and ignores the same
-# two advisories with the same evidence. Do not add an unmaintained ignore
-# without the same (a)/(b)/(c) evidence.
+# warnings in this gate: security.yml passes `--warn unmaintained` as the
+# standing policy so a new one is visible while vulnerabilities still fail.
+# The CI audit action also treats them as non-fatal warnings, but a local
+# `cargo audit` exits non-zero on them because `.cargo/audit.toml`'s
+# `[output] deny` list includes `unmaintained` and `warnings`. Both files
+# therefore ignore the same two chrono/humantime advisories with the same
+# evidence; each carries the documented (a)/(b)/(c) migration plan required by
+# the ignore-list policy. Do not add an unmaintained ignore without the same
+# evidence.
 yanked = "deny"
 
 # Fail when an ignore entry no longer matches any advisory in the actual
@@ -71,11 +71,11 @@ unused-ignored-advisory = "deny"
 #   RUSTSEC-2026-0204 (crossbeam-epoch) — crossbeam-epoch 0.9.21 is outside
 #     the advisory's affected range.
 ignore = [
-    # --- Unmaintained (informational; no vulnerability) ------------------
-    # Both gates report unmaintained advisories as warnings (cargo-audit via
-    # `informational_warnings`, cargo-deny via security.yml's
-    # `--warn unmaintained`). Both entries below record upstream maintenance
-    # status, not a defect.
+    # --- Unmaintained (no direct vulnerability) --------------------------
+    # cargo-deny and the CI audit action report these as non-fatal warnings;
+    # a local `cargo audit` fails on them (see `.cargo/audit.toml`). The
+    # entries below suppress the known chrono/humantime advisories in both
+    # gates; they record upstream maintenance status, not a defect.
 
     # RUSTSEC-2026-0543 — `chrono` is unmaintained (all versions).
     #   (a) Non-applicable as a vulnerability: chrono is used for UTC
