@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **`chv-agent` metrics fall back to loopback when `metrics_bind` is unset.**
+  A config that omitted the key bound the Prometheus endpoint on
+  `0.0.0.0:9100` (all interfaces) — the packaged and installer configs set
+  `127.0.0.1:9901` explicitly, so only hand-written configs were affected,
+  which is exactly where a silent public bind is most dangerous. The fallback
+  is now `127.0.0.1:9100` (port unchanged, so scrape targets do not move),
+  emits a warning naming the resolved bind, and is pinned by a unit test.
+  Explicit values are still honored verbatim.
 - **`url` bumped to 2.5.9 (RUSTSEC-2026-0592, #769).** The 2.5.8 pin was
   vulnerable to a stack overflow in `Url::origin()` on nested `blob:` URLs;
   the daily `cargo audit` gate had been red since 2026-11-23 and blocked the
@@ -20,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already documents.
 
 ### Changed
+- **Container image builds again; the compose stacks stay explicitly
+  unsupported.** `Dockerfile` pinned `rust:1.83` against the repo's 1.98.1
+  toolchain, installed neither `protoc` (required by `tonic-prost-build`) nor
+  `cmake` (`aws-lc-sys`), never copied `VERSION` (so every binary reported
+  `unknown`), depended on a `chv-stord` group it never created, and shipped no
+  Cloud Hypervisor at all. It now pins the builder, adds the real build inputs,
+  carries `cloud-hypervisor`/`ch-remote` at the qualified v53.0 pin with
+  digest verification, and uses the qualified ownership contract
+  (`chv:chv-stord` 0770 storage). `docker-compose.yml` gains an explicit
+  LEGACY/DEV-ONLY banner, the agent's `control_plane_addr` is `https`, and the
+  `command: >` heredoc folding that collapsed every generated TOML into one
+  invalid line is fixed. Neither stack provisions TLS or a bootstrap token, so
+  neither runs end-to-end; that is documented rather than papered over.
 - **stord surfaces unsupported Ceph/iSCSI volume destroy at startup
   (#522/DP3).** `CephRbdBackend` and `IscsiBackend` implement the
   open/attach/resize/snapshot surface but deliberately refuse
@@ -299,6 +320,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v4's automatic source detection would otherwise scan.
 
 ### Fixed
+- **The documented install path now works end to end.** Four independent
+  defects made the advertised quick start fail: `get.cellhv.com` does not
+  resolve (NXDOMAIN); `| sh -` is dash, which rejects `set -o pipefail`;
+  `${BASH_SOURCE[0]}` tripped `set -u` under `bash -s`; and both scripts
+  defaulted to `kubedoio/chv`, which now returns HTTP 301 while
+  `quick-install.sh`'s API helper did not follow redirects. Docs, pages and
+  scripts now use the raw-URL `bash -s` form against `o3kio/chv`, and the API
+  helper passes `-L`. Separately: `install_cloud_hypervisor` accepted *any*
+  preinstalled binary and returned, so a host with v43.0.0 silently ran the
+  version the #448 campaign moved away from — it now gates on major.minor
+  against the v53.0 pin, replaces a mismatch with the digest-verified binary,
+  and offers `INSTALL_CHV_ALLOW_VMM_MISMATCH=1` as an explicit off-pin escape.
+  `download_firmware` was commented out of the main flow, so a clean host had
+  no `/var/lib/chv/hypervisor-fw` and firmware-booting VMs failed with
+  `firmware not found`; the download is restored with `/root/CLOUDHV.fd` as a
+  local override. Version resolution no longer pins `0.3.0` silently on an API
+  failure. Capability docs were corrected alongside: `GAP_ANALYSIS.md` no
+  longer claims zero gaps (backup has no engine, multi-host is architecturally
+  blocked, Volvisor has no code), the stale production-readiness report is
+  marked superseded, and single-host is recorded as the declared posture
+  pending ratification of decision D1.
 - **nwd service exposures now survive restart/reboot (durable journal +
   gated replay).** Service exposures were in-memory only, so an nwd restart
   or host reboot dropped published ports/DNAT for running VMs even though
