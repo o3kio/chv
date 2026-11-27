@@ -13,7 +13,6 @@ export const BFFEndpoints = {
 	listNodes: '/v1/nodes',
 	getNode: '/v1/nodes/get',
 	mutateNode: '/v1/nodes/mutate',
-	createNode: '/v1/nodes/create',
 	enrollNode: '/v1/nodes/enroll',
 	listVms: '/v1/vms',
 	getVm: '/v1/vms/get',

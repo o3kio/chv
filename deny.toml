@@ -25,9 +25,17 @@ version = 2
 # expand `~` — see .cargo/audit.toml.)
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
-# A vulnerability is a hard fail. Unmaintained crates warn so we have time to
-# migrate without blocking unrelated PRs. Yanked versions fail because they
-# usually indicate an upstream-acknowledged problem.
+# A vulnerability is a hard fail. Yanked versions fail because they usually
+# indicate an upstream-acknowledged problem. Unmaintained advisories are
+# warnings in this gate: security.yml passes `--warn unmaintained` as the
+# standing policy so a new one is visible while vulnerabilities still fail.
+# The CI audit action also treats them as non-fatal warnings, but a local
+# `cargo audit` exits non-zero on them because `.cargo/audit.toml`'s
+# `[output] deny` list includes `unmaintained` and `warnings`. Both files
+# therefore ignore the same two chrono/humantime advisories with the same
+# evidence; each carries the documented (a)/(b)/(c) migration plan required by
+# the ignore-list policy. Do not add an unmaintained ignore without the same
+# evidence.
 yanked = "deny"
 
 # Fail when an ignore entry no longer matches any advisory in the actual
@@ -63,6 +71,36 @@ unused-ignored-advisory = "deny"
 #   RUSTSEC-2026-0204 (crossbeam-epoch) — crossbeam-epoch 0.9.21 is outside
 #     the advisory's affected range.
 ignore = [
+    # --- Unmaintained (no direct vulnerability) --------------------------
+    # cargo-deny and the CI audit action report these as non-fatal warnings;
+    # a local `cargo audit` fails on them (see `.cargo/audit.toml`). The
+    # entries below suppress the known chrono/humantime advisories in both
+    # gates; they record upstream maintenance status, not a defect.
+
+    # RUSTSEC-2026-0543 — `chrono` is unmaintained (all versions).
+    #   (a) Non-applicable as a vulnerability: chrono is used for UTC
+    #       timestamps only (RFC 3339 text in SQLite, per
+    #       docs/specs/cellhv-core-local-store.md). No advisory-specific
+    #       exploit exists; the gate exists to force a migration.
+    #   (b) Upstream: https://github.com/chronotope/chrono/issues/1768
+    #       (`object_store 0.14.2` and `cron 0.17` also require chrono, so
+    #       rewriting the 9 direct workspace crates would not remove it).
+    #   (c) Remove when object_store drops its unconditional chrono
+    #       dependency and cron/the direct users migrate to jiff/time.
+    #       Tracking: #755.
+    "RUSTSEC-2026-0543",
+
+    # RUSTSEC-2026-0542 — `humantime` is unmaintained (transitively via
+    # `object_store`'s duration parser; CHV has no direct use).
+    #   (a) Non-applicable as a vulnerability: maintenance status only; no
+    #       CHV code path calls humantime directly.
+    #   (b) Upstream: https://github.com/chronotope/chrono/issues/1768
+    #       (the advisory's own url field points at the chrono issue because
+    #       in this timeline humantime wraps chrono; object_store 0.14.2 is
+    #       the latest release and depends on humantime 2.1 unconditionally).
+    #   (c) Remove when object_store stops depending on humantime.
+    #       Tracking: #756.
+    "RUSTSEC-2026-0542",
     # Removed 2026-10-08 (#235 PR 2 — rustls-pemfile fully retired from the
     # graph): RUSTSEC-2025-0134 no longer requires an exception — the last
     # three rustls-pemfile sites (chv-stord-core's migration receiver TLS

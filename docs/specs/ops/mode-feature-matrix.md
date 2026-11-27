@@ -5,8 +5,8 @@ not claim that legacy mode has been removed.
 
 `chv-agent` accepts `authority_mode = "legacy" | "core-managed" |
 "core-native"` ([`crates/chv-config/src/lib.rs`](../../../crates/chv-config/src/lib.rs),
-`AgentAuthorityMode`). The config-loader default is `legacy`, but every shipped
-configuration selects `core-managed`:
+`AgentAuthorityMode`). The config-loader default is `core-managed` (a missing
+key fails closed), and every shipped configuration also selects it explicitly:
 `packaging/config/chv.yaml`, `docs/examples/agent.toml`, and the
 `scripts/install.sh` template. `core-native` is an explicit opt-in production
 composition; it is not the shipped default.
@@ -26,7 +26,7 @@ of performing its legacy side effect.
 
 | Feature / behavior | `legacy` | `core-managed` (shipped default) | `core-native` (explicit opt-in) |
 |---|---|---|---|
-| Selection | Explicit opt-in; missing key falls back here with the loader default | Every shipped config (`chv.yaml`, `examples/agent.toml`, `install.sh` template) | Explicit opt-in; standalone composition |
+| Selection | Explicit opt-in only; a missing key now defaults to `core-managed` (fail-closed) | Every shipped config (`chv.yaml`, `examples/agent.toml`, `install.sh` template) and the loader default | Explicit opt-in; standalone composition |
 | Legacy Controller connection, enrollment, inventory, health reporting | Yes | Yes | **No** — returns before the legacy stack |
 | Legacy gRPC `AgentServer` (lifecycle, reconcile, snapshot, migration, console) | Yes, full surface | Yes, as a compatibility adapter; lifecycle mutations submit to Core, legacy effectors fail closed with `unimplemented` | **No** |
 | Legacy `Reconciler` provider-mutation surface | Yes, full mutation surface | Observe-only (`Reconciler::new_observe_only`); structurally has no mutation state | **No** |

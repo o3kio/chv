@@ -207,6 +207,9 @@ impl NetworkExecutor for MockExecutor {
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Eligible sets passed to `recover_exposures`, kept separate from
+    /// `calls` so policy/teardown assertions are unaffected by server startup.
+    recover_calls: Arc<std::sync::Mutex<Vec<String>>>,
     /// Simulate an executor that cannot apply a valid-looking firewall
     /// payload (used to exercise the actionable recovery error).
     reject_firewall: bool,
@@ -410,6 +413,19 @@ impl NetworkExecutor for RecordingExecutor {
             .await
     }
 
+    async fn recover_exposures(
+        &self,
+        recoverable: &std::collections::HashSet<String>,
+    ) -> Result<(), ChvError> {
+        let mut networks: Vec<String> = recoverable.iter().cloned().collect();
+        networks.sort();
+        self.recover_calls
+            .lock()
+            .unwrap()
+            .push(format!("recover_exposures:{}", networks.join(",")));
+        Ok(())
+    }
+
     async fn send_gratuitous_arp(
         &self,
         namespace: &str,
@@ -420,6 +436,53 @@ impl NetworkExecutor for RecordingExecutor {
             .send_gratuitous_arp(namespace, bridge_name, vm_ip)
             .await
     }
+}
+
+fn recovered_topology_state(network_id: &str, fabric_backed: bool) -> TopologyState {
+    TopologyState {
+        network_id: network_id.to_string(),
+        tenant_id: "t1".to_string(),
+        bridge_name: chv_common::bridge_name_for_network(network_id),
+        namespace_name: format!("ns-{network_id}"),
+        subnet_cidr: "10.0.9.0/24".to_string(),
+        gateway_ip: "10.0.9.1".to_string(),
+        runtime_status: "ensured".to_string(),
+        vni: fabric_backed.then_some(100),
+        tenant_mtu: fabric_backed.then_some(1380),
+        fabric_plan_generation: fabric_backed.then_some(1),
+        binding_generation: fabric_backed.then_some(1),
+    }
+}
+
+/// The handler, not the executor, owns eligibility: only recovered
+/// bridge-only topologies may receive journaled DNAT. A fabric-backed
+/// topology is present in the table but its overlay is not recovered here,
+/// so it must be excluded from the set handed to `recover_exposures`.
+#[tokio::test]
+async fn handler_recover_exposures_excludes_fabric_backed_topology() {
+    let recover_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let table = Arc::new(TopologyTable::new());
+    table.upsert(recovered_topology_state("net-bridge", false));
+    table.upsert(recovered_topology_state("net-fabric", true));
+
+    let service = NetworkServiceImpl::new(
+        Arc::new(RecordingExecutor {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reject_firewall: false,
+            recover_calls: recover_calls.clone(),
+        }),
+        table,
+        Arc::new(Metrics::new()),
+    );
+    service.recover_exposures().await.unwrap();
+
+    let recovery_calls = recover_calls.lock().unwrap();
+    assert_eq!(
+        recovery_calls.len(),
+        1,
+        "only the recovered bridge-only topology may be eligible: {recovery_calls:?}"
+    );
+    assert_eq!(recovery_calls[0], "recover_exposures:net-bridge");
 }
 
 async fn make_channel(socket: PathBuf) -> tonic::transport::Channel {
@@ -954,6 +1017,7 @@ async fn attach_refreshes_policy_guard_scope() {
     let rec = RecordingExecutor {
         calls: calls.clone(),
         reject_firewall: false,
+        recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1056,6 +1120,7 @@ async fn concurrent_fw_nat_applies_persist_both_halves() {
     let rec = RecordingExecutor {
         calls: calls.clone(),
         reject_firewall: false,
+        recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1188,6 +1253,7 @@ async fn delete_without_state_row_runs_derived_names_local_teardown() {
     let rec = RecordingExecutor {
         calls: calls.clone(),
         reject_firewall: false,
+        recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let server = NetworkServer::new(rec, Metrics::new());
     let socket_clone = socket.clone();
@@ -1370,6 +1436,7 @@ async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
         Arc::new(RecordingExecutor {
             calls: calls.clone(),
             reject_firewall: false,
+            recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
@@ -1408,6 +1475,7 @@ async fn policy_recovers_and_rescopes_the_guard_after_a_restart() {
         Arc::new(RecordingExecutor {
             calls: calls.clone(),
             reject_firewall: false,
+            recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         table.clone(),
         Arc::new(Metrics::new()),
@@ -1564,6 +1632,7 @@ async fn rejected_policy_blocks_attach_until_a_valid_save_clears_it() {
         Arc::new(RecordingExecutor {
             calls: calls.clone(),
             reject_firewall: false,
+            recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
@@ -1667,6 +1736,7 @@ async fn rejected_nat_policy_blocks_attach_until_a_valid_save_clears_it() {
         Arc::new(RecordingExecutor {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             reject_firewall: false,
+            recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
@@ -1848,6 +1918,7 @@ async fn rejected_half_does_not_leak_into_the_journal_via_the_other_half() {
         Arc::new(RecordingExecutor {
             calls: calls.clone(),
             reject_firewall: false,
+            recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),
@@ -1896,6 +1967,7 @@ async fn recovery_names_the_journal_file_when_a_policy_cannot_be_reapplied() {
         Arc::new(RecordingExecutor {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             reject_firewall: true,
+            recover_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }),
         Arc::new(TopologyTable::new()),
         Arc::new(Metrics::new()),

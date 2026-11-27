@@ -491,37 +491,11 @@ pub async fn execute_backup_job(
     require_backup_resource_owner(&state, &claims, Some(&row.vm_id), row.volume_id.as_deref())
         .await?;
 
-    let input = BackupJobCreateInput {
-        vm_id: row.vm_id,
-        volume_id: row.volume_id,
-        schedule_id: row.schedule_id,
-        status: "Pending".into(),
-        backup_type: row.backup_type,
-        target_path: row.target_path.clone(),
-        storage_backend: row.storage_backend,
-        started_at: None,
-        completed_at: None,
-        error_message: None,
-        size_bytes: None,
-        checksum: None,
-        checksum_algorithm: None,
-        destination: row.destination.clone(),
-    };
-
-    let execution_id = state
-        .backup_repo
-        .create_job(&input)
-        .await
-        .map_err(|e| BffError::Internal(format!("failed to execute backup job: {}", e)))?;
-    state.cache.invalidate("overview").await;
-
-    Ok(Json(json!({
-        "accepted": true,
-        "task_id": execution_id,
-        "job_id": job_id,
-        "summary": format!("Executing backup job '{}'", job_id),
-        "next_refresh_path": format!("/api/v1/backups/jobs/{}", execution_id),
-    })))
+    // Defense in depth (#654): the route is fenced, but if a future change
+    // wires this handler, refuse before creating a fake Pending job. The
+    // ownership gate above is intentionally preserved so a non-owner still
+    // gets 403 instead of learning the engine is absent.
+    Err(BffError::NotImplemented(BACKUP_NOT_IMPLEMENTED.to_string()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1120,36 +1094,10 @@ pub async fn run_backup_job_api(
     )
     .await?;
 
-    let input = BackupJobCreateInput {
-        vm_id: schedule.vm_id.clone(),
-        volume_id: schedule.volume_id.clone(),
-        schedule_id: Some(job_id),
-        status: "Pending".into(),
-        backup_type: "full".into(),
-        target_path: schedule.destination.clone(),
-        storage_backend: None,
-        started_at: Some(Utc::now().to_rfc3339()),
-        completed_at: None,
-        error_message: None,
-        size_bytes: None,
-        checksum: None,
-        checksum_algorithm: None,
-        destination: schedule.destination.clone(),
-    };
-
-    let execution_id = state
-        .backup_repo
-        .create_job(&input)
-        .await
-        .map_err(|e| BffError::Internal(format!("failed to run backup job: {}", e)))?;
-    state.cache.invalidate("overview").await;
-
-    Ok(Json(json!({
-        "id": execution_id,
-        "job_id": execution_id,
-        "status": "Running",
-        "started_at": input.started_at,
-    })))
+    // Defense in depth (#654): fenced route; refuse before creating a fake
+    // execution row if this handler is ever wired again. Ownership above is
+    // preserved so a non-owner still gets 403.
+    Err(BffError::NotImplemented(BACKUP_NOT_IMPLEMENTED.to_string()))
 }
 
 pub async fn toggle_backup_job_api(

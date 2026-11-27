@@ -1,20 +1,15 @@
 <script lang="ts">
-import Button from '#lib/components/primitives/Button.svelte';
-	import type { PageData } from './$types';
-	import type { ShellTone } from '#lib/shell/app-shell.ts';
+import type { PageData } from './$types';
 	import InventoryListPage from '#lib/components/shell/InventoryListPage.svelte';
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
-	import AddNodeModal from '#lib/components/nodes/AddNodeModal.svelte';
 	import { getPageDefinition } from '#lib/shell/app-shell.ts';
-	import { Plus, AlertCircle, ShieldCheck } from 'lucide-svelte';
+	import { isNodeReady, nodeStateTone } from '#lib/webui/node-state.ts';
+	import { AlertCircle } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { toast } from '#lib/stores/toast.svelte.ts';
-	import type { CreateNodeInput, CreateNodeResponse } from '#lib/api/types.ts';
 
 	let { data }: { data: PageData } = $props();
 
-	let addNodeOpen = $state(false);
 	const model = $derived(data.nodes);
 	const items = $derived(model.items);
 
@@ -27,10 +22,18 @@ import Button from '#lib/components/primitives/Button.svelte';
 			label: 'State',
 			type: 'select' as const,
 			options: [
-				{ value: 'online', label: 'Online' },
-				{ value: 'offline', label: 'Offline' },
-				{ value: 'maintenance', label: 'Maintenance' },
-				{ value: 'error', label: 'Error' }
+				{ value: 'HostReady', label: 'Host Ready' },
+				{ value: 'StorageReady', label: 'Storage Ready' },
+				{ value: 'NetworkReady', label: 'Network Ready' },
+				{ value: 'TenantReady', label: 'Tenant Ready' },
+				{ value: 'Degraded', label: 'Degraded' },
+				{ value: 'Draining', label: 'Draining' },
+				{ value: 'Maintenance', label: 'Maintenance' },
+				{ value: 'Failed', label: 'Failed' },
+				{ value: 'Unreachable', label: 'Unreachable' },
+				{ value: 'Discovered', label: 'Discovered' },
+				{ value: 'Bootstrapping', label: 'Bootstrapping' },
+				{ value: 'Unknown', label: 'Unknown' }
 			]
 		},
 		{ key: 'maintenance', label: 'Maintenance', type: 'boolean' as const }
@@ -61,18 +64,9 @@ import Button from '#lib/components/primitives/Button.svelte';
 		{ key: 'version', label: 'Platform Rev' }
 	];
 
-	function mapStateTone(state: string, health?: string): ShellTone {
-		if (state === 'maintenance') return 'warning';
-		if (state === 'error' || health === 'critical') return 'failed';
-		if (health === 'warning') return 'degraded';
-		if (state === 'online' && health === 'healthy') return 'healthy';
-		return 'unknown';
-	}
-
 	const tableRows = $derived(items.map(item => ({
 		...item,
-		state: { label: item.state, tone: mapStateTone(item.state, item.health) },
-		network: { label: item.network || 'Optimal', tone: 'healthy' as ShellTone },
+		state: { label: item.state, tone: nodeStateTone(item.state, item.health) },
 		hypervisor_capabilities: item.hypervisor_capabilities?.includes('kvm') ? 'KVM' : '—'
 	})));
 
@@ -80,7 +74,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	const metrics = $derived([
 		{ label: 'Compute Capacity', value: items.length, color: 'neutral' as const },
-		{ label: 'Operational', value: items.filter(n => n.state === 'online').length, trend: 0, color: 'primary' as const },
+		{ label: 'Operational', value: items.filter(n => isNodeReady(n.state)).length, color: 'primary' as const },
 		{ label: 'Posture Warning', value: items.filter(n => n.health !== 'healthy').length, color: items.filter(n => n.health !== 'healthy').length > 0 ? 'warning' as const : 'neutral' as const }
 	]);
 </script>
@@ -100,17 +94,10 @@ import Button from '#lib/components/primitives/Button.svelte';
 	rows={tableRows}
 	rowHref={(row) => `/nodes/${row.node_id}`}
 >
-	{#snippet headerActions()}
-		<Button variant="primary" onclick={() => (addNodeOpen = true)}>
-			<Plus size={14} />
-			Enroll Node
-		</Button>
-	{/snippet}
-
 	{#snippet sidebar()}
 		<SectionCard title="Host Posture" icon={AlertCircle} badgeLabel={String(attentionNodes.length)}>
 			{#if attentionNodes.length === 0}
-				<p class="empty-hint">All compute hosts within nominal range.</p>
+				<p class="empty-hint">No host reports degradation or active alerts.</p>
 			{:else}
 				<ul class="attention-list">
 					{#each attentionNodes as node}
@@ -126,30 +113,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 				</ul>
 			{/if}
 		</SectionCard>
-
-		<SectionCard title="Compute Pipeline" icon={ShieldCheck}>
-			<ul class="task-list">
-				<li class="task-item">
-					<span class="task-label">Host Telemetry Sync</span>
-					<span class="task-time">Active</span>
-				</li>
-				<li class="task-item">
-					<span class="task-label">Policy Enforcement</span>
-					<span class="task-time">Verified</span>
-				</li>
-			</ul>
-		</SectionCard>
 	{/snippet}
 </InventoryListPage>
-
-<AddNodeModal
-	bind:open={addNodeOpen}
-	onClose={() => (addNodeOpen = false)}
-	onSubmit={async (data: CreateNodeInput): Promise<CreateNodeResponse> => {
-		toast.info('Initialising node enrollment protocol...');
-		return { id: 'new', name: data.name, status: 'offline' } as any;
-	}}
-/>
 
 <style>
 </style>

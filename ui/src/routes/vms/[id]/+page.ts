@@ -4,6 +4,14 @@ import { getVm, getVmConsoleUrl } from '#lib/bff/vms.ts';
 import { cachedFetch, DETAIL_TTL } from '#lib/stores/api-cache.svelte.ts';
 import type { VmSummary, RelatedTask, AttachedVolume, AttachedNic } from '#lib/bff/types.ts';
 
+const VALID_TABS = new Set(['summary', 'console', 'boot-log', 'events', 'metrics', 'snapshots']);
+
+function resolveTab(tab: string | null): string {
+	// Removed tabs (volumes, networks, tasks, configuration) still exist in
+	// bookmarks; fall back to Summary instead of rendering a blank panel.
+	return tab && VALID_TABS.has(tab) ? tab : 'summary';
+}
+
 export type VmDetailModel = {
 	state: 'ready' | 'empty' | 'error';
 	currentTab: string;
@@ -27,18 +35,16 @@ export type VmDetailModel = {
 };
 
 function buildSections(summary: VmSummary | null): { id: string; label: string; count?: number }[] {
-	const taskCount = summary?.recent_tasks?.length ?? 0;
+	// Only list tabs the page actually renders. Volumes, networks, and related
+	// tasks are shown on Summary; the full configuration grid lives in the
+	// support rail. Declaring extra ids here produced blank panels on click.
 	return [
 		{ id: 'summary', label: 'Summary' },
 		{ id: 'console', label: 'Console' },
 		{ id: 'boot-log', label: 'Boot Log' },
-		{ id: 'volumes', label: 'Volumes' },
-		{ id: 'networks', label: 'Networks' },
-		{ id: 'tasks', label: 'Tasks', count: taskCount },
 		{ id: 'events', label: 'Events' },
 		{ id: 'metrics', label: 'Metrics' },
-		{ id: 'snapshots', label: 'Snapshots', count: summary?.snapshot_count ?? 0 },
-		{ id: 'configuration', label: 'Configuration' }
+		{ id: 'snapshots', label: 'Snapshots', count: summary?.snapshot_count ?? 0 }
 	];
 }
 
@@ -100,7 +106,7 @@ function buildDetailModel(summary: VmSummary | null, currentTab: string, console
 
 export const load: PageLoad = async ({ params, url }) => {
 	const token = getStoredToken() ?? undefined;
-	const currentTab = url.searchParams.get('tab') ?? 'summary';
+	const currentTab = resolveTab(url.searchParams.get('tab'));
 	try {
 		const res = await cachedFetch(
 			`vms:detail:${params.id}`,

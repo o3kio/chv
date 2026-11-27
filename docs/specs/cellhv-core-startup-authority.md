@@ -1,8 +1,8 @@
 # CellHV Core Startup Authority Coordinator
 
 Status: Production wiring in the explicit `core-native` and `core-managed`
-authority modes (the config loader defaults to `legacy`; shipped
-configurations select `core-managed`).
+authority modes (the config loader defaults to `core-managed`, fail-closed;
+shipped configurations select it explicitly).
 
 ## Boundary
 
@@ -13,9 +13,10 @@ through `cellhv-core-operations::OperationService`; NodeCache conversion passes
 through `cellhv-nodecache-migration`.
 
 `cmd/chv-agent` calls this boundary when the operator selects the
-`core-native` or `core-managed` authority mode. The default legacy
-launch/reconcile path remains unchanged, and this boundary never launches,
-inspects, recovers, or manages a VM process.
+`core-native` or `core-managed` authority mode. A config that omits the key now
+selects the core-managed boundary (fail-closed); the legacy launch/reconcile
+path remains available as an explicit `legacy` opt-in and is unchanged. This
+boundary never launches, inspects, recovers, or manages a VM process.
 
 `StartupTransaction::begin` is the activation boundary intended for that
 wiring. It acquires the non-blocking process-lifetime `RuntimeAuthorityLease`

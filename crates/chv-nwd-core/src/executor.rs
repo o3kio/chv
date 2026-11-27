@@ -10,11 +10,17 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::exposure_store::{ExposureStore, StoredExposure, StoredExposures};
 use crate::fabric::{AppliedFabric, FabricHandle, FabricIdentity};
 
 // Metric names for network daemon operations.
 const NWD_NFT_ERRORS_TOTAL: &str = "chv_nwd_nft_errors_total";
 const NWD_DHCP_ERRORS_TOTAL: &str = "chv_nwd_dhcp_errors_total";
+/// By-design exposure replay skips (fabric-backed/absent topology, corrupt
+/// journal record). Deliberately distinct from [`NWD_NFT_ERRORS_TOTAL`]: a
+/// skipped replay is not an nft install failure, and incrementing the error
+/// counter on every restart would inflate it without any actionable fault.
+const NWD_EXPOSURE_REPLAY_SKIPPED_TOTAL: &str = "chv_nwd_exposure_replay_skipped_total";
 
 /// MTU a bridge-only topology runs at: a fresh bridge-only ensure never
 /// sets an MTU, so the kernel default for a new bridge (1500) is the
@@ -194,6 +200,33 @@ pub trait NetworkExecutor: Send + Sync + 'static {
         exposure_id: &str,
     ) -> Result<(), ChvError>;
 
+    /// Drop a deleted network's durable exposure journal. Called by the delete
+    /// path after the topology/nft table is gone. A failure fails the delete
+    /// closed (the entry would otherwise resurrect DNAT on the next restart).
+    /// The default is a no-op for test/mock executors without a journal.
+    async fn forget_exposures(&self, _network_id: &str) -> Result<(), ChvError> {
+        Ok(())
+    }
+
+    /// Replay journaled service exposures before the daemon serves RPCs.
+    ///
+    /// `recoverable` is the set of networks whose topology was actually
+    /// recovered (bridge-only, non-fabric). Exposures journaled for any other
+    /// network are skipped: a deleted network's stale entry and a fabric-backed
+    /// network (whose topology this node deliberately does not recover) must
+    /// not create an orphan nft table with live DNAT.
+    ///
+    /// The default is a no-op for test/mock executors. The Linux executor
+    /// re-installs each exposure's nft rules and repopulates the in-memory
+    /// re-assertion map, closing the "restart silently drops published ports"
+    /// gap.
+    async fn recover_exposures(
+        &self,
+        _recoverable: &std::collections::HashSet<String>,
+    ) -> Result<(), ChvError> {
+        Ok(())
+    }
+
     // --- Gratuitous ARP (ADR-021: flushes stale MAC/ARP caches after a
     // migration; the fabric's kernel MAC learning repopulates them) ---
 
@@ -289,12 +322,13 @@ pub struct LinuxExecutor {
     /// Per-network service exposures (keyed by network_id) for re-assertion
     /// after firewall applies.
     ///
-    /// NOTE (documented limitation): this is in-memory only — a daemon restart
-    /// loses it. On restart, an operator must re-declare exposures (the DNAT
-    /// prerouting rule also does not survive a restart unless re-applied by the
-    /// caller). Persisting exposures across restarts is tracked separately from
-    /// #227 and out of scope for this change.
+    /// The in-memory copy is a cache; the durable copy lives in
+    /// [`ExposureStore`] and is replayed by [`Self::recover_exposures`] before
+    /// the daemon serves, so a restart/reboot no longer drops published ports.
     exposures: Arc<DashMap<String, Vec<ExposureSpec>>>,
+    /// Durable exposure journal. `None` in unit tests and any composition that
+    /// has not opted in; the production daemon always wires it.
+    exposure_store: Option<Arc<ExposureStore>>,
 }
 
 /// Owned-argument helper for command sequences held as `Vec<String>`.
@@ -309,7 +343,152 @@ impl LinuxExecutor {
             fabric: None,
             nft_lock: Arc::new(Mutex::new(())),
             exposures: Arc::new(DashMap::new()),
+            exposure_store: None,
         }
+    }
+
+    /// Opt into the durable exposure journal. Production wiring calls this once
+    /// at startup; tests that do not exercise restart recovery leave it unset
+    /// (persistence is then a no-op).
+    pub fn with_exposure_store(mut self, store: ExposureStore) -> Self {
+        self.exposure_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Snapshot the in-memory exposures for one network in journal form.
+    fn stored_exposures(&self, network_id: &str) -> StoredExposures {
+        let exposures = self
+            .exposures
+            .get(network_id)
+            .map(|entry| {
+                entry
+                    .iter()
+                    .map(|record| StoredExposure {
+                        safe_exposure_id: record.safe_exposure_id.clone(),
+                        protocol: record.protocol.clone(),
+                        external_port: record.external_port,
+                        target_ip: record.target_ip.clone(),
+                        target_port: record.target_port,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        StoredExposures { exposures }
+    }
+
+    /// Merge the in-memory exposure set into an existing journal entry,
+    /// keyed by `safe_exposure_id` (the in-memory record wins).
+    ///
+    /// The journal can legitimately hold records the in-memory map does not:
+    /// restart replay skips a record whose network topology was not recovered
+    /// or whose fields fail re-validation, and deliberately retains it on disk
+    /// for a later retry. A rewrite from the map alone would silently drop
+    /// those records, so every persist that is not a network delete goes
+    /// through this read-modify-write. It never removes an id the map lacks —
+    /// an intentional withdrawal is removed from the journal by
+    /// [`Self::forget_exposure`].
+    fn merge_stored_exposures(
+        existing: Option<StoredExposures>,
+        current: StoredExposures,
+    ) -> StoredExposures {
+        let mut merged = existing.map(|entry| entry.exposures).unwrap_or_default();
+        for record in current.exposures {
+            match merged
+                .iter_mut()
+                .find(|existing| existing.safe_exposure_id == record.safe_exposure_id)
+            {
+                Some(slot) => *slot = record,
+                None => merged.push(record),
+            }
+        }
+        StoredExposures { exposures: merged }
+    }
+
+    /// Persist the current exposure set for a network, merging it into the
+    /// existing journal (see [`Self::merge_stored_exposures`]) so a record the
+    /// in-memory map does not know about is not silently dropped. An empty
+    /// merged set removes the entry. No-op when no store is wired.
+    async fn persist_exposures(&self, network_id: &str) -> Result<(), ChvError> {
+        let Some(store) = self.exposure_store.as_ref() else {
+            return Ok(());
+        };
+        let existing = store.load(network_id).await?;
+        let merged = Self::merge_stored_exposures(existing, self.stored_exposures(network_id));
+        store.persist(network_id, &merged).await
+    }
+
+    /// Record one successfully installed exposure and journal it. Replacing an
+    /// existing `safe_exposure_id` replaces its record (no unbounded growth).
+    ///
+    /// Crash window (accepted, not eliminated by reordering): the nft rules are
+    /// installed before this runs. A crash between the install and the journal
+    /// write leaves live NAT rules that are not journaled, so a restart loses
+    /// the exposure until it is re-declared. Journaling first would be worse:
+    /// a failure/crash before the install would replay rules that never applied
+    /// and, on the forward-accept failure path, could leave a half-installed
+    /// DNAT that redirects into default-deny.
+    async fn record_exposure(&self, network_id: &str, spec: ExposureSpec) -> Result<(), ChvError> {
+        let safe_exposure_id = spec.safe_exposure_id.clone();
+        self.exposures
+            .entry(network_id.to_string())
+            .or_default()
+            .retain(|r| r.safe_exposure_id != safe_exposure_id);
+        self.exposures
+            .entry(network_id.to_string())
+            .or_default()
+            .push(spec);
+        self.persist_exposures(network_id).await
+    }
+
+    /// Drop one withdrawn exposure from the re-assertion map and journal.
+    ///
+    /// The journal update is targeted: only this `safe_exposure_id` is
+    /// removed, so replay-skipped records for the same network (kept on disk
+    /// for retry/inspection) survive. Persisting the in-memory set instead
+    /// would delete the whole entry when the map has no record for this
+    /// network.
+    ///
+    /// Crash window (accepted, not eliminated by reordering): the nft rules are
+    /// deleted before this runs. A crash in between leaves no live DNAT but a
+    /// journal entry, which replays the withdrawn exposure on the next restart
+    /// until it is withdrawn again. Deleting from the journal first would allow
+    /// a crash to leave live DNAT with no durable record — the silent-loss
+    /// class this journal exists to close, in the opposite direction.
+    ///
+    /// Write-failure window: if the journal write fails (not a crash), the
+    /// in-memory map keeps the withdrawn id, so a later firewall apply's
+    /// `reassert_exposures` can re-install the withdrawn exposure until the
+    /// withdraw is retried; the RPC returns the error and the retry heals it
+    /// (map and journal stay consistent at "still exposed").
+    async fn forget_exposure(
+        &self,
+        network_id: &str,
+        safe_exposure_id: &str,
+    ) -> Result<(), ChvError> {
+        // Journal first: if the write fails the in-memory map still carries
+        // the record, so a later expose on this network cannot merge a journal
+        // entry the map already forgot (which would resurrect the withdrawal).
+        if let Some(store) = self.exposure_store.as_ref() {
+            if let Some(mut stored) = store.load(network_id).await? {
+                stored
+                    .exposures
+                    .retain(|record| record.safe_exposure_id != safe_exposure_id);
+                store.persist(network_id, &stored).await?;
+            }
+        }
+
+        let removed_all = if let Some(mut entry) = self.exposures.get_mut(network_id) {
+            let before = entry.len();
+            entry.retain(|r| r.safe_exposure_id != safe_exposure_id);
+            before > 0 && entry.is_empty()
+        } else {
+            false
+        };
+        // Drop the now-empty key so no stale empty entry lingers.
+        if removed_all {
+            self.exposures.remove(network_id);
+        }
+        Ok(())
     }
 
     /// Attach a fabric provider, enabling the stretched-L2 fabric paths
@@ -936,6 +1115,36 @@ impl LinuxExecutor {
         Self::signal_by_pid_file(&pid_path, "-HUP").await;
     }
 
+    /// Validate the protocol interpolated into nft argv. Shared by the
+    /// expose path and restart replay so a hand-edited journal record cannot
+    /// smuggle an arbitrary token into `nft`.
+    fn validate_exposure_protocol(protocol: &str) -> Result<(), ChvError> {
+        const ALLOWED_PROTOCOLS: &[&str] = &["tcp", "udp", "icmp", "sctp"];
+        if !ALLOWED_PROTOCOLS.contains(&protocol) {
+            return Err(ChvError::InvalidArgument {
+                field: "protocol".to_string(),
+                reason: format!(
+                    "invalid protocol '{}': must be one of tcp, udp, icmp, sctp",
+                    protocol
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate the target IP interpolated into nft argv. Shared by the
+    /// expose path and restart replay for the same reason as
+    /// [`Self::validate_exposure_protocol`].
+    fn validate_exposure_target_ip(target_ip: &str) -> Result<(), ChvError> {
+        if target_ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(ChvError::InvalidArgument {
+                field: "target_ip".to_string(),
+                reason: format!("invalid IP address: '{}'", target_ip),
+            });
+        }
+        Ok(())
+    }
+
     /// Install (idempotently replace) the DNAT rules for one service exposure.
     ///
     /// Deletes any prior rules carrying this exposure's comment marker, then
@@ -1281,8 +1490,11 @@ impl NetworkExecutor for LinuxExecutor {
         if let Ok(table) = Self::sanitized_nft_table(network_id) {
             let _ = Self::run_nft_quiet(&["delete", "table", "inet", &table]).await;
         }
-        // Drop remembered service exposures for this network.
-        self.exposures.remove(network_id);
+        // Drop remembered service exposures AND the durable journal entry.
+        // Leaving the journal behind would resurrect this deleted network's
+        // DNAT on the next nwd restart. A journal failure fails the delete
+        // closed (the idempotent retry clears it).
+        self.forget_exposures(network_id).await?;
 
         Ok(DeleteOutcome { fabric_removed })
     }
@@ -1333,7 +1545,18 @@ impl NetworkExecutor for LinuxExecutor {
         if let Ok(table) = Self::sanitized_nft_table(network_id) {
             let _ = Self::run_nft_quiet(&["delete", "table", "inet", &table]).await;
         }
-        self.exposures.remove(network_id);
+        // Clear the durable exposure journal too: this path exists precisely
+        // after a restart lost the in-memory row, so a surviving journal entry
+        // is the residue that would recreate orphan DNAT. Warn-only here to
+        // match this path's contract; the handler's fail-closed
+        // `forget_exposures` call surfaces a failure to the caller.
+        if let Err(e) = self.forget_exposures(network_id).await {
+            warn!(
+                network_id,
+                error = %e,
+                "derived-names teardown: failed to clear durable exposure journal"
+            );
+        }
     }
 
     async fn health(
@@ -1531,25 +1754,11 @@ impl NetworkExecutor for LinuxExecutor {
         // concurrent policy apply cannot flush this exposure's accept rule
         // mid-install.
         let _guard = self.nft_lock.lock().await;
-        // Validate protocol to prevent command injection
-        const ALLOWED_PROTOCOLS: &[&str] = &["tcp", "udp", "icmp", "sctp"];
-        if !ALLOWED_PROTOCOLS.contains(&protocol) {
-            return Err(ChvError::InvalidArgument {
-                field: "protocol".to_string(),
-                reason: format!(
-                    "invalid protocol '{}': must be one of tcp, udp, icmp, sctp",
-                    protocol
-                ),
-            });
-        }
-
-        // Validate target_ip to prevent command injection
-        if target_ip.parse::<std::net::IpAddr>().is_err() {
-            return Err(ChvError::InvalidArgument {
-                field: "target_ip".to_string(),
-                reason: format!("invalid IP address: '{}'", target_ip),
-            });
-        }
+        // Validate protocol/target_ip to prevent command injection. The same
+        // validation is re-applied on restart replay (mirror in
+        // `recover_exposures`) because the journal is a file on disk.
+        Self::validate_exposure_protocol(protocol)?;
+        Self::validate_exposure_target_ip(target_ip)?;
 
         let safe_exposure_id = Self::sanitize_id(exposure_id)?;
         self.install_exposure_rules(
@@ -1562,22 +1771,18 @@ impl NetworkExecutor for LinuxExecutor {
         )
         .await?;
         // Record so the exposure can be re-asserted after a firewall apply
-        // rebuilds the forward base chain. Replacing an existing exposure_id
-        // replaces its record (no unbounded growth).
-        self.exposures
-            .entry(network_id.to_string())
-            .or_default()
-            .retain(|r| r.safe_exposure_id != safe_exposure_id);
-        self.exposures
-            .entry(network_id.to_string())
-            .or_default()
-            .push(ExposureSpec {
+        // rebuilds the forward base chain, then journal the applied set.
+        self.record_exposure(
+            network_id,
+            ExposureSpec {
                 safe_exposure_id: safe_exposure_id.clone(),
                 protocol: protocol.to_string(),
                 external_port,
                 target_ip: target_ip.to_string(),
                 target_port,
-            });
+            },
+        )
+        .await?;
         info!(network_id = %network_id, exposure_id = %exposure_id, "service exposed via DNAT");
         Ok(())
     }
@@ -1592,20 +1797,170 @@ impl NetworkExecutor for LinuxExecutor {
         let safe_exposure_id = Self::sanitize_id(exposure_id)?;
         Self::delete_rules_by_comment(&table, "prerouting", &safe_exposure_id).await?;
         Self::delete_rules_by_comment(&table, "forward", &safe_exposure_id).await?;
-        {
-            let removed_all = if let Some(mut entry) = self.exposures.get_mut(network_id) {
-                let before = entry.len();
-                entry.retain(|r| r.safe_exposure_id != safe_exposure_id);
-                before > 0 && entry.is_empty()
-            } else {
-                false
-            };
-            // Drop the now-empty key so no stale empty entry lingers.
-            if removed_all {
-                self.exposures.remove(network_id);
+        self.forget_exposure(network_id, &safe_exposure_id).await?;
+        info!(network_id = %network_id, exposure_id = %exposure_id, "service exposure withdrawn");
+        Ok(())
+    }
+
+    async fn forget_exposures(&self, network_id: &str) -> Result<(), ChvError> {
+        self.exposures.remove(network_id);
+        // The network is gone, so clear the whole journal entry. Do NOT go
+        // through the merge path: the now-empty in-memory set merged with the
+        // file would retain every other record (including replay-skipped ones)
+        // and resurrect the deleted network's DNAT on the next restart.
+        let Some(store) = self.exposure_store.as_ref() else {
+            return Ok(());
+        };
+        store.remove(network_id).await
+    }
+
+    async fn recover_exposures(
+        &self,
+        recoverable: &std::collections::HashSet<String>,
+    ) -> Result<(), ChvError> {
+        let Some(store) = self.exposure_store.as_ref() else {
+            return Ok(());
+        };
+        // Hold the nft lock for the whole replay: recovery races nothing at
+        // startup today (it runs before the socket is bound), but the
+        // idempotent delete-then-install per exposure must not interleave with
+        // any other table mutation if a future caller replays later.
+        let _guard = self.nft_lock.lock().await;
+        let entries = store.load_all().await?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        info!(
+            count = entries.len(),
+            dir = %store.dir().display(),
+            "recovering journaled service exposures"
+        );
+
+        for (network_id, stored) in entries {
+            // Only replay onto a topology this process actually recovered.
+            // Fabric-backed networks are deliberately absent from
+            // `recoverable` (their topology lives in the provider's journal,
+            // not ours); replaying their DNAT here would create an orphan nft
+            // table pointing at a bridge/VXLAN that was not restored. A stale
+            // entry for a deleted network is skipped for the same reason.
+            //
+            // The journal entry is intentionally NOT deleted: a transient
+            // topology recovery failure would otherwise permanently drop the
+            // published port. The next start retries it with a loud metric.
+            if !recoverable.contains(&network_id) {
+                metrics::counter!(
+                    NWD_EXPOSURE_REPLAY_SKIPPED_TOTAL,
+                    "reason" => "no_recovered_topology"
+                )
+                .increment(1);
+                warn!(
+                    network_id = %network_id,
+                    reason = "no recovered topology (deleted or fabric-backed); not replaying journaled DNAT",
+                    "skipping journaled service exposure"
+                );
+                continue;
+            }
+            for exposure in stored.exposures {
+                // Journal entries are written after validation, but re-sanitize
+                // on replay: the id is interpolated into an nft comment and the
+                // protocol/target IP into nft argv. A hand-edited or corrupt
+                // entry must fail closed, never reach nft.
+                let safe_exposure_id = match Self::sanitize_id(&exposure.safe_exposure_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        metrics::counter!(
+                            NWD_EXPOSURE_REPLAY_SKIPPED_TOTAL,
+                            "reason" => "invalid_record"
+                        )
+                        .increment(1);
+                        warn!(
+                            network_id = %network_id,
+                            exposure_id = %exposure.safe_exposure_id,
+                            error = %e,
+                            "refusing to recover journaled exposure with an unsafe id"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(e) = Self::validate_exposure_protocol(&exposure.protocol) {
+                    metrics::counter!(
+                        NWD_EXPOSURE_REPLAY_SKIPPED_TOTAL,
+                        "reason" => "invalid_record"
+                    )
+                    .increment(1);
+                    warn!(
+                        network_id = %network_id,
+                        exposure_id = %safe_exposure_id,
+                        protocol = %exposure.protocol,
+                        error = %e,
+                        "refusing to recover journaled exposure with an invalid protocol"
+                    );
+                    continue;
+                }
+                if let Err(e) = Self::validate_exposure_target_ip(&exposure.target_ip) {
+                    metrics::counter!(
+                        NWD_EXPOSURE_REPLAY_SKIPPED_TOTAL,
+                        "reason" => "invalid_record"
+                    )
+                    .increment(1);
+                    warn!(
+                        network_id = %network_id,
+                        exposure_id = %safe_exposure_id,
+                        target_ip = %exposure.target_ip,
+                        error = %e,
+                        "refusing to recover journaled exposure with an invalid target IP"
+                    );
+                    continue;
+                }
+                match self
+                    .install_exposure_rules(
+                        &network_id,
+                        &safe_exposure_id,
+                        &exposure.protocol,
+                        exposure.external_port,
+                        &exposure.target_ip,
+                        exposure.target_port,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.exposures
+                            .entry(network_id.clone())
+                            .or_default()
+                            .retain(|r| r.safe_exposure_id != safe_exposure_id);
+                        self.exposures
+                            .entry(network_id.clone())
+                            .or_default()
+                            .push(ExposureSpec {
+                                safe_exposure_id: safe_exposure_id.clone(),
+                                protocol: exposure.protocol,
+                                external_port: exposure.external_port,
+                                target_ip: exposure.target_ip,
+                                target_port: exposure.target_port,
+                            });
+                        info!(
+                            network_id = %network_id,
+                            exposure_id = %safe_exposure_id,
+                            "recovered journaled service exposure"
+                        );
+                    }
+                    Err(e) => {
+                        // A stale entry (for example, its network was deleted
+                        // before the journal entry was cleaned) must not take
+                        // down every network. Log loudly and keep serving; the
+                        // metric makes the missing re-assertion observable.
+                        metrics::counter!(NWD_NFT_ERRORS_TOTAL, "operation" => "recover_exposure")
+                            .increment(1);
+                        warn!(
+                            network_id = %network_id,
+                            exposure_id = %safe_exposure_id,
+                            error = %e,
+                            "failed to recover journaled service exposure; published port is not re-asserted"
+                        );
+                    }
+                }
             }
         }
-        info!(network_id = %network_id, exposure_id = %exposure_id, "service exposure withdrawn");
         Ok(())
     }
 
@@ -1748,6 +2103,432 @@ mod tests {
     fn linux_executor_implements_network_executor() {
         let _executor = LinuxExecutor::new(std::env::temp_dir());
         // If this compiles, the trait is fully implemented.
+    }
+
+    fn test_exposure(id: &str) -> ExposureSpec {
+        ExposureSpec {
+            safe_exposure_id: id.to_string(),
+            protocol: "tcp".to_string(),
+            external_port: 18080,
+            target_ip: "10.201.0.2".to_string(),
+            target_port: 80,
+        }
+    }
+
+    /// The journal half of expose/withdraw, exercised without root/nft:
+    /// recording an exposure writes the durable entry, withdrawing the last
+    /// one removes it. (The nft install itself is covered by the host-gated
+    /// `exposure_survives_firewall_apply` integration test.)
+    #[tokio::test]
+    async fn exposure_journal_tracks_record_and_withdraw() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExposureStore::new(dir.path().join("exposures"));
+        let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store.clone());
+
+        executor
+            .record_exposure("net-journal", test_exposure("exp-1"))
+            .await
+            .unwrap();
+        let journaled = store
+            .load("net-journal")
+            .await
+            .unwrap()
+            .expect("recording an applied exposure must journal it");
+        assert_eq!(journaled.exposures.len(), 1);
+        assert_eq!(journaled.exposures[0].external_port, 18080);
+
+        executor
+            .forget_exposure("net-journal", "exp-1")
+            .await
+            .unwrap();
+        assert!(
+            store.load("net-journal").await.unwrap().is_none(),
+            "withdrawing the last exposure must remove the journal entry"
+        );
+    }
+
+    /// Regression for the durability bug where a journal rewrite from the
+    /// in-memory map silently dropped replay-skipped records. The map knows
+    /// only records this process applied; a record skipped during replay stays
+    /// on disk for retry. A later withdraw/expose on the same network must
+    /// merge with (or target) the file, never replace it with map contents.
+    #[tokio::test]
+    async fn journal_merge_preserves_replay_skipped_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExposureStore::new(dir.path().join("exposures"));
+        let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store.clone());
+
+        // A was skipped by replay (never entered the in-memory map); B was
+        // applied and replayed into it.
+        store
+            .persist(
+                "net-merge",
+                &StoredExposures {
+                    exposures: vec![
+                        stored_exposure("exp-a", "tcp", "10.201.0.2"),
+                        stored_exposure("exp-b", "tcp", "10.201.0.3"),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        executor
+            .record_exposure("net-merge", test_exposure("exp-b"))
+            .await
+            .unwrap();
+        let after_record = store
+            .load("net-merge")
+            .await
+            .unwrap()
+            .expect("recording an applied exposure must preserve the skipped record");
+        assert_eq!(
+            after_record.exposures.len(),
+            2,
+            "recording B must merge with the skipped A, not replace the journal"
+        );
+        assert_eq!(
+            after_record
+                .exposures
+                .iter()
+                .find(|record| record.safe_exposure_id == "exp-b")
+                .expect("B must be journaled")
+                .target_ip,
+            "10.201.0.2",
+            "the in-memory record must win over the existing journal record for the same id"
+        );
+
+        // Withdraw B: only B leaves the journal; the skipped A remains.
+        executor
+            .forget_exposure("net-merge", "exp-b")
+            .await
+            .unwrap();
+        let after_withdraw = store
+            .load("net-merge")
+            .await
+            .unwrap()
+            .expect("the skipped record must survive another exposure's withdrawal");
+        assert_eq!(
+            after_withdraw
+                .exposures
+                .iter()
+                .map(|e| e.safe_exposure_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exp-a"],
+            "withdrawing B must not remove the replay-skipped A"
+        );
+
+        // Expose C: the journal is A + C (A still skipped, C applied).
+        executor
+            .record_exposure("net-merge", test_exposure("exp-c"))
+            .await
+            .unwrap();
+        let after_expose = store
+            .load("net-merge")
+            .await
+            .unwrap()
+            .expect("a later expose must merge with, not replace, the journal");
+        assert_eq!(
+            after_expose
+                .exposures
+                .iter()
+                .map(|e| e.safe_exposure_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exp-a", "exp-c"],
+            "exposing C must retain the replay-skipped A"
+        );
+
+        // Deleting the network clears the whole file, including skipped A.
+        executor.forget_exposures("net-merge").await.unwrap();
+        assert!(
+            store.load("net-merge").await.unwrap().is_none(),
+            "network delete must remove the whole journal entry"
+        );
+    }
+
+    /// A withdrawal whose record is absent from the in-memory map (e.g. it was
+    /// never applied in this process lifetime) must still be targeted: it may
+    /// not wipe other journaled records for the network.
+    #[tokio::test]
+    async fn withdrawing_an_unmapped_exposure_preserves_other_journal_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExposureStore::new(dir.path().join("exposures"));
+        let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store.clone());
+
+        store
+            .persist(
+                "net-unmapped",
+                &StoredExposures {
+                    exposures: vec![
+                        stored_exposure("exp-keep", "tcp", "10.201.0.2"),
+                        stored_exposure("exp-gone", "tcp", "10.201.0.3"),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+
+        executor
+            .forget_exposure("net-unmapped", "exp-gone")
+            .await
+            .unwrap();
+        let journaled = store
+            .load("net-unmapped")
+            .await
+            .unwrap()
+            .expect("the unrelated record must survive");
+        assert_eq!(
+            journaled
+                .exposures
+                .iter()
+                .map(|e| e.safe_exposure_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exp-keep"]
+        );
+    }
+
+    /// A journaled exposure whose network has no recovered topology (deleted
+    /// network, or fabric-backed where the overlay is not recovered) must be
+    /// skipped before any nft install, and its journal entry must survive so a
+    /// transient recovery failure retries on the next start. The skip happens
+    /// before nft, so this runs unprivileged.
+    #[tokio::test]
+    async fn replay_skips_exposure_without_recovered_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExposureStore::new(dir.path().join("exposures"));
+        store
+            .persist(
+                "net-orphan",
+                &StoredExposures {
+                    exposures: vec![StoredExposure {
+                        safe_exposure_id: "exp-1".to_string(),
+                        protocol: "tcp".to_string(),
+                        external_port: 18080,
+                        target_ip: "10.201.0.2".to_string(),
+                        target_port: 80,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store.clone());
+
+        let recoverable = std::collections::HashSet::new();
+        executor.recover_exposures(&recoverable).await.unwrap();
+
+        assert!(
+            executor.exposures.get("net-orphan").is_none(),
+            "an exposure without a recovered topology must not be replayed"
+        );
+        assert!(
+            store.path_for("net-orphan").exists(),
+            "the journal entry must be kept for retry, not deleted on a skip"
+        );
+    }
+
+    fn stored_exposure(id: &str, protocol: &str, target_ip: &str) -> StoredExposure {
+        StoredExposure {
+            safe_exposure_id: id.to_string(),
+            protocol: protocol.to_string(),
+            external_port: 18080,
+            target_ip: target_ip.to_string(),
+            target_port: 80,
+        }
+    }
+
+    /// The restart replay re-applies the same protocol/target-IP validation as
+    /// `expose_service`: a hand-edited/corrupt journal entry must be skipped
+    /// before it reaches nft argv, and the entry must survive for inspection.
+    /// Unprivileged because validation runs before any nft install.
+    #[tokio::test]
+    async fn replay_refuses_invalid_protocol_and_target_ip_from_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExposureStore::new(dir.path().join("exposures"));
+        store
+            .persist(
+                "net-bad-protocol",
+                &StoredExposures {
+                    exposures: vec![stored_exposure("exp-1", "tcp; rm -rf /", "10.201.0.2")],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .persist(
+                "net-bad-ip",
+                &StoredExposures {
+                    exposures: vec![stored_exposure("exp-2", "tcp", "10.201.0.2; reboot")],
+                },
+            )
+            .await
+            .unwrap();
+        let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store.clone());
+
+        let recoverable = std::collections::HashSet::from([
+            "net-bad-protocol".to_string(),
+            "net-bad-ip".to_string(),
+        ]);
+        executor.recover_exposures(&recoverable).await.unwrap();
+
+        assert!(
+            executor.exposures.get("net-bad-protocol").is_none(),
+            "a journal entry with an invalid protocol must not be replayed"
+        );
+        assert!(
+            executor.exposures.get("net-bad-ip").is_none(),
+            "a journal entry with an invalid target IP must not be replayed"
+        );
+        assert!(
+            store.path_for("net-bad-protocol").exists() && store.path_for("net-bad-ip").exists(),
+            "a rejected journal entry must be kept so the corruption stays visible"
+        );
+    }
+
+    /// By-design replay skips must not inflate the nft error counter: an
+    /// operator alert on install failures should not fire on every restart
+    /// just because a fabric-backed or deleted network has a journal entry.
+    #[test]
+    fn replay_skips_use_a_dedicated_counter_not_nft_errors() {
+        use metrics::{
+            Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString,
+            Unit,
+        };
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        struct CapturingCounter {
+            map: Arc<StdMutex<HashMap<String, u64>>>,
+            key: String,
+        }
+
+        impl CounterFn for CapturingCounter {
+            fn increment(&self, value: u64) {
+                *self
+                    .map
+                    .lock()
+                    .unwrap()
+                    .entry(self.key.clone())
+                    .or_insert(0) += value;
+            }
+
+            fn absolute(&self, value: u64) {
+                self.map.lock().unwrap().insert(self.key.clone(), value);
+            }
+        }
+
+        struct CapturingRecorder {
+            counters: Arc<StdMutex<HashMap<String, u64>>>,
+        }
+
+        impl Recorder for CapturingRecorder {
+            fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _desc: SharedString) {}
+            fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _desc: SharedString) {}
+            fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _desc: SharedString) {}
+
+            fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+                let labels = key
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Counter::from_arc(Arc::new(CapturingCounter {
+                    map: self.counters.clone(),
+                    key: format!("{}{{{}}}", key.name(), labels),
+                }))
+            }
+
+            fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+
+            fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        let counters: Arc<StdMutex<HashMap<String, u64>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let recorder = CapturingRecorder {
+            counters: counters.clone(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let store = ExposureStore::new(dir.path().join("exposures"));
+                store
+                    .persist(
+                        "net-orphan",
+                        &StoredExposures {
+                            exposures: vec![stored_exposure("exp-orphan", "tcp", "10.201.0.2")],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .persist(
+                        "net-corrupt",
+                        &StoredExposures {
+                            exposures: vec![stored_exposure(
+                                "exp-corrupt",
+                                "not-a-protocol",
+                                "10.201.0.2",
+                            )],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store);
+                let recoverable = std::collections::HashSet::from(["net-corrupt".to_string()]);
+                executor.recover_exposures(&recoverable).await.unwrap();
+            });
+        });
+
+        let map = counters.lock().unwrap();
+        assert_eq!(
+            map.get("chv_nwd_exposure_replay_skipped_total{reason=no_recovered_topology}"),
+            Some(&1),
+            "an absent topology must increment the dedicated skip counter: {map:?}"
+        );
+        assert_eq!(
+            map.get("chv_nwd_exposure_replay_skipped_total{reason=invalid_record}"),
+            Some(&1),
+            "a corrupt journal record must increment the dedicated skip counter: {map:?}"
+        );
+        assert!(
+            !map.keys()
+                .any(|k| k.starts_with("chv_nwd_nft_errors_total")),
+            "by-design skips must not touch the nft error counter: {map:?}"
+        );
+    }
+
+    /// Regression for the delete-path leak: the derived-names teardown (the
+    /// path that runs when nwd has no in-memory state after a restart) must
+    /// clear the exposure journal, or a restart would resurrect the deleted
+    /// network's DNAT. Unprivileged: host commands are existence-gated and
+    /// warn-only on this path.
+    #[tokio::test]
+    async fn derived_names_delete_clears_exposure_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExposureStore::new(dir.path().join("exposures"));
+        let executor = LinuxExecutor::new(std::env::temp_dir()).with_exposure_store(store.clone());
+
+        executor
+            .record_exposure("net-delete-journal", test_exposure("exp-1"))
+            .await
+            .unwrap();
+        assert!(store.path_for("net-delete-journal").exists());
+
+        executor
+            .delete_local_topology_by_derived_names("net-delete-journal")
+            .await;
+
+        assert!(
+            !store.path_for("net-delete-journal").exists(),
+            "network delete must remove the durable exposure journal entry"
+        );
+        assert!(executor.exposures.get("net-delete-journal").is_none());
     }
 
     #[test]

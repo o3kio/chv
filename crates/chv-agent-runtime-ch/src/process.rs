@@ -17,6 +17,18 @@ use chv_hypervisor_api::resources::{
     rotate_console_log, vm_config_file, vm_console_log, vm_pid_file,
 };
 
+// Poisoned std locks in this module (`boot_watchdog`, `lifecycle_locks`,
+// `serial_heal_reboots`, `vms_root`) are recovered instead of panicking.
+//
+// Service code must not panic, and these maps mirror filesystem/VM state that
+// every path revalidates against the runtime directory (or the live VMM)
+// before acting. A panic that poisoned a guard already failed the operation
+// that triggered it; letting the poison cascade would take down unrelated VM
+// lifecycle calls. Per-entry state is independent, so recovering the guard is
+// safe: the worst case is a stale entry that the next observation corrects.
+// This matches the established policy in `core_runtime` (a poisoned side-effect
+// map fails/logs that operation, it does not abort the daemon).
+
 /// RAII guard that records VM lifecycle RED metrics when it drops.
 ///
 /// - `chv_vm_ops_total{op, result}` counter — `result` is `"ok"` or `"err"`
@@ -963,7 +975,7 @@ impl ProcessCloudHypervisorAdapter {
         let mut guard = self
             .boot_watchdog
             .write()
-            .expect("boot watchdog lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = Some(BootWatchdog::new(config));
     }
 
@@ -1008,7 +1020,7 @@ impl ProcessCloudHypervisorAdapter {
         let mut guard = self
             .boot_watchdog
             .write()
-            .expect("boot watchdog lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(wd) = guard.as_mut() {
             if let Some(state) = wd.vms.get_mut(vm_id) {
                 state.last_change = std::time::Instant::now();
@@ -1024,7 +1036,7 @@ impl ProcessCloudHypervisorAdapter {
         let mut guard = self
             .boot_watchdog
             .write()
-            .expect("boot watchdog lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let wd = guard.as_mut()?;
         let state = wd.vms.get_mut(vm_id)?;
         if state.stood_down || state.reboots_fired >= wd.config.max_reboots {
@@ -1100,7 +1112,7 @@ impl ProcessCloudHypervisorAdapter {
         let Some(config) = self
             .boot_watchdog
             .read()
-            .expect("boot watchdog lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|wd| wd.config.clone())
         else {
@@ -1163,7 +1175,7 @@ impl ProcessCloudHypervisorAdapter {
                 let mut guard = self
                     .boot_watchdog
                     .write()
-                    .expect("boot watchdog lock poisoned");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(wd) = guard.as_mut() {
                     wd.vms.remove(&obs.vm_id);
                 }
@@ -1201,7 +1213,7 @@ impl ProcessCloudHypervisorAdapter {
                 let mut guard = self
                     .boot_watchdog
                     .write()
-                    .expect("boot watchdog lock poisoned");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let Some(wd) = guard.as_mut() else {
                     return;
                 };
@@ -1305,7 +1317,7 @@ impl ProcessCloudHypervisorAdapter {
                 let mut guard = self
                     .boot_watchdog
                     .write()
-                    .expect("boot watchdog lock poisoned");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let Some(wd) = guard.as_mut() else {
                     return;
                 };
@@ -1422,7 +1434,7 @@ impl ProcessCloudHypervisorAdapter {
             let mut guard = self
                 .boot_watchdog
                 .write()
-                .expect("boot watchdog lock poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(wd) = guard.as_mut() {
                 wd.vms
                     .retain(|id, _| observations.iter().any(|obs| &obs.vm_id == id));
@@ -1521,7 +1533,7 @@ impl ProcessCloudHypervisorAdapter {
         let mut locks = self
             .lifecycle_locks
             .lock()
-            .expect("lifecycle lock map poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         locks
             .entry(vm_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -3894,7 +3906,7 @@ impl ProcessCloudHypervisorAdapter {
         if *self
             .serial_heal_reboots
             .lock()
-            .expect("serial heal lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(vm_id)
             .unwrap_or(&0)
             == pid
@@ -3928,7 +3940,7 @@ impl ProcessCloudHypervisorAdapter {
                         // VMM generation.
                         self.serial_heal_reboots
                             .lock()
-                            .expect("serial heal lock poisoned")
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .insert(vm_id.to_string(), pid);
                         info!(
                             vm_id = %vm_id,
@@ -5631,7 +5643,7 @@ impl ProcessCloudHypervisorAdapter {
         let Some(vms_root) = self
             .vms_root
             .read()
-            .expect("vms_root lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
         else {
             // Adoption never ran (non-standard construction): keep
@@ -5824,7 +5836,7 @@ impl ProcessCloudHypervisorAdapter {
         let Some(vms_root) = self
             .vms_root
             .read()
-            .expect("vms_root lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
         else {
             // Adoption never ran (non-standard construction): keep
@@ -5928,7 +5940,10 @@ impl ProcessCloudHypervisorAdapter {
         // paths (start after a force stop, the delete liveness gate)
         // need to re-derive entries from this layout even when there is
         // nothing to adopt yet (empty or missing vms/ tree).
-        *self.vms_root.write().expect("vms_root lock poisoned") = Some(runtime_root.to_path_buf());
+        *self
+            .vms_root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime_root.to_path_buf());
         let vms_base = runtime_root.join("vms");
         let entries = match std::fs::read_dir(&vms_base) {
             Ok(entries) => entries,

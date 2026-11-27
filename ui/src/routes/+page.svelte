@@ -55,13 +55,19 @@
 	const activeTopologyResourceIds = $derived(getActiveTopologyResourceIds(recentTasks));
 	const fleetBriefing = $derived(buildFleetBriefing(overview, inventory.nodes, inventory.vms));
 	const pressureCards = $derived(buildPressureCards(overview));
+	const cpuUsage = $derived(overview.cpu_usage_percent);
+	const memoryUsage = $derived(overview.memory_usage_percent);
 
+	const hasCapacityPanel = $derived(panelVisible.capacity && pressureCards.length > 0);
 	const hasBriefingRow = $derived(panelVisible.briefing || panelVisible.attention);
-	const hasRailPanels = $derived(panelVisible.pipeline || panelVisible.capacity);
+	const hasRailPanels = $derived(panelVisible.pipeline || hasCapacityPanel);
 	const compactRail = $derived(
 		hasRailPanels &&
 			(!panelVisible.pipeline || panelCollapsed.pipeline) &&
-			(!panelVisible.capacity || panelCollapsed.capacity)
+			(!hasCapacityPanel || panelCollapsed.capacity)
+	);
+	const availablePanels = $derived(
+		dashboardPanels.filter((panel) => panel.id !== 'capacity' || pressureCards.length > 0)
 	);
 
 	onMount(() => {
@@ -128,38 +134,39 @@
 				<CompactMetricCard
 					label="Managed Nodes"
 					value={inventory.nodes.length}
-					trend={0}
 					color="primary"
 				/>
 				<CompactMetricCard
 					label="Running Workloads"
 					value={inventory.vms.filter(v => v.actual_state === 'running').length}
 					unit={`/ ${inventory.vms.length}`}
-					trend={+2}
-					points={[10, 12, 11, 14, 15, 14, 16]}
 					color="accent"
 				/>
-				<CompactMetricCard
-					label="Fleet CPU"
-					value={Math.round(overview.cpu_usage_percent || 0)}
-					unit="%"
-					trend={-5}
-					points={[45, 42, 48, 50, 47, 45]}
-					color={overview.cpu_usage_percent > 80 ? 'danger' : 'primary'}
-				/>
-				<CompactMetricCard
-					label="Fleet memory"
-					value={Math.round(overview.memory_usage_percent || 0)}
-					unit="%"
-					trend={+1}
-					points={[65, 68, 70, 72, 71, 72]}
-					color={overview.memory_usage_percent > 85 ? 'danger' : 'primary'}
-				/>
+				{#if cpuUsage !== undefined}
+					<CompactMetricCard
+						label="Fleet CPU"
+						value={Math.round(cpuUsage)}
+						unit="%"
+						color={cpuUsage > 80 ? 'danger' : 'primary'}
+					/>
+				{:else}
+					<CompactMetricCard label="Fleet CPU" value="—" color="neutral" />
+				{/if}
+				{#if memoryUsage !== undefined}
+					<CompactMetricCard
+						label="Fleet memory"
+						value={Math.round(memoryUsage)}
+						unit="%"
+						color={memoryUsage > 85 ? 'danger' : 'primary'}
+					/>
+				{:else}
+					<CompactMetricCard label="Fleet memory" value="—" color="neutral" />
+				{/if}
 			</div>
 
 			<div class="dashboard-panel-bar" aria-label="Dashboard panel visibility">
 				<span>Dashboard panels</span>
-				{#each dashboardPanels as panel}
+				{#each availablePanels as panel}
 					<button
 						type="button"
 						class:dashboard-panel-toggle--active={panelVisible[panel.id]}
@@ -225,7 +232,7 @@
 									<li class="attention-item attention-item--quiet">
 										<Server size={15} />
 										<div>
-											<p>Signals nominal across the indexed fleet.</p>
+											<p>No alerts reported across the indexed fleet.</p>
 											<span>No active incidents are crowding the queue.</span>
 										</div>
 									</li>
@@ -257,7 +264,7 @@
 							</SectionCard>
 						{/if}
 
-						{#if panelVisible.capacity}
+						{#if hasCapacityPanel}
 							<SectionCard title="Capacity Pressure" icon={Zap} collapsed={panelCollapsed.capacity}>
 								{#snippet actions()}
 									<button class="panel-icon-button" type="button" aria-label={panelCollapsed.capacity ? 'Expand Capacity Pressure' : 'Minimize Capacity Pressure'} onclick={() => togglePanelCollapsed('capacity')}>

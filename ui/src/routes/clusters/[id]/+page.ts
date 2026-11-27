@@ -35,8 +35,6 @@ export type ClusterDetailModel = {
 		storagePercent: number;
 		activeTasks: number;
 		alerts: number;
-		vmCount?: number;
-		vmHealthy?: number;
 		topIssue?: string;
 	};
 };
@@ -90,8 +88,6 @@ export const load: PageLoad = async ({ params }) => {
 					storagePercent: item.storage_percent,
 					activeTasks: item.active_tasks,
 					alerts: item.alerts,
-					vmCount: (item as any).vm_count,
-					vmHealthy: (item as any).vm_healthy,
 					topIssue: item.top_issue
 				}
 			} satisfies ClusterDetailModel

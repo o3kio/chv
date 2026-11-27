@@ -774,6 +774,47 @@ the metrics and triage. The interceptor-denial writer (#762) inserts
 directly into `audit_log` and is unaffected: denial events have no
 mutation transaction to couple to.
 
+### Background and node-local writes
+
+Two privileged-write classes are outside both emitters and the outbox
+above. They remain **post-hoc/none** today, are tracked under #706, and
+this branch changes no behavior for either.
+
+**Migration reaper (background, no audit emitter).**
+`MigrationReaper` in
+`crates/chv-controlplane-service/src/migration_reaper.rs` writes with no
+request to hang a row on and has no `audit_log`/`audit_outbox`
+reference; its only durable record is the `migrations`/`operations`
+journal it mutates:
+
+| Write | Function (line) | Effect |
+|---|---|---|
+| Terminalize a stalled migration | `fail_migration` (821) | `migrations.phase = 'Failed'`, `agent_cancel_pending = 1`, resume intent |
+| Fail the parent operation | `fail_operation` (870) | `operations.status = 'Failed'`, `error_code = MIGRATION_STALLED` |
+| Drain agent-side cancels | `drain_pending_agent_cancels` (266) | confirmation/parking writes on `migrations` plus `CancelMigration` to the source and destination agents |
+| Auto-resume the source VM | `drain_pending_resumes` (641), `resume_source_vm` (916) | resume-state writes on `migrations` plus `ResumeVm` to the source agent |
+
+These are system-actor mutations: there is no authenticated user or node
+principal to attribute them to, so an operator reading `audit_log`
+cannot see that the reaper failed a migration, cancelled a detached
+agent task, or resumed a source VM.
+
+**Node-local storage (`chv-stord`, no audit emitter).**
+`cmd/chv-stord`, `crates/chv-stord-core`, and
+`crates/chv-stord-backends` mutate host storage directly: open/close,
+attach/detach, resize, snapshot/clone preparation, restore/delete
+snapshot, destroy, device policy, and disk-migration state. None of
+these references `audit_log` or `audit_outbox`; stord persists only its
+own session table and emits logs and metrics. When such a mutation is
+driven by a control-plane dispatch, the only control-plane record is the
+dispatch's `operations` row (for example the `Accepted` `DeleteVolume`
+operation behind `POST /v1/volumes/delete`), which is journal state, not
+audit evidence.
+
+Both classes need a deliberate system actor and a transaction (or a
+dedicated producer) to couple an evidence row to; that adoption remains
+#706 work.
+
 ## Denials and anonymous actors
 
 The audit middleware wraps the role middlewares, so a 403 from

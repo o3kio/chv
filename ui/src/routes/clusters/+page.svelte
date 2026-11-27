@@ -1,6 +1,5 @@
 <script lang="ts">
-import Button from '#lib/components/primitives/Button.svelte';
-	import PageHeaderWithAction from '#lib/components/shell/PageHeaderWithAction.svelte';
+import PageHeaderWithAction from '#lib/components/shell/PageHeaderWithAction.svelte';
 	import InventoryTable from '#lib/components/shell/InventoryTable.svelte';
 	import FilterBar from '#lib/components/shared/FilterBar.svelte';
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
@@ -10,7 +9,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	import StatusBadge from '#lib/components/shell/StatusBadge.svelte';
 	import { getPageDefinition } from '#lib/shell/app-shell.ts';
 	import type { PageData } from './$types';
-	import { Blocks, AlertTriangle, Activity, Plus, LayoutGrid } from 'lucide-svelte';
+	import { AlertTriangle, LayoutGrid } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { page as appPage } from '$app/state';
 
@@ -75,14 +74,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 </script>
 
 <div class="inventory-page">
-	<PageHeaderWithAction page={page}>
-		{#snippet actions()}
-			<Button variant="primary">
-				<Plus size={14} />
-				Enroll Fabric
-			</Button>
-		{/snippet}
-	</PageHeaderWithAction>
+	<PageHeaderWithAction page={page} />
 
 	<div class="inventory-metrics">
 		<CompactMetricCard 
@@ -166,15 +158,11 @@ import Button from '#lib/components/primitives/Button.svelte';
 				{/if}
 			</SectionCard>
 
-			<SectionCard title="Fabric Telemetry" icon={LayoutGrid}>
+			<SectionCard title="Fleet Inventory" icon={LayoutGrid}>
 				<div class="audit-summary">
 					<div class="summary-row">
 						<span>Total Compute Blocks</span>
 						<span>{items.reduce((sum, c) => sum + c.node_count, 0)}</span>
-					</div>
-					<div class="summary-row">
-						<span>Load Balancing</span>
-						<span>Automatic</span>
 					</div>
 				</div>
 			</SectionCard>

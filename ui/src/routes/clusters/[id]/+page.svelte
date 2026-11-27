@@ -1,14 +1,13 @@
 <script lang="ts">
-import Button from '#lib/components/primitives/Button.svelte';
-	import ResourceDetailHeader from '#lib/components/shell/ResourceDetailHeader.svelte';
+import ResourceDetailHeader from '#lib/components/shell/ResourceDetailHeader.svelte';
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
 	import PropertyGrid from '#lib/components/shell/PropertyGrid.svelte';
 	import CompactMetricCard from '#lib/components/shared/CompactMetricCard.svelte';
 	import ErrorState from '#lib/components/shell/ErrorState.svelte';
 	import StatusBadge from '#lib/components/shell/StatusBadge.svelte';
 	import { 
-		Blocks, Activity, AlertTriangle, Zap, Server, 
-		History, ExternalLink, ShieldCheck, Gauge
+		Blocks, AlertTriangle, Server, 
+		History, ShieldCheck, Gauge
 	} from 'lucide-svelte';
 	import type { PageData } from './$types';
 	import type { ShellTone } from '#lib/shell/app-shell.ts';
@@ -30,7 +29,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		{ label: 'Datacenter', value: summary.datacenter },
 		{ label: 'Fabric ID', value: summary.clusterId },
 		{ label: 'Managed Nodes', value: String(summary.nodeCount) },
-		{ label: 'Version Skew', value: summary.versionSkew ? 'NON_UNIFORM' : 'NOMINAL' }
+		{ label: 'Version Skew', value: summary.versionSkew ? 'NON_UNIFORM' : 'UNIFORM' }
 	]);
 </script>
 
@@ -46,14 +45,6 @@ import Button from '#lib/components/primitives/Button.svelte';
 			parentLabel="Clusters"
 			parentHref="/clusters"
 		>
-			{#snippet actions()}
-				<div class="header-actions">
-					<Button variant="secondary">
-						<ExternalLink size={14} />
-						FABRIC_CONSOLE
-					</Button>
-				</div>
-			{/snippet}
 		</ResourceDetailHeader>
 
 		<div class="inventory-metrics">
@@ -117,17 +108,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 					</div>
 				</SectionCard>
 
-				<SectionCard title="Distributed Workloads" icon={Server}>
-					<div class="workload-summary">
-						<div class="w-stat">
-							<span class="val">{summary.vmCount ?? '0'}</span>
-							<span class="lbl">TOTAL_INSTANCES</span>
-						</div>
-						<div class="w-stat">
-							<span class="val">{summary.vmHealthy ?? '0'}</span>
-							<span class="lbl">SLA_COMPLIANT</span>
-						</div>
-					</div>
+				<SectionCard title="Async Reporting" icon={Server}>
+					<p class="empty-hint">Workload counts and health are not reported by the cluster list API.</p>
 				</SectionCard>
 			</div>
 
@@ -147,7 +129,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 					{#if summary.alerts === 0}
 						<div class="safety-sign">
 							<ShieldCheck size={16} />
-							<span>CLUSTER_NOMINAL</span>
+							<span>NO ACTIVE ALERTS</span>
 						</div>
 					{:else}
 						<div class="mini-activity">
@@ -155,13 +137,6 @@ import Button from '#lib/components/primitives/Button.svelte';
 							<a href={`/events?query=${encodeURIComponent(summary.clusterId)}`} class="view-link">OPEN_INCIDENT_LOG</a>
 						</div>
 					{/if}
-				</SectionCard>
-
-				<SectionCard title="Placement Rules" icon={ShieldCheck}>
-					<div class="rule-list">
-						<div class="rule-item">HA_STRATEGY: BALANCED</div>
-						<div class="rule-item">PLACEMENT: PACKED</div>
-					</div>
 				</SectionCard>
 			</aside>
 		</main>
@@ -177,10 +152,6 @@ import Button from '#lib/components/primitives/Button.svelte';
 		gap: 0.75rem;
 	}
 
-	.header-actions {
-		display: flex;
-		gap: 0.5rem;
-	}
 
 	.inventory-metrics {
 		display: grid;
@@ -252,23 +223,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 		background: var(--color-warning);
 	}
 
-	.workload-summary {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 0.75rem;
-	}
 
-	.w-stat {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		padding: 0.75rem;
-		background: var(--bg-surface-muted);
-		border-radius: var(--radius-xs);
-	}
 
-	.w-stat .val { font-size: 18px; font-weight: 800; color: var(--chv-color-neutral-900); }
-	.w-stat .lbl { font-size: 9px; font-weight: 800; color: var(--chv-color-neutral-500); text-transform: uppercase; letter-spacing: 0.05em; }
 
 	.mini-activity {
 		display: flex;
@@ -302,20 +258,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		border-radius: var(--radius-xs);
 	}
 
-	.rule-list {
-		display: flex;
-		flex-direction: column;
-		gap: 0.25rem;
-	}
 
-	.rule-item {
-		font-size: 10px;
-		font-weight: 700;
-		color: var(--chv-color-neutral-600);
-		padding: 0.25rem 0.5rem;
-		background: var(--bg-surface-muted);
-		border-radius: 2px;
-	}
 
 	.empty-hint {
 		font-size: 11px;
@@ -330,23 +273,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 		}
 	}
 
-	.workload-summary {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 0.75rem;
-	}
 
-	.w-stat {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		padding: 0.75rem;
-		background: var(--shell-surface-muted);
-		border-radius: 0.35rem;
-	}
 
-	.w-stat .val { font-size: var(--chv-text-lg); font-weight: 700; }
-	.w-stat .lbl { font-size: 10px; color: var(--shell-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 
 	.mini-activity {
 		display: flex;

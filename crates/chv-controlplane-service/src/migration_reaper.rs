@@ -52,6 +52,26 @@ const PENDING_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// tick could race a terminal report that would have blocked it.
 const AGENT_CANCEL_SETTLE_SECS: i64 = 30;
 
+/// Serialises resume drains within the process.
+///
+/// The durable claim (see [`MigrationReaper::claim_pending_resume`]) is the
+/// cross-process guard; this lock closes the in-process window where a second
+/// pass scans a row the first pass is already resuming and would treat its
+/// `resuming` state as crash-stranded. A crashed pass releases the lock, so
+/// the SQL reclaim path still recovers the row on the next tick.
+///
+/// Known limitation (accepted, not solved here): the SQL claim is a
+/// compare-and-swap, not a lease. A second control-plane process sharing the
+/// database can reclaim a `resuming` row that the first process is still
+/// actively resuming, because there is no cross-process heartbeat/expiry to
+/// distinguish "in flight" from "crash-stranded". Correctness therefore
+/// requires a single active control plane (the supported topology); a
+/// distributed lease is deliberately out of scope.
+fn drain_pass_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Background task that reaps migrations which have stopped making progress.
 pub struct MigrationReaper {
     pool: StorePool,
@@ -140,6 +160,8 @@ impl MigrationReaper {
                 m.updated_at AS last_progress_at,
                 m.interrupted_from_phase,
                 m.interrupted_at,
+                m.reaper_resume_state,
+                m.reaper_resume_attempts,
                 CAST(
                     (julianday('now') - julianday(m.started_at)) * 86400
                     AS INTEGER
@@ -532,6 +554,8 @@ impl MigrationReaper {
                 m.updated_at AS last_progress_at,
                 m.interrupted_from_phase,
                 m.interrupted_at,
+                m.reaper_resume_state,
+                m.reaper_resume_attempts,
                 CAST(
                     (julianday('now') - julianday(m.started_at)) * 86400
                     AS INTEGER
@@ -559,6 +583,54 @@ impl MigrationReaper {
         })
     }
 
+    /// Claim one pending resume for this pass.
+    ///
+    /// Returns `true` only when this pass won the claim.
+    ///
+    /// A `pending` row uses a strict transition (`pending` -> `resuming`).
+    /// The old predicate (`state IN ('pending', 'resuming')`) let every pass
+    /// claim a row another pass already held, so two passes could both send
+    /// `resume_vm` for the same stalled migration. A `resuming` row is
+    /// stranded by a CP crash or a failed release write and must still be
+    /// reclaimable; its compare-and-swap on `reaper_resume_attempts` gives
+    /// that reclaim a single winner while leaving the next tick free to
+    /// retry it.
+    async fn claim_pending_resume(&self, row: &StuckMigrationRow) -> Result<bool, ChvError> {
+        let state = match row.reaper_resume_state.as_deref() {
+            Some(state @ ("pending" | "resuming")) => state,
+            _ => return Ok(false),
+        };
+
+        let result = if state == "pending" {
+            sqlx::query(
+                "UPDATE migrations SET reaper_resume_state = 'resuming' \
+                 WHERE migration_id = ? AND reaper_resume_state = 'pending'",
+            )
+            .bind(&row.migration_id)
+            .execute(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE migrations SET reaper_resume_state = 'resuming', \
+                     reaper_resume_attempts = reaper_resume_attempts + 1 \
+                 WHERE migration_id = ? AND reaper_resume_state = 'resuming' \
+                   AND reaper_resume_attempts = ?",
+            )
+            .bind(&row.migration_id)
+            .bind(row.reaper_resume_attempts)
+            .execute(&self.pool)
+            .await
+        }
+        .map_err(|e| ChvError::Internal {
+            reason: format!(
+                "migration reaper: failed to claim pending resume {}: {e}",
+                row.migration_id
+            ),
+        })?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Retry every source-VM resume that has not reached a final state.
     ///
     /// A `SkippedSenderActive` refusal is not permanent: the quiescence window
@@ -567,26 +639,22 @@ impl MigrationReaper {
     /// database (rather than the reaper's loop stack) is what prevents a
     /// transient refusal from stranding the VM paused forever.
     async fn drain_pending_resumes(&self) -> Result<(), ChvError> {
+        // Production runs one `run` loop, but the drain is callable directly
+        // (tests, a future supervisor). Serialise passes within the process so
+        // a second pass cannot observe the first pass's in-flight `resuming`
+        // row and mistake it for a crash-stranded one. A crashed pass drops
+        // this guard, so the SQL reclaim path above still recovers the row.
+        let _drain_guard = drain_pass_lock().lock().await;
         let pending = self.pending_resumes().await?;
 
         for row in &pending {
-            // Claim the row atomically before doing any async work. A late
+            // Claim the row before doing any async work. A late
             // agent-reported `Completed` sets `reaper_resume_state = 'blocked'`
             // concurrently; whichever write wins serialises the decision, and
             // the resume pass will not act on a row it no longer owns.
-            // `resuming` is reclaimable: a CP crash (or a failed release write)
-            // between claim and release must not strand the row forever, and a
-            // late `blocked` still wins the conditional update below.
-            let claimed = sqlx::query(
-                "UPDATE migrations SET reaper_resume_state = 'resuming' \
-                 WHERE migration_id = ? AND reaper_resume_state IN ('pending', 'resuming')",
-            )
-            .bind(&row.migration_id)
-            .execute(&self.pool)
-            .await;
-            match claimed {
-                Ok(result) if result.rows_affected() == 1 => {}
-                Ok(_) => continue,
+            match self.claim_pending_resume(row).await {
+                Ok(true) => {}
+                Ok(false) => continue,
                 Err(e) => {
                     warn!(
                         migration_id = %row.migration_id,
@@ -597,19 +665,26 @@ impl MigrationReaper {
                 }
             }
 
-            if let Err(e) = sqlx::query(
-                "UPDATE migrations SET reaper_resume_attempts = reaper_resume_attempts + 1 \
-                 WHERE migration_id = ?",
-            )
-            .bind(&row.migration_id)
-            .execute(&self.pool)
-            .await
-            {
-                warn!(
-                    migration_id = %row.migration_id,
-                    error = %e,
-                    "migration reaper: failed to record resume attempt"
-                );
+            // Attempt accounting: the pending transition leaves the counter
+            // alone (so the existing late-`Completed` trigger ordering is
+            // unchanged), while the stranded-`resuming` reclaim already
+            // incremented it inside its successful CAS. Incrementing twice
+            // would also make the CAS token skip a value under contention.
+            if row.reaper_resume_state.as_deref() == Some("pending") {
+                if let Err(e) = sqlx::query(
+                    "UPDATE migrations SET reaper_resume_attempts = reaper_resume_attempts + 1 \
+                     WHERE migration_id = ?",
+                )
+                .bind(&row.migration_id)
+                .execute(&self.pool)
+                .await
+                {
+                    warn!(
+                        migration_id = %row.migration_id,
+                        error = %e,
+                        "migration reaper: failed to record resume attempt"
+                    );
+                }
             }
 
             let outcome = self.resume_source_vm(row).await;
@@ -703,7 +778,7 @@ impl MigrationReaper {
             };
 
             let final_state = state.unwrap_or("pending");
-            if let Err(e) = sqlx::query(
+            match sqlx::query(
                 "UPDATE migrations SET reaper_resume_state = ? \
                  WHERE migration_id = ? AND reaper_resume_state = 'resuming'",
             )
@@ -712,12 +787,27 @@ impl MigrationReaper {
             .execute(&self.pool)
             .await
             {
-                warn!(
-                    migration_id = %row.migration_id,
-                    state = final_state,
-                    error = %e,
-                    "migration reaper: failed to persist resume state"
-                );
+                Ok(result) if result.rows_affected() == 0 => {
+                    // Another writer moved the row out of `resuming` (for
+                    // example a late agent-reported terminal state) between
+                    // our claim and this release. That writer owns the final
+                    // state now; log it so a lost release is visible rather
+                    // than silently assumed to have landed.
+                    warn!(
+                        migration_id = %row.migration_id,
+                        state = final_state,
+                        "migration reaper: resume-state release lost a race (0 rows); another writer owns the row"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        migration_id = %row.migration_id,
+                        state = final_state,
+                        error = %e,
+                        "migration reaper: failed to persist resume state"
+                    );
+                }
             }
         }
 
@@ -1002,7 +1092,9 @@ impl MigrationReaper {
     }
 
     /// Age of the source node's last heartbeat. `None` means the node has no
-    /// observed-state row (never reported), which is treated as unreachable.
+    /// observed-state row (never reported) or its heartbeat is future-dated
+    /// (clock moved backwards / writer clock ahead); both are treated as
+    /// unreachable, never as fresh.
     async fn source_node_heartbeat_age_secs(&self, node_id: &str) -> Result<Option<i64>, ChvError> {
         let last_seen: Option<(Option<String>,)> =
             sqlx::query_as("SELECT last_seen_at FROM node_observed_state WHERE node_id = ?")
@@ -1022,9 +1114,21 @@ impl MigrationReaper {
                     "reaper: failed to parse source node last_seen_at '{last_seen}': {e}"
                 ),
             })?;
-        Ok(Some(
-            (chrono::Utc::now().naive_utc() - parsed).num_seconds(),
-        ))
+        let age_secs = (chrono::Utc::now().naive_utc() - parsed).num_seconds();
+        if age_secs < 0 {
+            // A future timestamp means the clock moved backwards (or the
+            // heartbeat writer's clock is ahead). It is not positive evidence
+            // that the agent is alive, and treating it as fresh would let the
+            // reaper resume a source VM underneath a possibly-live sender.
+            warn!(
+                node_id,
+                last_seen_at = %last_seen,
+                age_secs,
+                "reaper: source node heartbeat is in the future; refusing to treat it as live"
+            );
+            return Ok(None);
+        }
+        Ok(Some(age_secs))
     }
 }
 
@@ -1117,6 +1221,10 @@ struct StuckMigrationRow {
     last_progress_at: String,
     interrupted_from_phase: Option<String>,
     interrupted_at: Option<String>,
+    /// Durable resume state as observed by the scan (`pending` or
+    /// `resuming` for rows from [`MigrationReaper::pending_resumes`]).
+    reaper_resume_state: Option<String>,
+    reaper_resume_attempts: i64,
     started_age_secs: i64,
     stalled_secs: i64,
 }
@@ -1205,6 +1313,8 @@ mod tests {
             last_progress_at: "ignored".to_string(),
             interrupted_from_phase: None,
             interrupted_at: None,
+            reaper_resume_state: Some("pending".to_string()),
+            reaper_resume_attempts: 0,
             started_age_secs: 10_800,
             stalled_secs: 10_800,
         }
@@ -1642,6 +1752,141 @@ mod tests {
         );
     }
 
+    /// One scan's claim has exactly one winner. Before this guard the claim
+    /// predicate accepted `resuming` as well as `pending`, so a second pass
+    /// holding the same scan snapshot could claim (and resume) a row the first
+    /// pass already owned.
+    #[tokio::test]
+    async fn pending_resume_claim_is_single_winner_from_one_scan() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "claim-once", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations SET reaper_resume_state = 'pending', \
+             reaper_stalled_secs = 10_800 WHERE migration_id = 'claim-once'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("mark pending");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let rows = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        assert!(
+            reaper.claim_pending_resume(row).await.expect("first claim"),
+            "the first pass must win the pending transition"
+        );
+        assert!(
+            !reaper
+                .claim_pending_resume(row)
+                .await
+                .expect("second claim"),
+            "a second pass using the same scan snapshot must not claim the row"
+        );
+
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT reaper_resume_state FROM migrations WHERE migration_id = 'claim-once'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .expect("read resume state");
+        assert_eq!(state.as_deref(), Some("resuming"));
+    }
+
+    /// A `resuming` row stranded by a crash or a failed release write remains
+    /// reclaimable, but every reclaim is a compare-and-swap on the attempt
+    /// counter: one winner per scan snapshot, and a later scan (attempts
+    /// advanced) is what recovers a genuinely stranded row.
+    #[tokio::test]
+    async fn stranded_resuming_row_reclaims_once_per_scan_snapshot() {
+        let test_db = TestDb::new().await;
+        seed_migration(&test_db.pool, "stranded-claim", "Failed", -10_800, -10_800).await;
+        sqlx::query(
+            "UPDATE migrations SET reaper_resume_state = 'resuming', \
+             reaper_stalled_secs = 10_800, reaper_resume_attempts = 4 \
+             WHERE migration_id = 'stranded-claim'",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("strand the row in resuming");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        let rows = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            reaper
+                .claim_pending_resume(&rows[0])
+                .await
+                .expect("reclaim stranded row"),
+            "a stranded resuming row must be reclaimable"
+        );
+        assert!(
+            !reaper
+                .claim_pending_resume(&rows[0])
+                .await
+                .expect("second reclaim"),
+            "the same scan snapshot cannot reclaim the row twice"
+        );
+
+        // The next tick's scan observes the advanced counter and may reclaim
+        // the row again (the recovery path that un-strands a crashed pass).
+        let next = reaper
+            .pending_resumes()
+            .await
+            .expect("query pending resumes next tick");
+        assert_eq!(next.len(), 1);
+        assert!(next[0].reaper_resume_attempts > rows[0].reaper_resume_attempts);
+        assert!(
+            reaper
+                .claim_pending_resume(&next[0])
+                .await
+                .expect("reclaim on later scan"),
+            "a later scan must still be able to recover the stranded row"
+        );
+    }
+
+    /// A clock jump backwards (or a heartbeat writer whose clock is ahead)
+    /// can leave `last_seen_at` in the future. The old subtraction produced a
+    /// negative age, which passed the `age <= MAX_AGE` liveness check and
+    /// would have let the reaper resume a source underneath a live sender.
+    #[tokio::test]
+    async fn future_source_heartbeat_is_not_treated_as_live() {
+        let test_db = TestDb::new().await;
+        sqlx::query(
+            "INSERT INTO nodes (node_id, hostname, display_name) \
+             VALUES ('source-node', 'source-node', 'source-node')",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed node");
+        sqlx::query(
+            "INSERT INTO node_observed_state \
+                 (node_id, observed_generation, observed_state, last_seen_at) \
+             VALUES ('source-node', 1, 'TenantReady', \
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+1 hour'))",
+        )
+        .execute(&test_db.pool)
+        .await
+        .expect("seed future heartbeat");
+
+        let reaper = test_reaper(test_db.pool.clone(), 60);
+        assert_eq!(
+            reaper
+                .source_node_heartbeat_age_secs("source-node")
+                .await
+                .expect("heartbeat query"),
+            None,
+            "a future-dated heartbeat must not count as fresh liveness evidence"
+        );
+    }
+
     /// A late agent-reported `Completed` that sets `blocked` during the tick
     /// must win over the resume pass's own release write.
     #[tokio::test]
@@ -1745,6 +1990,8 @@ mod tests {
             last_progress_at: "ignored".to_string(),
             interrupted_from_phase: None,
             interrupted_at: None,
+            reaper_resume_state: Some("pending".to_string()),
+            reaper_resume_attempts: 0,
             started_age_secs: 10_800,
             stalled_secs: 5,
         };
@@ -1954,6 +2201,8 @@ mod tests {
             last_progress_at: "ignored".to_string(),
             interrupted_from_phase: None,
             interrupted_at: None,
+            reaper_resume_state: Some("pending".to_string()),
+            reaper_resume_attempts: 0,
             started_age_secs: 10_800,
             stalled_secs: 10_800,
         };
@@ -1995,6 +2244,8 @@ mod tests {
             last_progress_at: "ignored".to_string(),
             interrupted_from_phase: None,
             interrupted_at: None,
+            reaper_resume_state: Some("pending".to_string()),
+            reaper_resume_attempts: 0,
             started_age_secs: 10_800,
             stalled_secs: 10_800,
         };
@@ -2039,6 +2290,8 @@ mod tests {
             last_progress_at: "ignored".to_string(),
             interrupted_from_phase: None,
             interrupted_at: None,
+            reaper_resume_state: Some("pending".to_string()),
+            reaper_resume_attempts: 0,
             started_age_secs: 10_800,
             stalled_secs: 10_800,
         };

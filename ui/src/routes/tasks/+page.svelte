@@ -13,7 +13,7 @@
 	import { getTaskStatusMeta, normalizeTaskStatus } from '#lib/webui/tasks.ts';
 	import { getTaskFailureCause } from '#lib/webui/task-failure.ts';
 	import type { PageData } from './$types';
-	import { History, User, Activity, Clock, ShieldAlert } from 'lucide-svelte';
+	import { History, User, ShieldAlert } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { page as appPage } from '$app/state';
 
@@ -91,6 +91,9 @@
 	const failedTasks = $derived(
 		items.filter(t => normalizeTaskStatus(t.status) === 'failed').slice(0, 3)
 	);
+	const failedCount = $derived(
+		items.filter(t => normalizeTaskStatus(t.status) === 'failed').length
+	);
 </script>
 
 <div class="inventory-page">
@@ -104,18 +107,18 @@
 		/>
 		<CompactMetricCard 
 			label="Active Ops" 
-			value={items.filter(t => t.status === 'running' || t.status === 'awaiting-operator-input').length} 
+			value={items.filter(t => ['running', 'awaiting-operator-input'].includes(normalizeTaskStatus(t.status))).length} 
 			color="primary"
 		/>
 		<CompactMetricCard 
 			label="Awaiting Input" 
-			value={items.filter(t => t.status === 'awaiting-operator-input').length} 
-			color={items.filter(t => t.status === 'awaiting-operator-input').length > 0 ? 'warning' : 'neutral'}
+			value={items.filter(t => normalizeTaskStatus(t.status) === 'awaiting-operator-input').length} 
+			color={items.filter(t => normalizeTaskStatus(t.status) === 'awaiting-operator-input').length > 0 ? 'warning' : 'neutral'}
 		/>
 		<CompactMetricCard 
 			label="Failed" 
-			value={items.filter(t => t.status === 'failed').length} 
-			color={items.filter(t => t.status === 'failed').length > 0 ? 'danger' : 'neutral'}
+			value={failedCount} 
+			color={failedCount > 0 ? 'danger' : 'neutral'}
 		/>
 	</div>
 
@@ -172,12 +175,12 @@
 			<SectionCard title="Mutation Audit" icon={History}>
 				<div class="audit-summary">
 					<div class="summary-row">
-						<span>Retention Policy</span>
-						<span>30 Days</span>
+						<span>Tasks in view</span>
+						<span>{items.length}</span>
 					</div>
 					<div class="summary-row">
-						<span>Consistency</span>
-						<span>Verified</span>
+						<span>Failed in view</span>
+						<span>{failedCount}</span>
 					</div>
 				</div>
 			</SectionCard>

@@ -574,3 +574,193 @@ async fn exposure_survives_firewall_apply() {
 
     drop(cleanup);
 }
+
+/// Privileged proof that the durable exposure journal is actually REPLAYED on
+/// restart: a second executor (fresh in-memory state, same journal directory)
+/// must re-install the DNAT/forward rules that the first executor applied.
+///
+/// This covers the install arm of `recover_exposures`; the skip arm is covered
+/// unprivileged by `replay_skips_exposure_without_recovered_topology`.
+///
+/// Requires root + `nft`; skipped on CI. Run against the built test binary
+/// under sudo with `--ignored --exact replay_reinstalls_journaled_exposure`.
+#[tokio::test]
+#[ignore = "requires root + real nftables on a Linux host; run locally via the fixture doc example"]
+async fn replay_reinstalls_journaled_exposure() {
+    use chv_nwd_core::executor::{LinuxExecutor, NetworkExecutor};
+    use chv_nwd_core::exposure_store::ExposureStore;
+    use std::path::PathBuf;
+
+    if !is_root() || !nft_available() {
+        tracing::info!("SKIP: replay_reinstalls_journaled_exposure needs root + nft");
+        return;
+    }
+
+    /// Drop the executor-owned `chv-<net>` table even when an assertion fails.
+    struct TableGuard(String);
+    impl Drop for TableGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("nft")
+                .args(["delete", "table", "inet", &self.0])
+                .output();
+        }
+    }
+
+    let u = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        format!("{:04x}{:04x}", std::process::id() & 0xffff, nanos & 0xffff)
+    };
+    let network_id = format!("hsr{u}");
+    let table = format!("chv-{network_id}");
+    let _guard = TableGuard(table.clone());
+    let port = 30000 + (std::process::id() % 10000) as u32;
+
+    let journal_dir = tempfile::tempdir().unwrap();
+    let store = ExposureStore::new(journal_dir.path().join("exposures"));
+
+    // First process lifetime: expose writes nft rules and the journal entry.
+    let first = LinuxExecutor::new(PathBuf::new()).with_exposure_store(store.clone());
+    first
+        .expose_service(&network_id, "exp1", "tcp", port, "10.201.0.2", 80, "")
+        .await
+        .unwrap();
+    assert!(
+        store.path_for(&network_id).exists(),
+        "expose_service must journal the applied exposure"
+    );
+    assert!(
+        chain_dump(&table, "prerouting").contains(&port.to_string()),
+        "the DNAT rule must exist after the first executor's expose"
+    );
+
+    // Simulate a restart: drop the table (kernel state is gone) but keep the
+    // journal, then build a SECOND executor with the same store.
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", &table])
+        .output();
+    assert!(
+        !Command::new("nft")
+            .args(["list", "table", "inet", &table])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+        "the table must be gone before replay so the assertion exercises reinstall"
+    );
+
+    let second = LinuxExecutor::new(PathBuf::new()).with_exposure_store(store.clone());
+    let recoverable = std::collections::HashSet::from([network_id.clone()]);
+    second.recover_exposures(&recoverable).await.unwrap();
+
+    let table_dump = Command::new("nft")
+        .args(["list", "table", "inet", &table])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    assert!(
+        table_dump.contains(&port.to_string()),
+        "replay must re-install the journaled DNAT rule: {table_dump}"
+    );
+    assert!(
+        table_dump.contains("dnat"),
+        "replayed rules must contain a DNAT expression: {table_dump}"
+    );
+    assert!(
+        table_dump.contains("10.201.0.2"),
+        "replayed DNAT must target the journaled IP: {table_dump}"
+    );
+    assert!(
+        table_dump.contains("exp1"),
+        "replayed rules must carry the journaled exposure comment marker: {table_dump}"
+    );
+}
+
+/// Privileged regression for the durable exposure journal: expose writes it,
+/// withdraw removes it, and a network delete (the derived-names teardown used
+/// after a restart lost the state row) clears it. This is the path that used to
+/// resurrect a deleted network's DNAT on the next nwd restart.
+///
+/// Requires root + `nft`; skipped on CI. Run against the built test binary
+/// under sudo with `--ignored --exact network_delete_clears_exposure_journal`.
+#[tokio::test]
+#[ignore = "requires root + real nftables on a Linux host; run locally via the fixture doc example"]
+async fn network_delete_clears_exposure_journal() {
+    use chv_nwd_core::executor::{LinuxExecutor, NetworkExecutor};
+    use chv_nwd_core::exposure_store::ExposureStore;
+    use std::path::PathBuf;
+
+    if !is_root() || !nft_available() {
+        tracing::info!("SKIP: network_delete_clears_exposure_journal needs root + nft");
+        return;
+    }
+
+    /// Drop the executor-owned `chv-<net>` table even when an assertion fails.
+    struct TableGuard(String);
+    impl Drop for TableGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("nft")
+                .args(["delete", "table", "inet", &self.0])
+                .output();
+        }
+    }
+
+    let u = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        format!("{:04x}{:04x}", std::process::id() & 0xffff, nanos & 0xffff)
+    };
+    let network_id = format!("hsj{u}");
+    let table = format!("chv-{network_id}");
+    let _guard = TableGuard(table.clone());
+    let journal_dir = tempfile::tempdir().unwrap();
+    let store = ExposureStore::new(journal_dir.path().join("exposures"));
+    let executor = LinuxExecutor::new(PathBuf::new()).with_exposure_store(store.clone());
+
+    // expose -> journal entry written after the nft install succeeded.
+    executor
+        .expose_service(&network_id, "exp1", "tcp", 18081, "10.201.0.9", 80, "")
+        .await
+        .unwrap();
+    assert!(
+        store.path_for(&network_id).exists(),
+        "expose_service must journal the applied exposure"
+    );
+
+    // withdraw -> last exposure removes the journal entry.
+    executor
+        .withdraw_service_exposure(&network_id, "exp1")
+        .await
+        .unwrap();
+    assert!(
+        !store.path_for(&network_id).exists(),
+        "withdrawing the last exposure must remove the journal entry"
+    );
+
+    // Re-expose, then delete through the derived-names teardown (no state row).
+    executor
+        .expose_service(&network_id, "exp1", "tcp", 18081, "10.201.0.9", 80, "")
+        .await
+        .unwrap();
+    assert!(store.path_for(&network_id).exists());
+
+    executor
+        .delete_local_topology_by_derived_names(&network_id)
+        .await;
+    assert!(
+        !store.path_for(&network_id).exists(),
+        "network delete must clear the durable exposure journal (otherwise \
+         the next restart resurrects the deleted network's DNAT)"
+    );
+
+    // The teardown also drops the executor-owned table; be defensive in case
+    // an earlier assertion failed before that ran.
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", &table])
+        .output();
+}

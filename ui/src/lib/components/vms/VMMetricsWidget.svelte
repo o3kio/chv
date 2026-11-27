@@ -127,7 +127,7 @@
           {#if vms.error > 0}
             <span class="text-danger">{vms.error} Issues</span>
           {:else if vms.running > 0}
-            <span class="text-success">Healthy</span>
+            <span class="text-success">No Errors</span>
           {:else}
             <span class="text-(--shell-text-muted)">Idle</span>
           {/if}
@@ -136,7 +136,7 @@
           {#if vms.error > 0}
             {vms.error} VM(s) in error state
           {:else if vms.running > 0}
-            All systems operational
+            No VM error states reported
           {:else}
             No active VMs
           {/if}

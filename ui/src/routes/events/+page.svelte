@@ -11,7 +11,7 @@
 	import StatusBadge from '#lib/components/shell/StatusBadge.svelte';
 	import { getPageDefinition } from '#lib/shell/app-shell.ts';
 	import type { PageData } from './$types';
-	import { Bell, AlertTriangle, ShieldAlert, Activity, Filter } from 'lucide-svelte';
+	import { ShieldAlert, Activity } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { page as appPage } from '$app/state';
 
@@ -125,9 +125,9 @@
 			color="warning"
 		/>
 		<CompactMetricCard 
-			label="Audit Pipeline" 
-			value="NOMINAL" 
-			color="primary"
+			label="Resolved Events" 
+			value={items.filter(e => e.state === 'resolved').length} 
+			color="neutral"
 		/>
 	</div>
 
@@ -175,7 +175,7 @@
 		<aside class="support-area">
 			<SectionCard title="Anomaly Priority" icon={ShieldAlert} badgeLabel={String(criticalEvents.length)}>
 				{#if criticalEvents.length === 0}
-					<p class="empty-hint">All systems reporting nominal telemetry.</p>
+					<p class="empty-hint">No events match the current filters.</p>
 				{:else}
 					<ul class="attention-list">
 						{#each criticalEvents as event}
