@@ -22,12 +22,14 @@
 #     when tabled moved off it; superseded state (proc-macro-error2) also gone.
 ignore = [
     # --- Unmaintained (informational; no vulnerability) -------------------
-    # Policy (deny.toml): unmaintained advisories are HARD FAILURES in both
-    # cargo-deny v2 and cargo-audit. The two entries below are the only
-    # accepted exceptions, each carrying the documented (a)/(b)/(c) migration
-    # plan required by the ignore-list policy; deny.toml repeats the same
-    # rationale so both gates agree. Neither advisory describes a defect —
-    # both record upstream maintenance status.
+    # Policy: unmaintained advisories are warnings, not failures. This file
+    # lists them under `informational_warnings` below, and cargo-deny runs
+    # with `--warn unmaintained` in security.yml. Only vulnerabilities fail
+    # the gate. The two entries below suppress the known chrono/humantime
+    # advisories from the report; each carries the documented (a)/(b)/(c)
+    # migration plan required by the ignore-list policy, and deny.toml repeats
+    # the same rationale so both gates agree. Neither advisory describes a
+    # defect — both record upstream maintenance status.
 
     # RUSTSEC-2026-0543 — `chrono` is unmaintained (all versions).
     #   (a) Non-applicable as a vulnerability: chrono is used for UTC

@@ -113,7 +113,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
             self.assertIn(f"AmbientCapabilities={expected}", unit)
             self.assertIn(f"CapabilityBoundingSet={expected}", unit)
 
-    def test_nwd_unit_prepares_the_topology_journal_directory(self):
+    def test_nwd_units_prepare_the_journal_directories(self):
         # Field blocker B9: nwd journals applied bridge-only topologies under
         # /var/lib/chv/nwd/topologies (and the last requested policy under
         # /var/lib/chv/nwd/policies) and replays both before serving. Service
@@ -122,9 +122,10 @@ class CellHvCorePackagingTests(unittest.TestCase):
         # directories before ExecStart (StateDirectory only creates
         # /var/lib/chv), with the daemon's identity so the non-root process can
         # write them under ProtectSystem=strict. Both unit copies are pinned
-        # because install.sh ships the standalone copy while packages ship the
-        # packaged copy; drift would silently break exposure persistence on one
-        # install path.
+        # because the release tarball ships docs/examples/systemd/ while repo
+        # checkouts and packages use packaging/systemd/; drift would leave the
+        # directory to be created lazily by the store (as the service user)
+        # instead of pre-created 0700 chv:chv by the unit.
         for relative in (
             "packaging/systemd/chv-nwd.service",
             "docs/examples/systemd/chv-nwd.service",

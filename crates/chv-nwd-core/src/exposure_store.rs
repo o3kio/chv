@@ -24,8 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Persistent exposure journal root. Matches the `ExecStartPre=` directory in
-/// `packaging/systemd/chv-nwd.service`.
+/// Persistent exposure journal root. Matches the `ExecStartPre=` directory
+/// declared in both `packaging/systemd/chv-nwd.service` and
+/// `docs/examples/systemd/chv-nwd.service`.
 pub const DEFAULT_EXPOSURE_STATE_DIR: &str = "/var/lib/chv/nwd/exposures";
 
 const EXTENSION: &str = "json";

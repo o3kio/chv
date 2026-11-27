@@ -42,6 +42,10 @@ export async function mutateNode(
 	});
 }
 
+// `createNode` and `enrollNode` are BFF client surface kept for the real
+// backend routes even though no page calls them yet: the fake create modal was
+// removed and enrollment remains a control-plane CLI flow until a real UI form
+// exists. They are not a substitute for that flow.
 export async function createNode(
 	req: CreateNodeRequest,
 	token?: string
