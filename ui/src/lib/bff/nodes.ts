@@ -7,9 +7,7 @@ import type {
 	GetNodeResponse,
 	MutateNodeRequest,
 	MutateNodeResponse,
-	EnrollNodeResponse,
-	CreateNodeRequest,
-	CreateNodeBffResponse
+	EnrollNodeResponse
 } from './types';
 
 export async function listNodes(
@@ -42,21 +40,9 @@ export async function mutateNode(
 	});
 }
 
-// `createNode` and `enrollNode` are BFF client surface kept for the real
-// backend routes even though no page calls them yet: the fake create modal was
-// removed and enrollment remains a control-plane CLI flow until a real UI form
-// exists. They are not a substitute for that flow.
-export async function createNode(
-	req: CreateNodeRequest,
-	token?: string
-): Promise<CreateNodeBffResponse> {
-	return bffFetch<CreateNodeBffResponse>(BFFEndpoints.createNode, {
-		method: 'POST',
-		body: JSON.stringify(req),
-		token
-	});
-}
-
+// `enrollNode` wraps the real `/v1/nodes/enroll` route but has no page caller
+// yet: the fake create modal was removed and enrollment remains a control-plane
+// CLI flow until a real UI form exists. It is not a substitute for that flow.
 export async function enrollNode(token?: string): Promise<EnrollNodeResponse> {
 	return bffFetch<EnrollNodeResponse>(BFFEndpoints.enrollNode, {
 		method: 'POST',
