@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`url` bumped to 2.5.9 (RUSTSEC-2026-0592, #769).** The 2.5.8 pin was
+  vulnerable to a stack overflow in `Url::origin()` on nested `blob:` URLs;
+  the daily `cargo audit` gate had been red since 2026-11-23 and blocked the
+  release preflight.
+- **`deny.toml` now mirrors `.cargo/audit.toml` for the two unmaintained
+  advisories (#755/#756).** `RUSTSEC-2026-0543` (chrono) and
+  `RUSTSEC-2026-0542` (humantime) carry the same (a)/(b)/(c) migration
+  rationale in both files, so `cargo deny check advisories` and `cargo audit`
+  agree instead of the deny gate failing on an exception the audit gate
+  already documents.
+
 ### Changed
+- **stord surfaces unsupported Ceph/iSCSI volume destroy at startup
+  (#522/DP3).** `CephRbdBackend` and `IscsiBackend` implement the
+  open/attach/resize/snapshot surface but deliberately refuse
+  `StorageBackend::destroy` with `InvalidArgument` (a silent no-op would
+  tombstone the volume row and reclaim nothing). That refusal remains
+  unchanged; the gap was that it was invisible until an operator tried
+  to delete a VM or volume. `cmd/chv-stord` now emits a prominent
+  `warn!` at startup when `backend_type` is `ceph` or `iscsi`, naming
+  the backend, stating that delete will fail, and pointing at
+  out-of-band reclaim (`rbd rm`, array-side LUN unmap) after ownership
+  is confirmed. `docs/OPERATIONS.md` gains a "Ceph RBD and iSCSI Volume
+  Deletion (Unsupported)" section with the check command and safe
+  reclaim procedure. No behavior change to any supported path and no
+  claim that these backends reclaim storage; see the new unit test
+  pinning the warning/absence for local and LVM.
+- **A missing `authority_mode` now defaults to `core-managed` (fail-closed).**
+  `AgentAuthorityMode` previously serde-defaulted to `legacy`, whose network
+  reconcile path intentionally swallows firewall/NAT/DHCP/DNS apply failures
+  (design §6). A config that omitted the key therefore silently selected the
+  fail-open mutation surface even though every shipped configuration selects
+  `core-managed`. `legacy` remains available as an explicit opt-in and is
+  unchanged. `InventoryReporter::new` now follows the same default.
 - **gRPC volume snapshot-family transitions adopt the audit outbox (#706
   half 1, PR 4).** `SnapshotVolume`, `RestoreVolume`, and
   `DeleteVolumeSnapshot` now commit their audit row with the **intent
@@ -263,6 +297,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cascade-layers/`oklch` capability. Also drops the unused `postcss`
   devDependency and deletes 17 stray captured `svelte-check` logs that
   v4's automatic source detection would otherwise scan.
+
+### Fixed
+- **nwd service exposures now survive restart/reboot (durable journal +
+  gated replay).** Service exposures were in-memory only, so an nwd restart
+  or host reboot dropped published ports/DNAT for running VMs even though
+  the guest stayed up. Applied exposures are now journaled under
+  `/var/lib/chv/nwd/exposures/<network_id>.json` after the nft rules install.
+  A withdrawal removes only its own record and every later expose merges the
+  in-memory set into the existing journal rather than replacing it, so a
+  record skipped by replay (kept on disk for retry) is never silently dropped.
+  The whole entry is cleared together with the
+  topology/policy journals on a network delete (a failed journal unlink fails
+  the delete closed). Startup replay re-installs each journaled exposure
+  idempotently, but only when its network's bridge-only topology was actually
+  recovered: stale entries for deleted networks and fabric-backed networks
+  (whose overlay is not recovered here) are skipped with a loud warn/metric
+  instead of creating orphan nft tables with live DNAT. The journal entry is
+  deliberately kept on a skip so a transient recovery failure retries next
+  start. Crash windows are accepted and documented: a crash after nft install
+  but before the journal write loses the exposure until re-declared; a crash
+  after nft delete but before the journal write can resurrect a withdrawn
+  exposure ON the next restart, where it persists until it is withdrawn again
+  (or its network is deleted). Journal entries now require every field on
+  decode, so a truncated entry fails loudly instead of replaying `dport 0`.
+- **Snapshot create failure and delete no longer leave zombie rows/artifacts.**
+  A definitely-rejected snapshot dispatch (not-found, bad-request, conflict, or
+  auth) rolls back the `creating` row (nothing reaps it, so it would look
+  in-flight forever). An ambiguous dispatch failure (for example a timeout
+  after the control plane accepted the request) keeps the row but marks it
+  `failed`, so an artifact the agent may still materialize stays discoverable
+  for cleanup instead of being orphaned. Delete removes the backing artifact
+  before the row and keeps the row when removal fails; a corrupt stored path
+  (including `..`, paths outside `<root>/vms/<vm_id>/snapshots`, and any
+  symlinked ancestor from the artifact up through `<root>/vms/<vm_id>`) is
+  rejected as a server error (`500`) and keeps the row, rather than a silent
+  `Ok` or a misleading client `400`, so an artifact cannot leak invisibly and
+  the corrupt row stays visible/retryable. A missing artifact remains
+  success, and a final-component symlink is unlinked rather than followed.
+- **Backup execute/run endpoints now return 501 (API contract change).**
+  `POST /v1/backups/execute` and the backup run-now API return
+  `501 NOT_IMPLEMENTED` (with the hard-fence reason) instead of pretending to
+  dispatch a job. CHV has no tenant-data backup execution engine; the explicit
+  refusal is the honest contract.
+- **Cluster CPU/memory percentages are computed from real running-VM data.**
+  The fleet utilization values are no longer constants: CPU and memory come
+  from the latest sample per VM, restricted to VMs observed `Running` with a
+  known health value, using one shared `vm_metrics` scan. `storage_percent`
+  remains a real provisioned-capacity/allocation ratio over enrolled node
+  disk capacity (it can exceed 100% under overcommit and is documented as an
+  allocation ratio, not live usage). NULL/zero still reports 0.
+- **Poisoned process locks are recovered instead of wedging the service.**
+  The agent runtime's VM lifecycle/watchdog maps (`boot_watchdog`,
+  `lifecycle_locks`, `serial_heal_reboots`, `vms_root`) previously unwrapped a
+  poisoned `std` mutex and panicked, taking down unrelated VM operations after
+  any thread panicked while holding one. They now log/recover the inner guard;
+  the mirrored filesystem/VM state is revalidated before use, so the worst case
+  is a stale entry the next observation corrects.
+- **Migration reaper resume claims are single-winner and fail closed on
+  heartbeat loss.** The pending→resuming claim is a strict compare-and-swap
+  (one reaper pass wins; the stranded-`resuming` reclaim is a separate guarded
+  transition) and source-VM resume still requires a fresh source-node
+  heartbeat, leaving the VM paused for an operator if it is missing. A release
+  write that updates 0 rows (lost race) now warns instead of assuming it
+  landed. Known limitation, documented: the claim is not a cross-process
+  lease, so the supported topology remains a single active control plane.
 
 ## [0.4.0-rc.8] - 2026-11-06
 

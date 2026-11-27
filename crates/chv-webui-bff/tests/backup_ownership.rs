@@ -555,15 +555,29 @@ async fn execute_job_denies_non_owner_and_creates_no_execution() {
 }
 
 #[tokio::test]
-async fn execute_job_allows_owner_and_admin() {
+async fn execute_job_refuses_owner_and_admin_after_ownership_passes() {
     let state = build_state().await;
     seed_node(&state).await;
     seed_vm(&state, "vm-alice", "u-alice").await;
     seed_job(&state, "job-1", "vm-alice", None).await;
 
-    expect_ok(execute_job(&state, &claims("u-alice", "operator"), "job-1").await);
-    expect_ok(execute_job(&state, &claims("u-root", "admin"), "job-1").await);
-    assert_eq!(count(&state, "backup_jobs").await, 3);
+    // The fence runs after the ownership gate: an allowed caller must still be
+    // refused rather than getting a fake execution row.
+    for caller in ["u-alice", "u-root"] {
+        let role = if caller == "u-root" {
+            "admin"
+        } else {
+            "operator"
+        };
+        let err = execute_job(&state, &claims(caller, role), "job-1")
+            .await
+            .expect_err("the backup engine is fenced");
+        assert!(
+            matches!(err, BffError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+    }
+    assert_eq!(count(&state, "backup_jobs").await, 1);
 }
 
 // ── Create restore ──────────────────────────────────────────────────────────

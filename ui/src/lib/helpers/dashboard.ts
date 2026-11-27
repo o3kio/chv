@@ -38,9 +38,10 @@ export type OverviewModel = {
 	unresolved_alerts: number;
 	maintenance_nodes: number;
 	capacity_hotspots: number;
-	cpu_usage_percent: number;
-	memory_usage_percent: number;
-	storage_usage_percent: number;
+	/** Absent when the control plane does not report fleet utilisation. */
+	cpu_usage_percent?: number;
+	memory_usage_percent?: number;
+	storage_usage_percent?: number;
 	alerts: OverviewAlert[];
 	recent_tasks: OverviewTask[];
 	state: 'ready' | 'loading' | 'empty' | 'error';
@@ -58,9 +59,6 @@ const EMPTY_OVERVIEW: Omit<OverviewModel, 'state'> = {
 	unresolved_alerts: 0,
 	maintenance_nodes: 0,
 	capacity_hotspots: 0,
-	cpu_usage_percent: 0,
-	memory_usage_percent: 0,
-	storage_usage_percent: 0,
 	alerts: [],
 	recent_tasks: []
 };
@@ -82,9 +80,9 @@ export function toOverviewModel(res: OverviewResponse): OverviewModel {
 		unresolved_alerts: res.unresolved_alerts ?? 0,
 		maintenance_nodes: res.maintenance_nodes ?? 0,
 		capacity_hotspots: res.capacity_hotspots ?? 0,
-		cpu_usage_percent: res.cpu_usage_percent ?? 0,
-		memory_usage_percent: res.memory_usage_percent ?? 0,
-		storage_usage_percent: res.storage_usage_percent ?? 0,
+		cpu_usage_percent: res.cpu_usage_percent,
+		memory_usage_percent: res.memory_usage_percent,
+		storage_usage_percent: res.storage_usage_percent,
 		alerts: (res.alerts ?? []).map((alert) => ({
 			summary: alert.summary,
 			scope: alert.scope,
@@ -246,24 +244,23 @@ export interface PressureCard {
 }
 
 export function buildPressureCards(overview: OverviewModel): PressureCard[] {
-	return [
-		{
-			label: 'CPU envelope',
-			value: `${Math.round(overview.cpu_usage_percent || 0)}%`,
-			width: overview.cpu_usage_percent || 0,
-			state: getPressureState(overview.cpu_usage_percent || 0)
-		},
-		{
-			label: 'Memory envelope',
-			value: `${Math.round(overview.memory_usage_percent || 0)}%`,
-			width: overview.memory_usage_percent || 0,
-			state: getPressureState(overview.memory_usage_percent || 0)
-		},
-		{
-			label: 'Storage pressure',
-			value: `${Math.round(overview.storage_usage_percent || 0)}%`,
-			width: overview.storage_usage_percent || 0,
-			state: getPressureState(overview.storage_usage_percent || 0)
-		}
-	];
+	const cards: PressureCard[] = [];
+
+	const addCard = (label: string, value: number | undefined) => {
+		// The control plane does not always report utilisation; omit those
+		// cards instead of rendering a fabricated 0% / Idle signal.
+		if (typeof value !== 'number' || Number.isNaN(value)) return;
+		cards.push({
+			label,
+			value: `${Math.round(value)}%`,
+			width: Math.max(0, Math.min(100, value)),
+			state: getPressureState(value)
+		});
+	};
+
+	addCard('CPU envelope', overview.cpu_usage_percent);
+	addCard('Memory envelope', overview.memory_usage_percent);
+	addCard('Storage pressure', overview.storage_usage_percent);
+
+	return cards;
 }

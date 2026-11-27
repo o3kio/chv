@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ShieldCheck, Activity } from 'lucide-svelte';
+  import { Activity } from 'lucide-svelte';
   import SectionCard from '#lib/components/shell/SectionCard.svelte';
   import type { BackupHistory } from '#lib/bff/types.ts';
 
@@ -12,23 +12,6 @@
 </script>
 
 <aside class="support-area">
-  <SectionCard title="SLA Integrity" icon={ShieldCheck}>
-    <div class="registry-vitals">
-       <div class="vital-row">
-          <span>RPO_TARGET</span>
-          <span>24_HOURS</span>
-       </div>
-       <div class="vital-row">
-          <span>STORAGE_POOL</span>
-          <span>DURABLE_S3</span>
-       </div>
-       <div class="vital-row">
-          <span>LAST_CONSISTENCY</span>
-          <span>NOMINAL</span>
-       </div>
-    </div>
-  </SectionCard>
-
   <SectionCard title="Recent Sequences" icon={Activity}>
     <div class="micro-trace-list">
       {#each backupHistory.slice(0, 3) as trace}
@@ -49,25 +32,6 @@
     flex-direction: column;
     gap: 1rem;
   }
-
-  .registry-vitals {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-
-  .vital-row {
-    display: flex;
-    justify-content: space-between;
-    font-size: 9px;
-    font-weight: 800;
-    color: var(--chv-color-neutral-500);
-    padding: 0.35rem 0.5rem;
-    background: var(--bg-surface-muted);
-    border-radius: var(--radius-xs);
-  }
-
-  .vital-row span:last-child { color: var(--chv-color-neutral-900); }
 
   .micro-trace-list {
     display: flex;

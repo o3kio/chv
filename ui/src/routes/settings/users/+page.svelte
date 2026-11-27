@@ -169,8 +169,6 @@
 		<div class="inventory-metrics">
 			<CompactMetricCard label="Total Identities" value={users.length} color="primary" />
 			<CompactMetricCard label="Admin Principals" value={adminCount} color="warning" />
-			<CompactMetricCard label="MFA Compliance" value="100%" color="success" />
-			<CompactMetricCard label="Registry Sync" value="NOMINAL" color="neutral" />
 		</div>
 
 		<main class="inventory-main">

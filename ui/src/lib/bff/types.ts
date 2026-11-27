@@ -505,7 +505,7 @@ export type InfrastructureEvent = {
 	resource_id: string;
 	resource_name?: string;
 	summary: string;
-	state: 'resolved' | 'unresolved';
+	state: 'open' | 'acknowledged' | 'resolved';
 	occurred_at: string;
 };
 
@@ -534,28 +534,26 @@ export type ImportImageResponse = {
 
 export type MaintenanceWindow = {
 	window_id: string;
-	title: string;
-	status: 'active' | 'pending' | 'completed';
-	started_at: string;
-	expected_end_at: string;
+	name: string;
+	cluster?: string;
+	status: string;
+	start_time: string;
+	end_time: string;
+	affected_nodes?: number;
 };
 
 export type MaintenanceNode = {
 	node_id: string;
 	name: string;
-	status: 'draining' | 'in_maintenance' | 'ready';
-	progress?: number;
+	cluster?: string;
+	state: string;
+	task_id?: string;
 };
 
 export type GetMaintenanceResponse = {
 	windows: MaintenanceWindow[];
 	nodes: MaintenanceNode[];
 	pending_actions: number;
-	pending_operator_actions?: { id: string; summary: string }[];
-	upgrade_available?: string;
-	current_version?: string;
-	reboot_required_nodes?: string[];
-	orchestrator_health?: string;
 };
 
 // View-model types used by the UI

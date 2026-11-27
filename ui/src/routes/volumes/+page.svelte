@@ -12,7 +12,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	import type { PageData } from './$types';
 	import CreateVolumeModal from '#lib/components/volumes/CreateVolumeModal.svelte';
 	import { getStoredRole } from '#lib/api/client.ts';
-	import { Plus, Database, Activity, HardDrive, ShieldAlert } from 'lucide-svelte';
+	import { Plus, ShieldAlert } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { page as appPage } from '$app/state';
 
@@ -140,8 +140,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 			color="neutral"
 		/>
 		<CompactMetricCard 
-			label="Storage IOPS" 
-			value="NOMINAL" 
+			label="Healthy Blocks" 
+			value={items.filter(v => v.health === 'healthy').length} 
 			color="primary"
 		/>
 	</div>
@@ -188,7 +188,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		<aside class="support-area">
 			<SectionCard title="Storage Anomalies" icon={ShieldAlert} badgeLabel={String(attentionVolumes.length)}>
 				{#if attentionVolumes.length === 0}
-					<p class="empty-hint">Block devices health reported as nominal.</p>
+					<p class="empty-hint">No volume reports warning, degraded, or critical health.</p>
 				{:else}
 					<ul class="attention-list">
 						{#each attentionVolumes as vol}
@@ -196,26 +196,13 @@ import Button from '#lib/components/primitives/Button.svelte';
 								<div class="attention-card">
 									<div class="attention-card__main">
 										<span class="res-name">{vol.name}</span>
-										<span class="res-issue">IO latency spike detected</span>
+										<span class="res-issue">Health: {vol.health}</span>
 									</div>
 								</div>
 							</li>
 						{/each}
 					</ul>
 				{/if}
-			</SectionCard>
-
-			<SectionCard title="Fabric Telemetry" icon={Activity}>
-				<div class="audit-summary">
-					<div class="summary-row">
-						<span>I/O Throughput</span>
-						<span>2.4 GB/s</span>
-					</div>
-					<div class="summary-row">
-						<span>Write Latency</span>
-						<span>&lt; 0.1ms</span>
-					</div>
-				</div>
 			</SectionCard>
 		</aside>
 	</main>
@@ -270,26 +257,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 		color: var(--chv-color-neutral-600);
 	}
 
-	.audit-summary {
-		display: flex;
-		flex-direction: column;
-		gap: 0.35rem;
-	}
 
-	.summary-row {
-		display: flex;
-		justify-content: space-between;
-		font-size: 10px;
-		color: var(--chv-color-neutral-600);
-		padding: 0.35rem 0.5rem;
-		background: var(--bg-surface-muted);
-		border-radius: var(--radius-xs);
-	}
 
-	.summary-row span:last-child {
-		font-weight: 800;
-		color: var(--chv-color-neutral-900);
-	}
 
 	.empty-hint {
 		font-size: 10px;

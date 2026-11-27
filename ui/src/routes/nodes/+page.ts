@@ -3,6 +3,7 @@ import { getStoredToken } from '#lib/api/client.ts';
 import { listNodes } from '#lib/bff/nodes.ts';
 import { cachedFetch, LIST_TTL } from '#lib/stores/api-cache.svelte.ts';
 import type { ListNodesRequest, NodeListItem } from '#lib/bff/types.ts';
+import { matchesNodeStateFilter } from '#lib/webui/node-state.ts';
 
 export type { NodeListItem };
 
@@ -23,7 +24,7 @@ function filterNodes(items: NodeListItem[], current: Record<string, string>): No
 	}
 	const state = current.state;
 	if (state && state !== 'all') {
-		result = result.filter((n) => n.state.toLowerCase() === state.toLowerCase());
+		result = result.filter((n) => matchesNodeStateFilter(n.state, state));
 	}
 	const maintenance = current.maintenance;
 	if (maintenance && maintenance !== 'all') {

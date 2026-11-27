@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download, Tag } from 'lucide-svelte';
+	import { Download } from 'lucide-svelte';
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
 
 	interface PendingImage {
@@ -32,19 +32,6 @@
 				{/each}
 			</ul>
 		{/if}
-	</SectionCard>
-
-	<SectionCard title="Base Manifest" icon={Tag}>
-		<div class="artifact-manifest">
-			<div class="manifest-row">
-				<span>Standard Templates</span>
-				<span>Online</span>
-			</div>
-			<div class="manifest-row">
-				<span>Global Projections</span>
-				<span>3 Verified</span>
-			</div>
-		</div>
 	</SectionCard>
 </aside>
 
@@ -96,26 +83,5 @@
 		color: var(--color-warning);
 		font-weight: 600;
 		text-transform: uppercase;
-	}
-
-	.artifact-manifest {
-		display: flex;
-		flex-direction: column;
-		gap: 0.35rem;
-	}
-
-	.manifest-row {
-		display: flex;
-		justify-content: space-between;
-		font-size: 10px;
-		color: var(--chv-color-neutral-600);
-		padding: 0.35rem 0.5rem;
-		background: var(--bg-surface-muted);
-		border-radius: var(--radius-xs);
-	}
-
-	.manifest-row span:last-child {
-		font-weight: 700;
-		color: var(--chv-color-neutral-900);
 	}
 </style>

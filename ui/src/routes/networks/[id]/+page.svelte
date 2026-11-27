@@ -64,16 +64,16 @@ import Button from '#lib/components/primitives/Button.svelte';
 		if (s === 'running') return 'healthy';
 		if (s === 'stopped') return 'unknown';
 		if (s.includes('fail') || s.includes('error')) return 'failed';
-		return 'warning';
+		return 'unknown';
 	}
 
 	let showEditModal = $state(false);
 
 	const vmRows = $derived(detail.attached_vms.map(v => ({
 		...v,
-		ip_address: v.ip_address || 'DHCP-pending',
+		ip_address: v.ip_address || '—',
 		mac_address: v.mac_address || '—',
-		runtime_status: { label: v.runtime_status || 'connected', tone: vmStatusTone(v.runtime_status) },
+		runtime_status: { label: v.runtime_status || 'unknown', tone: vmStatusTone(v.runtime_status || '') },
 		addressing_mode: { label: addressingLabel(detail.ipam_mode), tone: addressingTone(detail.ipam_mode) }
 	})));
 </script>

@@ -218,7 +218,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 		{ label: 'Attached VM', value: detail.summary.attached_vm_name || '-', subtext: detail.summary.attached_vm_id || 'None' },
 		{ label: 'Device Path', value: detail.summary.device_name || 'N/A' },
 		{ label: 'Read Only', value: detail.summary.read_only ? 'Yes' : 'No' },
-		{ label: 'Storage Class', value: detail.summary.storage_class || 'Standard' }
+		{ label: 'Storage Class', value: detail.summary.storage_class || '—' }
 	]);
 
 	const configProps = $derived(detail.configuration.map(c => ({ label: c.label, value: c.value })));
@@ -334,22 +334,16 @@ import Button from '#lib/components/primitives/Button.svelte';
 					<PropertyGrid 
 						columns={1}
 						properties={[
-							{ label: 'Kind', value: detail.summary.volume_kind || 'Block' },
-							{ label: 'Pool', value: 'Default ZFS Pool' },
-							{ label: 'Redundancy', value: 'RAID-10 (Mirror)' }
+							{ label: 'Kind', value: detail.summary.volume_kind || '—' },
+							{ label: 'Storage Class', value: detail.summary.storage_class || '—' }
 						]} 
 					/>
 				</SectionCard>
 
 				<SectionCard title="Health Status" icon={AlertTriangle}>
-					{#if detail.summary.health === 'healthy'}
-						<p class="empty-hint">Volume integrity verified. No underlying hardware faults.</p>
-					{:else}
-						<div class="alert-box tone-warning">
-							<span class="alert-label">IO Latency Detected</span>
-							<p class="alert-desc">Higher than average latency detected on the backing pool. Performance may be impacted.</p>
-						</div>
-					{/if}
+					<p class="empty-hint">
+						Control plane reports health as <strong>{detail.summary.health || 'unknown'}</strong>.
+					</p>
 				</SectionCard>
 			</aside>
 		</main>
@@ -466,28 +460,9 @@ import Button from '#lib/components/primitives/Button.svelte';
 		font-size: 0.875rem;
 	}
 
-	.alert-box {
-		padding: 0.75rem;
-		border-radius: 0.375rem;
-		border: 1px solid;
-	}
 
-	.alert-box.tone-warning {
-		background: var(--color-warning-light);
-		border-color: var(--color-warning);
-	}
 
-	.alert-label {
-		font-weight: 600;
-		font-size: 0.875rem;
-		color: var(--color-ink);
-	}
 
-	.alert-desc {
-		font-size: 0.875rem;
-		color: var(--color-muted);
-		margin-top: 0.25rem;
-	}
 
 	.modal-body {
 		display: flex;

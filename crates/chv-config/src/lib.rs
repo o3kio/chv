@@ -760,12 +760,18 @@ pub fn load_nwd_config(path: Option<&Path>) -> Result<NwdConfig, ConfigError> {
     Ok(cfg)
 }
 
+/// How `chv-agent` establishes lifecycle authority.
+///
+/// The compiled/serde default is [`AgentAuthorityMode::CoreManaged`] so that a
+/// config which omits the key fails closed: `legacy` is the fail-open mutation
+/// surface (network applies swallow errors) and must be an explicit opt-in.
+/// Every shipped configuration already selects `core-managed`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentAuthorityMode {
-    #[default]
     Legacy,
     CoreNative,
+    #[default]
     CoreManaged,
 }
 
@@ -947,7 +953,7 @@ fn default_watchdog_healthy_reset_secs() -> u64 {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            authority_mode: AgentAuthorityMode::Legacy,
+            authority_mode: AgentAuthorityMode::default(),
             socket_path: PathBuf::from("/run/chv/agent/api.sock"),
             runtime_dir: PathBuf::from("/var/lib/chv/agent"),
             log_level: "info".to_string(),
@@ -2912,14 +2918,16 @@ max_lifetime_secs = 1200
     }
 
     #[test]
-    fn agent_authority_mode_is_strict_and_defaults_legacy() {
+    fn agent_authority_mode_is_strict_and_defaults_core_managed() {
         #[derive(Deserialize)]
         struct Wrapper {
             #[serde(default)]
             authority_mode: AgentAuthorityMode,
         }
         let defaulted: Wrapper = toml::from_str("").unwrap();
-        assert_eq!(defaulted.authority_mode, AgentAuthorityMode::Legacy);
+        assert_eq!(defaulted.authority_mode, AgentAuthorityMode::CoreManaged);
+        let legacy: Wrapper = toml::from_str("authority_mode = 'legacy'").unwrap();
+        assert_eq!(legacy.authority_mode, AgentAuthorityMode::Legacy);
         let native: Wrapper = toml::from_str("authority_mode = 'core-native'").unwrap();
         assert_eq!(native.authority_mode, AgentAuthorityMode::CoreNative);
         assert!(toml::from_str::<Wrapper>("authority_mode = 'core'").is_err());

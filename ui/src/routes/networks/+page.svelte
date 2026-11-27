@@ -187,7 +187,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 								<div class="attention-card">
 									<div class="attention-card__main">
 										<span class="res-name">{net.name}</span>
-										<span class="res-issue">Public Traffic Active</span>
+										<span class="res-issue">Public exposure enabled</span>
 									</div>
 									<Globe size={12} class="text-warning" />
 								</div>
@@ -198,16 +198,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 			</SectionCard>
 
 			<SectionCard title="Fabric Topology" icon={Lock}>
-				<ul class="task-list">
-					<li class="task-item">
-						<span class="task-label">SDN Controller</span>
-						<span class="task-time">Synchronized</span>
-					</li>
-					<li class="task-item">
-						<span class="task-label">BGP Peer Status</span>
-						<span class="task-time">Established</span>
-					</li>
-				</ul>
+				<p class="empty-hint">Fabric topology and routing peer state are not reported by this API.</p>
 			</SectionCard>
 		</aside>
 	</main>
@@ -314,35 +305,9 @@ import Button from '#lib/components/primitives/Button.svelte';
 		text-transform: uppercase;
 	}
 
-	.task-list {
-		display: flex;
-		flex-direction: column;
-		gap: 0.25rem;
-		list-style: none;
-		padding: 0;
-		margin: 0;
-	}
 
-	.task-item {
-		display: flex;
-		justify-content: space-between;
-		font-size: 10px;
-		padding: 0.35rem 0.5rem;
-		background: var(--bg-surface-muted);
-		border-radius: var(--radius-xs);
-	}
 
-	.task-label {
-		font-weight: 600;
-		color: var(--chv-color-neutral-700);
-	}
 
-	.task-time {
-		color: var(--color-success);
-		font-weight: 700;
-		text-transform: uppercase;
-		font-size: 9px;
-	}
 
 	@media (max-width: 1100px) {
 		.inventory-main {

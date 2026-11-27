@@ -547,6 +547,52 @@ agent's volume open and stord's own backend validation remain the enforcement.
 | LV materialized for a VM volume | `lvs chv-vg` |
 | Agent failed to parse the config | `journalctl -u chv-agent \| grep -i stord_config` (silence is expected on success — the agent logs this key only on the warn/degrade path; "Node reports the class" above is the positive signal) |
 
+### Ceph RBD and iSCSI Volume Deletion (Unsupported)
+
+The `ceph` and `iscsi` stord backends implement open/attach/close,
+resize, and the snapshot family, but **not `destroy`** (#522/DP3). Their
+storage classes are unqualified for independent volume provisioning
+(#379 §8), so rather than silently tombstone a volume while reclaiming
+nothing, `StorageBackend::destroy` returns `InvalidArgument` naming the
+backend.
+
+Operational consequences:
+
+- **Deleting a VM or volume that uses these backends fails at runtime**
+  with that `InvalidArgument`; the operation/task shows the failure. The
+  backing RBD image or LUN is *not* removed.
+- **stord warns at startup** when `backend_type` is `ceph` or `iscsi`,
+  naming the limitation. Check for it when commissioning a node:
+
+  ```bash
+  journalctl -u chv-stord -n 200 | grep -i "does not implement volume destroy"
+  ```
+
+- **Reclaim out-of-band, with ownership confirmed first.** The control
+  plane refuses the delete rather than guessing, so an operator (or a
+  storage administrator) must remove the backing store directly:
+
+  ```bash
+  # Ceph RBD: confirm no VM/snapshot references the image first.
+  rbd info <pool>/<volume_id>
+  rbd snap ls <pool>/<volume_id>
+  rbd rm <pool>/<volume_id>
+
+  # iSCSI: unmap/unexport the LUN through the array/target tooling.
+  # Do not tear down a session that another volume on the same target
+  # still uses (stord reference-counts shared sessions).
+  ```
+
+  Stop the VM and detach the volume before removing anything; a removal
+  underneath a live host can corrupt the guest's view of the block
+  device.
+
+The fail-closed refusal is deliberate: a silent "deleted" success would
+leave the row `Deleting`/tombstoned while the data and capacity leak.
+There is no capability flag or automatic reclaim for these backends
+today; a future implementation must add a tested per-backend destroy
+path rather than weakening the refusal.
+
 ### Upgrade Failures
 
 The automated upgrade orchestrator was removed in PR #213, and the `chvctl upgrade` subcommands were removed in #427 — they targeted `/v1/upgrades` BFF routes that were never registered. There is no automated upgrade surface to troubleshoot; upgrades are performed manually (see "Upgrade Procedure (Manual)" below). If a manual binary swap leaves a node drained, force it back to a healthy state:

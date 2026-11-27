@@ -132,6 +132,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "storage backend initialized"
     );
 
+    // #522 (DP3): the ceph and iscsi backends implement the read/write
+    // volume surface but not `destroy`. A delete reaching them fails
+    // closed at runtime (InvalidArgument) rather than tombstoning the row
+    // and reclaiming nothing, which is the right behavior but is invisible
+    // until an operator tries to delete a VM/volume. Surface the limitation
+    // at startup so it is not discovered mid-incident.
+    if let Some(warning) = unsupported_destroy_warning(config.backend_type.as_deref()) {
+        tracing::warn!("{warning}");
+    }
+
     // Load + validate the storage-migration mTLS identity at startup (issue #232).
     // Fail-closed: a partially configured client half, unreadable material or
     // a mismatched keypair is a startup error (never a runtime downgrade).
@@ -275,6 +285,33 @@ fn validate_backend_type(backend_type: Option<&str>) -> Result<(), String> {
              iscsi, ceph, lvm); refusing to start. Remove the key to select the local \
              backend — an absent key still means local (#379 DP2 fail-closed guard)"
         )),
+    }
+}
+
+/// #522 (DP3) startup visibility for backends without `destroy`.
+///
+/// `CephRbdBackend` and `IscsiBackend` implement the full open/attach/
+/// snapshot family but deliberately refuse `destroy`: their storage
+/// classes are unqualified for standalone provisioning (#379 §8), and a
+/// silent no-op would tombstone the row while reclaiming nothing. The
+/// refusal is correct, but without this warning the first signal is a
+/// failed delete at runtime. Return the operator-facing warning for
+/// either backend; `None` for every backend that can reclaim.
+fn unsupported_destroy_warning(backend_type: Option<&str>) -> Option<&'static str> {
+    match backend_type {
+        Some("ceph") => Some(
+            "OPERATIONS: backend_type = 'ceph' does not implement volume destroy. Deleting a VM \
+             or volume will fail with InvalidArgument and the RBD image will NOT be reclaimed. \
+             Remove the image out-of-band (rbd rm <pool>/<volume_id>) only after confirming no \
+             VM or snapshot still uses it (issue #522/DP3)",
+        ),
+        Some("iscsi") => Some(
+            "OPERATIONS: backend_type = 'iscsi' does not implement volume destroy. Deleting a VM \
+             or volume will fail with InvalidArgument and the LUN will NOT be unmapped or \
+             reclaimed. Unmount/unmap the LUN out-of-band only after confirming no VM still \
+             uses it (issue #522/DP3)",
+        ),
+        _ => None,
     }
 }
 
@@ -441,7 +478,8 @@ fn load_migration_limits(migration: &StordMigrationConfig) -> Result<MigrationLi
 mod tests {
     use super::{
         load_migration_authorization, load_migration_limits, load_migration_materials,
-        start_metrics_endpoint, validate_backend_type, verify_volume_group, DEFAULT_METRICS_BIND,
+        start_metrics_endpoint, unsupported_destroy_warning, validate_backend_type,
+        verify_volume_group, DEFAULT_METRICS_BIND,
     };
     use chv_config::StordMigrationConfig;
     use chv_stord_core::migration::auth::MigrationReceiverAuthorization;
@@ -774,6 +812,37 @@ mod tests {
                 ),
                 Ok(()) => panic!("a present-but-unknown backend_type '{typo}' must abort"),
             }
+        }
+    }
+
+    /// #522 (DP3): only the backends that refuse `destroy` warn at
+    /// startup; local/LVM (which reclaim) and an absent key (local) do
+    /// not. The warning must name the backend and state that reclaim does
+    /// not happen — that is the operator action this helper exists for.
+    #[test]
+    fn unsupported_destroy_warning_covers_only_ceph_and_iscsi() {
+        let ceph = unsupported_destroy_warning(Some("ceph"))
+            .expect("ceph must warn about unimplemented destroy");
+        let iscsi = unsupported_destroy_warning(Some("iscsi"))
+            .expect("iscsi must warn about unimplemented destroy");
+        assert!(
+            ceph.contains("backend_type = 'ceph'"),
+            "the ceph warning must name the exact backend: {ceph}"
+        );
+        assert!(
+            iscsi.contains("backend_type = 'iscsi'"),
+            "the iscsi warning must name the exact backend: {iscsi}"
+        );
+        assert_ne!(
+            ceph, iscsi,
+            "the two backends have different reclaim guidance and must not share one message"
+        );
+        for backend in [None, Some("local"), Some("lvm"), Some("")] {
+            assert_eq!(
+                unsupported_destroy_warning(backend),
+                None,
+                "{backend:?} must not carry the ceph/iscsi destroy warning"
+            );
         }
     }
 

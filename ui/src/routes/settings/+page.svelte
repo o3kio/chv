@@ -1,14 +1,13 @@
 <script lang="ts">
-import Button from '#lib/components/primitives/Button.svelte';
-	import PageHeaderWithAction from '#lib/components/shell/PageHeaderWithAction.svelte';
+import PageHeaderWithAction from '#lib/components/shell/PageHeaderWithAction.svelte';
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
 	import PropertyGrid from '#lib/components/shell/PropertyGrid.svelte';
 	import StatusBadge from '#lib/components/shell/StatusBadge.svelte';
 	import CompactMetricCard from '#lib/components/shared/CompactMetricCard.svelte';
 	import ErrorState from '#lib/components/shell/ErrorState.svelte';
 	import { 
-		Settings, Shield, Fingerprint, Users as UsersIcon, 
-		History, Lock, Terminal, User, Cpu, Activity
+		Settings, Shield, Users as UsersIcon,
+		Terminal, User, Cpu
 	} from 'lucide-svelte';
 	import { getPageDefinition } from '#lib/shell/app-shell.ts';
 	import type { PageData } from './$types';
@@ -17,6 +16,9 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	const page = getPageDefinition('/settings');
 	const model = $derived(data.settings);
+	const operatorCount = $derived(
+		model.usersState === 'error' ? '—' : String(model.users.length)
+	);
 
 	const envProps = $derived([
 		{ label: 'Control Plane', value: model.version },
@@ -27,7 +29,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	const accessProps = $derived([
 		{ label: 'Session TTL', value: `${model.session_ttl_hours} hours` },
-		{ label: 'Active Operators', value: String(model.users.length) }
+		{ label: 'Active Operators', value: operatorCount }
 	]);
 </script>
 
@@ -39,23 +41,23 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 		<div class="inventory-metrics">
 			<CompactMetricCard 
-				label="Platform Integrity" 
-				value="VERIFIED" 
+				label="Control Plane" 
+				value={model.version} 
 				color="primary"
 			/>
 			<CompactMetricCard 
-				label="Operator Count" 
-				value={model.users.length} 
+				label="Environment" 
+				value={model.environment} 
 				color="neutral"
 			/>
 			<CompactMetricCard 
-				label="Governance Mode" 
-				value="STRICT" 
-				color="primary"
+				label="Operator Count" 
+				value={operatorCount} 
+				color="neutral"
 			/>
 			<CompactMetricCard 
-				label="Identity Epoch" 
-				value="v1.4.2" 
+				label="Session TTL" 
+				value={`${model.session_ttl_hours}h`} 
 				color="neutral"
 			/>
 		</div>
@@ -71,29 +73,25 @@ import Button from '#lib/components/primitives/Button.svelte';
 					
 					<div class="operators-roster">
 						<div class="roster-header">Authorized Principal Identities</div>
-						<ul class="operator-list">
-							{#each model.users as user}
-								<li>
-									<div class="operator-card">
-										<div class="operator-info">
-											<User size={12} />
-											<span class="operator-id">{user.email}</span>
+						{#if model.usersState === 'error'}
+							<p class="roster-empty">Operator roster unavailable — the control plane did not return it.</p>
+						{:else if model.users.length === 0}
+							<p class="roster-empty">No operator principals enrolled.</p>
+						{:else}
+							<ul class="operator-list">
+								{#each model.users as user}
+									<li>
+										<div class="operator-card">
+											<div class="operator-info">
+												<User size={12} />
+												<span class="operator-id">{user.email}</span>
+											</div>
+											<StatusBadge label={user.role} tone="healthy" />
 										</div>
-										<StatusBadge label={user.role} tone="healthy" />
-									</div>
-								</li>
-							{/each}
-						</ul>
-					</div>
-				</SectionCard>
-
-				<SectionCard title="Security Hardening" icon={Lock}>
-					<div class="governance-alert">
-						<Fingerprint size={16} />
-						<div class="alert-content">
-							<span class="alert-title">Advanced Policies Engaged</span>
-							<p class="alert-desc">Identity rotation, audit-locking, and cryptographic sealing are active across the fleet.</p>
-						</div>
+									</li>
+								{/each}
+							</ul>
+						{/if}
 					</div>
 				</SectionCard>
 			</div>
@@ -101,35 +99,14 @@ import Button from '#lib/components/primitives/Button.svelte';
 			<aside class="support-area">
 				<SectionCard title="Administrative Ops" icon={Settings}>
 					<div class="ops-pipeline">
-						<Button variant="secondary" class="op-button">
-							<History size={14} />
-							Audit Registry
-						</Button>
-						<Button variant="secondary" class="op-button">
-							<Lock size={14} />
-							Seal Control Plane
-						</Button>
 						<a href="/settings/hypervisor" class="btn-secondary op-button">
 							<Cpu size={14} />
 							Fabric Parameters
 						</a>
-						<Button variant="primary" class="op-button">
+						<a href="/settings/users" class="btn-secondary op-button">
 							<UsersIcon size={14} />
 							Authorize Principal
-						</Button>
-					</div>
-				</SectionCard>
-
-				<SectionCard title="Compliance State" icon={Activity}>
-					<div class="compliance-summary">
-						<div class="summary-row">
-							<span>ISO-27001</span>
-							<span>VERIFIED</span>
-						</div>
-						<div class="summary-row">
-							<span>SOC2-ATT</span>
-							<span>READY</span>
-						</div>
+						</a>
 					</div>
 				</SectionCard>
 			</aside>
@@ -214,25 +191,8 @@ import Button from '#lib/components/primitives/Button.svelte';
 		color: var(--chv-color-neutral-900);
 	}
 
-	.governance-alert {
-		display: flex;
-		gap: 1rem;
-		padding: 0.75rem;
-		background: var(--bg-surface-muted);
-		border: 1px solid var(--border-subtle);
-		border-radius: var(--radius-xs);
-	}
-
-	.alert-title {
-		display: block;
+	.roster-empty {
 		font-size: 11px;
-		font-weight: 800;
-		color: var(--chv-color-neutral-900);
-		margin-bottom: 0.125rem;
-	}
-
-	.alert-desc {
-		font-size: 10px;
 		color: var(--chv-color-neutral-500);
 		margin: 0;
 	}
@@ -244,32 +204,14 @@ import Button from '#lib/components/primitives/Button.svelte';
 	}
 
 	.op-button {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
 		width: 100%;
 		justify-content: flex-start;
 		font-size: 10px;
 		font-weight: 700;
 		text-transform: uppercase;
-	}
-
-	.compliance-summary {
-		display: flex;
-		flex-direction: column;
-		gap: 0.25rem;
-	}
-
-	.summary-row {
-		display: flex;
-		justify-content: space-between;
-		font-size: 10px;
-		color: var(--chv-color-neutral-600);
-		padding: 0.35rem 0.5rem;
-		background: var(--bg-surface-muted);
-		border-radius: var(--radius-xs);
-	}
-
-	.summary-row span:last-child {
-		font-weight: 800;
-		color: var(--color-primary);
 	}
 
 	@media (max-width: 1100px) {

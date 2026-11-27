@@ -61,6 +61,10 @@ impl<E: NetworkExecutor> NetworkServer<E> {
         // restart) always observes the recovered table. A recovery failure
         // aborts startup loudly instead of serving a partial table.
         self.inner.recover_topologies().await?;
+        // Service exposures are journaled separately from topology/policy.
+        // Replay them after the tables exist and before the socket is bound so
+        // a restart cannot silently drop published ports/NAT.
+        self.inner.recover_exposures().await?;
 
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)

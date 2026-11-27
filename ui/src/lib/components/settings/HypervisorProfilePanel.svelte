@@ -54,10 +54,10 @@ import Button from '#lib/components/primitives/Button.svelte';
 	</div>
 </SectionCard>
 
-<SectionCard title="Audit Posture" icon={Check}>
+<SectionCard title="Active Profile" icon={Check}>
 	<div class="safety-sign">
 		<Check size={16} />
-		<span>FABRIC_LEVEL_VERIFIED ({currentProfileName})</span>
+		<span>Current profile: {currentProfileName}</span>
 	</div>
 </SectionCard>
 

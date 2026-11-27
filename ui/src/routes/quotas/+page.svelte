@@ -1,8 +1,9 @@
 <script lang="ts">
 import Button from '#lib/components/primitives/Button.svelte';
   import { onMount } from 'svelte';
-  import { Cpu, HardDrive, Network, Server, Settings, AlertTriangle, Activity, ShieldCheck, RefreshCcw } from 'lucide-svelte';
-  import { createAPIClient, getStoredRole } from '#lib/api/client.ts';
+  import { Cpu, HardDrive, Network, Server, Settings, AlertTriangle, Activity, RefreshCcw } from 'lucide-svelte';
+  import { createAPIClient, getStoredRole, getStoredToken } from '#lib/api/client.ts';
+  import { listUsers } from '#lib/bff/users.ts';
   import { toast } from '#lib/stores/toast.svelte.ts';
   import SectionCard from '#lib/components/shell/SectionCard.svelte';
   import CompactMetricCard from '#lib/components/shared/CompactMetricCard.svelte';
@@ -18,7 +19,6 @@ import Button from '#lib/components/primitives/Button.svelte';
   const pageDef = getPageDefinition('/overview'); // Reusing overview as it contains quota context
 
   let usageData = $state<UsageWithQuota | null>(null);
-  let allQuotas = $state<Quota[]>([]);
   let users = $state<UserInfo[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -41,6 +41,24 @@ import Button from '#lib/components/primitives/Button.svelte';
     error = null;
     try {
       usageData = await client.getUsage();
+      // The adjust-policy modal needs the principal list to choose a user.
+      // Only admins can reach it, and /v1/users is operator-or-admin, so a
+      // failed lookup must not fail the usage view itself.
+      if (isAdmin) {
+        try {
+          const res = await listUsers(getStoredToken() ?? undefined);
+          users = (res.items ?? []).map((user) => ({
+            id: user.user_id,
+            username: user.username,
+            email: user.email ?? undefined,
+            role: user.role
+          }));
+        } catch (userErr) {
+          // eslint-disable-next-line no-console
+          console.warn('Failed to load users for quota policy:', userErr);
+          users = [];
+        }
+      }
     } catch (err: any) {
       error = err.message || 'Usage registry unavailable';
     } finally {
@@ -53,7 +71,9 @@ import Button from '#lib/components/primitives/Button.svelte';
     return usageData.usage[key as keyof typeof usageData.usage] as number;
   }
 
-  function handleModalSuccess() {}
+  function handleModalSuccess() {
+    void loadQuotaData();
+  }
 
   function getQuotaValue(key: ResourceKey): number {
     if (!usageData) return 0;
@@ -135,19 +155,6 @@ import Button from '#lib/components/primitives/Button.svelte';
       </section>
 
       <aside class="support-area">
-        <SectionCard title="Limit Compliance" icon={ShieldCheck}>
-          <div class="audit-summary">
-            <div class="summary-row">
-              <span>Policy Status</span>
-              <span>NOMINAL</span>
-            </div>
-            <div class="summary-row">
-              <span>Oversubscription</span>
-              <span>1.2x</span>
-            </div>
-          </div>
-        </SectionCard>
-
         <SectionCard title="Pressure Audit" icon={Activity}>
           {#if resources.some(r => getPercentage(r.key) > 80)}
             <div class="pressure-list">
@@ -159,7 +166,7 @@ import Button from '#lib/components/primitives/Button.svelte';
                {/each}
             </div>
           {:else}
-             <p class="empty-hint">All resource families reporting nominal headroom.</p>
+             <p class="empty-hint">No resource family is above 80% of its quota.</p>
           {/if}
         </SectionCard>
       </aside>
@@ -171,7 +178,7 @@ import Button from '#lib/components/primitives/Button.svelte';
   bind:open={showSettingsModal}
   quota={editingQuota}
   {users}
-  onSuccess={loadQuotaData}
+  onSuccess={handleModalSuccess}
 />
 
 <style>
@@ -320,26 +327,8 @@ import Button from '#lib/components/primitives/Button.svelte';
     border-radius: 4px;
   }
 
-  .audit-summary {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-  }
 
-  .summary-row {
-    display: flex;
-    justify-content: space-between;
-    font-size: 10px;
-    color: var(--chv-color-neutral-600);
-    padding: 0.35rem 0.5rem;
-    background: var(--bg-surface-muted);
-    border-radius: var(--radius-xs);
-  }
 
-  .summary-row span:last-child {
-    font-weight: 700;
-    color: var(--chv-color-neutral-900);
-  }
 
   .empty-hint {
     font-size: 11px;
@@ -354,11 +343,3 @@ import Button from '#lib/components/primitives/Button.svelte';
     }
   }
 </style>
-
-<!-- Quota Settings Modal -->
-<QuotaSettingsModal
-  bind:open={showSettingsModal}
-  quota={editingQuota}
-  {users}
-  onSuccess={handleModalSuccess}
-/>

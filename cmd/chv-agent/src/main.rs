@@ -2110,9 +2110,11 @@ mod tests {
     }
 
     #[test]
-    fn omitted_authority_mode_is_legacy_and_does_not_select_core_paths() {
+    fn omitted_authority_mode_defaults_to_core_managed() {
+        // Fail-closed: a config that omits `authority_mode` must not select
+        // the legacy fail-open mutation surface.
         let config = AgentConfig::default();
-        assert_eq!(config.authority_mode, AgentAuthorityMode::Legacy);
+        assert_eq!(config.authority_mode, AgentAuthorityMode::CoreManaged);
     }
 
     #[test]

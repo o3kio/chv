@@ -6,7 +6,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	import CreateVMModal from '#lib/components/vms/CreateVMModal.svelte';
 	import { getPageDefinition } from '#lib/shell/app-shell.ts';
 	import { mapPowerTone } from '#lib/shell/power-tone.ts';
-	import { Plus, Activity, AlertCircle, ShieldCheck } from 'lucide-svelte';
+	import { Plus, Activity, AlertCircle } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { page as appPage } from '$app/state';
 
@@ -86,7 +86,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 	const metrics = $derived([
 		{ label: 'Catalog', value: items.length, color: 'neutral' as const },
-		{ label: 'Running', value: items.filter(v => v.power_state.toLowerCase() === 'running').length, trend: +1, color: 'primary' as const },
+		{ label: 'Running', value: items.filter(v => v.power_state.toLowerCase() === 'running').length, color: 'primary' as const },
 		{ label: 'Attention', value: items.filter(v => v.health !== 'healthy').length, color: items.filter(v => v.health !== 'healthy').length > 0 ? 'warning' as const : 'neutral' as const }
 	]);
 </script>
@@ -129,7 +129,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 
 		<SectionCard title="Anomaly Detection" icon={AlertCircle} badgeLabel={String(attentionVms.length)}>
 			{#if attentionVms.length === 0}
-				<p class="empty-hint">Signals nominal. Posture is stable.</p>
+				<p class="empty-hint">No workload reports degradation or active alerts.</p>
 			{:else}
 				<ul class="attention-list">
 					{#each attentionVms as vm}
@@ -144,19 +144,6 @@ import Button from '#lib/components/primitives/Button.svelte';
 					{/each}
 				</ul>
 			{/if}
-		</SectionCard>
-
-		<SectionCard title="Provisioning Log" icon={ShieldCheck}>
-			<ul class="task-list">
-				<li class="task-item">
-					<span class="task-label">Replication Engine</span>
-					<span class="task-time">Online</span>
-				</li>
-				<li class="task-item">
-					<span class="task-label">Migration Target Sync</span>
-					<span class="task-time">Active</span>
-				</li>
-			</ul>
 		</SectionCard>
 	{/snippet}
 </InventoryListPage>

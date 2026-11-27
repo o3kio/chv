@@ -59,9 +59,9 @@ pub struct InventoryReporter {
     stord_backend: StordBackendInfo,
     /// #378: the agent's authority mode (a static per-process config
     /// fact), reported on every inventory so the control plane can
-    /// reject volume snapshot-family requests at accept time. Defaults to
-    /// `Legacy` — the config default — so existing constructions are
-    /// unchanged.
+    /// reject volume snapshot-family requests at accept time. Follows the
+    /// config default (`core-managed`, fail-closed); callers that own the
+    /// configured mode override it with [`Self::with_authority_mode`].
     authority_mode: AgentAuthorityMode,
 }
 
@@ -71,7 +71,7 @@ impl InventoryReporter {
             node_id: node_id.into(),
             hostname: hostname.into(),
             stord_backend: StordBackendInfo::default(),
-            authority_mode: AgentAuthorityMode::Legacy,
+            authority_mode: AgentAuthorityMode::default(),
         }
     }
 
@@ -194,14 +194,13 @@ mod tests {
     fn inventory_reports_authority_mode_from_config() {
         // #378: the agent reports its authority mode (a static per-process
         // config fact) on every inventory so the CP can reject the volume
-        // snapshot family at accept time. Default construction reports
-        // Legacy — the config default — so pre-#378 call sites are
-        // unchanged.
+        // snapshot family at accept time. Default construction now follows
+        // the fail-closed config default (core-managed); legacy is explicit.
         assert_eq!(
             InventoryReporter::new("n", "h")
                 .build_inventory()
                 .authority_mode,
-            proto::AuthorityMode::Legacy as i32
+            proto::AuthorityMode::CoreManaged as i32
         );
         for (mode, expected) in [
             (AgentAuthorityMode::Legacy, proto::AuthorityMode::Legacy),

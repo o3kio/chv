@@ -13,7 +13,7 @@ import Button from '#lib/components/primitives/Button.svelte';
 	import StatusBadge from '#lib/components/shell/StatusBadge.svelte';
 	import ErrorState from '#lib/components/shell/ErrorState.svelte';
 	import EmptyInfrastructureState from '#lib/components/shell/EmptyInfrastructureState.svelte';
-	import { Pause, Play, Wrench, ArrowUpFromLine, Activity, Box, Info, AlertTriangle, ShieldCheck } from 'lucide-svelte';
+	import { Wrench, ArrowUpFromLine, Activity, Box, Info, AlertTriangle, ShieldCheck } from 'lucide-svelte';
 	import TargetMonitoringPanel from '#lib/components/monitoring/TargetMonitoringPanel.svelte';
 	import type { ShellTone } from '#lib/shell/app-shell.ts';
 
@@ -175,16 +175,16 @@ import Button from '#lib/components/primitives/Button.svelte';
 			</section>
 
 			<aside class="support-area">
-				<SectionCard title="Safety Integrity" icon={ShieldCheck}>
+				<SectionCard title="Reported Health" icon={ShieldCheck}>
 					{#if detail.summary.health === 'healthy'}
 						<div class="safety-sign">
 							<ShieldCheck size={16} />
-							<span>HOST_LEVEL_VERIFIED</span>
+							<span>Health reported healthy</span>
 						</div>
 					{:else}
 						<div class="safety-sign alert">
 							<AlertTriangle size={16} />
-							<span>DEGRADATION_DETECTED</span>
+							<span>Health reported {detail.summary.health || 'unknown'}</span>
 						</div>
 					{/if}
 				</SectionCard>

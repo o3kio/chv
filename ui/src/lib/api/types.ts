@@ -124,11 +124,12 @@ export interface Event {
 
 export interface LoginResponse {
   user: {
-    id: string;
+    // The BFF login payload does not include identity/activation metadata.
+    id?: string;
     username: string;
     email?: string;
     role: string;
-    is_active: boolean;
+    is_active?: boolean;
   };
   token: string;
   token_type: string;
@@ -141,7 +142,7 @@ export interface UserInfo {
   username: string;
   email?: string;
   role: string;
-  is_active: boolean;
+  is_active?: boolean;
 }
 
 export interface APIErrorEnvelope {

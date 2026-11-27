@@ -1,7 +1,7 @@
 <script lang="ts">
 	import SectionCard from '#lib/components/shell/SectionCard.svelte';
 	import PropertyGrid from '#lib/components/shell/PropertyGrid.svelte';
-	import { ChevronRight, Info, ShieldCheck, ChevronLeft } from 'lucide-svelte';
+	import { ChevronRight, Info, ChevronLeft } from 'lucide-svelte';
 
 	interface ConfigProp {
 		label: string;
@@ -46,9 +46,6 @@
 			<button class="support-rail-tab" type="button" onclick={onToggle} title="Workload meta" aria-label="Expand workload meta">
 				<Info size={13} />
 			</button>
-			<button class="support-rail-tab" type="button" onclick={onToggle} title="Safety integrity" aria-label="Expand safety integrity">
-				<ShieldCheck size={13} />
-			</button>
 		{/if}
 	</div>
 
@@ -57,22 +54,13 @@
 			<PropertyGrid
 				columns={1}
 				properties={[
-					{ label: 'Fabric Host', value: nodeId },
-					{ label: 'Security Domain', value: 'BALANCED' },
-					{ label: 'Hypervisor Sub', value: 'CLOUD_HYPERVISOR_v3' }
+					{ label: 'Fabric Host', value: nodeId }
 				]}
 			/>
 		</SectionCard>
 
 		<SectionCard title="Workload Meta" icon={Info}>
 			<PropertyGrid properties={configProps} columns={1} />
-		</SectionCard>
-
-		<SectionCard title="Safety Integrity" icon={ShieldCheck}>
-			<div class="safety-sign">
-				<ShieldCheck size={16} />
-				<span>GUEST_LEVEL_NOMINAL</span>
-			</div>
 		</SectionCard>
 	{/if}
 </aside>
@@ -116,18 +104,6 @@
 		border-color: var(--shell-accent);
 		background: var(--shell-accent-soft);
 		color: var(--shell-text);
-	}
-
-	.safety-sign {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		padding: 0.65rem 0.75rem;
-		border-radius: var(--radius-sm);
-		background: var(--color-success-light);
-		color: var(--color-success-dark);
-		font-size: var(--chv-text-sm);
-		font-weight: 600;
 	}
 
 	@media (max-width: 1200px) {

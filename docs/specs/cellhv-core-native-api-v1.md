@@ -13,10 +13,10 @@ The configured endpoint is `/run/chv/core/core-v1.sock`. `chv-agent` composes
 the listener in both `core-managed` and `core-native` authority modes. In
 core-managed mode, `CoreRuntimeOwner::start` binds the native listener
 alongside the legacy stack. Only the `legacy` authority mode leaves the
-listener unstarted. The config-loader default is `legacy`; shipped
-configurations select `core-managed`, so the shipped agent binds the native
-listener. Core-native mode does not compose the legacy Controller, VMM, or
-provider stack.
+listener unstarted. The config-loader default is `core-managed` and shipped
+configurations select it explicitly, so both the default and shipped agent bind
+the native listener. Core-native mode does not compose the legacy Controller,
+VMM, or provider stack.
 
 ## Contract
 

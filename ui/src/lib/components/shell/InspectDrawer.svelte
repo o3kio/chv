@@ -3,13 +3,11 @@
 	import { getStoredToken } from '#lib/api/client.ts';
 	import { getVm } from '#lib/bff/vms.ts';
 	import { getNode } from '#lib/bff/nodes.ts';
-	import type { VmSummary, NodeSummary } from '#lib/bff/types.ts';
 	import { fade } from 'svelte/transition';
 	import { ChevronRight, Loader2 } from 'lucide-svelte';
 	import InspectorHeader from './InspectorHeader.svelte';
 	import EntityIdentity from './EntityIdentity.svelte';
 	import PostureCard from './PostureCard.svelte';
-	import MetricBars from './MetricBars.svelte';
 	import PropertyMesh from './PropertyMesh.svelte';
 	import MutationControls from './MutationControls.svelte';
 	import InspectorEmptyState from './InspectorEmptyState.svelte';
@@ -47,24 +45,21 @@
 		try {
 			if (type === 'node') {
 				const res = await getNode({ node_id: id }, token);
-				const summary = res.summary as NodeSummary & { architecture?: string; provider_type?: string };
+				const summary = res.summary;
 				details = {
 					...summary,
 					id: summary.node_id,
 					status: normalizeNodeStatus(summary.state),
-					architecture: summary.architecture || 'x86_64',
-					provider_type: summary.provider_type || 'LOCAL_HOST'
+					version: summary.version
 				};
 			} else if (type === 'vm') {
 				const res = await getVm({ vm_id: id }, token);
-				const summary = res.summary as VmSummary & { architecture?: string; provider_type?: string };
+				const summary = res.summary;
 				details = {
 					...summary,
 					id: summary.vm_id,
 					actual_state: normalizeVmState(summary.power_state),
-					status: normalizeVmState(summary.power_state),
-					architecture: summary.architecture || 'x86_64',
-					provider_type: summary.provider_type || 'LOCAL_HOST'
+					status: normalizeVmState(summary.power_state)
 				};
 			}
 		} catch (err) {
@@ -97,18 +92,12 @@
 						<PostureCard status={details.status} actual_state={details.actual_state} />
 					</div>
 
-					<div class="flex flex-col gap-2.5">
-						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">System Pulse</div>
-						<MetricBars cpuUsage={0} memoryUsagePercent={0} />
-					</div>
-
-					<div class="flex flex-col gap-2.5">
-						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">Properties</div>
-						<PropertyMesh
-							architecture={details.architecture}
-							providerType={details.provider_type}
-						/>
-					</div>
+					{#if details.version}
+						<div class="flex flex-col gap-2.5">
+							<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">Properties</div>
+							<PropertyMesh version={details.version} />
+						</div>
+					{/if}
 
 					<div class="flex flex-col gap-2.5">
 						<div class="text-[9px] font-extrabold text-(--chv-color-neutral-500) uppercase tracking-widest">Actions</div>

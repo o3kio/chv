@@ -85,15 +85,12 @@ import Button from '#lib/components/primitives/Button.svelte';
     { key: 'resources', label: 'Resource Profile' },
     { key: 'image_name', label: 'Base Image' },
     { key: 'tags', label: 'Directives' },
-    { key: 'status', label: 'Availability', align: 'center' as const },
     { key: '_actions', label: '', align: 'center' as const }
   ];
 
   const ciColumns = [
     { key: 'name', label: 'Identity' },
-    { key: 'variables', label: 'Defined Var Registry' },
-    { key: 'last_used', label: 'Last Seq', align: 'right' as const },
-    { key: '_actions', label: '', align: 'center' as const }
+    { key: 'variables', label: 'Defined Var Registry' }
   ];
 
   async function loadData() {
@@ -166,9 +163,9 @@ import Button from '#lib/components/primitives/Button.svelte';
       color="neutral"
     />
     <CompactMetricCard
-      label="SLA Compliance"
-      value="NOMINAL"
-      color="primary"
+      label="Network Fabrics"
+      value={networks.length}
+      color="neutral"
     />
   </div>
 

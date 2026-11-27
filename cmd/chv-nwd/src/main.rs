@@ -50,7 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // running a daemon with no observability surface (#657).
     start_metrics_endpoint(&config, process_started).await?;
 
-    let mut executor = chv_nwd_core::executor::LinuxExecutor::new(config.runtime_dir.clone());
+    let mut executor = chv_nwd_core::executor::LinuxExecutor::new(config.runtime_dir.clone())
+        .with_exposure_store(chv_nwd_core::exposure_store::ExposureStore::default_dir());
     if config.fabric.enabled {
         let fabric = chv_nwd_core::fabric::NwdFabricProvider::real(&config.fabric)?;
         info!(
@@ -66,11 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("stretched-L2 fabric provider disabled; fabric RPCs fail closed");
     }
 
-    // rc.8 blocker B9: journal every bridge-only topology and the last
-    // requested firewall/NAT policy under /var/lib/chv/nwd, then replay both
-    // before serving. A documented nwd restart (or host reboot) re-materializes
-    // the topology and its guard set instead of failing the next policy update
-    // with `not found: topology` or leaving attached guests unfiltered.
+    // rc.8 blocker B9: journal every bridge-only topology, the last requested
+    // firewall/NAT policy, and every applied service exposure under
+    // /var/lib/chv/nwd, then replay all three before serving. A documented nwd
+    // restart (or host reboot) re-materializes the topology, its guard set, and
+    // published ports instead of failing the next policy update with
+    // `not found: topology`, leaving attached guests unfiltered, or silently
+    // dropping DNAT for running VMs.
     let server = NetworkServer::new(executor, chv_observability::Metrics::new())
         .with_topology_store(chv_nwd_core::topology_store::TopologyStore::default_dir())
         .with_policy_store(chv_nwd_core::policy_store::PolicyStore::default_dir());

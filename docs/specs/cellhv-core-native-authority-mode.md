@@ -4,12 +4,12 @@ Status: explicit opt-in production composition; the shipped default is
 `core-managed` (see below).
 
 `chv-agent` accepts `authority_mode = "legacy" | "core-managed" |
-"core-native"`. A missing key defaults to `legacy` for developer/compat
-strictness (the config loader's own default; selecting it explicitly logs a
-warning), while every shipped configuration — the packaged
-`/etc/chv/agent.toml`, `docs/examples/agent.toml`, and the `install.sh`
-template — sets `core-managed`, the qualified production composition (#326).
-`legacy` preserves the legacy Controller-facing AgentServer, reconciler,
+"core-native"`. A missing key defaults to `core-managed` (fail-closed; the
+config loader's own default), matching every shipped configuration — the
+packaged `/etc/chv/agent.toml`, `docs/examples/agent.toml`, and the
+`install.sh` template — which also select `core-managed`, the qualified
+production composition (#326). `legacy` is an explicit opt-in that logs a
+warning and preserves the legacy Controller-facing AgentServer, reconciler,
 provider, VMM, metrics, console, and NodeCache startup path.
 
 `core-native` dispatches before any legacy component is constructed. It

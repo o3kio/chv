@@ -155,6 +155,13 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
         store.remove(network_id).await
     }
 
+    /// Drop the durable exposure journal for a deleted network. A failure fails
+    /// the delete closed for the same reason as `forget_topology`: a surviving
+    /// entry would replay the deleted network's DNAT on the next restart.
+    async fn forget_exposures(&self, network_id: &str) -> Result<(), ChvError> {
+        self.executor.forget_exposures(network_id).await
+    }
+
     /// Record the requested firewall half durably before the executor apply.
     /// Mutating the in-memory pair and taking the persistence snapshot under
     /// one lock keeps a concurrent NAT RPC from persisting a half pair. The
@@ -337,6 +344,25 @@ impl<E: NetworkExecutor> NetworkServiceImpl<E> {
                 ),
             })
         }
+    }
+
+    /// Replay journaled service exposures before the server starts accepting
+    /// RPCs. Topologies (and their policies) must already be recovered: an
+    /// exposure installs DNAT/forward rules into a network's nft table.
+    ///
+    /// Only networks with a recovered bridge-only topology are eligible.
+    /// Fabric-backed states are excluded even if present: their overlay is not
+    /// recovered here, so replaying DNAT would attach rules to a network that
+    /// does not exist.
+    pub async fn recover_exposures(&self) -> Result<(), ChvError> {
+        let recoverable: std::collections::HashSet<String> = self
+            .topologies
+            .list()
+            .into_iter()
+            .filter(|state| state.fabric_plan_generation.is_none())
+            .map(|state| state.network_id)
+            .collect();
+        self.executor.recover_exposures(&recoverable).await
     }
 
     /// Restore and re-apply the last requested firewall/NAT policy for one
@@ -1061,6 +1087,13 @@ impl<E: NetworkExecutor> proto::network_service_server::NetworkService for Netwo
             }
             self.policy_state.remove(&req.network_id);
             self.rejected_policies.remove(&req.network_id);
+        }
+        // Drop the durable exposure journal last. Without this, a later nwd
+        // restart replays the deleted network's DNAT into an orphan nft table.
+        // Fail closed: the journal entry is the only remaining reference, and a
+        // retry is idempotent.
+        if let Err(e) = self.forget_exposures(&req.network_id).await {
+            return Ok(Response::new(Self::err_result(&e)));
         }
 
         Ok(Response::new(Self::ok_result()))
