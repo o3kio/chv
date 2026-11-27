@@ -116,10 +116,15 @@ class CellHvCorePackagingTests(unittest.TestCase):
     def test_nwd_unit_prepares_the_topology_journal_directory(self):
         # Field blocker B9: nwd journals applied bridge-only topologies under
         # /var/lib/chv/nwd/topologies (and the last requested policy under
-        # /var/lib/chv/nwd/policies) and replays both before serving. The
-        # unit must create those directories before ExecStart (StateDirectory
-        # only creates /var/lib/chv), with the daemon's identity so the
-        # non-root process can write them under ProtectSystem=strict.
+        # /var/lib/chv/nwd/policies) and replays both before serving. Service
+        # exposures are journaled under /var/lib/chv/nwd/exposures so they
+        # survive a restart (see ExposureStore). The unit must create those
+        # directories before ExecStart (StateDirectory only creates
+        # /var/lib/chv), with the daemon's identity so the non-root process can
+        # write them under ProtectSystem=strict. Both unit copies are pinned
+        # because install.sh ships the standalone copy while packages ship the
+        # packaged copy; drift would silently break exposure persistence on one
+        # install path.
         for relative in (
             "packaging/systemd/chv-nwd.service",
             "docs/examples/systemd/chv-nwd.service",
@@ -128,7 +133,7 @@ class CellHvCorePackagingTests(unittest.TestCase):
             self.assertIn(
                 "ExecStartPre=+/usr/bin/install -d -m 0700 -o chv -g chv "
                 "/var/lib/chv/nwd/topologies /var/lib/chv/nwd/policies "
-                "/var/lib/chv/nwd/dhcp",
+                "/var/lib/chv/nwd/exposures /var/lib/chv/nwd/dhcp",
                 unit,
             )
 
@@ -136,10 +141,13 @@ class CellHvCorePackagingTests(unittest.TestCase):
         main = (ROOT / "cmd/chv-nwd/src/main.rs").read_text()
         self.assertIn(".with_topology_store(", main)
         self.assertIn(".with_policy_store(", main)
+        self.assertIn(".with_exposure_store(", main)
         self.assertIn("TopologyStore::default_dir()", main)
         self.assertIn("PolicyStore::default_dir()", main)
+        self.assertIn("ExposureStore::default_dir()", main)
         server = (ROOT / "crates/chv-nwd-core/src/server.rs").read_text()
         self.assertIn("recover_topologies().await", server)
+        self.assertIn("recover_exposures().await", server)
         handlers = (ROOT / "crates/chv-nwd-core/src/handlers.rs").read_text()
         # Recovery must restore the guard set, not just the topology row.
         self.assertIn("recover_policies(&spec.network_id, &state)", handlers)

@@ -10,7 +10,11 @@ test.describe('Node Management', () => {
 
 	test('renders node list table with mocked hosts', async ({ page }) => {
 		await expect(page.getByRole('link', { name: 'hv-01' }).first()).toBeVisible();
-		await expect(page.getByRole('button', { name: /enroll node/i })).toBeVisible();
+		// Enrollment is a control-plane CLI flow (`/v1/nodes/enroll`); the page
+		// intentionally ships no create/enroll button until there is a real
+		// enrollment UI. Assert the rendered table itself instead of a button
+		// that must stay absent.
+		await expect(page.getByRole('columnheader', { name: 'Compute Node' })).toBeVisible();
 	});
 
 	test('navigates to node detail page', async ({ page }) => {
