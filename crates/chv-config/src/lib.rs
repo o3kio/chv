@@ -162,7 +162,7 @@ const DEV_SECRET: &str = "chv-dev-secret-change-in-production";
 /// new `[secrets]` fields. Independent rotation requires explicit values —
 /// rotating the legacy master rotates every derived key together.
 fn derive_domain_secret(master: &str, domain: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let mut mac =
         Hmac::<Sha256>::new_from_slice(master.as_bytes()).expect("HMAC accepts keys of any length");

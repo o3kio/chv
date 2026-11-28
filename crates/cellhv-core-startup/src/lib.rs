@@ -680,7 +680,7 @@ fn verify_archive(path: &Path, checksum: &str) -> Result<()> {
     let bytes = read_optional(path)?.ok_or_else(|| StartupError::ArchiveMismatch {
         path: path.to_owned(),
     })?;
-    if format!("{:x}", Sha256::digest(bytes)) != checksum {
+    if hex::encode(Sha256::digest(bytes)) != checksum {
         return Err(StartupError::ArchiveMismatch {
             path: path.to_owned(),
         });
@@ -698,7 +698,7 @@ fn verify_archive(path: &Path, checksum: &str) -> Result<()> {
 /// heals on the next boot — a leftover temp cannot match the verified
 /// source and would otherwise wedge every later boot.
 fn restore_archive(path: &Path, bytes: &[u8], checksum: &str) -> Result<()> {
-    debug_assert_eq!(format!("{:x}", Sha256::digest(bytes)), checksum);
+    debug_assert_eq!(hex::encode(Sha256::digest(bytes)), checksum);
     let temp = archive_temp_path(path);
     match fs::remove_file(&temp) {
         Ok(()) => {}
@@ -1332,7 +1332,7 @@ mod tests {
         // The archive was restored from the verified live cache.
         assert!(verify_archive(
             &paths.node_cache_archive,
-            &format!("{:x}", Sha256::digest(cache_bytes("node-a", "7")))
+            &hex::encode(Sha256::digest(cache_bytes("node-a", "7")))
         )
         .is_ok());
     }
@@ -1356,7 +1356,7 @@ mod tests {
         assert_eq!(healed.kind(), ActivationKind::ImportedNodeCache);
         assert!(verify_archive(
             &paths.node_cache_archive,
-            &format!("{:x}", Sha256::digest(cache_bytes("node-a", "7")))
+            &hex::encode(Sha256::digest(cache_bytes("node-a", "7")))
         )
         .is_ok());
     }
@@ -1388,7 +1388,7 @@ mod tests {
         assert_eq!(healed.kind(), ActivationKind::ImportedNodeCache);
         assert!(verify_archive(
             &paths.node_cache_archive,
-            &format!("{:x}", Sha256::digest(cache_bytes("node-a", "7")))
+            &hex::encode(Sha256::digest(cache_bytes("node-a", "7")))
         )
         .is_ok());
         assert!(!archive_temp_path(&paths.node_cache_archive).exists());
@@ -1457,7 +1457,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         let original = cache_bytes("node-a", "7");
-        let checksum = format!("{:x}", Sha256::digest(&original));
+        let checksum = hex::encode(Sha256::digest(&original));
         let mut service = OperationService::create_migration_target(&paths.core_database).unwrap();
         let host = cellhv_core_types::HostIdentity {
             id: cellhv_core_types::HostId::new("node-a").unwrap(),

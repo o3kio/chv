@@ -22,7 +22,7 @@
 //! payload is only trusted after the HMAC verifies in constant time using
 //! the `hmac` crate's `verify_slice`.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

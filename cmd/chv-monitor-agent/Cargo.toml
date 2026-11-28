@@ -31,6 +31,7 @@ libc = "0.2"
 # executables (security/plugins contract v1 — digest re-verified
 # before every execution).
 sha2 = { workspace = true }
+hex = { workspace = true }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 # Same reqwest line as chv-netbox-adapter / chvctl (rustls, JSON bodies).
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -47,10 +48,7 @@ axum = { workspace = true }
 # Independent HMAC-SHA256 verification of the rig's webhook
 # signatures (g4b evidence: the test must not reuse the signer's
 # code). Same version line as chv-controlplane-service.
-hmac = "0.12"
-# Digest pin verification of the VictoriaMetrics binary (g5b export
-# rig): the evidence run must state and check the binary sha256.
-hex = "0.4"
+hmac = "0.13"
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

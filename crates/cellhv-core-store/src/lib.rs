@@ -1264,7 +1264,7 @@ impl CoreStore {
                 "recovery evidence exceeds 16 KiB".to_owned(),
             ));
         }
-        let evidence_fingerprint = format!("{:x}", Sha256::digest(evidence_json.as_bytes()));
+        let evidence_fingerprint = hex::encode(Sha256::digest(evidence_json.as_bytes()));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1362,7 +1362,7 @@ impl CoreStore {
                 "restart classification evidence exceeds 16 KiB".to_owned(),
             ));
         }
-        let evidence_fingerprint = format!("{:x}", Sha256::digest(evidence_json.as_bytes()));
+        let evidence_fingerprint = hex::encode(Sha256::digest(evidence_json.as_bytes()));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1438,7 +1438,7 @@ impl CoreStore {
                 "abandonment evidence exceeds 16 KiB".to_owned(),
             ));
         }
-        let evidence_fingerprint = format!("{:x}", Sha256::digest(evidence_json.as_bytes()));
+        let evidence_fingerprint = hex::encode(Sha256::digest(evidence_json.as_bytes()));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1540,7 +1540,7 @@ impl CoreStore {
             _ => None,
         };
         let error = error_payload.map(canonical_json).transpose()?;
-        let evidence_fingerprint = format!("{:x}", Sha256::digest(evidence_json.as_bytes()));
+        let evidence_fingerprint = hex::encode(Sha256::digest(evidence_json.as_bytes()));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2016,7 +2016,7 @@ fn configure(conn: &Connection) -> Result<()> {
 }
 
 fn checksum(sql: &str) -> String {
-    format!("{:x}", Sha256::digest(sql.as_bytes()))
+    hex::encode(Sha256::digest(sql.as_bytes()))
 }
 
 fn apply_migrations_with_host(
@@ -2849,10 +2849,7 @@ fn recovery_record(
             "recovery evidence is not an object".to_owned(),
         ));
     }
-    let actual = format!(
-        "{:x}",
-        Sha256::digest(canonical_json(&evidence)?.as_bytes())
-    );
+    let actual = hex::encode(Sha256::digest(canonical_json(&evidence)?.as_bytes()));
     if actual != fingerprint {
         return Err(StoreError::Integrity(
             "recovery evidence fingerprint mismatch".to_owned(),
@@ -3292,7 +3289,7 @@ fn schema_fingerprint(conn: &Connection) -> Result<String> {
             digest.update(value.as_bytes());
         }
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
@@ -5360,7 +5357,7 @@ mod tests {
     fn recovery_revision_beyond_sqlite_range_is_rejected_without_partial_write() {
         let (_directory, _path, mut store, id) = running_recovery_store("op-recovery-overflow");
         let evidence = canonical_json(&serde_json::json!({"seed":true})).unwrap();
-        let fingerprint = format!("{:x}", Sha256::digest(evidence.as_bytes()));
+        let fingerprint = hex::encode(Sha256::digest(evidence.as_bytes()));
         store.conn.execute(
             "INSERT INTO operation_recovery_assessments (operation_id,revision,active_attempt_token,classification,disposition,evidence_fingerprint,evidence_json) VALUES (?1,?2,'attempt-recovery','ambiguous_preserve','quarantined',?3,?4)",
             params![id.as_str(), i64::MAX, fingerprint, evidence],
@@ -5481,7 +5478,7 @@ mod tests {
                 &serde_json::json!({"source":"operator-resolution","note":"prefix"}),
             )
             .unwrap();
-            let fingerprint = format!("{:x}", Sha256::digest(evidence.as_bytes()));
+            let fingerprint = hex::encode(Sha256::digest(evidence.as_bytes()));
             conn.execute(
                 "INSERT INTO operation_recovery_assessments (operation_id,revision,active_attempt_token,classification,disposition,evidence_fingerprint,evidence_json) VALUES (?1,2,'attempt-recovery','exited_owned','exited_pending_policy',?2,?3)",
                 params![id.as_str(), fingerprint, evidence],
