@@ -40,7 +40,7 @@
     "vitest": "^5.1.0"
   },
   "dependencies": {
-    "@xyflow/svelte": "^1.7.1",
+    "@xyflow/svelte": "^2.0.3",
     "chart.js": "^4.6.1",
     "fuse.js": "^7.5.0",
     "js-yaml": "^5.5.0",
