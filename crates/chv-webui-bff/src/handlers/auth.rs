@@ -201,10 +201,12 @@ pub async fn login(
         token_version: Some(token_version),
     };
 
+    let encoding_key = jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes())
+        .map_err(|e| BffError::Internal(format!("invalid signing key: {}", e)))?;
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &encoding_key,
     )
     .map_err(|e| BffError::Internal(format!("failed to encode token: {}", e)))?;
 
@@ -692,7 +694,8 @@ mod tests {
         jsonwebtoken::encode(
             &header,
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("encode test token")
     }

@@ -214,7 +214,8 @@ fn token_for(state: &AppState, role: &str) -> String {
     jsonwebtoken::encode(
         &header,
         &claims,
-        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes())
+            .expect("test secret is non-empty"),
     )
     .expect("encode test token")
 }

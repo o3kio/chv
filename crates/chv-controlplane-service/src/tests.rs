@@ -131,7 +131,7 @@ fn test_token_claims(sub: &str, username: &str, role: &str) -> String {
     jsonwebtoken::encode(
         &header,
         &claims,
-        &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        &jsonwebtoken::EncodingKey::from_secret(b"test-secret").expect("test secret is non-empty"),
     )
     .expect("test token encoding should succeed")
 }

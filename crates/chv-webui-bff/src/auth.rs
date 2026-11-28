@@ -352,7 +352,7 @@ pub fn require_admin(claims: &Claims) -> Result<(), BffError> {
 }
 
 pub fn validate_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+    let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())?;
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     // Audience is checked manually below so pre-#660 tokens (no `aud`) keep
     // working during the documented rollout window.
@@ -703,7 +703,8 @@ mod tests {
         jsonwebtoken::encode(
             &header,
             claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("encoding should succeed in tests")
     }
@@ -759,7 +760,8 @@ mod tests {
                 "aud": chv_common::CONSOLE_AUDIENCE,
                 "exp": exp,
             }),
-            &jsonwebtoken::EncodingKey::from_secret(console_secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(console_secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("encode console token");
         assert!(
@@ -939,7 +941,8 @@ mod tests {
         let token = jsonwebtoken::encode(
             &header,
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("HS512 encoding should succeed");
 
@@ -1116,7 +1119,8 @@ mod tests {
         let token = jsonwebtoken::encode(
             &header,
             &payload,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("encoding json value should succeed");
         let validated = validate_token(&token, &secret).expect("unknown fields must be ignored");
@@ -1139,7 +1143,8 @@ mod tests {
         let token = jsonwebtoken::encode(
             &header,
             &payload,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("encoding json value should succeed");
         let result = validate_token(&token, &secret);

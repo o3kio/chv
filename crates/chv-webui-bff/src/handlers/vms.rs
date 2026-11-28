@@ -1452,11 +1452,8 @@ fn generate_console_token(
         exp,
     };
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    jsonwebtoken::encode(
-        &header,
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
-    )
+    let encoding_key = jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())?;
+    jsonwebtoken::encode(&header, &claims, &encoding_key)
 }
 
 #[derive(serde::Deserialize)]

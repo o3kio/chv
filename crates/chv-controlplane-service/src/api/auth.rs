@@ -152,11 +152,16 @@ pub async fn login_handler(
     };
 
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    let token = match jsonwebtoken::encode(
-        &header,
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    ) {
+    let encoding_key = match jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid jwt signing key");
+            return Err(chv_webui_bff::BffError::Internal(
+                "failed to generate token".into(),
+            ));
+        }
+    };
+    let token = match jsonwebtoken::encode(&header, &claims, &encoding_key) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "failed to encode jwt token");

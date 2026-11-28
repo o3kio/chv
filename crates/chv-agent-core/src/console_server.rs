@@ -431,7 +431,7 @@ fn validate_console_token(
     token: &str,
     secret: &str,
 ) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+    let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())?;
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     // Console tokens must carry exactly the console audience, and `exp`,
     // `aud`, and `sub` are all mandatory. This stops a user session token
@@ -478,7 +478,8 @@ mod tests {
         jsonwebtoken::encode(
             &header,
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes())
+                .expect("test secret is non-empty"),
         )
         .expect("encoding should succeed in tests")
     }
@@ -561,7 +562,8 @@ mod tests {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(test_secret().as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(test_secret().as_bytes())
+                .expect("test secret is non-empty"),
         )
         .unwrap();
         assert!(validate_console_token(&token, &test_secret()).is_err());
