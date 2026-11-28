@@ -200,7 +200,8 @@ fn token_with_username(state: &AppState, sub: &str, username: &str, role: &str) 
     jsonwebtoken::encode(
         &header,
         &claims,
-        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes())
+            .expect("test secret is non-empty"),
     )
     .expect("encode test token")
 }
