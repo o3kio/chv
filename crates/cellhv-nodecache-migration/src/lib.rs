@@ -154,7 +154,7 @@ pub fn plan(source: &[u8]) -> Result<ImportPlan> {
     }
     definitions.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(ImportPlan {
-        checksum: format!("{:x}", Sha256::digest(source)),
+        checksum: hex::encode(Sha256::digest(source)),
         host: HostIdentity {
             id: HostId::new(cache.node_id).map_err(|error| malformed(&error.to_string()))?,
             resource_version: ResourceVersion::new(1).expect("one is valid"),

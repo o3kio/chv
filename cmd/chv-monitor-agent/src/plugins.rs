@@ -530,7 +530,7 @@ async fn sha256_file(path: &Path) -> io::Result<String> {
         }
         hasher.update(&chunk[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Component-wise containment: `candidate` must be strictly inside
@@ -882,7 +882,7 @@ mod tests {
     fn sha256_sync(path: &Path) -> String {
         let mut hasher = Sha256::new();
         hasher.update(std::fs::read(path).unwrap());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     fn write_script(path: &Path, body: &str) {

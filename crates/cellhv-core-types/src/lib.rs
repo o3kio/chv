@@ -30,7 +30,7 @@ pub fn canonical_json(value: &serde_json::Value) -> Result<String, serde_json::E
 pub fn canonical_request_fingerprint(
     value: &serde_json::Value,
 ) -> Result<String, serde_json::Error> {
-    Ok(format!("{:x}", Sha256::digest(canonical_json(value)?)))
+    Ok(hex::encode(Sha256::digest(canonical_json(value)?)))
 }
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), ChvError> {

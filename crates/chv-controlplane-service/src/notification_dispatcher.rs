@@ -27,7 +27,7 @@
 //! the durable `notification_outbox`) lives elsewhere in this crate
 //! and composes these primitives.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::Sha256;
 use std::fmt::Write as _;

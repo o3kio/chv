@@ -63,7 +63,7 @@ use chv_controlplane_store::{
 };
 use chv_monitoring_core::model::{CheckStatus, TargetKind};
 use chv_monitoring_store::{MonitoringHealth, MonitoringStore, MonitoringStoreConfig, StoredCheck};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
